@@ -20,6 +20,7 @@ from chocofarm.model.env import Environment
 from chocofarm.eval.harness import realizable_static, clairvoyant_rate
 from chocofarm.solvers.nmcs import NMCSPolicy
 from chocofarm.solvers.ismcts import ISMCTSPolicy
+from chocofarm.solvers.uct import UCTPolicy
 from tensorboardX import SummaryWriter
 
 
@@ -39,6 +40,8 @@ def make_policy(method, cfg):
         return NMCSPolicy(level=int(cfg))
     if method == "ismcts":
         return ISMCTSPolicy(iterations=int(cfg))
+    if method == "uct":
+        return UCTPolicy(iterations=int(cfg))
     raise SystemExit("unknown method " + method)
 
 
