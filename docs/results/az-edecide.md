@@ -71,6 +71,52 @@ baseline skipped:
 
 ---
 
+## (b-result) FULL E-DECIDE RESULT (orchestrator-driven — the actual verdict)
+
+Run on a freed core (solver daemons paused), streamed to TensorBoard
+(`tb/az_edecide_train`, `tb/az_edecide_eval`). Stage-1 dataset = 300 decomp episodes
+(4,421 transitions); value head 200 epochs. Stage-2 = interleaved paired (same-seed)
+net-value vs playout-leaf at fixed λ₀=0.0855, N=200, it=200.
+
+**Stage 1 — Gate 1 (value learnability): PASS, moderate.** Held-out **R² = 0.413**,
+MAE 0.562 (target mean −0.32, std 0.96). R² peaks ~0.44 by epoch 40 then plateaus — a
+representational ceiling of the §2.2 features, not undertraining. The λ-value IS learnable
+on the honest 44-face env (F6 holds), but the features leave ~59% of the return variance
+unexplained.
+
+**Stage 2 — the decisive comparison (fixed λ₀=0.0855, N=200):**
+
+| leaf | rate | E[T] | %VoI |
+|---|---|---|---|
+| net-value (learned) | **0.0694** | 52.3 | −27% |
+| playout (determinized) | 0.0665 | 42.5 | −32% |
+| Δ (net − playout) | **+0.0030** | **+9.9** | +5 pts |
+
+**Verdict: a marginal, mechanism-WRONG beat — a weak/provisional GO, not a clean one.**
+The net-value leaf reliably (stable across the streamed run, not noise) edges the playout
+leaf by +0.0030 / +5 VoI points — but it stays **well below the 0.0855 floor** (−27%), and
+the over-collection signature goes the **wrong way**: net E[T] is *longer* (52.3 vs 42.5),
+i.e. the learned value drives *more* over-collection, not less. The design's H-calibrate
+mechanism (a calibrated value *cures* the F4 over-collection optimism → shorter E[T], higher
+rate) is therefore **not confirmed** at iteration-0: the net gets its small edge by banking
+more reward over a longer excursion, not by the hypothesized risk-calibration.
+
+This matches the documented teacher-coverage caveat — decomp's myopic-macro policy never
+visits the deep multi-detector sensing chains where the VoI lives, so the value net is
+under-calibrated exactly there. Read this as **"the iteration-0 value from a non-exploring
+teacher gives a marginal, mechanism-ambiguous lift"** — NOT proof a learned value cures F4
+(it didn't here), and NOT a NO-GO (it didn't trail).
+
+**Decision (per the maintainer's standing authorization — start the real run if reasonable,
+restart later with more information):** value is learnable and net did not collapse → no red
+flag → **proceed to the full Gumbel ExIt loop**, warm-started from this value net, flagged
+**provisional**. The loop's Gumbel root exploration is the actual test of whether reaching
+the deep-sensing beliefs converts this lukewarm iteration-0 into a real gain; the
+feature-response diagnostic (`chocofarm/az/feature_response.py`) may redirect the
+featurization first.
+
+---
+
 ## (c) Exact commands for the FULL experiment (orchestrator runs these)
 
 Each is a single bounded, core-3-pinned line. `PY` and `TS` for brevity:
