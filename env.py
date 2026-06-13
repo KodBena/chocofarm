@@ -2,7 +2,7 @@
 """
 chocofarm environment — the SIMULATION MODEL, decoupled from any solver.
 
-Owns: the instance (treasures, disjunctive detectors, teleports, travel, values), the exact
+Owns: the instance (treasures, arrangement-face sense actions, teleports, travel, values), the exact
 belief mechanics (numpy world-set + filtering), the dynamics (legal actions, apply), and the
 unbiased simulation/evaluation (simulate one episode; Monte-Carlo rate; Dinkelbach fixed
 point). It knows nothing about HOW a decision is made — that is a `Policy` (see policies.py),
@@ -14,7 +14,8 @@ import os
 import math
 import itertools
 import numpy as np
-from shapely import wkt
+
+import arrangement as A
 
 TERMINATE = ("term", None)
 
@@ -31,15 +32,18 @@ class Environment:
         self.value = list(value) if value is not None else [1.0] * self.N
         self.entry, self.tp = entry, float(teleport_overhead)
 
-        # detectors: disjunctive cover = region ∪ its area-overlap neighbours (the real 17 pairs)
-        regions = {int(i): wkt.loads(w) for i, w in data["regions_wkt"].items()}
-        nbr = {i: {i} for i in regions}
-        for a, b in data["overlaps"]:
-            nbr[int(a)].add(int(b)); nbr[int(b)].add(int(a))
-        self.detectors = list(regions)
-        self.det_pt = {i: (regions[i].representative_point().x, regions[i].representative_point().y)
-                       for i in regions}
-        self.cover_mask = {i: sum(1 << j for j in nbr[i]) for i in regions}
+        # detectors: arrangement faces (consult-002 §4 / facemodel.ENV_ADOPTION). A sense action
+        # is "stand at face F's representative point and read the disjunction over F's cover" —
+        # cover and position are consistent BY CONSTRUCTION (the face is the single carrier of
+        # both). This replaces the old `cover_mask[i] = {i} ∪ overlap-neighbours`, which read
+        # the union over every face in Δ_i (a k=5 semantics) at one face's rep-point (a k≤2
+        # position) — an over-approximation that handed out information no real sensor could.
+        # The detector abstraction is re-keyed from regions to faces; the ('d', id) action shape
+        # and every method below are UNCHANGED IN FORM — only the underlying data are faces.
+        faces = A.load()                                          # 44 atomic arrangement faces
+        self.detectors = list(range(len(faces)))                 # face ids 0..43 are the sense actions
+        self.det_pt = {k: faces[k].rep_point for k in self.detectors}
+        self.cover_mask = {k: faces[k].bitmask for k in self.detectors}
 
         self.coord = {}
         for i, xy in self.treasures.items():
