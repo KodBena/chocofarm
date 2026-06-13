@@ -13,6 +13,7 @@ the clairvoyant ceiling for reference.
 """
 import sys
 import os
+import time
 import argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
@@ -52,7 +53,7 @@ def main():
     ap.add_argument("--configs", required=True)         # comma list (levels or iteration budgets)
     ap.add_argument("--tag", required=True)             # logdir subtag
     ap.add_argument("--logroot", default="/home/bork/w/vdc/chocobo/tb")
-    ap.add_argument("--batch", type=int, default=4)     # episodes per logged step
+    ap.add_argument("--batch", type=int, default=1)     # episodes per logged step (1 = snappy)
     ap.add_argument("--rss_cap_mb", type=float, default=1200.0)
     a = ap.parse_args()
 
@@ -64,11 +65,8 @@ def main():
     writer = SummaryWriter(os.path.join(a.logroot, a.tag))
     state = {c: dict(sumR=0.0, sumT=0.0, n=0, lam=0.0) for c in configs}
 
-    for c in configs:                                   # warm each config's lambda (short)
-        lam = 0.0
-        for _ in range(2):
-            lam = env.rate(pols[c], lam, max(4, a.batch), seed=1)[0]
-        state[c]["lam"] = lam
+    for c in configs:                                   # no warm-up (it cost minutes of silence);
+        state[c]["lam"] = 0.08                           # init lambda near observed rates, nudge in-loop
 
     seed, total = 1000, 0
     while True:
@@ -78,7 +76,9 @@ def main():
             break
         for c in configs:
             s = state[c]
+            t_ep = time.time()
             _, ER, ET, _ = env.rate(pols[c], s["lam"], a.batch, seed=seed)
+            sec_ep = (time.time() - t_ep) / a.batch
             seed += 1
             s["sumR"] += ER * a.batch
             s["sumT"] += ET * a.batch
@@ -95,6 +95,7 @@ def main():
             writer.add_scalar(f"lambda/{lab}", s["lam"], s["n"])
             writer.add_scalar(f"ref/static_{lab}", static, s["n"])
             writer.add_scalar(f"ref/ceiling_{lab}", ceil, s["n"])
+            writer.add_scalar(f"sec_per_episode/{lab}", sec_ep, s["n"])
             writer.add_scalar("diag/rss_mb", rss_mb(), total)
             writer.flush()
 
