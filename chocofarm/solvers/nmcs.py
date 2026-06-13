@@ -42,8 +42,8 @@ caches the belief space (per the project's bounded-safety rule).
 """
 import numpy as np
 
-from env import TERMINATE
-from policies import Policy, GreedyPolicy, _base_value
+from chocofarm.model.env import TERMINATE
+from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value
 
 
 class NMCSPolicy(Policy):

@@ -20,9 +20,9 @@ Flags:
 import argparse
 import time
 
-from env import Environment
-from run import realizable_static, clairvoyant_rate
-from decomp_solver import DecompPolicy
+from chocofarm.model.env import Environment
+from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.solvers.decomp import DecompPolicy
 
 
 def measure_decomp(env, static, ceil, runs, horizon):
@@ -76,7 +76,7 @@ def main():
 
     if args.search:
         # the shallow/search pack — all below the floor (the project's prior finding)
-        from policies import (GreedyPolicy, CertaintyEquivalentPolicy,
+        from chocofarm.solvers.base import (GreedyPolicy, CertaintyEquivalentPolicy,
                               RolloutPolicy, SparseSamplingPolicy)
         greedy, ce = GreedyPolicy(), CertaintyEquivalentPolicy()
         pack = [

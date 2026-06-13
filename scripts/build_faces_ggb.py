@@ -23,7 +23,7 @@ import re
 import zipfile
 import xml.etree.ElementTree as ET
 from shapely import wkt
-import arrangement as A
+from chocofarm.model import arrangement as A
 
 SRC = "/home/bork/chocobo.ggb"
 DST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chocobo_faces.ggb")

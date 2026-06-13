@@ -42,8 +42,8 @@ import numpy as np
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
-import arrangement as A
-from analyzer import Instance
+from chocofarm.model import arrangement as A
+from chocofarm.analysis.analyzer import Instance
 
 
 def _convex_blob(cx, cy, r, rng, n_vert=7):
@@ -131,7 +131,7 @@ def generate(n_treasures=14, K=4, n_regions=8, overlap_density=0.5,
 
 if __name__ == "__main__":
     import sys
-    from analyzer import analyze, _print_report
+    from chocofarm.analysis.analyzer import analyze, _print_report
 
     seed = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     inst = generate(seed=seed)

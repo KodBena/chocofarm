@@ -12,9 +12,9 @@ run counts are kept modest and every measurement sits under a wall-clock timeout
 """
 import time
 import numpy as np
-from env import Environment
-from ismcts import ISMCTSPolicy
-from run import realizable_static, clairvoyant_rate
+from chocofarm.model.env import Environment
+from chocofarm.solvers.ismcts import ISMCTSPolicy
+from chocofarm.eval.harness import realizable_static, clairvoyant_rate
 
 
 def main():

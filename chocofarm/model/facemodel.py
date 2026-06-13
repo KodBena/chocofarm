@@ -23,7 +23,7 @@ arrangement.Face and a metric `d`; it touches no solver.  See ENV_ADOPTION
 """
 from __future__ import annotations
 import numpy as np
-import arrangement as A
+from chocofarm.model import arrangement as A
 
 
 class SenseAction:

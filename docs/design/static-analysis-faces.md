@@ -241,7 +241,7 @@ a one-off fit to the real geometry.
 
 All via `/home/bork/w/vdc/venvs/generic/bin/python` under `timeout`, bounded counting/structure
 only; only artifact written by the analyzer is none (it returns a `StructuralReport`). Run
-`python analyzer.py` for the real instance, `python synthetic.py <seed>` for a synthetic one.
+`python -m chocofarm.analysis.analyzer` for the real instance, `python -m chocofarm.analysis.synthetic <seed>` for a synthetic one.
 Each figure is one named function in `analyzer.py`; the load-bearing re-derivations: every
 single-face #neg equals the hypergeometric `C(20−k,5)`; `occupancy_factorization` confirms
 `#worlds == ∏ C(size,k)` exactly; `face_signature` shows only the δ-class is multi-element;

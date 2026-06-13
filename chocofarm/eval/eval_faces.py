@@ -31,12 +31,12 @@ import time
 
 import numpy as np
 
-from env import Environment
-from policies import (GreedyPolicy, CertaintyEquivalentPolicy, RolloutPolicy,
+from chocofarm.model.env import Environment
+from chocofarm.solvers.base import (GreedyPolicy, CertaintyEquivalentPolicy, RolloutPolicy,
                       SparseSamplingPolicy)
-from nmcs import NMCSPolicy
-from ismcts import ISMCTSPolicy
-from run import realizable_static, clairvoyant_rate
+from chocofarm.solvers.nmcs import NMCSPolicy
+from chocofarm.solvers.ismcts import ISMCTSPolicy
+from chocofarm.eval.harness import realizable_static, clairvoyant_rate
 
 
 def build_plan(env):
