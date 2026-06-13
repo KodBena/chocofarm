@@ -156,9 +156,11 @@ def main():
         "delta_treasures": delta_treasures,
         "overlaps": [[i, j] for i, j, *_ in overlaps],
     }
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "chocobo_instance.json"), "w") as f:
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "chocofarm", "data", "instance.json")
+    with open(out_path, "w") as f:
         json.dump(out, f, indent=2)
-    print("\nsaved parsed instance -> /home/bork/w/vdc/chocobo_instance.json")
+    print(f"\nsaved parsed instance -> {os.path.abspath(out_path)}")
 
 
 if __name__ == "__main__":

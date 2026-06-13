@@ -38,8 +38,8 @@ early-exit option that the clairvoyant ceiling shows is where most of the +70% l
 """
 import math
 import numpy as np
-from policies import Policy, _base_value
-from env import TERMINATE
+from chocofarm.solvers.base import Policy, _base_value
+from chocofarm.model.env import TERMINATE
 
 
 class GreedyStopBase(Policy):

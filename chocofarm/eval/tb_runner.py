@@ -15,12 +15,11 @@ import sys
 import os
 import time
 import argparse
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
-from env import Environment
-from run import realizable_static, clairvoyant_rate
-from nmcs import NMCSPolicy
-from ismcts import ISMCTSPolicy
+from chocofarm.model.env import Environment
+from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.solvers.nmcs import NMCSPolicy
+from chocofarm.solvers.ismcts import ISMCTSPolicy
 from tensorboardX import SummaryWriter
 
 

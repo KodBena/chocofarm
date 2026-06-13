@@ -21,9 +21,9 @@ No argument runs both (longer).
 import sys
 import time
 
-from env import Environment
-from nmcs import NMCSPolicy
-from run import realizable_static, clairvoyant_rate
+from chocofarm.model.env import Environment
+from chocofarm.solvers.nmcs import NMCSPolicy
+from chocofarm.eval.harness import realizable_static, clairvoyant_rate
 
 
 # (label, policy, dinkelbach budget) -- tuned so each level finishes within a bounded

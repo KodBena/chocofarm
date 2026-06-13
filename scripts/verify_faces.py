@@ -14,7 +14,7 @@ import json
 from shapely import wkt
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
-import arrangement as A
+from chocofarm.model import arrangement as A
 
 GGB = "chocobo_faces.ggb"
 

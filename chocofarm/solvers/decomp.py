@@ -78,7 +78,7 @@ import math
 from dataclasses import dataclass, field
 from functools import lru_cache
 
-from env import Environment, TERMINATE
+from chocofarm.model.env import Environment, TERMINATE
 
 
 # ===========================================================================

@@ -5,9 +5,9 @@ chocofarm environment — the SIMULATION MODEL, decoupled from any solver.
 Owns: the instance (treasures, arrangement-face sense actions, teleports, travel, values), the exact
 belief mechanics (numpy world-set + filtering), the dynamics (legal actions, apply), and the
 unbiased simulation/evaluation (simulate one episode; Monte-Carlo rate; Dinkelbach fixed
-point). It knows nothing about HOW a decision is made — that is a `Policy` (see policies.py),
-passed in. New solution methods (NMCS, ISMCTS, …) are new Policy subclasses; this file
-does not change.
+point). It knows nothing about HOW a decision is made — that is a `Policy` (see
+chocofarm/solvers/base.py), passed in. New solution methods (NMCS, ISMCTS, …) are new
+Policy subclasses; this file does not change.
 """
 import json
 import os
@@ -15,7 +15,7 @@ import math
 import itertools
 import numpy as np
 
-import arrangement as A
+from chocofarm.model import arrangement as A
 
 TERMINATE = ("term", None)
 
@@ -24,7 +24,7 @@ class Environment:
     def __init__(self, instance_path=None, value=None, teleport_overhead=12.0, entry="CSNE"):
         if instance_path is None:
             instance_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "chocobo_instance.json")
+                                          "..", "data", "instance.json")
         data = json.load(open(instance_path))
         self.treasures = {int(i): tuple(xy) for i, xy in data["treasures"].items()}
         self.teleports = {k: tuple(v) for k, v in data["teleports"].items()}

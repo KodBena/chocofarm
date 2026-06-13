@@ -25,8 +25,8 @@ from shapely import wkt
 from shapely.geometry import Point
 from shapely.ops import polygonize, unary_union
 
-INSTANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chocobo_instance.json")
-FACES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chocobo_faces.json")
+INSTANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "instance.json")
+FACES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "faces.json")
 
 
 @dataclass(frozen=True)

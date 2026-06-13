@@ -173,7 +173,7 @@ it *does* enter, optimally.
 ## Reproduce
 
 ```
-timeout 600 taskset -c 3 /home/bork/w/vdc/venvs/generic/bin/python eval_decomp.py \
+timeout 600 taskset -c 3 /home/bork/w/vdc/venvs/generic/bin/python -m chocofarm.eval.eval_decomp \
     --runs 2000 --search --horizon-sweep
 ```
 

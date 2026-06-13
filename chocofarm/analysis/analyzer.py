@@ -49,7 +49,7 @@ from math import comb
 
 import numpy as np
 
-import arrangement as A
+from chocofarm.model import arrangement as A
 
 
 # ===========================================================================

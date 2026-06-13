@@ -10,7 +10,7 @@ env.py changes. The env is passed in, so a policy may freely query dynamics/beli
 """
 from abc import ABC, abstractmethod
 import numpy as np
-from env import TERMINATE
+from chocofarm.model.env import TERMINATE
 
 
 class Policy(ABC):

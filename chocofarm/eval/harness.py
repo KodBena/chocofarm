@@ -10,8 +10,8 @@ References (bounds, not deployable policies):
 import itertools
 import time
 import numpy as np
-from env import Environment
-from policies import GreedyPolicy, CertaintyEquivalentPolicy, RolloutPolicy, SparseSamplingPolicy
+from chocofarm.model.env import Environment
+from chocofarm.solvers.base import GreedyPolicy, CertaintyEquivalentPolicy, RolloutPolicy, SparseSamplingPolicy
 
 
 def realizable_static(env):
