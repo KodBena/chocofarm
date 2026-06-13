@@ -24,7 +24,7 @@ This module builds the two layers the faces note (§6) recommends:
 
   MICRO  (build_cluster_micro):  for each (cluster, occupancy k) an EXACT
          λ-penalised belief-MDP solved by backward induction over the
-         occupancy-conditioned local belief lattice.  State =
+         occupancy-conditioned local belief semilattice.  State =
          (local-position, support of surviving size-k local present-sets,
          locally-collected set).  Actions = in-cluster face reads (every face id
          whose cover ⊆ cluster), in-cluster collects, and LEAVE (boundary action).
@@ -186,7 +186,7 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
         cluster's occupancy" framing.
       * k is None → the JOINT (occupancy-marginal) MDP: the initial belief is ALL
         2**size local subsets (every present-set, every k), the unconditioned local
-        belief lattice the analyzer sized (745 / 1448 reachable beliefs).  This is
+        belief semilattice the analyzer sized (745 / 1448 reachable beliefs).  This is
         what the RUNTIME executes, because a priori the cluster's occupancy is not
         known — the policy must act on the mixed-k belief, and the joint VI handles
         it exactly (no per-k mixture approximation).

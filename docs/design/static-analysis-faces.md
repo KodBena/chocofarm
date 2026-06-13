@@ -121,7 +121,7 @@ the same combinatorial computation on the corrected partition.
 
 `reachable_local_beliefs`.
 
-**[DET-DEP — SUPERSEDES old §4.]** BFS over each cluster's local belief lattice (states =
+**[DET-DEP — SUPERSEDES old §4.]** BFS over each cluster's local belief semilattice (states =
 frozensets of in-cluster latent subsets; transitions = every in-cluster face read both
 polarities + every in-cluster collect both outcomes), counting distinct reachable beliefs =
 the exact backward-induction table size:

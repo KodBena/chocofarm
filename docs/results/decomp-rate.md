@@ -41,7 +41,7 @@ chains the search methods could not.
 ## The micro layer — exact per-cluster belief-MDPs (tractable, confirmed)
 
 For each cluster, `build_cluster_micro` does **exact backward induction** over the
-local belief lattice (state = `(in-cluster position, support of surviving local
+local belief semilattice (state = `(in-cluster position, support of surviving local
 present-sets, locally-collected)`; actions = in-cluster face reads / collects /
 LEAVE; expectimax over read polarities and presence). Two exact constructions:
 
@@ -57,7 +57,7 @@ LEAVE; expectimax over read polarities and presence). Two exact constructions:
 
 - **Joint** (occupancy-marginal) — the MDP the RUNTIME executes, because a priori
   the cluster's occupancy is unknown and the policy must act on the mixed-`k`
-  belief. This is the unconditioned local lattice the analyzer sized (**745** beliefs
+  belief. This is the unconditioned local semilattice the analyzer sized (**745** beliefs
   for NW, **1,448** for SE+mid); the VI table peaks at **34,405 states** (SE+mid),
   built in ~1.4 s. Here the cross-occupancy weights are **not** uniform, so each
   local present-set carries its exact env-prior weight `C(N−size, K−j)` (its

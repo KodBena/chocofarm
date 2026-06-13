@@ -378,7 +378,10 @@ def n_occupancy_partitions(inst: Instance, partition: list) -> int:
 def reachable_local_beliefs(inst: Instance, cluster: list,
                             max_cluster_bits: int = 8,
                             max_states: int = 200_000) -> dict:
-    """[DET-DEP] BFS over a cluster's LOCAL belief lattice: states are frozensets
+    """[DET-DEP] BFS over a cluster's LOCAL belief semilattice (the reachable beliefs
+    under observational refinement — a meet-semilattice: top = the cluster prior,
+    meet = conjoining face-reads; NOT closed under union, so not a sublattice of the
+    Boolean 2**W, only a sub-poset of it).  States are frozensets
     of in-cluster latent subsets (≤ 2**size of them).  Transitions: every distinct
     in-cluster face read (both polarities) and every in-cluster collect (both
     presence outcomes).  Counts distinct reachable beliefs — the size of the exact
