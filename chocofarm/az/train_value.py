@@ -33,7 +33,7 @@ def r2_score(y_true, y_pred):
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
-def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden):
+def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
     rng = np.random.default_rng(seed)
     n = X.shape[0]
     perm = rng.permutation(n)
@@ -59,13 +59,20 @@ def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden):
                 continue
             ep_loss += net.train_step_value(Xtr[b].astype(np.float64),
                                              ytr[b].astype(np.float64), lr, l2)
-        if (ep + 1) % max(1, epochs // 5) == 0 or ep == 0:
+        do_print = (ep + 1) % max(1, epochs // 5) == 0 or ep == 0
+        if writer is not None or do_print:
             pv = net.predict_value(Xva.astype(np.float64))
             r2 = r2_score(yva, pv)
             mae = float(np.mean(np.abs(yva - pv)))
-            print(f"  epoch {ep + 1:>4}/{epochs}  train_std_mse={ep_loss / steps_per_epoch:.4f}"
-                  f"  held-out R²={r2:.4f}  MAE={mae:.4f}  ({time.time() - t0:.0f}s)",
-                  flush=True)
+            if writer is not None:
+                writer.add_scalar("value/train_std_mse", ep_loss / steps_per_epoch, ep + 1)
+                writer.add_scalar("value/heldout_R2", r2, ep + 1)
+                writer.add_scalar("value/heldout_MAE", mae, ep + 1)
+                writer.flush()
+            if do_print:
+                print(f"  epoch {ep + 1:>4}/{epochs}  train_std_mse={ep_loss / steps_per_epoch:.4f}"
+                      f"  held-out R²={r2:.4f}  MAE={mae:.4f}  ({time.time() - t0:.0f}s)",
+                      flush=True)
 
     pv = net.predict_value(Xva.astype(np.float64))
     return net, r2_score(yva, pv), float(np.mean(np.abs(yva - pv))), (y_mean, y_std)
@@ -82,13 +89,22 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--hidden", type=int, default=256)
+    ap.add_argument("--tb-logdir", type=str, default=None,
+                    help="if set, stream per-epoch train_mse / held-out R² / MAE to this TB logdir")
     args = ap.parse_args()
 
     z = np.load(args.data, allow_pickle=False)
     X, y = z["X"], z["y"]
     print(f"dataset: {X.shape[0]} transitions × {X.shape[1]} feats", flush=True)
+    writer = None
+    if args.tb_logdir:
+        from tensorboardX import SummaryWriter
+        writer = SummaryWriter(args.tb_logdir)
+        print(f"streaming training curve -> {args.tb_logdir}", flush=True)
     net, r2, mae, (ym, ys) = train(X, y, args.epochs, args.batch, args.lr, args.l2,
-                                   args.val_frac, args.seed, args.hidden)
+                                   args.val_frac, args.seed, args.hidden, writer=writer)
+    if writer is not None:
+        writer.close()
     net.save(args.out)
     print(f"\nFINAL held-out R²={r2:.4f}  MAE={mae:.4f}  (target mean={ym:.4f} std={ys:.4f})",
           flush=True)
