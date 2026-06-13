@@ -46,13 +46,21 @@ regions = {int(i): wkt.loads(w) for i, w in data["regions_wkt"].items()}
 N, K = len(treasures), 5
 value = [1.0] * N
 
-# detectors: representative point of each region; reveal = OR over treasures covering it
+# detectors: a region's disjunctive cover = itself + every region it AREA-overlaps with
+# (the parsed `overlaps` array, 17 pairs). Entering region i reveals ">=1 present among
+# {i} ∪ overlap-neighbours" — the genuinely disjunctive sensor. (Over-approximation: treats
+# entry to region i as exposure to all its overlaps; per-arrangement-face reification is a
+# later refinement. Fixes consult-001 flaw #1, where a single representative_point() dropped
+# 9 of 17 overlaps and left 8/16 detectors as singletons.)
 det_pt, cover_mask = {}, {}
+overlap_nbrs = {i: {i} for i in regions}
+for a, b in data["overlaps"]:
+    overlap_nbrs[int(a)].add(int(b))
+    overlap_nbrs[int(b)].add(int(a))
 for i, reg in regions.items():
     p = reg.representative_point()
     det_pt[i] = (p.x, p.y)
-    cov = {j for j, r in regions.items() if r.contains(p)} | {i}
-    cover_mask[i] = sum(1 << j for j in cov)
+    cover_mask[i] = sum(1 << j for j in overlap_nbrs[i])
 
 coord = {}
 for i, xy in treasures.items():
