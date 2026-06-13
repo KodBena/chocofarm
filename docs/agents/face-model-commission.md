@@ -1,0 +1,27 @@
+# Face-model build agent — commission (verbatim)
+
+> The exact prompt sent to the agent. Its report is in `face-model-report.md`.
+
+---
+
+You are implementing the CORRECTED detector model for "chocofarm" — replacing a broken `cover_mask` with the true polygon-arrangement-face model — plus a GeoGebra round-trip file so the maintainer can VISUALLY verify the face extraction. Work in your worktree **/home/bork/w/vdc/chocobo-facemodel** (branch `feat/face-model`). Do NOT touch /home/bork/w/omega, the main checkout, or sibling worktrees. Venv: `/home/bork/w/vdc/venvs/generic/bin/python` (numpy, shapely). Keep all runs BOUNDED and under `timeout`.
+
+**READ FIRST (your worktree):** `docs/agents/consult-002-detector-misspec-report.md` — it diagnoses the exact bug and specifies the correct model; treat it as your spec. Also `env.py` (the broken `cover_mask` at the detector block; `filter_detector`; the Policy/Environment interface), `chocobo_geometry.py` (how the `.ggb` was parsed — your reference for the GeoGebra XML schema: point elements with `<coords x y z>`, `Polygon` commands with `<input>` vertex labels and `<output>`, captions via `<caption val>`), `chocobo_instance.json` (treasure coords, `regions_wkt`, `overlaps`, teleports), `docs/STATUS.md`.
+
+**THE BUG (recap):** `cover_mask[i] = {i} ∪ {j : Δ_i overlaps Δ_j}` treats "enter region i" as revealing the disjunction over i AND all its overlap-neighbours *simultaneously*. That's geometrically false: the disjunction you actually read depends on which **arrangement face** (which subset of polygons covers that exact point) you stand in. There is no point covered by all of {8,9,10,11,12}; the max-cardinality face is the tiny `Q=Δ_8∩Δ_9∩Δ_11∩Δ_12` (area ~0.052). ~70% of sensing area is singleton-cover.
+
+**NON-CONVEXITY (maintainer note):** most regions are convex but **Δ_2, Δ_5, Δ_12, Δ_18 are non-convex** (small concave residues). Do NOT assume convexity anywhere — use `representative_point()` (interior-guaranteed) not `centroid` (can fall outside a non-convex polygon); `polygonize`/`intersection` handle non-convex simple polygons fine.
+
+**MAINTAINER REQUIREMENT — ABSTRACTION/AUDITABILITY:** the maintainer has a mathematics background and audits by reasoning, not by wading through verbose code. The data construction AND the model must be **abstract, concise, and mathematically legible** — faces as a first-class set with a cover function; the sense-action as a clean map `face → binary disjunction over its cover`. Favor clear definitions over long imperative blocks. A small legible module beats a sprawling one.
+
+**DELIVERABLES (commit on `feat/face-model`, do NOT push):**
+
+1. **Face extraction (`arrangement.py`, abstract & concise).** Compute the planar arrangement of the 16 detection polygons: `faces = polygonize(unary_union(boundaries))`. For each atomic face F, its cover set = `{j : Δ_j contains an interior point of F}`. Expose a clean data structure: each face = `(cover: frozenset[int], rep_point: (x,y), area: float, polygon_wkt: str)`. Persist to `chocobo_faces.json`. Keep it small and legible.
+
+2. **`chocobo_faces.ggb` — the verification round-trip (PRIMARY artifact).** Copy the original `/home/bork/chocobo.ggb`, and in its `geogebra.xml` **replace the Δ detection polygons with the computed arrangement faces** — each face a Polygon (its vertices as points), captioned by its cover set (e.g. `{8,9}`, `{8,9,11,12}`). **KEEP** the treasure points, teleport points, and the background map image (`Bild1` + the embedded image file) so the faces overlay the real map. Re-zip as `chocobo_faces.ggb`. Validate it's a well-formed zip with valid XML (you can't run GeoGebra, but confirm the zip + XML parse, and that every face polygon references defined points). This is what the maintainer opens to confirm the extraction — make the faces faithfully reproduce the geometry, especially the non-convex regions and the tiny Q sliver.
+
+3. **Abstract sensing model.** A clean module (or a minimal, contained `env.py` extension — your call, but keep it auditable) where a **sense-action = "go to face F"**: travel cost to `F.rep_point`, observation = disjunction over `F.cover` (`(bw & cover_bitmask) != 0`). Point-and-cover are consistent by construction (unlike the old single-rep-point + union-cover). Do NOT rewire the solvers/run.py — keep the change contained and reviewable; include a short note on how `Environment` would adopt it (action set becomes ~20 collects + informative faces + TERMINATE).
+
+4. **Self-verification (print + a short `docs/design/face-model-verification.md`).** Confirm against consult-002's numbers: total faces (~44); cover-cardinality distribution by area (~70% singleton, ~24% pairs, ~5% triples, one k=4 sliver ~0.052, zero k=5); faces tile the detector union (Σ face areas ≈ union area); per region, the union of its faces' covers equals the old `cover_mask[i]` (proves you've *refined*, not changed, the geometry); the unique k=4 face is exactly `{8,9,11,12}`. Report any discrepancy honestly.
+
+Stage by EXPLICIT path (never `git add -A`); commit with a message ending `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Do NOT push (the orchestrator inspects + merges). RETURN a complete final report: the extraction approach, how you handled the 4 non-convex regions, the GeoGebra file's structure + how to open/verify it, the abstract model's interface, and the self-check numbers (matched against consult-002 or flagged).
