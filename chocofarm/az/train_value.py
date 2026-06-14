@@ -3,8 +3,8 @@
 chocofarm AZ — train the value head; report held-out R² / MAE (design §9 Stage-1, Gate 1).
 
 Loads a (X, y) dataset (from `dataset.py`), splits train/held-out, standardizes the value
-target from the TRAIN split only (mean/std stored in the net for inference), and runs manual-
-Adam SGD on the value MSE (`mlp.ValueMLP`). Reports held-out R² and MAE — both on the RAW
+target from the TRAIN split only (mean/std stored in the net for inference), and runs optax-Adam
+SGD on the value MSE via `mlp_jax_train.JaxTrainer` (writing into `mlp.ValueMLP`). Reports held-out R² and MAE — both on the RAW
 (de-standardized) return scale, so the numbers are directly interpretable.
 
   **Decision Gate 1 (design §9):** is V_λ learnable to decent R² from the §2.2 features on the
