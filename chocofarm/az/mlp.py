@@ -143,7 +143,23 @@ class ValueMLP:
         cache = (X, z1, a1, z2, a2, head_in, res_cache)
         return cache, v_std, logits
 
-    # ---- residual-block backward (shared by both train_step paths) ----
+    # ======================================================================================
+    # SUPERSEDED — manual backprop + hand-rolled Adam (the methods below: _residual_backward,
+    # train_step_value, train_step, _adam_apply, _init_adam). Training moved to JAX/optax autodiff
+    # in `mlp_jax_train.JaxTrainer`: `jax.value_and_grad` makes the gradient correct-by-
+    # construction (no hand-derived residual backward, no finite-diff gradient-check), and an
+    # architecture change is a one-line forward edit with no backward to re-derive. The exit_loop
+    # and train_value harnesses now train via the JaxTrainer.
+    #
+    # These methods are KEPT (not deleted) because: (1) they document the exact loss/optimizer the
+    # JAX path reproduces, (2) the numpy↔jax-jit FLOAT32 EQUIVALENCE TEST (the load-bearing
+    # safeguard, tests/test_jax_equivalence.py) needs the numpy `_forward` they were built around,
+    # and (3) deleting working, tested code mid-migration is a larger blast radius than marking it.
+    # `_init_adam`/`_adam_apply`/`self.m`/`self.v`/`self.t` are the dead Adam state. They are no
+    # longer ON the training path; do not add new callers — use `JaxTrainer`.
+    # ======================================================================================
+
+    # ---- residual-block backward (DEAD — superseded by jax autodiff; see banner above) ----
     def _residual_backward(self, dhead, a2, res_cache):
         """Backprop ∂L/∂head_in (`dhead`) through the residual block to ∂L/∂a2.
 

@@ -136,10 +136,17 @@ class ReplayBuffer:
         return X, PI, M, Y
 
 
-def train_epochs(net, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
-    """Adam epochs over the buffer; re-pins the value standardization to the buffer's Y stats
-    (design §3) before training so the MSE stays O(1) as the return distribution drifts. Returns
-    (mean_ce, mean_value_std_mse, heldout_R2_on_buffer)."""
+def train_epochs(trainer, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
+    """Adam epochs over the buffer via the JAX/optax trainer (`mlp_jax_train.JaxTrainer`);
+    autodiff over the jit'd forward replaces the manual numpy backprop. Re-pins the value
+    standardization to the buffer's Y stats (design §3) before training so the MSE stays O(1) as
+    the return distribution drifts — the trainer reads y_mean/y_std off the net per step, so the
+    re-pin propagates. After training, numpy inference (`predict_value`) reads the trained weights
+    the trainer wrote back into the net. Returns (mean_ce, mean_value_std_mse, heldout_R2_on_buffer).
+
+    `lr`/`l2` are fixed at trainer construction (the loop varies neither); they are accepted here to
+    keep the prior signature shape but the trainer's configured lr/l2 are authoritative."""
+    net = trainer.net
     net.set_value_scale(float(Y.mean()), float(Y.std()))
     n = X.shape[0]
     steps = max(1, n // batch)
@@ -150,9 +157,7 @@ def train_epochs(net, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
             b = idx[s * batch:(s + 1) * batch]
             if len(b) == 0:
                 continue
-            ce, vl = net.train_step(X[b].astype(np.float64), PI[b].astype(np.float64),
-                                    M[b].astype(np.float64), Y[b].astype(np.float64),
-                                    lr, l2, alpha=alpha, beta=beta)
+            ce, vl = trainer.train_step(X[b], PI[b], M[b], Y[b], alpha=alpha, beta=beta)
             ce_tot += ce; v_tot += vl; cnt += 1
     pv = net.predict_value(X.astype(np.float64))
     return ce_tot / max(1, cnt), v_tot / max(1, cnt), r2_score(Y, pv)
@@ -203,6 +208,16 @@ def run(args):
                        residual=args.residual)
         res_note = "residual block ON" if net.residual else "no residual block"
         print(f"cold net (hidden={args.hidden}); both heads random; {res_note}", flush=True)
+
+    # --- JAX/optax trainer: autodiff training over the jit'd forward (replaces mlp.py's manual
+    #     backprop + hand-rolled Adam). Built ONCE so Adam's running moments persist across
+    #     iterations, exactly as the numpy net's self.m/self.v/self.t did. It reads the (now
+    #     fully-initialised, possibly warm-started) net's weights and writes the trained weights
+    #     back into the net after each step — numpy inference (generation/eval) reads them. ---
+    from chocofarm.az.mlp_jax_train import JaxTrainer
+    trainer = JaxTrainer(net, lr=args.lr, l2=args.l2)
+    print(f"training: JAX/optax Adam (lr={args.lr} l2={args.l2}); inference: numpy float32",
+          flush=True)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = None
@@ -275,7 +290,7 @@ def run(args):
 
         # ---- 2. TRAIN ----
         bX, bPI, bM, bY = buf.arrays()
-        ce, vmse, r2 = train_epochs(net, bX, bPI, bM, bY, args.epochs, args.batch,
+        ce, vmse, r2 = train_epochs(trainer, bX, bPI, bM, bY, args.epochs, args.batch,
                                     args.lr, args.l2, args.alpha, args.beta, train_rng)
         t_train = time.time() - t0 - t_gen
 

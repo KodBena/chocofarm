@@ -46,6 +46,11 @@ def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
     y_mean, y_std = float(ytr.mean()), float(ytr.std())
     net = ValueMLP(X.shape[1], hidden=hidden, n_actions=None, seed=seed,
                    y_mean=y_mean, y_std=y_std)
+    # JAX/optax trainer (value-only loss); autodiff over the jit'd forward replaces the manual
+    # numpy backprop. Built once so Adam's moments persist across epochs; writes trained weights
+    # back into the net so predict_value (numpy) reads them.
+    from chocofarm.az.mlp_jax_train import JaxTrainer
+    trainer = JaxTrainer(net, lr=lr, l2=l2)
 
     n_tr = Xtr.shape[0]
     steps_per_epoch = max(1, n_tr // batch)
@@ -57,8 +62,7 @@ def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
             b = idx[s * batch:(s + 1) * batch]
             if len(b) == 0:
                 continue
-            ep_loss += net.train_step_value(Xtr[b].astype(np.float64),
-                                             ytr[b].astype(np.float64), lr, l2)
+            ep_loss += trainer.train_step_value(Xtr[b], ytr[b])
         do_print = (ep + 1) % max(1, epochs // 5) == 0 or ep == 0
         if writer is not None or do_print:
             pv = net.predict_value(Xva.astype(np.float64))
