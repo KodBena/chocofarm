@@ -51,7 +51,7 @@ import numpy as np
 from chocofarm.model.env import TERMINATE
 from chocofarm.az.features import FeatureBuilder
 from chocofarm.az.actions import (n_action_slots, action_to_slot, slot_to_action,
-                                  legal_mask_from_features)
+                                  legal_mask_from_features, slot_action_tables)
 from chocofarm.solvers.ismcts import _belief_key
 from chocofarm.solvers.base import Policy
 
@@ -102,20 +102,29 @@ class GumbelAZSearch:
         self.max_depth = int(max_depth)
         self.n_slots = n_action_slots(env)
         self.term_slot = env.N + len(env.detectors)
+        # hoist the slot<->action bijection tables once (the search converts millions of times in
+        # its edge loops; per-call function dispatch was a measurable hot-path cost). Index these
+        # directly in the inner loops instead of calling slot_to_action / action_to_slot.
+        self._s2a, self._a2s = slot_action_tables(env)
 
     # ---- net evaluation (one forward, cached on the node) ----
     def _evaluate(self, node, loc, bw, collected):
-        """Populate node.feat/mask/prior/value/legal from a single net forward pass."""
+        """Populate node.feat/mask/prior/value/legal from a single net forward pass.
+
+        The marginals call is left to `FeatureBuilder.build`, which serves the belief-derived
+        block (marginals included) from its per-belief cache when this belief was already seen in
+        the episode — so we do NOT pre-compute `env.marginals` here (it would be discarded on a
+        cache hit, the ~3.5× common case). On a cache miss `build` computes marginals once."""
         env = self.env
-        marg = env.marginals(bw)
-        feat = self.fb.build(loc, bw, collected, marg=marg)
+        feat = self.fb.build(loc, bw, collected)
         mask = legal_mask_from_features(env, feat)
         v, p = self.net.predict_both(feat, mask)
         node.feat = feat
         node.mask = mask
         node.prior = p
         node.value = v
-        node.legal = [slot_to_action(env, s) for s in np.nonzero(mask)[0]]
+        s2a = self._s2a
+        node.legal = [s2a[s] for s in np.nonzero(mask)[0]]
         return v
 
     # ---- public API ----
@@ -125,6 +134,18 @@ class GumbelAZSearch:
             pi = np.zeros(n_slots)
             pi[self.term_slot] = 1.0
             return TERMINATE, pi
+
+        # The belief-feature cache (FeatureBuilder._belief_cache) is scoped to ONE EPISODE: the
+        # same belief recurs ~3.5× across an episode's decisions (and ~2.6× within one decision's
+        # search tree), so episode-wide reuse beats per-decision. The episode boundary is detected
+        # caller-agnostically: an episode's FIRST decision is the only one whose root belief is
+        # the full world-set (`len(bw) == len(env.worlds)`) — every action filters to a strict
+        # subset, so the full size never recurs mid-episode (asserted by the belief mechanics).
+        # Resetting there bounds the cache to one episode's distinct beliefs (hundreds, small),
+        # not the whole iteration. Correctness is cache-independent — a hit only ever returns
+        # features of a belief that compared equal — so the reset is purely a memory bound.
+        if len(bw) == len(env.worlds):
+            self.fb.reset_belief_cache()
 
         root = _Node()
         self._evaluate(root, loc, bw, set(collected))
@@ -278,18 +299,26 @@ class GumbelAZSearch:
     def _puct_select(self, env, node):
         """AlphaZero PUCT (Silver et al. 2017): argmax Q + c_puct·P·√(ΣN)/(1+N), over the legal
         actions, with the net prior P and Q the running mean (net value for unvisited via the
-        node's own value as the optimistic-free baseline)."""
-        total_n = sum(node.N.values())
+        node's own value as the optimistic-free baseline).
+
+        Hot-loop form of the SAME formula, kept bit-identical: the slot lookup is the hoisted
+        bijection dict (not the per-call wrapper), Q is inlined as `W[a]/n` (exactly `node.q(a)`)
+        instead of via `node.q` (which re-did the `N.get`), and the U term keeps the original
+        `c_puct * p * sqrt_total / (1 + n)` operation order with `p` still the numpy float64
+        prior scalar — so the arithmetic, the result, and the strict-`>` argmax are unchanged."""
+        N_map, W_map = node.N, node.W
+        total_n = sum(N_map.values())
         sqrt_total = math.sqrt(total_n) if total_n > 0 else 1.0
-        best_a, best_v = None, -np.inf
+        c_puct = self.c_puct
+        prior = node.prior
+        a2s = self._a2s
         base_v = node.value if node.value is not None else 0.0
+        best_a, best_v = None, -np.inf
         for a in node.legal:
-            s = action_to_slot(env, a)
-            p = node.prior[s]
-            n = node.N.get(a, 0)
-            q = node.q(a) if n > 0 else base_v   # unvisited Q completed by the node value
-            u = self.c_puct * p * sqrt_total / (1 + n)
-            v = q + u
+            n = N_map.get(a, 0)
+            q = (W_map[a] / n) if n else base_v   # unvisited Q completed by the node value (= node.q(a))
+            p = prior[a2s[a]]
+            v = q + c_puct * p * sqrt_total / (1 + n)
             if v > best_v:
                 best_v, best_a = v, a
         return best_a

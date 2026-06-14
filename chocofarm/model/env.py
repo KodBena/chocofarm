@@ -57,8 +57,27 @@ class Environment:
             [sum(1 << t for t in c) for c in itertools.combinations(range(self.N), self.K)],
             dtype=np.int64)
 
+        # Precomputed inter-node distance table (perf). The coordinate set is STATIC for an
+        # instance, so `d(a, b)` is a static function of the two coord keys; recomputing
+        # `math.hypot` per call cost ~2M hypot calls per generated episode (the hot-path
+        # profile). The table is built from the SAME `math.hypot(x1-x2, y1-y2)` inputs, so it is
+        # bit-identical to the on-the-fly computation — a structural memoization, not an
+        # approximation. 67 coord keys -> ~4.5k entries, a few ms to build, negligible memory.
+        self._dist = {}
+        coord_items = list(self.coord.items())
+        for ka, (x1, y1) in coord_items:
+            for kb, (x2, y2) in coord_items:
+                self._dist[(ka, kb)] = math.hypot(x1 - x2, y1 - y2)
+
     # ---- geometry ----
     def d(self, a, b):
+        """Distance between two coord keys. Served from the precomputed static table built at
+        construction (same `math.hypot` inputs -> bit-identical); falls back to a live compute
+        for any key pair not in the table (none arise in normal use, but keeps the contract
+        total)."""
+        v = self._dist.get((a, b))
+        if v is not None:
+            return v
         (x1, y1), (x2, y2) = self.coord[a], self.coord[b]
         return math.hypot(x1 - x2, y1 - y2)
 

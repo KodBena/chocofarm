@@ -72,8 +72,8 @@ def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_step
         temp = 1.0 if ply < n_explore_plies else 0.0
         action, pi = search.decide_with_target(env, loc, bw, collected, lam, rng, temperature=temp)
         # the node the search just evaluated cached feat+mask for THIS belief; rebuild cheaply
-        marg = env.marginals(bw)
-        feat = fb.build(loc, bw, collected, marg=marg)
+        # (marginals are served by build's per-belief cache, so we don't pre-compute them here)
+        feat = fb.build(loc, bw, collected)
         mask = legal_mask_from_features(env, feat)
         feats.append(feat); pis.append(pi); masks.append(mask)
         if action == TERMINATE:

@@ -38,27 +38,46 @@ def term_slot(env) -> int:
     return env.N + len(env.detectors)
 
 
+# Slot<->action lookup tables, keyed by id(env). The mapping is a fixed env-derived bijection
+# (design §3), computed once per env and served by O(1) lookup — eliminating the ~3.5M
+# per-element function-body executions the search's edge loops incurred (hot-path profile). The
+# tables encode EXACTLY the same bijection the original branch logic did (asserted by
+# tests/test_az_loop.py::test_action_slot_bijection), so this is a structural memoization, not a
+# behavioral change. Hot loops that convert millions of times should hoist the tables once via
+# `slot_action_tables(env)` and index them directly, rather than calling the wrapper per element.
+_SLOT_TABLES = {}
+
+
+def slot_action_tables(env):
+    """Return (slot_to_action_tuple, action_to_slot_dict) for `env`, building+caching on first
+    use. `slot_to_action_tuple[s]` is the action for slot s; `action_to_slot_dict[a]` the slot
+    for action a (TERMINATE included)."""
+    key = id(env)
+    tabs = _SLOT_TABLES.get(key)
+    if tabs is None:
+        N, nD = env.N, len(env.detectors)
+        s2a = (tuple(("t", i) for i in range(N))
+               + tuple(("d", j) for j in range(nD))
+               + (TERMINATE,))
+        a2s = {a: s for s, a in enumerate(s2a)}
+        tabs = (s2a, a2s)
+        _SLOT_TABLES[key] = tabs
+    return tabs
+
+
 def action_to_slot(env, action) -> int:
-    """('t',i) / ('d',j) / TERMINATE  ->  fixed slot id."""
-    if action == TERMINATE:
-        return env.N + len(env.detectors)
-    kind, i = action
-    if kind == "t":
-        return i
-    if kind == "d":
-        return env.N + i
+    """('t',i) / ('d',j) / TERMINATE  ->  fixed slot id. O(1) via the cached bijection table."""
+    s = slot_action_tables(env)[1].get(action)
+    if s is not None:
+        return s
     raise ValueError(f"unknown action {action!r}")
 
 
 def slot_to_action(env, slot: int):
-    """fixed slot id  ->  ('t',i) / ('d',j) / TERMINATE."""
-    nD = len(env.detectors)
-    if slot < env.N:
-        return ("t", slot)
-    if slot < env.N + nD:
-        return ("d", slot - env.N)
-    if slot == env.N + nD:
-        return TERMINATE
+    """fixed slot id  ->  ('t',i) / ('d',j) / TERMINATE. O(1) via the cached bijection table."""
+    s2a = slot_action_tables(env)[0]
+    if 0 <= slot < len(s2a):
+        return s2a[slot]
     raise ValueError(f"slot {slot} out of range for action space {n_action_slots(env)}")
 
 
