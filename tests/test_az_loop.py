@@ -360,6 +360,200 @@ def test_decide_with_value_returns_finite_bootstrap():
     assert np.allclose(pi1, pi2, atol=1e-9)
 
 
+# ---- residual block (toggleable, between trunk output and the heads) ----
+
+def _residual_grad_check(residual, l2, seed=0, eps=1e-4):
+    """Central finite differences vs the analytic grads train_step computes, for the residual
+    block. Returns the worst per-param relative error, EXCLUDING ReLU-kink-crossing entries (a
+    pre-activation that flips sign across ±eps — the central difference is not a valid gradient
+    there; detected by disagreeing one-sided slopes). eps=1e-4 is the float64 sweet spot: an eps
+    sweep shows the error shrinking as eps GROWS, the signature of roundoff cancellation in
+    (f(+eps)-f(-eps)), not a backprop bug (which would be eps-insensitive / grow from truncation)."""
+    env = Environment()
+    fb = FeatureBuilder(env)
+    in_dim, na, B = feature_dim(env), n_action_slots(env), 8
+    net = ValueMLP(in_dim, hidden=16, n_actions=na, seed=seed, residual=residual)
+    rng = np.random.default_rng(seed + 1)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    X = np.stack([feat] * B) + 0.01 * rng.standard_normal((B, in_dim))
+    M = np.stack([legal_mask_from_features(env, feat)] * B).astype(np.float64)
+    PI = M / M.sum(1, keepdims=True)
+    Y = rng.standard_normal(B)
+    net.set_value_scale(float(Y.mean()), float(Y.std()))
+
+    def total_loss():
+        cache, v_std, logits = net._forward(X)
+        resid = v_std - (Y - net.y_mean) / net.y_std
+        value_loss = float(np.mean(resid ** 2))
+        p = net._masked_softmax(logits, M)
+        logp = np.where(p > 0, np.log(np.clip(p, 1e-12, 1.0)), 0.0)
+        ce = float(-np.mean(np.sum(PI * logp, axis=1)))
+        l2t = sum(0.5 * l2 * float(np.sum(a * a))
+                  for nm, a in net._params().items() if net._is_weight(nm)) if l2 > 0 else 0.0
+        return ce + value_loss + l2t
+
+    # analytic grads — replicate train_step's computation WITHOUT stepping
+    n = X.shape[0]
+    cache, v_std, logits = net._forward(X)
+    X_, z1, a1, z2, a2, head_in, res_cache = cache
+    resid = v_std - (Y - net.y_mean) / net.y_std
+    dv = (2.0 / n) * resid[:, None]
+    p = net._masked_softmax(logits, M)
+    dlogits = (1.0 / n) * ((p - PI) * M)
+    dWv = head_in.T @ dv; dbv = dv.sum(0)
+    dWp = head_in.T @ dlogits; dbp = dlogits.sum(0)
+    dhead = dv @ net.Wv.T + dlogits @ net.Wp.T
+    da2, res_grads = net._residual_backward(dhead, a2, res_cache)
+    dz2 = da2 * (z2 > 0); dW2 = a1.T @ dz2; db2 = dz2.sum(0)
+    dz1 = (dz2 @ net.W2.T) * (z1 > 0); dW1 = X_.T @ dz1; db1 = dz1.sum(0)
+    ana = {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "Wv": dWv, "bv": dbv,
+           "Wp": dWp, "bp": dbp}
+    ana.update(res_grads)
+    if l2 > 0:
+        for nm in ana:
+            if net._is_weight(nm):
+                ana[nm] = ana[nm] + l2 * net._params()[nm]
+
+    worst = 0.0
+    for name, arr in net._params().items():
+        flat = arr.ravel(); ga = ana[name].ravel()
+        for i in range(flat.size):
+            o = flat[i]
+            flat[i] = o + eps; lp = total_loss()
+            flat[i] = o - eps; lm = total_loss()
+            flat[i] = o;       l0 = total_loss()
+            right = (lp - l0) / eps; left = (l0 - lm) / eps
+            if abs(right - left) / (abs(right) + abs(left) + 1e-12) > 1e-2:
+                continue  # ReLU kink crossing
+            gnum = (lp - lm) / (2 * eps)
+            worst = max(worst, abs(ga[i] - gnum) / (abs(ga[i]) + abs(gnum) + 1e-12))
+    return worst
+
+
+def test_residual_gradient_check():
+    """The residual-block backprop is analytically correct: analytic vs central finite-difference
+    grads agree to ~1e-5 (the load-bearing check — a wrong residual backward silently corrupts
+    training). Both residual ON and OFF, with and without L2."""
+    for residual in (True, False):
+        for l2 in (0.0, 1e-3):
+            mx = _residual_grad_check(residual, l2)
+            assert mx < 1e-5, f"grad check failed residual={residual} l2={l2}: {mx:.2e}"
+
+
+def test_residual_off_bit_identical_to_baseline():
+    """residual=False must be numerically identical to the pre-residual net: head_in IS the trunk
+    output a2 (the identity skip-less path), no block params exist, and the forward is byte-for-byte
+    the explicit pre-residual matmul chain. This is the clean-ablation guarantee."""
+    env = Environment()
+    fb = FeatureBuilder(env)
+    in_dim, na = feature_dim(env), n_action_slots(env)
+    net = ValueMLP(in_dim, hidden=32, n_actions=na, seed=3, residual=False)
+    assert not hasattr(net, "Wr1") and "Wr1" not in net._params()
+    # draw-order guard: residual=False must consume the SAME rng draws as a net built before the
+    # block existed — i.e. the block params are not drawn at all when OFF, so every trunk/head
+    # weight is byte-identical to a residual-ON net's trunk/head (the block draws come AFTER).
+    net_on = ValueMLP(in_dim, hidden=32, n_actions=na, seed=3, residual=True)
+    for k in ("W1", "b1", "W2", "b2", "Wv", "bv", "Wp", "bp"):
+        assert np.array_equal(getattr(net, k), getattr(net_on, k)), \
+            f"{k} differs between residual OFF/ON at same seed — block draws perturbed the stream"
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    X = np.stack([feat] * 4).astype(np.float64)
+    cache, v_got, lg_got = net._forward(X)
+    _, _, _, _, a2, head_in, res_cache = cache
+    assert head_in is a2 and res_cache is None
+    # explicit pre-residual math (what the old code computed)
+    z1 = X @ net.W1 + net.b1; a1c = np.maximum(z1, 0.0)
+    z2 = a1c @ net.W2 + net.b2; a2c = np.maximum(z2, 0.0)
+    v_ref = (a2c @ net.Wv + net.bv).ravel()
+    lg_ref = a2c @ net.Wp + net.bp
+    assert np.array_equal(v_ref, v_got) and np.array_equal(lg_ref, lg_got)
+
+
+def test_residual_on_train_step_finite_and_reduces():
+    """With residual ON, train_step is finite and reduces the value MSE on a fixed batch (the
+    machinery is wired end to end — forward, both heads through the block, backward, Adam)."""
+    env = Environment()
+    fb = FeatureBuilder(env)
+    net = ValueMLP(feature_dim(env), hidden=32, n_actions=n_action_slots(env),
+                   seed=0, residual=True)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    mask = legal_mask_from_features(env, feat)
+    B = 16
+    X = np.stack([feat] * B); M = np.stack([mask] * B)
+    PI = M / M.sum(1, keepdims=True); Y = np.linspace(-1.0, 1.0, B)
+    ce0, vl0 = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
+    for _ in range(100):
+        ce, vl = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
+    assert np.isfinite(ce) and np.isfinite(vl)
+    assert vl < vl0
+
+
+def test_residual_on_cache_coherent_across_writers():
+    """The float32 inference cache stays coherent with residual ON across every weight writer —
+    here a REBIND of a residual-block param (the load/warm-start shape) after the cache is
+    populated. (The non-residual coverage lives in test_predict_both_cache_coherent_across_writers.)"""
+    env = Environment()
+    fb = FeatureBuilder(env)
+    net = ValueMLP(feature_dim(env), hidden=64, n_actions=n_action_slots(env),
+                   seed=0, residual=True)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    mask = legal_mask_from_features(env, feat)
+
+    def truth_value():
+        _, v_std, _ = net._forward(np.asarray(feat, dtype=np.float64)[None, :])
+        return float(v_std[0] * net.y_std + net.y_mean)
+
+    net.predict_both(feat, mask)            # populate cache
+    rng = np.random.default_rng(7)
+    net.Wr1 = rng.standard_normal(net.Wr1.shape)
+    net.Wr2 = rng.standard_normal(net.Wr2.shape)
+    v_after, _ = net.predict_both(feat, mask)
+    assert abs(v_after - truth_value()) < 1e-2, "stale cache after residual-param rebind"
+
+
+def test_residual_save_load_roundtrip_and_old_npz():
+    """A residual net round-trips through save/load (block params preserved, predictions match);
+    and a pre-residual npz (no Wr*/br*, 3-field _meta) loads with the block OFF — the graceful
+    backward-compat path mirroring the --init-weights dim-mismatch handling (ADR-0002)."""
+    import tempfile
+    env = Environment()
+    fb = FeatureBuilder(env)
+    in_dim, na = feature_dim(env), n_action_slots(env)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    mask = legal_mask_from_features(env, feat)
+    net = ValueMLP(in_dim, hidden=32, n_actions=na, seed=2, residual=True)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "res.npz")
+        v0, p0 = net.predict_both(feat, mask)
+        net.save(path)
+        net2 = ValueMLP.load(path)
+        assert net2.residual and hasattr(net2, "Wr1")
+        v1, p1 = net2.predict_both(feat, mask)
+        assert abs(v0 - v1) < 1e-6 and np.allclose(p0, p1, atol=1e-6)
+
+        # forge a "pre-residual" npz: drop the block params and the 4th _meta field
+        z = dict(np.load(path, allow_pickle=False))
+        for k in ("Wr1", "br1", "Wr2", "br2"):
+            z.pop(k)
+        z["_meta"] = z["_meta"][:3]
+        old_path = os.path.join(d, "old.npz")
+        np.savez(old_path, **z)
+        net_old = ValueMLP.load(old_path)
+        assert not net_old.residual and "Wr1" not in net_old._params()
+
+        # corrupt block-param shape (flag ON) must fail LOUDLY at load (ADR-0002: at setup, not
+        # deep in the first forward).
+        zc = dict(np.load(path, allow_pickle=False))
+        zc["Wr1"] = zc["Wr1"][:, :-1]  # wrong shape
+        bad_path = os.path.join(d, "bad.npz")
+        np.savez(bad_path, **zc)
+        try:
+            ValueMLP.load(bad_path)
+            assert False, "expected ValueError on corrupt residual param shape"
+        except ValueError:
+            pass
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
