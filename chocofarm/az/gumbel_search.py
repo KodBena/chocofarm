@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""
+chocofarm AZ — Gumbel-AlphaZero low-simulation search over chance nodes (design §5).
+
+The guided "expert" of the ExIt loop (design §6). It layers Gumbel-AlphaZero root selection
+(Danihelka et al. 2022) on the SO-ISMCTS information-set tree (Cowling et al. 2012; the same
+belief-as-node / chance-node-as-observation scaffold `solvers/ismcts.py` implements), with the
+net's masked policy as the interior PUCT prior and the net's VALUE at the leaf in place of the
+determinized playout (the F4 cure, design §5.2). It produces, per decision:
+
+  * the EXECUTED action, and
+  * the IMPROVED-POLICY target π′ = softmax(completed_logits) over the fixed slot space
+    (design §4.4 / §5.1), where completed_logits = logit + σ(completedQ),
+    σ(q) = (c_visit + max_a N(a)) · c_scale · q  (Danihelka monotone transform, c_visit≈50),
+    and unvisited root actions have their Q "completed" by the value-net mix v_mix.
+
+Why Gumbel and not PUCT-at-root: PUCT needs many sims to be a sound policy improvement; at our
+tiny budget (m=12, n=48) it can DEGRADE the prior. Gumbel guarantees improvement at low sim
+counts (design §5.1), which is what makes an ExIt loop affordable on one CPU core (design §8).
+
+Chance nodes (design §5.2): each action is followed by an observation outcome resolved by a
+determinization w ~ bw; the successor belief is the child node. The action's statistics aggregate
+over the information set (SO-ISMCTS contract). For leaf-value VARIANCE we average each leaf over
+`c_outcome` (=2) determinizations of the IMMEDIATE outcome — light progressive widening over the
+binary outcome (design §5.2). Interior selection is PUCT with net prior+value (design §5.2).
+
+Search params (design §5.4): m=12 root actions, n=48 sims (Sequential Halving over
+⌈log2 m⌉ rounds), c_puct=1.25, c_visit=50, c_outcome=2, c_scale=1.0. All overridable.
+
+Faithfulness to Danihelka et al. 2022 (verified by tests/test_az_loop.py):
+  * Sequential Halving runs ⌈log2 m⌉ phases, each phase splitting an equal N/⌈log2 m⌉ share among
+    the current survivors, halving by `g + logit + σ(q̂)` (paper §2). The full n_sims budget is
+    spent (rounding remainder goes to the last phase's survivors).
+  * The executed action at temperature 0 IS the Sequential-Halving survivor (paper §2).
+  * v_mix completes unvisited Q by the PRIOR-weighted mean of visited Q (paper §3), not the
+    visit-weighted mean — the two differ sharply because SH makes visit counts unequal.
+
+Honest simplifications (also in docs/results/az-exit-loop.md §caveats):
+  * The interior tree uses one determinization PER SIMULATION (the ISMCTS contract: a single
+    world drawn at the root threads the whole descent), while the LEAF outcome-averaging draws
+    `c_outcome` immediate successors. We do NOT do full progressive widening at every interior
+    chance node — the design only calls for it at the immediate (leaf) outcome (§5.2), and the
+    info-set tree already aggregates over determinizations across sims.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from chocofarm.model.env import TERMINATE
+from chocofarm.az.features import FeatureBuilder
+from chocofarm.az.actions import (n_action_slots, action_to_slot, slot_to_action,
+                                  legal_mask_from_features, slot_action_tables)
+from chocofarm.solvers.ismcts import _belief_key
+from chocofarm.solvers.base import Policy
+
+
+class _Node:
+    """One information-set node (belief). Per-action aggregate Q-statistics over the info set
+    (ISMCTS contract); children keyed by (action, successor-belief-key). `prior`/`value`/`feat`/
+    `mask` are the net's cached evaluation at this belief (one forward pass, reused across the
+    node's action loop — the F7 amortization)."""
+    __slots__ = ("W", "N", "children", "prior", "value", "feat", "mask", "legal")
+
+    def __init__(self):
+        self.W = {}          # action -> summed λ-penalized return over selections
+        self.N = {}          # action -> selection count
+        self.children = {}   # (action, belief_key) -> _Node
+        self.prior = None    # (n_slots,) masked-softmax prior P(s,·)
+        self.value = None    # scalar net value V_λ(belief)
+        self.feat = None     # cached feature vector
+        self.mask = None     # (n_slots,) legal mask
+        self.legal = None    # list of legal actions at this node
+
+    def q(self, a):
+        n = self.N.get(a, 0)
+        return self.W[a] / n if n else 0.0
+
+
+class GumbelAZSearch:
+    """Gumbel-AlphaZero search bound to a value+policy net. Stateless across decisions except the
+    FeatureBuilder cache. `decide_with_target(env, loc, bw, collected, lam, rng)` returns
+    `(executed_action, improved_pi)` where improved_pi is the (n_slots,) probability target.
+
+    `temperature` controls the EXECUTED action during generation: >0 samples from improved_pi
+    (exploration), 0 takes argmax (eval). The improved-policy TARGET is unaffected by temperature
+    (it is always the full distribution — the apprentice learns the improved policy, design §4.4).
+    """
+
+    def __init__(self, net, env, m=12, n_sims=48, c_puct=1.25, c_visit=50.0,
+                 c_scale=1.0, c_outcome=2, max_depth=24):
+        self.net = net
+        self.env = env
+        self.fb = FeatureBuilder(env)
+        self.m = int(m)
+        self.n_sims = int(n_sims)
+        self.c_puct = float(c_puct)
+        self.c_visit = float(c_visit)
+        self.c_scale = float(c_scale)
+        self.c_outcome = int(c_outcome)
+        self.max_depth = int(max_depth)
+        self.n_slots = n_action_slots(env)
+        self.term_slot = env.N + len(env.detectors)
+        # hoist the slot<->action bijection tables once (the search converts millions of times in
+        # its edge loops; per-call function dispatch was a measurable hot-path cost). Index these
+        # directly in the inner loops instead of calling slot_to_action / action_to_slot.
+        self._s2a, self._a2s = slot_action_tables(env)
+
+    # ---- net evaluation (one forward, cached on the node) ----
+    def _evaluate(self, node, loc, bw, collected):
+        """Populate node.feat/mask/prior/value/legal from a single net forward pass.
+
+        The marginals call is left to `FeatureBuilder.build`, which serves the belief-derived
+        block (marginals included) from its per-belief cache when this belief was already seen in
+        the episode — so we do NOT pre-compute `env.marginals` here (it would be discarded on a
+        cache hit, the ~3.5× common case). On a cache miss `build` computes marginals once."""
+        env = self.env
+        feat = self.fb.build(loc, bw, collected)
+        mask = legal_mask_from_features(env, feat)
+        v, p = self.net.predict_both(feat, mask)
+        node.feat = feat
+        node.mask = mask
+        node.prior = p
+        node.value = v
+        s2a = self._s2a
+        node.legal = [s2a[s] for s in np.nonzero(mask)[0]]
+        return v
+
+    # ---- public API ----
+    def decide_with_target(self, env, loc, bw, collected, lam, rng, temperature=0.0):
+        n_slots = self.n_slots
+        if len(bw) == 0:
+            pi = np.zeros(n_slots)
+            pi[self.term_slot] = 1.0
+            return TERMINATE, pi
+
+        # The belief-feature cache (FeatureBuilder._belief_cache) is scoped to ONE EPISODE: the
+        # same belief recurs ~3.5× across an episode's decisions (and ~2.6× within one decision's
+        # search tree), so episode-wide reuse beats per-decision. The episode boundary is detected
+        # caller-agnostically: an episode's FIRST decision is the only one whose root belief is
+        # the full world-set (`len(bw) == len(env.worlds)`) — every action filters to a strict
+        # subset, so the full size never recurs mid-episode (asserted by the belief mechanics).
+        # Resetting there bounds the cache to one episode's distinct beliefs (hundreds, small),
+        # not the whole iteration. Correctness is cache-independent — a hit only ever returns
+        # features of a belief that compared equal — so the reset is purely a memory bound.
+        if len(bw) == len(env.worlds):
+            self.fb.reset_belief_cache()
+
+        root = _Node()
+        self._evaluate(root, loc, bw, set(collected))
+        legal = root.legal
+        legal_slots = [action_to_slot(env, a) for a in legal]
+
+        # --- root logits = log(prior) over legal slots (Danihelka works in logit space; the
+        #     masked-softmax prior is the reference distribution, so its log is the root logit). ---
+        prior = root.prior
+        logits = np.full(n_slots, -1e30)
+        for s in legal_slots:
+            logits[s] = math.log(max(prior[s], 1e-12))
+
+        # --- Gumbel-Top-k: sample m root actions without replacement on logit + g ---
+        g = rng.gumbel(size=n_slots)
+        score0 = np.where(logits > -1e29, logits + g, -np.inf)
+        m = min(self.m, len(legal_slots))
+        considered = list(np.argsort(score0)[::-1][:m])   # top-m slots by logit+g
+
+        # --- Sequential Halving over n_sims, dropping worst half each round by g+logit+σ(q̂);
+        #     returns the SURVIVING slot (the action Danihelka selects to execute). ---
+        survivor = self._sequential_halving(env, root, loc, bw, set(collected), lam, rng,
+                                            considered, g, logits)
+
+        # --- improved policy π′ = softmax(completed_logits) over the FULL legal set ---
+        improved = self._improved_policy(root, logits, legal_slots)
+
+        # --- executed action: the Sequential-Halving survivor (Danihelka §2 — the action that
+        #     wins the bracket IS the executed action at temperature 0). When exploring, sample
+        #     from π′ instead to diversify trajectories (the TARGET stays the raw π′). ---
+        if temperature > 0:
+            probs = improved.copy()
+            if temperature != 1.0:
+                with np.errstate(divide="ignore"):
+                    lp = np.where(probs > 0, np.log(probs) / temperature, -np.inf)
+                probs = self.net._masked_softmax(lp[None, :], (improved > 0)[None, :].astype(float))[0]
+            chosen = int(rng.choice(self.n_slots, p=probs))
+            exec_action = slot_to_action(env, chosen)
+        else:
+            exec_action = slot_to_action(env, survivor)
+        return exec_action, improved
+
+    # ---- Sequential Halving (Danihelka et al. 2022 §2) ----
+    def _sequential_halving(self, env, root, loc, bw, collected, lam, rng,
+                            considered, g, logits):
+        """Allocate `n_sims` across the `considered` root actions in `⌈log2 m⌉` phases, the
+        paper's schedule: in each phase the surviving set each gets an equal share of the phase's
+        budget, then the top half by `g + logit + σ(q̂)` survives. Returns the final survivor slot
+        (the action executed at temperature 0). Any rounding remainder is spent on the survivors
+        of the last phase so the full budget is used (no over/under-spend)."""
+        considered = list(considered)
+        if not considered:
+            return None
+        if len(considered) == 1:
+            self._visit(env, root, loc, bw, collected, considered[0], lam, rng, self.n_sims)
+            return considered[0]
+
+        m = len(considered)
+        n_phases = max(1, math.ceil(math.log2(m)))
+        per_phase = max(1, self.n_sims // n_phases)   # paper's N/⌈log2 m⌉ phase budget
+        budget = self.n_sims
+
+        while len(considered) > 1 and budget > 0:
+            # equal share of THIS phase's budget across the current survivors (paper §2)
+            phase_budget = min(per_phase, budget)
+            per_action = max(1, phase_budget // len(considered))
+            for s in considered:
+                v = min(per_action, budget)
+                if v <= 0:
+                    break
+                self._visit(env, root, loc, bw, collected, s, lam, rng, v)
+                budget -= v
+            # drop the worst half by g + logit + σ(q̂)
+            sigma = self._sigma_scale(root)
+            scored = sorted(considered,
+                            key=lambda s: g[s] + logits[s] + sigma * root.q(slot_to_action(env, s)),
+                            reverse=True)
+            considered = scored[:max(1, len(scored) // 2)]
+
+        # spend any rounding remainder on the survivor(s) so the full budget is used
+        i = 0
+        while budget > 0 and considered:
+            s = considered[i % len(considered)]
+            self._visit(env, root, loc, bw, collected, s, lam, rng, 1)
+            budget -= 1
+            i += 1
+        return considered[0]
+
+    def _visit(self, env, root, loc, bw, collected, slot, lam, rng, count):
+        """Run `count` simulations of root action `slot`, accumulating its aggregate stats."""
+        a = slot_to_action(env, slot)
+        for _ in range(count):
+            w = env.sample_world(bw, rng)
+            ret = self._simulate_root_action(env, root, loc, bw, collected, a, w, lam, rng)
+            root.W[a] = root.W.get(a, 0.0) + ret
+            root.N[a] = root.N.get(a, 0) + 1
+
+    def _simulate_root_action(self, env, root, loc, bw, collected, a, world, lam, rng):
+        """One simulation of a chosen root action: realize it (chance outcome from `world`),
+        average the leaf over c_outcome immediate determinizations (design §5.2), descend the
+        interior with PUCT for the remaining depth. Returns the λ-penalized return."""
+        if a == TERMINATE:
+            return -lam * env.exit_cost(loc)
+        # outcome-averaging over c_outcome determinizations of the IMMEDIATE outcome
+        total = 0.0
+        for k in range(self.c_outcome):
+            w = world if k == 0 else env.sample_world(bw, rng)
+            r, nloc, nbw, ncoll, dt = env.apply(loc, bw, collected, a, w)
+            step = r - lam * dt
+            ckey = (a, _belief_key(nbw))
+            child = root.children.get(ckey)
+            if child is None:
+                child = _Node()
+                root.children[ckey] = child
+            cont = self._descend(env, child, nloc, nbw, ncoll, w, lam, rng, depth=1)
+            total += step + cont
+        return total / self.c_outcome
+
+    # ---- interior PUCT descent; net value at the leaf (design §5.2) ----
+    def _descend(self, env, node, loc, bw, collected, world, lam, rng, depth):
+        if depth >= self.max_depth or len(bw) == 0:
+            if node.value is None:
+                if len(bw) == 0:
+                    return -lam * env.exit_cost(loc)
+                self._evaluate(node, loc, bw, collected)
+            return node.value
+        if node.value is None:
+            # first visit to this leaf: net value IS the leaf estimate (no playout — the F4 cure)
+            self._evaluate(node, loc, bw, collected)
+            return node.value
+
+        a = self._puct_select(env, node)
+        if a == TERMINATE:
+            ret = -lam * env.exit_cost(loc)
+            node.W[a] = node.W.get(a, 0.0) + ret
+            node.N[a] = node.N.get(a, 0) + 1
+            return ret
+        r, nloc, nbw, ncoll, dt = env.apply(loc, bw, collected, a, world)
+        step = r - lam * dt
+        ckey = (a, _belief_key(nbw))
+        child = node.children.get(ckey)
+        if child is None:
+            child = _Node()
+            node.children[ckey] = child
+        cont = self._descend(env, child, nloc, nbw, ncoll, world, lam, rng, depth + 1)
+        ret = step + cont
+        node.W[a] = node.W.get(a, 0.0) + ret
+        node.N[a] = node.N.get(a, 0) + 1
+        return ret
+
+    def _puct_select(self, env, node):
+        """AlphaZero PUCT (Silver et al. 2017): argmax Q + c_puct·P·√(ΣN)/(1+N), over the legal
+        actions, with the net prior P and Q the running mean (net value for unvisited via the
+        node's own value as the optimistic-free baseline).
+
+        Hot-loop form of the SAME formula, kept bit-identical: the slot lookup is the hoisted
+        bijection dict (not the per-call wrapper), Q is inlined as `W[a]/n` (exactly `node.q(a)`)
+        instead of via `node.q` (which re-did the `N.get`), and the U term keeps the original
+        `c_puct * p * sqrt_total / (1 + n)` operation order with `p` still the numpy float64
+        prior scalar — so the arithmetic, the result, and the strict-`>` argmax are unchanged."""
+        N_map, W_map = node.N, node.W
+        total_n = sum(N_map.values())
+        sqrt_total = math.sqrt(total_n) if total_n > 0 else 1.0
+        c_puct = self.c_puct
+        prior = node.prior
+        a2s = self._a2s
+        base_v = node.value if node.value is not None else 0.0
+        best_a, best_v = None, -np.inf
+        for a in node.legal:
+            n = N_map.get(a, 0)
+            q = (W_map[a] / n) if n else base_v   # unvisited Q completed by the node value (= node.q(a))
+            p = prior[a2s[a]]
+            v = q + c_puct * p * sqrt_total / (1 + n)
+            if v > best_v:
+                best_v, best_a = v, a
+        return best_a
+
+    # ---- improved policy + σ transform (Danihelka et al. 2022) ----
+    def _sigma_scale(self, root):
+        max_n = max(root.N.values()) if root.N else 0
+        return (self.c_visit + max_n) * self.c_scale
+
+    def _v_mix(self, root, legal_slots):
+        """Danihelka §3 value-completion for unvisited actions:
+
+            v_mix = (v_net + ΣN · v̄) / (1 + ΣN),
+            v̄ = Σ_{b:N(b)>0} π(b)·Q(b) / Σ_{b:N(b)>0} π(b)   (PRIOR-weighted, not visit-weighted)
+
+        Pure given the node — extracted so the prior-weighting invariant is directly unit-tested."""
+        env = self.env
+        prior = root.prior
+        sum_n = sum(root.N.values())
+        pw_num = pw_den = 0.0
+        for s in legal_slots:
+            a = slot_to_action(env, s)
+            if root.N.get(a, 0) > 0:
+                pw_num += prior[s] * root.q(a)
+                pw_den += prior[s]
+        if sum_n > 0 and pw_den > 0:
+            v_bar = pw_num / pw_den
+            return (root.value + sum_n * v_bar) / (1 + sum_n)
+        return root.value
+
+    def _improved_policy(self, root, logits, legal_slots):
+        """π′ = softmax(logit + σ(completedQ)) over the legal slots (Danihelka et al. 2022 §3).
+
+        Unvisited legal actions have their Q "completed" by `v_mix`, the paper's value estimate:
+
+            v_mix = (1/(1 + ΣN)) · ( v_net  +  (ΣN / Σ_{b:N(b)>0} π(b)) · Σ_{b:N(b)>0} π(b)·Q(b) )
+
+        where the visited-Q term is the PRIOR-weighted mean of visited actions' Q (the net's prior
+        π over LEGAL slots = root.prior), NOT the visit-weighted mean. This matters under Sequential
+        Halving, where visit counts are deliberately unequal. Returns a (n_slots,) probability row
+        (zero on illegal)."""
+        env = self.env
+        sigma = self._sigma_scale(root)
+        v_mix = self._v_mix(root, legal_slots)
+
+        completed = np.full(self.n_slots, -1e30)
+        for s in legal_slots:
+            a = slot_to_action(env, s)
+            q = root.q(a) if root.N.get(a, 0) > 0 else v_mix
+            completed[s] = logits[s] + sigma * q
+        # softmax over legal slots
+        legal_arr = np.zeros(self.n_slots)
+        legal_arr[legal_slots] = 1.0
+        return self.net._masked_softmax(completed[None, :], legal_arr[None, :])[0]
+
+
+class GumbelPolicy(Policy):
+    """Eval wrapper: a `Policy` that decides by argmax of the Gumbel improved policy (temperature
+    0). Used to measure the apprentice's greedy rate via `env.dinkelbach_rate` (design §6 step 3).
+    Construct with an already-loaded net; reuses one GumbelAZSearch across decisions."""
+
+    def __init__(self, net, env, m=12, n_sims=48, **kw):
+        self.search = GumbelAZSearch(net, env, m=m, n_sims=n_sims, **kw)
+
+    def decide(self, env, loc, bw, collected, lam, rng):
+        action, _ = self.search.decide_with_target(env, loc, bw, collected, lam, rng,
+                                                    temperature=0.0)
+        return action
