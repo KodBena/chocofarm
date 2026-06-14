@@ -318,3 +318,42 @@ The auditor's findings beyond the verdict, and their disposition:
   separate non-transactional pipes (harmless under LRU) — NOTED, no action.** Neither is a
   correctness risk (a fold collision would only mildly correlate two episodes, not break
   worker-count invariance; a delete-of-evicted-key is a no-op).
+
+---
+
+## Real-run result (coordinator-driven, 2026-06-14) — FIRST METHOD PAST DECOMP
+
+Full parallel run: cold-start, TD λ_blend=0.6, belief features (dim 241), 4-worker/redis,
+I=40 E=300. **Broke past the ~0.094 decomp-parity plateau.**
+
+| | rate | %VoI | E[T] | value R² (train) |
+|---|---|---|---|---|
+| static floor | 0.0855 | 0% | — | — |
+| decomp (exact) | 0.0941 | +14% | — | — |
+| prior AZ (plain-MC, 220-d) | ~0.0925 | +12% | ~45 | ~0.62 |
+| **this run (TD0.6 + unc feats)** | **0.0973–0.0978** | **+20%** | ~43 | **0.90** |
+| clairvoyant ceiling | 0.1454 | +100% | — | — |
+
+- Steady last-10 mean 0.0978; final-net **N=400 confirm 0.09734** (~2σ above decomp +
+  sustained 5 consecutive iters); best single eval 0.0994 (+23%).
+- E[T] ~43 stable — the TD bootstrap did NOT reintroduce over-collection.
+- Per-iter wall ~55s (4-worker/redis + numba/float32) vs ~7min serial original (~7-8×).
+
+### Mechanism (feature-response, final 241-d net; value head)
+baseline R² 0.54 (fresh loop-dist, MC target). Importance shift vs the prior 220-d AZ:
+`treasure/collected` 0.43→0.50 (still dominant); `detector/dist` ~0.003→**0.028** and
+`treasure/dist` ~0.002→0.012 (geometry rose OFF ZERO); `informative` 0.027→0.060,
+`p_pos` 0.026→0.042; **`treasure/unc` (the new feature) = 0.002 — near-inert in the value.**
+
+- **Part B (lower-variance TD target) is the cause**: it made the value far more predictive
+  and modestly de-blinded it to geometry/sensing — enough for +5 VoI past decomp.
+- **Part C (uncertainty feature) free-rode** in the value head (0.002). It MAY aid the policy's
+  sense-selection (untested — feature-response is value-head-only), and there was no B-only vs
+  B+C ablation, so the gain is not cleanly attributed.
+
+### Caveats
+- Modest exceed: +0.0032 over decomp, ~2σ at N=400; still +20% of the +70% ceiling (far below).
+- 4-vCPU libvirt host caps the parallel win.
+- No B-vs-C ablation; `unc` policy-head effect untested.
+- Parallel runs require redis (raw-bytes transport) up at 127.0.0.1:6380; `redis-py` + `numba`
+  are now runtime deps of the parallel/fast path.
