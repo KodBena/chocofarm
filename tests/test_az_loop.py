@@ -4,9 +4,10 @@ test_az_loop.py — bounded correctness gate for the Gumbel ExIt loop machinery.
 
 Asserts the load-bearing contracts of the AZ loop modules without running the (multi-hour) real
 loop: the action↔slot mapping is a fixed env-derived bijection, the two legal-mask paths agree,
-the masked softmax puts zero mass on illegal slots, the combined train_step is finite and
-reduces loss on a fixed batch, and the Gumbel search returns a well-formed improved-policy
-target (sums to 1, zero on illegal, finite) plus a legal executed action.
+the masked softmax puts zero mass on illegal slots, the JaxTrainer's combined train_step is finite
+and reduces loss on a fixed batch (training is JAX/optax; the numpy net is inference-only), and the
+Gumbel search returns a well-formed improved-policy target (sums to 1, zero on illegal, finite)
+plus a legal executed action.
 
 Run pinned + bounded, e.g.:
     taskset -c 2 timeout 180 /home/bork/w/vdc/venvs/generic/bin/python -m pytest tests/test_az_loop.py -q
@@ -81,31 +82,17 @@ def test_masked_softmax_zero_on_illegal():
     assert float(p[mask == 0].sum()) == 0.0
 
 
-def test_train_step_finite_and_reduces():
-    env = Environment()
-    fb = FeatureBuilder(env)
-    net = ValueMLP(feature_dim(env), hidden=32, n_actions=n_action_slots(env), seed=0)
-    feat = fb.build(("w", env.entry), env.worlds, set())
-    mask = legal_mask_from_features(env, feat)
-    B = 16
-    X = np.stack([feat] * B)
-    M = np.stack([mask] * B)
-    PI = M / M.sum(1, keepdims=True)
-    Y = np.linspace(-1.0, 1.0, B)
-    ce0, vl0 = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    for _ in range(100):
-        ce, vl = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    assert np.isfinite(ce) and np.isfinite(vl)
-    assert vl < vl0  # value MSE must come down on a fixed batch
-
-
 def test_predict_both_cache_coherent_across_writers():
     """The float32 inference cache (mlp.ValueMLP._f32_cache) must never serve weights that no
-    longer match the float64 source. This pins the invariant over EVERY weight writer — a rebind
-    (load / warm-start replacing the array object), an in-place Adam mutation, and a y-scale
+    longer match the float64 source. This pins the invariant over the surviving weight writers — a
+    rebind (load / warm-start / the JaxTrainer write-back replacing the array object) and a y-scale
     change — after the cache has been populated by a prior predict. (Out-of-frame-audit guard: the
-    first cut gated invalidation on the Adam step alone, so a post-populate rebind served stale
-    weights; this test reproduces that order and asserts the served forward tracks the source.)"""
+    first cut gated invalidation on the optimizer step alone, so a post-populate rebind served stale
+    weights; this test reproduces that order and asserts the served forward tracks the source.
+
+    Post-training cache coherence — that numpy inference sees the trained weights — is covered at
+    the integration level by test_jax_train_writes_back_numpy_inference; the manual in-place Adam
+    step that this test used to exercise was removed with the JAX training migration.)"""
     env = Environment()
     fb = FeatureBuilder(env)
     net = ValueMLP(feature_dim(env), hidden=64, n_actions=n_action_slots(env), seed=0)
@@ -126,18 +113,10 @@ def test_predict_both_cache_coherent_across_writers():
     v_after_rebind, _ = net.predict_both(feat, mask)
     assert abs(v_after_rebind - truth_value()) < 1e-2, "stale cache after weight rebind"
 
-    # IN-PLACE Adam mutation must also be reflected
-    X = np.stack([feat] * 8); M = np.stack([mask] * 8)
-    PI = M / M.sum(1, keepdims=True); Y = np.linspace(-1.0, 1.0, 8)
-    v_before = net.predict_both(feat, mask)[0]
-    net.train_step(X.astype(np.float64), PI, M.astype(np.float64), Y, 1e-2, 0.0)
-    v_after_step = net.predict_both(feat, mask)[0]
-    assert v_after_step != v_before, "stale cache after in-place Adam step"
-
     # y-scale change must be reflected
     net.set_value_scale(5.0, 2.0)
     v_after_scale = net.predict_both(feat, mask)[0]
-    assert v_after_scale != v_after_step, "stale cache after y-scale change"
+    assert v_after_scale != v_after_rebind, "stale cache after y-scale change"
 
 
 def test_gumbel_target_well_formed():
@@ -361,84 +340,71 @@ def test_decide_with_value_returns_finite_bootstrap():
 
 
 # ---- residual block (toggleable, between trunk output and the heads) ----
+#
+# NOTE: the hand-derived residual-backward finite-difference gradient-check that used to live here
+# (`_residual_grad_check` / `test_residual_gradient_check`) was DROPPED with the JAX/optax training
+# migration. Training gradients are now produced by `jax.value_and_grad` over the jit'd forward
+# (`mlp_jax_train`), i.e. correct-by-construction — there is no hand-derived backward left to
+# finite-difference-check. The load-bearing safeguard moved to `tests/test_jax_equivalence.py`,
+# which pins the numpy inference forward against the jit'd jax training forward to float32. The
+# "jax train_step reduces loss" test below replaces the manual-train-reduces checks.
 
-def _residual_grad_check(residual, l2, seed=0, eps=1e-3):
-    """Central finite differences vs the analytic grads train_step computes, for the residual
-    block. Returns the worst per-param relative error, EXCLUDING ReLU-kink-crossing entries (a
-    pre-activation that flips sign across ±eps — the central difference is not a valid gradient
-    there; detected by disagreeing one-sided slopes). eps=1e-3 is the float64 sweet spot for the
-    pre-activation (no-outer-ReLU) block — the eps sweep gives 2.4e-6 @1e-3, 1.5e-5 @1e-4,
-    1.7e-4 @1e-5, 1.3e-3 @1e-6: error SHRINKS as eps grows, the signature of roundoff cancellation
-    in (f(+eps)-f(-eps)), not a backprop bug (which would be eps-insensitive / grow from truncation)."""
+
+def test_jax_train_step_reduces_loss():
+    """The JAX/optax train step reduces BOTH the policy CE and the value MSE on a fixed batch, with
+    the residual block ON — the autodiff training path is wired end to end (forward, value_and_grad,
+    optax-Adam, weights written back into the net). Replaces the manual residual gradient-check
+    (gradients are now correct-by-construction)."""
+    from chocofarm.az.mlp_jax_train import JaxTrainer
     env = Environment()
     fb = FeatureBuilder(env)
-    in_dim, na, B = feature_dim(env), n_action_slots(env), 8
-    net = ValueMLP(in_dim, hidden=16, n_actions=na, seed=seed, residual=residual)
-    rng = np.random.default_rng(seed + 1)
+    in_dim, na = feature_dim(env), n_action_slots(env)
+    net = ValueMLP(in_dim, hidden=64, n_actions=na, seed=0, residual=True)
     feat = fb.build(("w", env.entry), env.worlds, set())
-    X = np.stack([feat] * B) + 0.01 * rng.standard_normal((B, in_dim))
-    M = np.stack([legal_mask_from_features(env, feat)] * B).astype(np.float64)
-    PI = M / M.sum(1, keepdims=True)
-    Y = rng.standard_normal(B)
+    mask = legal_mask_from_features(env, feat)
+    B = 64
+    rng = np.random.default_rng(0)
+    X = (np.stack([feat] * B) + 0.05 * rng.standard_normal((B, in_dim))).astype(np.float32)
+    M = np.stack([mask] * B).astype(np.float32)
+    # a non-uniform target so the CE has a real gradient to descend
+    PI = M * rng.random((B, na)).astype(np.float32)
+    PI = PI / PI.sum(1, keepdims=True)
+    Y = rng.standard_normal(B).astype(np.float32)
     net.set_value_scale(float(Y.mean()), float(Y.std()))
-
-    def total_loss():
-        cache, v_std, logits = net._forward(X)
-        resid = v_std - (Y - net.y_mean) / net.y_std
-        value_loss = float(np.mean(resid ** 2))
-        p = net._masked_softmax(logits, M)
-        logp = np.where(p > 0, np.log(np.clip(p, 1e-12, 1.0)), 0.0)
-        ce = float(-np.mean(np.sum(PI * logp, axis=1)))
-        l2t = sum(0.5 * l2 * float(np.sum(a * a))
-                  for nm, a in net._params().items() if net._is_weight(nm)) if l2 > 0 else 0.0
-        return ce + value_loss + l2t
-
-    # analytic grads — replicate train_step's computation WITHOUT stepping
-    n = X.shape[0]
-    cache, v_std, logits = net._forward(X)
-    X_, z1, a1, z2, a2, head_in, res_cache = cache
-    resid = v_std - (Y - net.y_mean) / net.y_std
-    dv = (2.0 / n) * resid[:, None]
-    p = net._masked_softmax(logits, M)
-    dlogits = (1.0 / n) * ((p - PI) * M)
-    dWv = head_in.T @ dv; dbv = dv.sum(0)
-    dWp = head_in.T @ dlogits; dbp = dlogits.sum(0)
-    dhead = dv @ net.Wv.T + dlogits @ net.Wp.T
-    da2, res_grads = net._residual_backward(dhead, a2, res_cache)
-    dz2 = da2 * (z2 > 0); dW2 = a1.T @ dz2; db2 = dz2.sum(0)
-    dz1 = (dz2 @ net.W2.T) * (z1 > 0); dW1 = X_.T @ dz1; db1 = dz1.sum(0)
-    ana = {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "Wv": dWv, "bv": dbv,
-           "Wp": dWp, "bp": dbp}
-    ana.update(res_grads)
-    if l2 > 0:
-        for nm in ana:
-            if net._is_weight(nm):
-                ana[nm] = ana[nm] + l2 * net._params()[nm]
-
-    worst = 0.0
-    for name, arr in net._params().items():
-        flat = arr.ravel(); ga = ana[name].ravel()
-        for i in range(flat.size):
-            o = flat[i]
-            flat[i] = o + eps; lp = total_loss()
-            flat[i] = o - eps; lm = total_loss()
-            flat[i] = o;       l0 = total_loss()
-            right = (lp - l0) / eps; left = (l0 - lm) / eps
-            if abs(right - left) / (abs(right) + abs(left) + 1e-12) > 1e-2:
-                continue  # ReLU kink crossing
-            gnum = (lp - lm) / (2 * eps)
-            worst = max(worst, abs(ga[i] - gnum) / (abs(ga[i]) + abs(gnum) + 1e-12))
-    return worst
+    tr = JaxTrainer(net, lr=1e-3, l2=1e-4)
+    ce0, vl0 = tr.train_step(X, PI, M, Y)
+    for _ in range(150):
+        ce, vl = tr.train_step(X, PI, M, Y)
+    assert np.isfinite(ce) and np.isfinite(vl)
+    assert vl < vl0, f"value MSE did not reduce: {vl0:.4f} -> {vl:.4f}"
+    assert ce < ce0, f"policy CE did not reduce: {ce0:.4f} -> {ce:.4f}"
 
 
-def test_residual_gradient_check():
-    """The residual-block backprop is analytically correct: analytic vs central finite-difference
-    grads agree to ~1e-5 (the load-bearing check — a wrong residual backward silently corrupts
-    training). Both residual ON and OFF, with and without L2."""
-    for residual in (True, False):
-        for l2 in (0.0, 1e-3):
-            mx = _residual_grad_check(residual, l2)
-            assert mx < 1e-5, f"grad check failed residual={residual} l2={l2}: {mx:.2e}"
+def test_jax_train_writes_back_numpy_inference():
+    """After a JAX train step the net's numpy inference (predict_both) reads the TRAINED weights:
+    the trainer rebinds the net's arrays, so the float32 inference cache's identity check rebuilds
+    (the cache-coherence invariant). The predicted value must change after training."""
+    from chocofarm.az.mlp_jax_train import JaxTrainer
+    env = Environment()
+    fb = FeatureBuilder(env)
+    in_dim, na = feature_dim(env), n_action_slots(env)
+    net = ValueMLP(in_dim, hidden=64, n_actions=na, seed=1, residual=True)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    mask = legal_mask_from_features(env, feat)
+    B = 32
+    X = np.stack([feat] * B).astype(np.float32)
+    M = np.stack([mask] * B).astype(np.float32)
+    PI = M / M.sum(1, keepdims=True)
+    Y = np.linspace(-1.0, 1.0, B).astype(np.float32)
+    net.set_value_scale(float(Y.mean()), float(Y.std()))
+    v_before, p_before = net.predict_both(feat, mask)   # populate the f32 cache
+    tr = JaxTrainer(net, lr=1e-2, l2=0.0)
+    for _ in range(20):
+        tr.train_step(X, PI, M, Y)
+    v_after, p_after = net.predict_both(feat, mask)
+    assert v_after != v_before, "numpy inference served stale weights after JAX training (cache bug)"
+    assert abs(float(p_after.sum()) - 1.0) < 1e-6
+    assert float(p_after[mask == 0].sum()) == 0.0
 
 
 def test_residual_off_bit_identical_to_baseline():
@@ -468,25 +434,6 @@ def test_residual_off_bit_identical_to_baseline():
     v_ref = (a2c @ net.Wv + net.bv).ravel()
     lg_ref = a2c @ net.Wp + net.bp
     assert np.array_equal(v_ref, v_got) and np.array_equal(lg_ref, lg_got)
-
-
-def test_residual_on_train_step_finite_and_reduces():
-    """With residual ON, train_step is finite and reduces the value MSE on a fixed batch (the
-    machinery is wired end to end — forward, both heads through the block, backward, Adam)."""
-    env = Environment()
-    fb = FeatureBuilder(env)
-    net = ValueMLP(feature_dim(env), hidden=32, n_actions=n_action_slots(env),
-                   seed=0, residual=True)
-    feat = fb.build(("w", env.entry), env.worlds, set())
-    mask = legal_mask_from_features(env, feat)
-    B = 16
-    X = np.stack([feat] * B); M = np.stack([mask] * B)
-    PI = M / M.sum(1, keepdims=True); Y = np.linspace(-1.0, 1.0, B)
-    ce0, vl0 = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    for _ in range(100):
-        ce, vl = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    assert np.isfinite(ce) and np.isfinite(vl)
-    assert vl < vl0
 
 
 def test_residual_on_cache_coherent_across_writers():

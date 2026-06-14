@@ -66,7 +66,18 @@ def _redis_params():
 
 def _connect():
     import redis  # local import so a serial (workers=0) run needs no redis at all
-    r = redis.Redis(**_redis_params())
+    # Bound EVERY socket op (ADR-0002 / deadlock fix H2). The default `socket_timeout=None`
+    # makes every r.get / pipe.execute block FOREVER if the TCP socket stalls — a stalled
+    # worker read is then indistinguishable, from the parent's imap fan-out, from a wedged
+    # worker, and the loop sits at futex_do_wait at ~1% CPU with no way out. A bounded timeout
+    # turns a stall into a loud redis.TimeoutError (retryable / restart-recoverable; checkpoints
+    # are per-iteration) instead of a silent permanent hang. Loopback redis under no memory
+    # pressure never trips 60s, so this is a safety net, not a happy-path behavior change.
+    r = redis.Redis(
+        socket_timeout=float(os.environ.get("CHOCO_REDIS_SOCKET_TIMEOUT", "60")),
+        socket_connect_timeout=float(os.environ.get("CHOCO_REDIS_CONNECT_TIMEOUT", "10")),
+        **_redis_params(),
+    )
     r.ping()   # fail loud now if redis is unreachable (ADR-0002), not mid-iteration
     return r
 
@@ -114,7 +125,6 @@ def unpack_net(manifest_json, blob):
                           count=int(np.prod(e["shape"])) if e["shape"] else 1,
                           offset=e["off"]).reshape(e["shape"]).copy()
         setattr(net, e["name"], a)
-    net._init_adam()
     return net
 
 
@@ -129,6 +139,38 @@ def _worker_init(core_list, base_seed, m, n_sims):
     """Process-pool initializer: pin THIS worker to its core, build env/feature-builder, open the
     redis connection, warm the numba kernel. The net is loaded lazily on the first task (when the
     first weight version arrives over redis)."""
+    # Pin native thread counts to 1 DETERMINISTICALLY, before numba/numpy/BLAS import inside this
+    # child (deadlock fix H1a / Fix C). The worker is core-pinned and wants exactly one native
+    # thread per math runtime; relying on the parent's JAX import to have `setdefault`'d these
+    # into the inherited environment makes the worker's threading config depend on parent import
+    # order and on JAX being present. Setting them here makes the child's native-threading
+    # configuration independent of the parent — the same single-thread pin the (clean) numpy
+    # runs had, severing the JAX→spawn-child residue the RCA fingers as the most likely
+    # worker-wedge trigger. setdefault so an operator override still wins.
+    for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS"):
+        os.environ.setdefault(_var, "1")
+    os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+
+    # WORKER-SIDE FAULTHANDLER (the discriminating instrument). The deadlock is intermittent and
+    # the prime-suspect cause (a worker wedged in a native-runtime lock vs a redis socket recv)
+    # cannot be PROVEN without a dump of the WORKER process — ptrace_scope blocked py-spy, and the
+    # parent's faulthandler only dumps the parent. Registering faulthandler here, with a SIGUSR1
+    # handler, makes the next recurrence debuggable on the worker side: a watcher sends SIGUSR1 to
+    # the wedged worker PID and gets an all-thread Python traceback on stderr (→ the run log),
+    # which discriminates H1a (numba/native threading-init lock) from H2 (timeout-less socket
+    # recv). This is the cheap, low-risk confirming step the bounding fixes (A/B) cannot supply on
+    # their own — without it, Fix C ships un-falsifiable. faulthandler writes a C-level traceback
+    # from a signal handler, so it is safe to call even when the GIL is contended (the exact hang
+    # state). Fail soft if signals aren't available (e.g. a non-POSIX host).
+    try:
+        import faulthandler, signal
+        faulthandler.enable()
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except (ImportError, OSError, ValueError):
+        pass   # diagnostic only — never block worker startup on it
+
     import multiprocessing as mp
     name = mp.current_process().name
     try:
@@ -204,10 +246,17 @@ def _gen_task(args):
     r = _W["redis"]
     base = f"az:res:{res_token}:{idx}"
     pipe = r.pipeline(transaction=False)
-    pipe.set(base + ":X", X.tobytes())
-    pipe.set(base + ":PI", PI.tobytes())
-    pipe.set(base + ":M", M.tobytes())
-    pipe.set(base + ":Y", Y.tobytes())
+    # Result blobs carry a TTL so an ABORTED iteration self-cleans. The happy path deletes them in
+    # `_collect_results` the same iteration; but if the fan-out is aborted (Fix A's loud timeout)
+    # the parent never reaches the delete, and a bare SET leaves the blob with no expiry forever
+    # (the post-mortem found ~980 such leaked az:res:* keys, TTL=-1). A 1h TTL bounds that leak
+    # without affecting the happy path (read+deleted within seconds). `ex=` sets the expiry in the
+    # same SET round-trip (no extra command).
+    _res_ttl = int(os.environ.get("CHOCO_RESULT_TTL", "3600"))
+    pipe.set(base + ":X", X.tobytes(), ex=_res_ttl)
+    pipe.set(base + ":PI", PI.tobytes(), ex=_res_ttl)
+    pipe.set(base + ":M", M.tobytes(), ex=_res_ttl)
+    pipe.set(base + ":Y", Y.tobytes(), ex=_res_ttl)
     pipe.execute()
     return (idx, n, feat_dim, n_slots)
 
@@ -222,6 +271,43 @@ def _eval_task(args):
     rng = _task_rng(version, "eval", idx)
     R, T, _ = _W["env"].simulate(pol, world, lam, rng)
     return float(R), float(T)
+
+
+# Per-result timeout for the fan-out drain (deadlock fix H1 / Fix A). An episode is ~0.2–0.4s of
+# search × ~30 plies; 600s is ~1000× headroom and only trips on a TRUE wedge (a worker stuck in a
+# native-runtime lock or a timeout-less socket read). Env-overridable.
+_RESULT_TIMEOUT_S = float(os.environ.get("CHOCO_RESULT_TIMEOUT", "600"))
+
+
+def _drain_imap(it, n_expected, phase, run):
+    """Drive a Pool `imap_unordered` iterator to exhaustion with a PER-RESULT timeout, instead of
+    the unbounded `list(imap_unordered(...))` that blocks forever on a wedged worker.
+
+    `list(...)` parks the parent's main thread on the result-queue condition until EVERY task
+    reports back; a worker that is alive-but-hung (stuck in a native-threading-init lock, or in a
+    timeout-less redis recv) produces no Pool event, so the parent waits at futex_do_wait at ~1%
+    CPU forever — the observed deadlock. Pulling each result with a timeout converts that silent
+    permanent hang into a LOUD, diagnosable RuntimeError (ADR-0002) naming the phase, the run, and
+    how many of the expected results were collected before the stall. A per-iteration checkpoint
+    means a restart loses nothing."""
+    import multiprocessing
+    out = []
+    while True:
+        try:
+            out.append(it.next(_RESULT_TIMEOUT_S))
+        except StopIteration:
+            break
+        except multiprocessing.TimeoutError as e:
+            raise RuntimeError(
+                f"parallel {phase} fan-out (run={run}) stalled: collected {len(out)}/{n_expected} "
+                f"results, then NO further result arrived within {_RESULT_TIMEOUT_S:.0f}s of the "
+                f"previous one (per-result wait, not a whole-fan-out bound) — likely a wedged "
+                f"worker (native-runtime lock or redis socket stall). To get a worker-side "
+                f"traceback, send SIGUSR1 to the stuck worker PID (faulthandler is registered in "
+                f"_worker_init). Aborting loud rather than deadlocking at futex_do_wait "
+                f"(ADR-0002). Restart from the last checkpoint."
+            ) from e
+    return out
 
 
 class ParallelExecutor:
@@ -262,7 +348,9 @@ class ParallelExecutor:
         res_token = uuid.uuid4().hex[:12]
         tasks = [(self.run, version, int(w), lam, explore_plies, lam_blend, n_step, i, res_token)
                  for i, w in enumerate(worlds)]
-        metas = list(self.pool.imap_unordered(_gen_task, tasks, chunksize=1))
+        # bounded drain (Fix A): per-result timeout so a wedged worker aborts loud, not deadlocks
+        metas = _drain_imap(self.pool.imap_unordered(_gen_task, tasks, chunksize=1),
+                            len(tasks), "generate", self.run)
         return self._collect_results(res_token, metas)
 
     def _collect_results(self, res_token, metas):
@@ -301,13 +389,31 @@ class ParallelExecutor:
         tasks = [(self.run, version, int(w), lam, i) for i, w in enumerate(worlds)]
         totR = totT = 0.0
         ets = []
-        for R, T in self.pool.imap_unordered(_eval_task, tasks, chunksize=1):
+        # bounded drain (Fix A): per-result timeout so a wedged worker aborts loud, not deadlocks
+        for R, T in _drain_imap(self.pool.imap_unordered(_eval_task, tasks, chunksize=1),
+                                len(tasks), "evaluate", self.run):
             totR += R; totT += T; ets.append(T)
         return totR, totT, ets
 
     def close(self):
+        # Bounded teardown (completes the "parent never waits unbounded" invariant — see Fix A).
+        # `Pool.join()` takes NO timeout, so a worker wedged at end-of-run would hang close()
+        # forever exactly as the hot loop could. Instead: close (no new tasks), then join each
+        # worker process with a timeout; any worker still alive after the grace period is
+        # terminate()'d (SIGTERM) so teardown is bounded. Low-severity vs the hot loop (runs once
+        # at end-of-run) but it makes the no-unbounded-wait property hold everywhere.
         self.pool.close()
-        self.pool.join()
+        grace = float(os.environ.get("CHOCO_POOL_JOIN_TIMEOUT", "30"))
+        procs = list(getattr(self.pool, "_pool", []))
+        for p in procs:
+            p.join(grace)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()      # bounded: don't let a wedged worker hang teardown
+        try:
+            self.pool.join()       # reap; all workers are now exited or terminated
+        except Exception:
+            pass
         try:
             self.r.close()
         except Exception:

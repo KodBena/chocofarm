@@ -136,10 +136,17 @@ class ReplayBuffer:
         return X, PI, M, Y
 
 
-def train_epochs(net, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
-    """Adam epochs over the buffer; re-pins the value standardization to the buffer's Y stats
-    (design §3) before training so the MSE stays O(1) as the return distribution drifts. Returns
-    (mean_ce, mean_value_std_mse, heldout_R2_on_buffer)."""
+def train_epochs(trainer, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
+    """Adam epochs over the buffer via the JAX/optax trainer (`mlp_jax_train.JaxTrainer`);
+    autodiff over the jit'd forward replaces the manual numpy backprop. Re-pins the value
+    standardization to the buffer's Y stats (design §3) before training so the MSE stays O(1) as
+    the return distribution drifts — the trainer reads y_mean/y_std off the net per step, so the
+    re-pin propagates. After training, numpy inference (`predict_value`) reads the trained weights
+    the trainer wrote back into the net. Returns (mean_ce, mean_value_std_mse, heldout_R2_on_buffer).
+
+    `lr`/`l2` are fixed at trainer construction (the loop varies neither); they are accepted here to
+    keep the prior signature shape but the trainer's configured lr/l2 are authoritative."""
+    net = trainer.net
     net.set_value_scale(float(Y.mean()), float(Y.std()))
     n = X.shape[0]
     steps = max(1, n // batch)
@@ -150,9 +157,7 @@ def train_epochs(net, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
             b = idx[s * batch:(s + 1) * batch]
             if len(b) == 0:
                 continue
-            ce, vl = net.train_step(X[b].astype(np.float64), PI[b].astype(np.float64),
-                                    M[b].astype(np.float64), Y[b].astype(np.float64),
-                                    lr, l2, alpha=alpha, beta=beta)
+            ce, vl = trainer.train_step(X[b], PI[b], M[b], Y[b], alpha=alpha, beta=beta)
             ce_tot += ce; v_tot += vl; cnt += 1
     pv = net.predict_value(X.astype(np.float64))
     return ce_tot / max(1, cnt), v_tot / max(1, cnt), r2_score(Y, pv)
@@ -175,8 +180,17 @@ def run(args):
     print(f"env: N={env.N} faces={len(env.detectors)} teleports={len(env.teleports)} "
           f"feat_dim={in_dim} action_slots={n_slots}", flush=True)
 
-    # --- net: warm-start value head from E-DECIDE weights if given; policy head random ---
-    if args.init_weights:
+    # --- net: resume full net (--resume), warm-start value head (--init-weights), or cold ---
+    if args.resume:
+        net = ValueMLP.load(args.resume)
+        if net.in_dim != in_dim or net.n_actions != n_slots:
+            raise SystemExit(
+                f"--resume net dims (in_dim={net.in_dim}, n_actions={net.n_actions}) "
+                f"!= env (in_dim={in_dim}, n_slots={n_slots}) — incompatible checkpoint")
+        _res_note = "residual block ON" if net.residual else "no residual block"
+        print(f"RESUMED full net (trunk + {_res_note} + value + policy heads) from "
+              f"{args.resume} (hidden={net.H}); JaxTrainer inits a fresh optax optimizer", flush=True)
+    elif args.init_weights:
         warm = ValueMLP.load(args.init_weights)
         net = ValueMLP(in_dim, hidden=warm.H, n_actions=n_slots, seed=args.seed,
                        y_mean=warm.y_mean, y_std=warm.y_std, residual=args.residual)
@@ -194,7 +208,6 @@ def run(args):
         else:
             w1_note = (f"input layer RANDOM (warm net in_dim={warm.in_dim} ≠ current {in_dim}; "
                        f"Part C feature change — W1 cannot warm-start)")
-        net._init_adam()
         res_note = "residual block ON (random init)" if net.residual else "no residual block"
         print(f"warm-started 2nd-trunk + value head from {args.init_weights} "
               f"(hidden={warm.H}); {w1_note}; policy head random; {res_note}", flush=True)
@@ -203,6 +216,16 @@ def run(args):
                        residual=args.residual)
         res_note = "residual block ON" if net.residual else "no residual block"
         print(f"cold net (hidden={args.hidden}); both heads random; {res_note}", flush=True)
+
+    # --- JAX/optax trainer: autodiff training over the jit'd forward (replaces mlp.py's manual
+    #     backprop + hand-rolled Adam). Built ONCE so Adam's running moments persist across
+    #     iterations, exactly as the numpy net's self.m/self.v/self.t did. It reads the (now
+    #     fully-initialised, possibly warm-started) net's weights and writes the trained weights
+    #     back into the net after each step — numpy inference (generation/eval) reads them. ---
+    from chocofarm.az.mlp_jax_train import JaxTrainer
+    trainer = JaxTrainer(net, lr=args.lr, l2=args.l2)
+    print(f"training: JAX/optax Adam (lr={args.lr} l2={args.l2}); inference: numpy float32",
+          flush=True)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = None
@@ -275,7 +298,7 @@ def run(args):
 
         # ---- 2. TRAIN ----
         bX, bPI, bM, bY = buf.arrays()
-        ce, vmse, r2 = train_epochs(net, bX, bPI, bM, bY, args.epochs, args.batch,
+        ce, vmse, r2 = train_epochs(trainer, bX, bPI, bM, bY, args.epochs, args.batch,
                                     args.lr, args.l2, args.alpha, args.beta, train_rng)
         t_train = time.time() - t0 - t_gen
 
@@ -365,6 +388,9 @@ def main():
                          "pre-residual net (a clean ablation axis).")
     ap.add_argument("--init-weights", type=str, default=None,
                     help="E-DECIDE value-net npz to warm-start the value head + trunk")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="full-net npz to RESUME: loads ALL weights (trunk, residual block, value "
+                         "AND policy head), resets Adam. Unlike --init-weights, keeps nothing random.")
     # --- Part A: 4-core actor/learner parallelism ---
     ap.add_argument("--workers", type=int, default=4,
                     help="process-pool workers for the generation+eval fan-out, each pinned to a "
