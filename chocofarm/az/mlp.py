@@ -9,11 +9,14 @@ and an OPTIONAL policy head (logits over the fixed `n_actions`-slot action space
 
 The value head alone served the E-DECIDE probe (design §1, §9 — the F4 calibration cure rides
 on the value). The full Gumbel ExIt loop (design §5/§6) needs BOTH heads: the policy head is the
-search prior `P(s,a)` and the apprentice target, the value head is the leaf evaluation. So the
-policy head is now completed: masked softmax + a combined AlphaZero loss `CE(masked) + MSE +
-L2` (Silver et al. 2017, design §6).
+search prior `P(s,a)` and the apprentice target, the value head is the leaf evaluation. The
+policy head serves masked-softmax inference here; the AlphaZero training loss `CE(masked) + MSE +
+L2` (Silver et al. 2017, design §6) lives with the JaxTrainer (see below).
 
-Manual forward, manual backprop, manual Adam, L2 on weights (not biases). Save/load is npz.
+This net is INFERENCE-ONLY: manual forward, masked softmax, a float32 inference fast path, and npz
+save/load. TRAINING moved to JAX/optax autodiff in `mlp_jax_train.JaxTrainer` (which reads and
+writes these weights); the hand-rolled Adam + manual backprop that used to live here are gone.
+L2 (on weights, not biases) is now applied by the JaxTrainer's loss, reproducing the prior scope.
 
 Standardization: the value head regresses the z-scored target `(y - mu) / sigma`; `mu`, `sigma`
 are stored in the npz so inference de-standardizes back to the λ-penalized return scale. This
@@ -43,7 +46,7 @@ class ValueMLP:
     """Trunk (in→H→H, ReLU) + linear value head over standardized targets.
 
     Optional policy head (logits over `n_actions`) is built only if `n_actions` is given; the
-    E-DECIDE probe leaves it None. Adam state is per-parameter; `l2` decays weight matrices.
+    E-DECIDE probe leaves it None. Inference-only — the JaxTrainer owns the optimizer.
     """
 
     def __init__(self, in_dim, hidden=256, n_actions=None, seed=0,
@@ -82,21 +85,21 @@ class ValueMLP:
         #
         # CACHE COHERENCE — the invariant over ALL writers, not a per-writer gate. The float32
         # cache must never serve weights that no longer match the float64 source. Rather than ask
-        # every weight-mutating site (Adam step, load(), warm-start copy, any future EMA/restart)
-        # to remember to invalidate — the fragile per-producer shape an out-of-frame audit caught
-        # as a latent stale-serve bug — the cache validates against the *identity AND in-place
-        # revision* of the source arrays at every read: it stores `id(W)` of each weight it was
-        # built from and the float64 arrays' `.ctypes.data` (buffer address). Any writer that
-        # REBINDS a weight (`self.W1 = ...` in load/warm-start) changes `id`; the Adam step
-        # mutates IN PLACE so `id` is stable — that one in-place writer bumps `_w_revision`, the
-        # single explicit signal still needed. A rebind needs no cooperation: a fresh id forces a
-        # rebuild. This closes the audit's hazard (a rebinding writer that forgot to invalidate).
+        # every weight-mutating site (load(), warm-start copy, the JaxTrainer's write-back, any
+        # future EMA/restart) to remember to invalidate — the fragile per-producer shape an
+        # out-of-frame audit caught as a latent stale-serve bug — the cache validates against the
+        # *identity* of the source arrays at every read: it stores the source array objects and
+        # compares them by `is`. Every current weight writer REBINDS (`self.Wx = ...` in
+        # load/warm-start, `setattr` in the JaxTrainer write-back), so a fresh object id forces a
+        # rebuild with no cooperation from the writer. This closes the audit's hazard (a rebinding
+        # writer that forgot to invalidate). `_w_revision` is retained as the explicit signal an
+        # IN-PLACE weight writer would bump (the numpy Adam step was the one such writer; it moved
+        # to the JaxTrainer, which rebinds, so nothing bumps it today — it stays at 0).
         self._w_revision = 0
         self._f32_cache = None
         self._f32_cache_sig = None
-        self._init_adam()
 
-    # ---- parameter registry (drives Adam + L2) ----
+    # ---- parameter registry (drives L2; consumed by save/load + the JaxTrainer) ----
     def _params(self):
         p = {"W1": self.W1, "b1": self.b1, "W2": self.W2, "b2": self.b2,
              "Wv": self.Wv, "bv": self.bv}
@@ -110,11 +113,6 @@ class ValueMLP:
     def _is_weight(self, name):
         return name.startswith("W")  # L2 on weight matrices only, not biases
 
-    def _init_adam(self):
-        self.m = {k: np.zeros_like(v) for k, v in self._params().items()}
-        self.v = {k: np.zeros_like(v) for k, v in self._params().items()}
-        self.t = 0
-
     # ---- forward ----
     def _forward(self, X):
         """Returns (cache, value_standardized, policy_logits_or_None).
@@ -124,7 +122,8 @@ class ValueMLP:
             zr2 = ar1 @ Wr2 + br2
             head_in = a2 + zr2                  # pre-activation skip, no outer ReLU (Wr*: H×H)
         The heads read `head_in`. With `residual` OFF, `head_in is a2` and the math is the
-        pre-residual net exactly. The cache carries the block intermediates only when ON."""
+        pre-residual net exactly. `res_cache` is always None — it packaged the residual-block
+        intermediates for the (removed) manual backward; inference reads only `v_std`/`logits`."""
         z1 = X @ self.W1 + self.b1
         a1 = np.maximum(z1, 0.0)
         z2 = a1 @ self.W2 + self.b2
@@ -134,54 +133,21 @@ class ValueMLP:
             ar1 = np.maximum(zr1, 0.0)
             zr2 = ar1 @ self.Wr2 + self.br2
             head_in = a2 + zr2                     # pre-activation skip, NO outer ReLU (firewall A/B: best CE)
-            res_cache = (zr1, ar1, zr2)
         else:
             head_in = a2
-            res_cache = None
         v_std = (head_in @ self.Wv + self.bv).ravel()
         logits = (head_in @ self.Wp + self.bp) if self.n_actions is not None else None
-        cache = (X, z1, a1, z2, a2, head_in, res_cache)
+        cache = (X, z1, a1, z2, a2, head_in, None)
         return cache, v_std, logits
 
-    # ======================================================================================
-    # SUPERSEDED — manual backprop + hand-rolled Adam (the methods below: _residual_backward,
-    # train_step_value, train_step, _adam_apply, _init_adam). Training moved to JAX/optax autodiff
-    # in `mlp_jax_train.JaxTrainer`: `jax.value_and_grad` makes the gradient correct-by-
-    # construction (no hand-derived residual backward, no finite-diff gradient-check), and an
-    # architecture change is a one-line forward edit with no backward to re-derive. The exit_loop
-    # and train_value harnesses now train via the JaxTrainer.
-    #
-    # These methods are KEPT (not deleted) because: (1) they document the exact loss/optimizer the
-    # JAX path reproduces, (2) the numpy↔jax-jit FLOAT32 EQUIVALENCE TEST (the load-bearing
-    # safeguard, tests/test_jax_equivalence.py) needs the numpy `_forward` they were built around,
-    # and (3) deleting working, tested code mid-migration is a larger blast radius than marking it.
-    # `_init_adam`/`_adam_apply`/`self.m`/`self.v`/`self.t` are the dead Adam state. They are no
-    # longer ON the training path; do not add new callers — use `JaxTrainer`.
-    # ======================================================================================
-
-    # ---- residual-block backward (DEAD — superseded by jax autodiff; see banner above) ----
-    def _residual_backward(self, dhead, a2, res_cache):
-        """Backprop ∂L/∂head_in (`dhead`) through the residual block to ∂L/∂a2.
-
-        Block forward (see `_forward`):
-            zr1 = a2 @ Wr1 + br1; ar1 = ReLU(zr1); zr2 = ar1 @ Wr2 + br2
-            pre = a2 + zr2;       head_in = ReLU(pre)
-        ∂L/∂a2 collects BOTH paths — the skip (`pre = a2 + zr2`) and the block
-        (`zr1 = a2 @ Wr1 + …`). With the block OFF, `head_in is a2` so this is the identity:
-        `dhead` is already ∂L/∂a2 and there are no block grads."""
-        if res_cache is None:
-            return dhead, {}
-        zr1, ar1, zr2 = res_cache
-        da2 = dhead.copy()                        # skip path: head_in = a2 + zr2 (no outer ReLU)
-        dzr2 = dhead
-        dWr2 = ar1.T @ dzr2
-        dbr2 = dzr2.sum(0)
-        dar1 = dzr2 @ self.Wr2.T
-        dzr1 = dar1 * (zr1 > 0)                   # through ar1 = ReLU(zr1)
-        dWr1 = a2.T @ dzr1
-        dbr1 = dzr1.sum(0)
-        da2 += dzr1 @ self.Wr1.T                  # block path: zr1 = a2 @ Wr1 + br1
-        return da2, {"Wr1": dWr1, "br1": dbr1, "Wr2": dWr2, "br2": dbr2}
+    # Training moved to JAX/optax autodiff in `mlp_jax_train.JaxTrainer`: `jax.value_and_grad`
+    # makes the gradient correct-by-construction (no hand-derived residual backward, no finite-diff
+    # gradient-check), and an architecture change is a one-line forward edit with no backward to
+    # re-derive. The numpy net below is INFERENCE-ONLY (forward + masked softmax + the float32
+    # inference cache) plus npz serialization; the exit_loop / train_value harnesses train via the
+    # JaxTrainer. The numpy `_forward` survives because the numpy↔jax-jit FLOAT32 EQUIVALENCE TEST
+    # (tests/test_jax_equivalence.py) pins it as the reference. Do not re-add a numpy training
+    # path — use `JaxTrainer`.
 
     # ---- float32 inference fast path (the parametric hot-path precision) ----
     def _f32_weights(self):
@@ -326,119 +292,11 @@ class ValueMLP:
             return float(v[0]), p[0]
         return v, p
 
-    # ---- one Adam step on the value loss (MSE on standardized target + L2) ----
-    def train_step_value(self, X, y, lr, l2, betas=(0.9, 0.999), eps=1e-8):
-        """X: (B, in_dim); y: (B,) RAW (un-standardized) targets. Returns standardized-MSE."""
-        n = X.shape[0]
-        y_std_target = (y - self.y_mean) / self.y_std
-        cache, v_std, _ = self._forward(X)
-        X_, z1, a1, z2, a2, head_in, res_cache = cache
-        resid = v_std - y_std_target            # (B,)
-        loss = float(np.mean(resid ** 2))
-
-        # backprop (MSE = mean over batch of resid^2 → dL/dv_std = 2*resid/n)
-        dv = (2.0 / n) * resid[:, None]         # (B,1)
-        dWv = head_in.T @ dv
-        dbv = dv.sum(0)
-        dhead = dv @ self.Wv.T                   # ∂L/∂head_in
-        # residual block backward → ∂L/∂a2 (and the block param grads), else identity
-        da2, res_grads = self._residual_backward(dhead, a2, res_cache)
-        dz2 = da2 * (z2 > 0)
-        dW2 = a1.T @ dz2
-        db2 = dz2.sum(0)
-        da1 = dz2 @ self.W2.T
-        dz1 = da1 * (z1 > 0)
-        dW1 = X_.T @ dz1
-        db1 = dz1.sum(0)
-
-        grads = {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "Wv": dWv, "bv": dbv}
-        grads.update(res_grads)
-        # the value step does not touch the policy head (no gradient flows to it)
-        self._adam_apply(grads, lr, l2, betas, eps)
-        return loss
-
-    # ---- combined AlphaZero loss step (CE(masked) + value MSE + L2) ----
-    def train_step(self, X, target_pi, legal_mask, target_v, lr, l2,
-                   alpha=1.0, beta=1.0, betas=(0.9, 0.999), eps=1e-8):
-        """One Adam step on the AlphaZero loss (design §6, Silver et al. 2017):
-
-            L = alpha · CE(p_net, target_pi)  +  beta · (v_net − v_target)²  +  l2 · ‖W‖²
-
-        X: (B, in_dim). target_pi: (B, n_actions) — the Gumbel improved policy π′, a probability
-        row over the LEGAL slots (zero on illegal). legal_mask: (B, n_actions) {0,1}. target_v:
-        (B,) RAW (un-standardized) value targets. Returns (ce, value_std_mse) for logging.
-
-        CE is over the masked softmax; illegal slots carry zero probability in both p and π′ so
-        they contribute nothing to the cross-entropy and receive no gradient (the masked-softmax
-        Jacobian leaves illegal logits untouched). This is the standard masked-policy gradient:
-        for the softmax+CE pair the logit gradient is `(p − π′)` on legal slots, 0 on illegal."""
-        if self.n_actions is None:
-            raise ValueError("net has no policy head (n_actions=None) — cannot train policy")
-        n = X.shape[0]
-        lm = legal_mask.astype(np.float64)
-        # --- forward (shared trunk) ---
-        cache, v_std, logits = self._forward(X)
-        X_, z1, a1, z2, a2, head_in, res_cache = cache
-
-        # --- value branch (standardized MSE) ---
-        y_std_target = (target_v - self.y_mean) / self.y_std
-        resid = v_std - y_std_target                         # (B,)
-        value_loss = float(np.mean(resid ** 2))
-        dv = (2.0 / n) * (beta * resid)[:, None]             # (B,1), dL/dv_std
-
-        # --- policy branch (masked CE) ---
-        p = self._masked_softmax(logits, lm)                 # (B, n_actions)
-        # CE = -mean_b Σ_a π'_ba log p_ba   (illegal slots zero in both → no contribution)
-        logp = np.where(p > 0, np.log(np.clip(p, 1e-12, 1.0)), 0.0)
-        ce = float(-np.mean(np.sum(target_pi * logp, axis=1)))
-        # softmax+CE logit gradient: (p − π') on legal slots, masked to legal, mean over batch.
-        dlogits = (alpha / n) * ((p - target_pi) * lm)       # (B, n_actions)
-
-        # --- backprop both heads into head_in, then through the residual block into the trunk ---
-        dWv = head_in.T @ dv
-        dbv = dv.sum(0)
-        dWp = head_in.T @ dlogits
-        dbp = dlogits.sum(0)
-        dhead = dv @ self.Wv.T + dlogits @ self.Wp.T     # ∂L/∂head_in (both heads)
-        # residual block backward → ∂L/∂a2 (and block param grads), else identity
-        da2, res_grads = self._residual_backward(dhead, a2, res_cache)
-        dz2 = da2 * (z2 > 0)
-        dW2 = a1.T @ dz2
-        db2 = dz2.sum(0)
-        da1 = dz2 @ self.W2.T
-        dz1 = da1 * (z1 > 0)
-        dW1 = X_.T @ dz1
-        db1 = dz1.sum(0)
-
-        grads = {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2,
-                 "Wv": dWv, "bv": dbv, "Wp": dWp, "bp": dbp}
-        grads.update(res_grads)
-        self._adam_apply(grads, lr, l2, betas, eps)
-        return ce, value_loss
-
     def set_value_scale(self, y_mean, y_std):
         """Re-pin the value-target standardization (the ExIt loop sets it from the replay
         buffer's running target statistics; design §3 standardize-targets)."""
         self.y_mean = float(y_mean)
         self.y_std = float(y_std) if y_std > 1e-8 else 1.0
-
-    def _adam_apply(self, grads, lr, l2, betas, eps):
-        b1, b2 = betas
-        self.t += 1
-        params = self._params()
-        for name, g in grads.items():
-            if self._is_weight(name) and l2 > 0:
-                g = g + l2 * params[name]
-            self.m[name] = b1 * self.m[name] + (1 - b1) * g
-            self.v[name] = b2 * self.v[name] + (1 - b2) * (g * g)
-            mhat = self.m[name] / (1 - b1 ** self.t)
-            vhat = self.v[name] / (1 - b2 ** self.t)
-            params[name] -= lr * mhat / (np.sqrt(vhat) + eps)
-        # Adam mutates the weight arrays IN PLACE (`params[name] -= ...`), so their id/buffer
-        # address is unchanged — the identity check can't see it. Bump the explicit revision so
-        # the float32 cache rebuilds. (Rebinding writers — load/warm-start — are caught by the
-        # identity check and need no bump; this is the one in-place writer.)
-        self._w_revision += 1
 
     # ---- persistence (npz) ----
     def save(self, path):
@@ -488,5 +346,4 @@ class ValueMLP:
             net.Wr2, net.br2 = z["Wr2"], z["br2"]
         if n_actions is not None:
             net.Wp, net.bp = z["Wp"], z["bp"]
-        net._init_adam()
         return net

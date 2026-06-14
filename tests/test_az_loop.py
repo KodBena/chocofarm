@@ -4,9 +4,10 @@ test_az_loop.py — bounded correctness gate for the Gumbel ExIt loop machinery.
 
 Asserts the load-bearing contracts of the AZ loop modules without running the (multi-hour) real
 loop: the action↔slot mapping is a fixed env-derived bijection, the two legal-mask paths agree,
-the masked softmax puts zero mass on illegal slots, the combined train_step is finite and
-reduces loss on a fixed batch, and the Gumbel search returns a well-formed improved-policy
-target (sums to 1, zero on illegal, finite) plus a legal executed action.
+the masked softmax puts zero mass on illegal slots, the JaxTrainer's combined train_step is finite
+and reduces loss on a fixed batch (training is JAX/optax; the numpy net is inference-only), and the
+Gumbel search returns a well-formed improved-policy target (sums to 1, zero on illegal, finite)
+plus a legal executed action.
 
 Run pinned + bounded, e.g.:
     taskset -c 2 timeout 180 /home/bork/w/vdc/venvs/generic/bin/python -m pytest tests/test_az_loop.py -q
@@ -81,31 +82,17 @@ def test_masked_softmax_zero_on_illegal():
     assert float(p[mask == 0].sum()) == 0.0
 
 
-def test_train_step_finite_and_reduces():
-    env = Environment()
-    fb = FeatureBuilder(env)
-    net = ValueMLP(feature_dim(env), hidden=32, n_actions=n_action_slots(env), seed=0)
-    feat = fb.build(("w", env.entry), env.worlds, set())
-    mask = legal_mask_from_features(env, feat)
-    B = 16
-    X = np.stack([feat] * B)
-    M = np.stack([mask] * B)
-    PI = M / M.sum(1, keepdims=True)
-    Y = np.linspace(-1.0, 1.0, B)
-    ce0, vl0 = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    for _ in range(100):
-        ce, vl = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    assert np.isfinite(ce) and np.isfinite(vl)
-    assert vl < vl0  # value MSE must come down on a fixed batch
-
-
 def test_predict_both_cache_coherent_across_writers():
     """The float32 inference cache (mlp.ValueMLP._f32_cache) must never serve weights that no
-    longer match the float64 source. This pins the invariant over EVERY weight writer — a rebind
-    (load / warm-start replacing the array object), an in-place Adam mutation, and a y-scale
+    longer match the float64 source. This pins the invariant over the surviving weight writers — a
+    rebind (load / warm-start / the JaxTrainer write-back replacing the array object) and a y-scale
     change — after the cache has been populated by a prior predict. (Out-of-frame-audit guard: the
-    first cut gated invalidation on the Adam step alone, so a post-populate rebind served stale
-    weights; this test reproduces that order and asserts the served forward tracks the source.)"""
+    first cut gated invalidation on the optimizer step alone, so a post-populate rebind served stale
+    weights; this test reproduces that order and asserts the served forward tracks the source.
+
+    Post-training cache coherence — that numpy inference sees the trained weights — is covered at
+    the integration level by test_jax_train_writes_back_numpy_inference; the manual in-place Adam
+    step that this test used to exercise was removed with the JAX training migration.)"""
     env = Environment()
     fb = FeatureBuilder(env)
     net = ValueMLP(feature_dim(env), hidden=64, n_actions=n_action_slots(env), seed=0)
@@ -126,18 +113,10 @@ def test_predict_both_cache_coherent_across_writers():
     v_after_rebind, _ = net.predict_both(feat, mask)
     assert abs(v_after_rebind - truth_value()) < 1e-2, "stale cache after weight rebind"
 
-    # IN-PLACE Adam mutation must also be reflected
-    X = np.stack([feat] * 8); M = np.stack([mask] * 8)
-    PI = M / M.sum(1, keepdims=True); Y = np.linspace(-1.0, 1.0, 8)
-    v_before = net.predict_both(feat, mask)[0]
-    net.train_step(X.astype(np.float64), PI, M.astype(np.float64), Y, 1e-2, 0.0)
-    v_after_step = net.predict_both(feat, mask)[0]
-    assert v_after_step != v_before, "stale cache after in-place Adam step"
-
     # y-scale change must be reflected
     net.set_value_scale(5.0, 2.0)
     v_after_scale = net.predict_both(feat, mask)[0]
-    assert v_after_scale != v_after_step, "stale cache after y-scale change"
+    assert v_after_scale != v_after_rebind, "stale cache after y-scale change"
 
 
 def test_gumbel_target_well_formed():
@@ -455,25 +434,6 @@ def test_residual_off_bit_identical_to_baseline():
     v_ref = (a2c @ net.Wv + net.bv).ravel()
     lg_ref = a2c @ net.Wp + net.bp
     assert np.array_equal(v_ref, v_got) and np.array_equal(lg_ref, lg_got)
-
-
-def test_residual_on_train_step_finite_and_reduces():
-    """With residual ON, train_step is finite and reduces the value MSE on a fixed batch (the
-    machinery is wired end to end — forward, both heads through the block, backward, Adam)."""
-    env = Environment()
-    fb = FeatureBuilder(env)
-    net = ValueMLP(feature_dim(env), hidden=32, n_actions=n_action_slots(env),
-                   seed=0, residual=True)
-    feat = fb.build(("w", env.entry), env.worlds, set())
-    mask = legal_mask_from_features(env, feat)
-    B = 16
-    X = np.stack([feat] * B); M = np.stack([mask] * B)
-    PI = M / M.sum(1, keepdims=True); Y = np.linspace(-1.0, 1.0, B)
-    ce0, vl0 = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    for _ in range(100):
-        ce, vl = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
-    assert np.isfinite(ce) and np.isfinite(vl)
-    assert vl < vl0
 
 
 def test_residual_on_cache_coherent_across_writers():

@@ -208,7 +208,6 @@ def run(args):
         else:
             w1_note = (f"input layer RANDOM (warm net in_dim={warm.in_dim} ≠ current {in_dim}; "
                        f"Part C feature change — W1 cannot warm-start)")
-        net._init_adam()
         res_note = "residual block ON (random init)" if net.residual else "no residual block"
         print(f"warm-started 2nd-trunk + value head from {args.init_weights} "
               f"(hidden={warm.H}); {w1_note}; policy head random; {res_note}", flush=True)

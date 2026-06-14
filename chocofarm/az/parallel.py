@@ -125,7 +125,6 @@ def unpack_net(manifest_json, blob):
                           count=int(np.prod(e["shape"])) if e["shape"] else 1,
                           offset=e["off"]).reshape(e["shape"]).copy()
         setattr(net, e["name"], a)
-    net._init_adam()
     return net
 
 
