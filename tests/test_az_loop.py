@@ -237,6 +237,129 @@ def test_vmix_prior_weighted():
     assert abs(got - v_mix_visit) > 0.1   # and clearly NOT the visit-weighted variant
 
 
+# ---- Part C: belief-resolution features (uncertainty encoding) ----
+
+def test_feature_dim_includes_unc_block():
+    """feature_dim is N×5 + nD×3 + (6+n_tele) — the per-treasure block grew 4N→5N (the unc
+    sub-block) and the global block 5→6 (the Σunc scalar). On the live env: 241."""
+    env = Environment()
+    N, nD, nt = env.N, len(env.detectors), len(env.teleports)
+    assert feature_dim(env) == N * 5 + nD * 3 + (6 + nt) == 241
+
+
+def test_unc_features_are_bernoulli_variance():
+    """Per-treasure unc[i] = marg[i]·(1−marg[i]); global Σunc sums it over UNCOLLECTED treasures.
+    At the root every marginal is K/N = 5/20 = 0.25, so unc = 0.1875 and Σunc = 20·0.1875 = 3.75.
+    A resolved treasure (marg 0 or 1) carries unc 0 — the known-vs-unknown signal."""
+    env = Environment()
+    fb = FeatureBuilder(env)
+    N, nD = env.N, len(env.detectors)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    marg = feat[0:N]
+    unc = feat[4 * N:5 * N]                       # 5th per-treasure sub-block (after dist)
+    assert np.allclose(unc, marg * (1.0 - marg), atol=1e-6)
+    assert np.allclose(unc, 0.25 * 0.75, atol=1e-6)   # root marginals are all 0.25
+    sum_u_idx = 5 * N + 3 * nD + 5                # global block, 6th scalar (after nonempty)
+    assert abs(float(feat[sum_u_idx]) - float(np.sum(unc))) < 1e-5  # no treasure collected yet
+    assert abs(float(feat[sum_u_idx]) - 3.75) < 1e-5
+
+
+def test_unc_zero_when_resolved():
+    """After sensing enough to resolve a treasure's presence to 0 or 1, its unc drops to 0 — the
+    feature distinguishes a resolved treasure from a split (marg-0.5) one, which marg alone cannot."""
+    env = Environment()
+    fb = FeatureBuilder(env)
+    N = env.N
+    # drive a chain of senses to sharpen the belief, then check at least one treasure resolved
+    loc, bw, coll = ("w", env.entry), env.worlds, set()
+    rng = np.random.default_rng(0)
+    w = int(env.worlds[500])
+    for _ in range(6):
+        feat = fb.build(loc, bw, coll)
+        from chocofarm.az.actions import legal_mask_from_features
+        legal = env.legal_actions(loc, bw, coll)
+        senses = [a for a in legal if a[0] == "d"]
+        if not senses:
+            break
+        a = senses[0]
+        _, loc, bw, coll, _ = env.apply(loc, bw, coll, a, w)
+    feat = fb.build(loc, bw, coll)
+    marg = feat[0:N]
+    unc = feat[4 * N:5 * N]
+    resolved = (marg == 0.0) | (marg == 1.0)
+    assert np.all(unc[resolved] == 0.0), "resolved treasures must carry zero uncertainty"
+    assert np.allclose(unc, marg * (1.0 - marg), atol=1e-6)
+
+
+# ---- Part B: lower-variance value target (TD(λ)/n-step blend) ----
+
+def test_value_target_mc_limit_bit_identical():
+    """blended_returns_to_go at λ_blend=1 / n_step=None is bit-identical to the pure-MC suffix
+    rule — Part B is opt-in, the default recovers the prior behavior exactly."""
+    from chocofarm.az.value_target import suffix_returns_to_go, blended_returns_to_go
+    step_rt = [(1.0, 3.0), (0.0, 5.0), (2.0, 4.0), (0.0, 2.0)]
+    boot = [-0.5, -0.4, -0.3, -0.2]
+    exit_c, lam = 10.0, 0.0855
+    mc = suffix_returns_to_go(step_rt, exit_c, lam)
+    assert blended_returns_to_go(step_rt, boot, exit_c, lam, lam_blend=1.0) == mc
+    assert blended_returns_to_go(step_rt, boot, exit_c, lam, n_step=None) == mc
+
+
+def test_value_target_td_lambda_limits():
+    """λ_blend→0 equals the 1-step bootstrap target; the backward recurrence matches the forward
+    view (geometric average of n-step returns) for several λ_blend."""
+    from chocofarm.az.value_target import blended_returns_to_go
+    step_rt = [(1.0, 3.0), (0.0, 5.0), (2.0, 4.0), (0.0, 2.0)]
+    boot = [-0.5, -0.4, -0.3, -0.2]
+    exit_c, lam = 10.0, 0.0855
+
+    def nstep_forward(j, n):
+        D = len(step_rt); acc = 0.0; end = j + n
+        if end >= D:
+            for t in range(j, D):
+                acc += step_rt[t][0] - lam * step_rt[t][1]
+            acc += -lam * exit_c
+        else:
+            for t in range(j, end):
+                acc += step_rt[t][0] - lam * step_rt[t][1]
+            acc += boot[end]
+        return acc
+
+    def td_forward(ell):
+        D = len(step_rt); out = []
+        for j in range(D):
+            g = 0.0
+            for n in range(1, D - j):
+                g += (1 - ell) * ell ** (n - 1) * nstep_forward(j, n)
+            g += ell ** (D - j - 1) * nstep_forward(j, D - j)
+            out.append(g)
+        return out
+
+    b0 = blended_returns_to_go(step_rt, boot, exit_c, lam, lam_blend=0.0)
+    b1 = blended_returns_to_go(step_rt, boot, exit_c, lam, n_step=1)
+    assert np.allclose(b0, b1, atol=1e-9)
+    for ell in (0.0, 0.3, 0.7, 0.95, 1.0):
+        assert np.allclose(blended_returns_to_go(step_rt, boot, exit_c, lam, lam_blend=ell),
+                           td_forward(ell), atol=1e-9), ell
+
+
+def test_decide_with_value_returns_finite_bootstrap():
+    """decide_with_value returns (action, pi, root_value); the bootstrap is finite and the
+    (action, pi) pair is identical to decide_with_target on the SAME rng stream (the wrappers share
+    one core)."""
+    env = Environment()
+    net = ValueMLP(feature_dim(env), hidden=32, n_actions=n_action_slots(env), seed=1)
+    search = GumbelAZSearch(env=env, net=net, m=6, n_sims=16)
+    loc, bw, coll = ("w", env.entry), env.worlds, set()
+    a1, pi1, boot = search.decide_with_value(env, loc, bw, coll, 0.0855,
+                                             np.random.default_rng(5), temperature=0.0)
+    a2, pi2 = search.decide_with_target(env, loc, bw, coll, 0.0855,
+                                        np.random.default_rng(5), temperature=0.0)
+    assert np.isfinite(boot)
+    assert a1 == a2
+    assert np.allclose(pi1, pi2, atol=1e-9)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

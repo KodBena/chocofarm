@@ -39,15 +39,19 @@ def feature_names(env):
     order (mirrors features.py exactly)."""
     N, nD = env.N, len(env.detectors)
     names, blocks = [], []
+    # per-treasure block (N×5): the `unc` sub-block (Bernoulli variance, Part C belief-resolution)
+    # is the 5th, AFTER dist — mirrors features.py build order exactly.
     for sub, tag in [("marg", "treasure/marg"), ("collected", "treasure/collected"),
-                     ("available", "treasure/available"), ("dist", "treasure/dist")]:
+                     ("available", "treasure/available"), ("dist", "treasure/dist"),
+                     ("unc", "treasure/unc")]:
         for i in range(N):
             names.append(f"t{i}.{sub}"); blocks.append(tag)
     for sub, tag in [("informative", "detector/informative"), ("p_pos", "detector/p_pos"),
                      ("dist", "detector/dist")]:
         for j in range(nD):
             names.append(f"d{j}.{sub}"); blocks.append(tag)
-    gnames = ["log|bw|", "n_collected", "sum_marg", "exit_cost", "nonempty"]
+    # global block (6 + n_tele): sum_unc (Σ_uncollected unc, Part C) is the 6th, after nonempty.
+    gnames = ["log|bw|", "n_collected", "sum_marg", "exit_cost", "nonempty", "sum_unc"]
     for g in gnames:
         names.append(f"global.{g}"); blocks.append("global")
     for k in range(len(env.teleports)):

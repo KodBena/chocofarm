@@ -144,13 +144,53 @@ class GumbelAZSearch:
         node.legal = [s2a[s] for s in np.nonzero(mask)[0]]
         return v
 
+    # ---- root-value bootstrap (Part B: the lower-variance value-target seam) ----
+    @staticmethod
+    def _root_search_value(root):
+        """The search's ~n_sims-averaged estimate of the ROOT belief's value: the visit-weighted
+        mean of the root actions' aggregate λ-penalized returns, Σ_a W[a] / Σ_a N[a].
+
+        This is exactly the empirical MCTS root value — it averages ALL n_sims simulated returns
+        (each `_visit` adds the realized return of one simulation to W and 1 to N), so it is a
+        ~48-sample average of the same λ-penalized-return quantity the MC target measures, at no
+        extra rollout cost (the sims were run for action selection anyway). It is the bootstrap
+        used by the TD(λ)/n-step value target (Part B). Falls back to the net leaf value `root.value`
+        when no sims landed (degenerate single-action / empty-considered case)."""
+        sum_n = sum(root.N.values())
+        if sum_n <= 0:
+            return float(root.value) if root.value is not None else 0.0
+        sum_w = sum(root.W.values())
+        return sum_w / sum_n
+
     # ---- public API ----
+    def decide_with_value(self, env, loc, bw, collected, lam, rng, temperature=0.0):
+        """Like `decide_with_target` but ALSO returns the search's root-value bootstrap
+        `_root_search_value(root)` — the ~n_sims-averaged λ-penalized root value the Part B
+        lower-variance value target bootstraps from. Returns `(executed_action, improved_pi,
+        root_value)`. `decide_with_target` is the thin (action, pi) wrapper over this."""
+        n_slots = self.n_slots
+        if len(bw) == 0:
+            pi = np.zeros(n_slots)
+            pi[self.term_slot] = 1.0
+            # the only continuation from an empty belief is to exit; its value is the exit toll
+            return TERMINATE, pi, -lam * env.exit_cost(loc)
+        action, pi, root = self._decide_root(env, loc, bw, collected, lam, rng, temperature)
+        return action, pi, self._root_search_value(root)
+
     def decide_with_target(self, env, loc, bw, collected, lam, rng, temperature=0.0):
         n_slots = self.n_slots
         if len(bw) == 0:
             pi = np.zeros(n_slots)
             pi[self.term_slot] = 1.0
             return TERMINATE, pi
+        action, pi, _root = self._decide_root(env, loc, bw, collected, lam, rng, temperature)
+        return action, pi
+
+    def _decide_root(self, env, loc, bw, collected, lam, rng, temperature):
+        """Shared core: run the Gumbel search at the root and return (executed_action, improved_pi,
+        root_node). The root node carries the per-action W/N stats the root-value bootstrap reads.
+        `decide_with_target` and `decide_with_value` are thin wrappers selecting what to expose."""
+        n_slots = self.n_slots
 
         # The belief-feature cache (FeatureBuilder._belief_cache) is scoped to ONE EPISODE: the
         # same belief recurs ~3.5× across an episode's decisions (and ~2.6× within one decision's
@@ -203,7 +243,7 @@ class GumbelAZSearch:
             exec_action = slot_to_action(env, chosen)
         else:
             exec_action = slot_to_action(env, survivor)
-        return exec_action, improved
+        return exec_action, improved, root
 
     # ---- Sequential Halving (Danihelka et al. 2022 §2) ----
     def _sequential_halving(self, env, root, loc, bw, collected, lam, rng,
