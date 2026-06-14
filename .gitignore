@@ -6,3 +6,4 @@ venvs/
 tb/
 tb_test/
 tb_runlogs/
+.scratch/

@@ -73,7 +73,11 @@ def test_masked_softmax_zero_on_illegal():
     mask = legal_mask_from_features(env, feat)
     v, p = net.predict_both(feat, mask)
     assert np.isfinite(v)
-    assert abs(float(p.sum()) - 1.0) < 1e-9
+    # The probability sum is normalized to 1 up to the working precision. With the parametric
+    # hot-path DTYPE at float32 (the default), the softmax sum carries float32 rounding (~1e-7);
+    # the float64 path is tighter. 1e-6 covers both. The LOGIC invariant — exactly zero mass on
+    # illegal slots — is asserted exactly below and is unaffected by precision.
+    assert abs(float(p.sum()) - 1.0) < 1e-6
     assert float(p[mask == 0].sum()) == 0.0
 
 
@@ -93,6 +97,47 @@ def test_train_step_finite_and_reduces():
         ce, vl = net.train_step(X, PI, M, Y, 1e-3, 1e-4)
     assert np.isfinite(ce) and np.isfinite(vl)
     assert vl < vl0  # value MSE must come down on a fixed batch
+
+
+def test_predict_both_cache_coherent_across_writers():
+    """The float32 inference cache (mlp.ValueMLP._f32_cache) must never serve weights that no
+    longer match the float64 source. This pins the invariant over EVERY weight writer — a rebind
+    (load / warm-start replacing the array object), an in-place Adam mutation, and a y-scale
+    change — after the cache has been populated by a prior predict. (Out-of-frame-audit guard: the
+    first cut gated invalidation on the Adam step alone, so a post-populate rebind served stale
+    weights; this test reproduces that order and asserts the served forward tracks the source.)"""
+    env = Environment()
+    fb = FeatureBuilder(env)
+    net = ValueMLP(feature_dim(env), hidden=64, n_actions=n_action_slots(env), seed=0)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    mask = legal_mask_from_features(env, feat)
+
+    def truth_value():
+        _, v_std, _ = net._forward(np.asarray(feat, dtype=np.float64)[None, :])
+        return float(v_std[0] * net.y_std + net.y_mean)
+
+    # populate the cache, then REBIND weights (the load/warm-start shape) and predict again
+    net.predict_both(feat, mask)
+    rng = np.random.default_rng(99)
+    net.W1 = rng.standard_normal(net.W1.shape)
+    net.W2 = rng.standard_normal(net.W2.shape)
+    net.Wv = rng.standard_normal(net.Wv.shape)
+    net.Wp = rng.standard_normal(net.Wp.shape)
+    v_after_rebind, _ = net.predict_both(feat, mask)
+    assert abs(v_after_rebind - truth_value()) < 1e-2, "stale cache after weight rebind"
+
+    # IN-PLACE Adam mutation must also be reflected
+    X = np.stack([feat] * 8); M = np.stack([mask] * 8)
+    PI = M / M.sum(1, keepdims=True); Y = np.linspace(-1.0, 1.0, 8)
+    v_before = net.predict_both(feat, mask)[0]
+    net.train_step(X.astype(np.float64), PI, M.astype(np.float64), Y, 1e-2, 0.0)
+    v_after_step = net.predict_both(feat, mask)[0]
+    assert v_after_step != v_before, "stale cache after in-place Adam step"
+
+    # y-scale change must be reflected
+    net.set_value_scale(5.0, 2.0)
+    v_after_scale = net.predict_both(feat, mask)[0]
+    assert v_after_scale != v_after_step, "stale cache after y-scale change"
 
 
 def test_gumbel_target_well_formed():

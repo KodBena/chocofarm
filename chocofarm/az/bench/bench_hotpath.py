@@ -104,7 +104,31 @@ def bench(net_path, states_path, repeat=5):
             _ = (~hit).any(0)
     results["belief_reductions"] = _time(f_belief_red, S, repeat)
 
-    # --- predict_both (NN forward + masked softmax) ---
+    # --- belief reductions, NUMBA fused kernel (marginals + detector counts in one pass) ---
+    from chocofarm.az.kernels import belief_marg_cover, warmup as _kwarm
+    _kwarm(N, nD)
+    i["k"] = 0
+
+    def f_belief_red_numba():
+        i["k"] = (i["k"] + 1) % S
+        bw = bws[i["k"]]
+        if len(bw):
+            belief_marg_cover(bw, cover, N)
+    results["belief_reductions_numba"] = _time(f_belief_red_numba, S, repeat)
+
+    # --- env.marginals, NUMBA kernel (the marginals-only fast path) ---
+    from chocofarm.az.kernels import marginals_kernel
+    i["k"] = 0
+
+    def f_marg_numba():
+        i["k"] = (i["k"] + 1) % S
+        bw = bws[i["k"]]
+        if len(bw):
+            marginals_kernel(bw, N)
+    results["env.marginals_numba"] = _time(f_marg_numba, S, repeat)
+
+    # --- predict_both (NN forward + masked softmax). `net.predict_both` is the float32-numpy
+    #     fast path when CHOCO_AZ_DTYPE=float32 (default) and the float64 path otherwise. ---
     i["k"] = 0
 
     def f_predict():
@@ -112,6 +136,47 @@ def bench(net_path, states_path, repeat=5):
         k = i["k"]
         net.predict_both(feats[k], masks[k])
     results["predict_both"] = _time(f_predict, S, repeat)
+
+    # --- predict_both, EXPLICIT float64 path (the pre-opt baseline forward) ---
+    i["k"] = 0
+
+    def f_predict_f64():
+        i["k"] = (i["k"] + 1) % S
+        k = i["k"]
+        _, v_std, logits = net._forward(feats[k].astype(np.float64)[None, :])
+        v = v_std * net.y_std + net.y_mean
+        net._masked_softmax(logits, masks[k][None, :].astype(np.float64))
+    results["predict_both_f64"] = _time(f_predict_f64, S, repeat)
+
+    # --- predict_both, JAX-jit single-eval (XLA float32). Compiled via warmup; the fresh-numpy
+    #     per-call pattern the search actually drives it with — exposes the CPU-JAX per-dispatch
+    #     overhead that makes single-eval LOSE to f32-numpy. ---
+    try:
+        from chocofarm.az.mlp_jax import MlpJaxForward
+        jfwd = MlpJaxForward(net)
+        jfwd.warmup(net.in_dim, net.n_actions)
+        i["k"] = 0
+
+        def f_predict_jax():
+            i["k"] = (i["k"] + 1) % S
+            k = i["k"]
+            jfwd.predict_both(feats[k], masks[k])
+        results["predict_both_jax_single"] = _time(f_predict_jax, S, repeat)
+
+        # --- JAX BATCHED: stack 48 leaves and eval at once (the regime where XLA amortizes the
+        #     dispatch — reported per-item so it is comparable to the single-eval numbers). ---
+        B = 48
+        Xb = np.stack([feats[k % S] for k in range(B)]).astype(np.float32)
+        Mb = np.stack([masks[k % S] for k in range(B)]).astype(np.float32)
+        jfwd.predict_both(Xb, Mb)   # compile the batched signature
+
+        def f_predict_jax_batch():
+            jfwd.predict_both(Xb, Mb)
+        results["predict_both_jax_batch48_peritem"] = _time(f_predict_jax_batch, 1, repeat) / B
+    except Exception as e:  # pragma: no cover - jax optional
+        results["predict_both_jax_single"] = float("nan")
+        results["predict_both_jax_batch48_peritem"] = float("nan")
+        print(f"[bench] jax variants skipped: {e}")
 
     # --- slot conversions (round-trip per legal slot) ---
     legal_lists = []
