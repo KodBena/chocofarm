@@ -43,6 +43,7 @@ from chocofarm.az.features import FeatureBuilder, feature_dim
 from chocofarm.az.actions import n_action_slots, legal_mask_from_features
 from chocofarm.az.mlp import ValueMLP
 from chocofarm.az.gumbel_search import GumbelAZSearch, GumbelPolicy
+from chocofarm.az.value_target import blended_returns_to_go
 
 # reference lines (docs/results/voi-ceiling-2026-06-13.md, decomp-rate.md)
 STATIC_FLOOR = 0.0855
@@ -56,47 +57,61 @@ def r2_score(y_true, y_pred):
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
-def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_steps=40):
+def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_steps=40,
+                     lam_blend=1.0, n_step=None):
     """One self-play episode driven by the Gumbel search. Records, per decision,
-    (features, improved-pi, legal-mask). Value targets are filled by suffix accumulation after
-    the episode (the realized λ-penalized return-to-go, design §4.5).
+    (features, improved-pi, legal-mask, value-target). The value target is the Part B blended
+    return-to-go (lower-variance TD(λ)/n-step over the realized λ-return and the search's root-value
+    bootstrap); with `lam_blend=1.0, n_step=None` it is the prior pure-MC suffix rule, bit-identical.
 
     `n_explore_plies`: sample the EXECUTED action from π′ for the first this-many plies
     (temperature 1), argmax thereafter (design §6: temperature on executed action to diversify
-    trajectories). The improved-policy TARGET is always the full π′ regardless."""
+    trajectories). The improved-policy TARGET is always the full π′ regardless.
+
+    `lam_blend` / `n_step`: the Part B value-target knobs (mutually exclusive; n_step takes
+    precedence if set). λ_blend=1 / n=∞ → pure MC (prior behavior). See value_target.py."""
     loc, bw, collected = ("w", env.entry), env.worlds, set()
-    feats, pis, masks, step_rt = [], [], [], []
+    feats, pis, masks, step_rt, boots = [], [], [], [], []
     for ply in range(max_steps):
         if len(bw) == 0:
             break
         temp = 1.0 if ply < n_explore_plies else 0.0
-        action, pi = search.decide_with_target(env, loc, bw, collected, lam, rng, temperature=temp)
+        # decide_with_value also returns the search's ~n_sims-averaged root-value bootstrap for THIS
+        # belief (Part B) — the value of the state we decided from, used by the lower-variance target.
+        action, pi, boot = search.decide_with_value(env, loc, bw, collected, lam, rng,
+                                                    temperature=temp)
         # the node the search just evaluated cached feat+mask for THIS belief; rebuild cheaply
         # (marginals are served by build's per-belief cache, so we don't pre-compute them here)
         feat = fb.build(loc, bw, collected)
         mask = legal_mask_from_features(env, feat)
-        feats.append(feat); pis.append(pi); masks.append(mask)
         if action == TERMINATE:
+            # the TERMINATE decision executes no step; its target is the continuation (exit toll),
+            # which the blend supplies as boot_term. We record it with the MC tail value below by
+            # NOT appending a step — but we DO want a training target for the terminate state. Keep
+            # the prior behavior: the terminate decision's target is the pure exit-toll continuation
+            # (same as boot for an empty/terminal belief), so append it as a zero-step tail decision.
+            feats.append(feat); pis.append(pi); masks.append(mask); boots.append(boot)
             break
+        feats.append(feat); pis.append(pi); masks.append(mask); boots.append(boot)
         r, loc, bw, collected, dt = env.apply(loc, bw, collected, action, world)
         step_rt.append((r, dt))
     exit_c = env.exit_cost(loc)
-    # realized λ-penalized return-to-go from each decision j (suffix accumulation; exit charged once)
+    n_dec = len(step_rt)            # decisions that executed a non-TERMINATE action
+    n_rec = len(feats)             # all recorded decisions (incl. a trailing TERMINATE decision)
+
+    # Value targets. The blend operates over the EXECUTED-step decisions (those with a (r,dt) step);
+    # a trailing TERMINATE decision (n_rec > n_dec) has no step — its target is the continuation
+    # value = exit toll (the boot_term boundary), matching the prior code's last-decision handling.
+    g_steps = blended_returns_to_go(step_rt, boots[:n_dec], exit_c, lam,
+                                    lam_blend=lam_blend, n_step=n_step)
     out = []
-    suffix_r = suffix_t = 0.0
-    n_dec = len(step_rt)   # decisions that executed a non-TERMINATE action
-    # if the episode ended on TERMINATE, the last feat/pi/mask has no step; align targets to steps
-    for j in range(len(feats) - 1, -1, -1):
+    for j in range(n_rec):
         if j < n_dec:
-            r_j, dt_j = step_rt[j]
-            suffix_r += r_j
-            suffix_t += dt_j
-            g = suffix_r - lam * (suffix_t + exit_c)
+            g = g_steps[j]
         else:
-            # the TERMINATE decision: continuation value is just the exit toll
-            g = suffix_r - lam * (suffix_t + exit_c)
+            # the TERMINATE decision: continuation value is just the exit toll (no step, no boot)
+            g = -lam * exit_c
         out.append((feats[j], pis[j], masks[j], g))
-    out.reverse()
     return out
 
 
@@ -165,13 +180,23 @@ def run(args):
         warm = ValueMLP.load(args.init_weights)
         net = ValueMLP(in_dim, hidden=warm.H, n_actions=n_slots, seed=args.seed,
                        y_mean=warm.y_mean, y_std=warm.y_std)
-        # copy trunk + value head; policy head stays random
-        net.W1, net.b1 = warm.W1.copy(), warm.b1.copy()
+        # copy the second trunk layer + value head; policy head stays random.
         net.W2, net.b2 = warm.W2.copy(), warm.b2.copy()
         net.Wv, net.bv = warm.Wv.copy(), warm.bv.copy()
+        # The INPUT layer (W1) can only be warm-started if the warm net was trained on the SAME
+        # feature dimension. Part C grew feature_dim (220 → 241), so an old-dim E-DECIDE net's W1 is
+        # shape-incompatible with the current input. Detect it and KEEP the fresh random W1 (Part C
+        # explicitly says "no warm-start of the input layer" when the dim changes) rather than
+        # crash deep in the first forward (ADR-0002: fail informative at setup, not opaque later).
+        if warm.W1.shape == net.W1.shape:
+            net.W1, net.b1 = warm.W1.copy(), warm.b1.copy()
+            w1_note = "input layer warm-started"
+        else:
+            w1_note = (f"input layer RANDOM (warm net in_dim={warm.in_dim} ≠ current {in_dim}; "
+                       f"Part C feature change — W1 cannot warm-start)")
         net._init_adam()
-        print(f"warm-started value head + trunk from {args.init_weights} "
-              f"(hidden={warm.H}); policy head random", flush=True)
+        print(f"warm-started 2nd-trunk + value head from {args.init_weights} "
+              f"(hidden={warm.H}); {w1_note}; policy head random", flush=True)
     else:
         net = ValueMLP(in_dim, hidden=args.hidden, n_actions=n_slots, seed=args.seed)
         print(f"cold net (hidden={args.hidden}); both heads random", flush=True)
@@ -189,23 +214,60 @@ def run(args):
     train_rng = np.random.default_rng(args.seed + 2)
     history = []
     lam = args.lam
+    n_step = args.n_step
+    lam_blend = args.td_lambda
+    if n_step is not None and lam_blend < 1.0:
+        raise ValueError("set at most one of --n-step / --td-lambda (the other stays at the "
+                         "pure-MC default); both were given")  # ADR-0002 fail-loud
+    bmode = (f"n-step={n_step}" if n_step is not None
+             else (f"TD(λ_blend={lam_blend})" if lam_blend < 1.0 else "pure-MC (λ_blend=1)"))
+    print(f"value target: {bmode}", flush=True)
 
-    for it in range(args.iters):
+    # --- Part A: persistent core-pinned process pool (parallel actor/learner). workers<=0 keeps
+    #     the in-process serial path (the true serial baseline for the A/B). ---
+    executor = None
+    if args.workers and args.workers > 0:
+        from chocofarm.az.parallel import ParallelExecutor
+        cores = [int(c) for c in args.cores.split(",")] if args.cores else None
+        executor = ParallelExecutor(args.workers, cores, args.seed, args.m, args.n_sims)
+        print(f"parallel actor/learner: {args.workers} workers pinned to cores "
+              f"{executor.cores}; weights + transitions over redis (raw bytes, no pickle) "
+              f"run={executor.run}", flush=True)
+    else:
+        print("serial (in-process) generation + eval", flush=True)
+
+    try:
+      for it in range(args.iters):
         t0 = time.time()
+        # the parent draws the per-episode true worlds so the world sequence is reproducible
+        # regardless of worker count (parallel≈serial): same worlds → same episodes given seeds.
+        gen_worlds = [int(gen_rng.choice(env.worlds)) for _ in range(args.episodes)]
+        eval_rng = np.random.default_rng(args.eval_seed)
+        eval_worlds = [int(eval_rng.choice(env.worlds)) for _ in range(args.eval_n)]
+
         # ---- 1. GENERATE ----
-        search = GumbelAZSearch(net, env, m=args.m, n_sims=args.n_sims)
+        if executor is not None:
+            # publishes the frozen weights to redis (raw bytes) + fans the episodes; gathers
+            # transitions back over redis (no pickle of the array payloads)
+            recs_all = executor.generate(net, it, gen_worlds, lam,
+                                         args.explore_plies, lam_blend, n_step)
+        else:
+            search = GumbelAZSearch(net, env, m=args.m, n_sims=args.n_sims)
+            recs_all = []
+            for world in gen_worlds:
+                recs_all.extend(generate_episode(env, search, fb, world, lam, gen_rng,
+                                                 args.explore_plies,
+                                                 lam_blend=lam_blend, n_step=n_step))
         Xs, PIs, Ms, Ys, all_pis = [], [], [], [], []
-        for ep in range(args.episodes):
-            world = int(gen_rng.choice(env.worlds))
-            recs = generate_episode(env, search, fb, world, lam, gen_rng, args.explore_plies)
-            for feat, pi, mask, g in recs:
-                Xs.append(feat); PIs.append(pi); Ms.append(mask); Ys.append(g); all_pis.append(pi)
+        for feat, pi, mask, g in recs_all:
+            Xs.append(feat); PIs.append(pi); Ms.append(mask); Ys.append(g); all_pis.append(pi)
         X = np.asarray(Xs, dtype=np.float32)
         PI = np.asarray(PIs, dtype=np.float32)
         M = np.asarray(Ms, dtype=np.float32)
         Y = np.asarray(Ys, dtype=np.float32)
         buf.add(X, PI, M, Y)
         ent = policy_entropy(all_pis)
+        y_var = float(np.var(Y)) if Y.size else 0.0    # Part B: value-target variance watch
         t_gen = time.time() - t0
 
         # ---- 2. TRAIN ----
@@ -215,13 +277,16 @@ def run(args):
         t_train = time.time() - t0 - t_gen
 
         # ---- 3. EVALUATE (greedy argmax-π′ policy on a held-out seed, fixed λ₀) ----
-        eval_pol = GumbelPolicy(net, env, m=args.m, n_sims=args.n_sims)
-        eval_rng = np.random.default_rng(args.eval_seed)
-        totR = totT = 0.0; ets = []
-        for _ in range(args.eval_n):
-            w = int(eval_rng.choice(env.worlds))
-            R, T, _ = env.simulate(eval_pol, w, lam, eval_rng)
-            totR += R; totT += T; ets.append(T)
+        if executor is not None:
+            # re-publishes the now-trained weights at a distinct version, fans eval episodes
+            totR, totT, ets = executor.evaluate(net, it + 1_000_000, eval_worlds, lam)
+        else:
+            eval_pol = GumbelPolicy(net, env, m=args.m, n_sims=args.n_sims)
+            ev_rng = np.random.default_rng(args.eval_seed)
+            totR = totT = 0.0; ets = []
+            for w in eval_worlds:
+                R, T, _ = env.simulate(eval_pol, w, lam, ev_rng)
+                totR += R; totT += T; ets.append(T)
         rate = totR / totT if totT > 0 else 0.0
         et = float(np.mean(ets)) if ets else 0.0
         voi = (rate - STATIC_FLOOR) / (CLAIRVOYANT_CEIL - STATIC_FLOOR) * 100
@@ -232,6 +297,7 @@ def run(args):
         net.save(ckpt)
         rec = {"iter": it, "rate": rate, "voi_pct": voi, "ET": et,
                "policy_CE": ce, "value_MSE": vmse, "value_R2": r2, "entropy": ent,
+               "target_var": y_var,
                "n_transitions": int(X.shape[0]), "buffer_size": int(bX.shape[0]),
                "t_gen": t_gen, "t_train": t_train, "t_eval": t_eval, "lam": lam}
         history.append(rec)
@@ -250,12 +316,16 @@ def run(args):
             writer.add_scalar("train/value_MSE", vmse, it)
             writer.add_scalar("train/value_R2", r2, it)
             writer.add_scalar("gen/exec_policy_entropy", ent, it)
+            writer.add_scalar("gen/target_var", y_var, it)   # Part B: value-target variance watch
             writer.flush()
 
         print(f"iter {it:>3}/{args.iters}  rate={rate:.4f} (%VoI={voi:+.0f}) ET={et:.1f}  "
-              f"CE={ce:.3f} vMSE={vmse:.3f} R²={r2:.3f} H={ent:.2f}  "
+              f"CE={ce:.3f} vMSE={vmse:.3f} R²={r2:.3f} H={ent:.2f} yVar={y_var:.3f}  "
               f"[{X.shape[0]} tr | gen {t_gen:.0f}s train {t_train:.0f}s eval {t_eval:.0f}s]",
               flush=True)
+    finally:
+        if executor is not None:
+            executor.close()
 
     if writer is not None:
         writer.close()
@@ -288,6 +358,19 @@ def main():
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--init-weights", type=str, default=None,
                     help="E-DECIDE value-net npz to warm-start the value head + trunk")
+    # --- Part A: 4-core actor/learner parallelism ---
+    ap.add_argument("--workers", type=int, default=4,
+                    help="process-pool workers for the generation+eval fan-out, each pinned to a "
+                         "distinct core (Part A). 0 = serial in-process (the A/B baseline).")
+    ap.add_argument("--cores", type=str, default="0,1,2,3",
+                    help="comma-separated cores to pin workers to (Part A; default 0,1,2,3)")
+    # --- Part B: lower-variance value target (mutually exclusive; default = pure MC) ---
+    ap.add_argument("--td-lambda", type=float, default=1.0,
+                    help="TD(λ) blend weight on the value target (Part B): 1.0 = pure MC (current "
+                         "behavior), →0 = pure search-root bootstrap. Mutually exclusive with --n-step.")
+    ap.add_argument("--n-step", type=int, default=None,
+                    help="n-step value target (Part B): realized reward for n steps then bootstrap "
+                         "off the search root value. None/∞ = pure MC. Mutually exclusive with --td-lambda.")
     ap.add_argument("--tb-logdir", type=str, default=None)
     ap.add_argument("--ckpt-dir", type=str, required=True)
     args = ap.parse_args()

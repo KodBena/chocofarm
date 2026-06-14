@@ -13,14 +13,27 @@ the open-clause separators + geometry. It is built from a SINGLE `env.marginals(
 
 Layout (all blocks fixed-dimension, derived from env):
 
-  per-treasure  (env.N × 4):     marg[i], collected[i], available[i], dist[i]
+  per-treasure  (env.N × 5):     marg[i], collected[i], available[i], dist[i], unc[i]
   per-detector  (len(env.detectors) × 3): informative[i], p_pos[i], dist[i]
-  global        (5 + n_teleports): log|bw|/log Nworlds, n_collected/K, Σmarg/K,
-                                    exit_cost(loc)/diag, |bw|>0 flag, {dist to each teleport}
+  global        (6 + n_teleports): log|bw|/log Nworlds, n_collected/K, Σmarg/K,
+                                    exit_cost(loc)/diag, |bw|>0 flag, Σ_uncollected unc[i],
+                                    {dist to each teleport}
 
-On the live instance (env.N=20, 44 faces, 3 teleports): 20·4 + 44·3 + (5+3) = 80 + 132 + 8 =
-220 floats. This is LARGER than the doc's 90 — expected, faces are more numerous than the stale
-regions. `feature_dim(env)` reports the exact value; nothing downstream assumes a constant.
+The belief-resolution block (Part C, az-parallel-exp): per-treasure `unc[i] = marg[i]·(1−marg[i])`
+is the Bernoulli variance of treasure i's presence — 0 when the treasure is resolved (marg 0 or 1),
+0.25 at maximum doubt (marg 0.5). It is the "is this one known or still in question" signal the
+prior feature set lacked: the bare marginal cannot distinguish a resolved-absent treasure (marg 0,
+unc 0) from one the belief is split on (marg 0.5, unc 0.25). The global `Σ_{uncollected} unc[i]`
+is the expected number of still-in-question treasures — a scalar "how much belief structure remains
+to resolve" the value head can read directly (the geometry/belief-dependent component the high-
+variance MC target collapsed away from; see docs/results/az-parallel-exp.md). It sums only over
+UNCOLLECTED treasures (a collected treasure carries no remaining decision-relevant uncertainty).
+
+On the live instance (env.N=20, 44 faces, 3 teleports): 20·5 + 44·3 + (6+3) = 100 + 132 + 9 =
+241 floats. This is LARGER than the prior 220 (the +20 per-treasure unc block + 1 global Σunc) and
+than the doc's stale 90. `feature_dim(env)` reports the exact value; nothing downstream assumes a
+constant — adding the block re-inits the net's input layer (no warm-start of W1; the trunk's other
+rows are fine to re-learn from the richer input).
 
 Distances are normalized by the coordinate-bbox diagonal (`map_diag`), so geometry the value
 head needs (route cost, early-exit option) is O(1) and recoverable; marginals alone cannot
@@ -47,9 +60,13 @@ def map_diag(env: Environment) -> float:
 
 
 def feature_dim(env: Environment) -> int:
-    """Exact feature-vector length for THIS env. Derived, never hardcoded."""
+    """Exact feature-vector length for THIS env. Derived, never hardcoded.
+
+    Per-treasure block is N×5 (marg, collected, available, dist, unc — the belief-resolution
+    `unc` is Part C); per-detector is nD×3; global is (6 + n_teleports) (the +1 over the prior 5
+    is the global Σ_uncollected unc scalar). On the live env: 20·5 + 44·3 + (6+3) = 241."""
     n_tel = len(env.teleports)
-    return env.N * 4 + len(env.detectors) * 3 + (5 + n_tel)
+    return env.N * 5 + len(env.detectors) * 3 + (6 + n_tel)
 
 
 class FeatureBuilder:
@@ -178,27 +195,37 @@ class FeatureBuilder:
         out = np.empty(self.dim, dtype=DTYPE)
         o = 0
 
-        # --- per-treasure block (N × 4): marg, collected, available, dist ---
+        # --- per-treasure block (N × 5): marg, collected, available, dist, unc ---
         coll = np.zeros(N)
         for i in collected:
             coll[i] = 1.0
         avail = ((marg > 0) & (coll == 0)).astype(np.float64)  # legal-collect mask
+        # belief-resolution (Part C): Bernoulli variance of treasure-i presence. 0 when resolved
+        # (marg 0 or 1), 0.25 at max doubt (marg 0.5). The "known-vs-unknown" signal the bare
+        # marginal cannot carry (a resolved-absent marg-0 and a split marg-0.5 both look "not here"
+        # to a value head reading marg alone).
+        unc = marg * (1.0 - marg)
         out[o:o + N] = marg; o += N
         out[o:o + N] = coll; o += N
         out[o:o + N] = avail; o += N
         out[o:o + N] = dist_t; o += N
+        out[o:o + N] = unc; o += N
 
         # --- per-detector block (nD × 3): informative (open-clause), p_pos, dist ---
         out[o:o + nD] = informative; o += nD
         out[o:o + nD] = p_pos; o += nD
         out[o:o + nD] = dist_d; o += nD
 
-        # --- global block (5 + n_teleports) ---
+        # --- global block (6 + n_teleports) ---
+        # Σ_uncollected unc[i] — expected number of treasures still in question (Part C). Only
+        # uncollected treasures count: a collected one carries no remaining decision-relevant doubt.
+        sum_u = float(np.sum(unc * (coll == 0)))
         out[o] = sharpness; o += 1                          # belief sharpness
         out[o] = len(collected) / self.K; o += 1            # n_collected
         out[o] = marg_sum / self.K; o += 1                  # Σmarg (≈ remaining present)
         out[o] = exit_norm; o += 1                          # early-exit geometry
         out[o] = 1.0 if nb else 0.0; o += 1                 # non-empty belief flag
+        out[o] = sum_u; o += 1                              # Σ_uncollected unc (belief-resolution)
         out[o:o + len(dist_w)] = dist_w; o += len(dist_w)   # per-teleport distances
 
         assert o == self.dim, (o, self.dim)

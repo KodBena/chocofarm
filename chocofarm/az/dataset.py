@@ -39,6 +39,7 @@ import numpy as np
 from chocofarm.model.env import Environment, TERMINATE
 from chocofarm.solvers.decomp import DecompPolicy
 from chocofarm.az.features import FeatureBuilder, feature_dim
+from chocofarm.az.value_target import suffix_returns_to_go
 
 
 def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=40):
@@ -60,21 +61,13 @@ def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=40):
         r, loc, bw, collected, dt = env.apply(loc, bw, collected, a, world)
         step_rt.append((r, dt))
     exit_c = env.exit_cost(loc)
-    # realized λ-penalized return-to-go from each decision point j:
-    #   G_j = Σ_{t≥j} r_t − λ·(Σ_{t≥j} dt_t + exit_c)
-    # Build by suffix accumulation. The exit toll is charged once, in every suffix.
-    out = []
-    suffix_r = 0.0
-    suffix_t = 0.0
-    # walk decisions from last to first
-    for j in range(len(feats) - 1, -1, -1):
-        r_j, dt_j = step_rt[j]
-        suffix_r += r_j
-        suffix_t += dt_j
-        g = suffix_r - lam * (suffix_t + exit_c)
-        out.append((feats[j], g))
-    out.reverse()
-    return out
+    # realized λ-penalized return-to-go from each decision point j (the pure-MC suffix rule, the
+    # decomp teacher's honest label — Part B's blend does NOT apply here: the dataset is the
+    # un-bootstrapped MC target by design). Routed through the shared value_target module so the
+    # suffix rule lives in ONE place (the az-exit-loop §(f) audit's prescription, now that exit_loop
+    # adds a TD(λ) blend over the same rule).
+    g = suffix_returns_to_go(step_rt, exit_c, lam)
+    return list(zip(feats, g))
 
 
 def generate(env, n_episodes, lam, seed, report_every=50):
