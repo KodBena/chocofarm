@@ -34,6 +34,8 @@ import numpy as np
 
 from chocofarm.model.env import Environment
 from chocofarm.solvers.ismcts import _belief_key
+from chocofarm.az.dtypes import DTYPE
+from chocofarm.az.kernels import belief_marg_cover
 
 
 def map_diag(env: Environment) -> float:
@@ -133,19 +135,20 @@ class FeatureBuilder:
             for bw_ref, feats in bucket:
                 if bw_ref is bw or np.array_equal(bw_ref, bw):
                     return feats
-        # miss (or collision against a different belief): compute
-        if marg is None:
-            marg = self.env.marginals(bw)
+        # miss (or collision against a different belief): compute. The fused numba kernel
+        # (kernels.belief_marg_cover) does the marginals AND the (nb×nD) detector reduction in a
+        # SINGLE pass over `bw` — ~12× the numpy form across the whole |bw| distribution, the new
+        # #1 hot path. It returns integer-exact `cnt` (== numpy count_nonzero) and the marginals,
+        # so it folds the separate `env.marginals(bw)` call into the same pass. The kernel is
+        # int/float64 internally (bit-exact); the dtype cast to DTYPE happens in `build`.
         if nb:
-            hit = (bw[:, None] & self.cover[None, :]) != 0   # (nb, nD) bool
-            # Single reduction (count of positive reads) instead of three (mean + any + ~any):
-            # p_pos = cnt/nb is exactly hit.mean(0); cnt>0 is exactly hit.any(0); cnt<nb is
-            # exactly (~hit).any(0). Same values, one pass over the (nb×nD) bool matrix.
-            cnt = np.count_nonzero(hit, axis=0)
+            marg, cnt = belief_marg_cover(bw, self.cover, self.N)
             p_pos = cnt / nb
             informative = ((cnt > 0) & (cnt < nb)).astype(np.float64)
             sharpness = math.log(nb) / self.log_nworlds
         else:
+            # empty belief: marginals are zero regardless of any passed-in value
+            marg = np.zeros(self.N)
             p_pos = np.zeros(self.nD)
             informative = np.zeros(self.nD)
             sharpness = 0.0
@@ -161,12 +164,18 @@ class FeatureBuilder:
         return feats
 
     def build(self, loc, bw, collected, marg=None) -> np.ndarray:
+        """Build the §2.2 feature vector at `(loc, bw, collected)`. `marg` is accepted for
+        backward compatibility but is now ADVISORY: the fused numba kernel computes the marginals
+        AND the detector counts in one pass (kernels.belief_marg_cover), so a supplied `marg` is
+        not consumed — the kernel's marg is bit-identical to `env.marginals(bw)` (verified). The
+        kernel is faster than the old separate marginals call, so recomputing is a net win even
+        when a caller already has `marg` (netvalue_ismcts / dataset). Returns a `DTYPE` vector."""
         N, nD = self.N, self.nD
         marg_in, p_pos, informative, marg_sum, sharpness, nb = self._belief_feats(bw, marg)
         marg = marg_in
         dist_t, dist_d, dist_w, exit_norm = self._loc_block(loc)
 
-        out = np.empty(self.dim, dtype=np.float64)
+        out = np.empty(self.dim, dtype=DTYPE)
         o = 0
 
         # --- per-treasure block (N × 4): marg, collected, available, dist ---

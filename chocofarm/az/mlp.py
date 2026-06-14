@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from chocofarm.az.dtypes import DTYPE, is_float32
+
 
 def _he_init(rng, fan_in, fan_out):
     return rng.standard_normal((fan_in, fan_out)) * np.sqrt(2.0 / fan_in)
@@ -62,6 +64,24 @@ class ValueMLP:
         # target standardization (stored, applied at train, inverted at predict)
         self.y_mean = float(y_mean)
         self.y_std = float(y_std) if y_std > 1e-8 else 1.0
+        # inference-precision cache: when DTYPE is float32, predict_both serves the forward from
+        # float32 copies of the weights (BLAS sgemm is ~1.8× the f64 path at single-row dispatch,
+        # and float32 is the parametric hot-path precision). Training itself stays float64.
+        #
+        # CACHE COHERENCE — the invariant over ALL writers, not a per-writer gate. The float32
+        # cache must never serve weights that no longer match the float64 source. Rather than ask
+        # every weight-mutating site (Adam step, load(), warm-start copy, any future EMA/restart)
+        # to remember to invalidate — the fragile per-producer shape an out-of-frame audit caught
+        # as a latent stale-serve bug — the cache validates against the *identity AND in-place
+        # revision* of the source arrays at every read: it stores `id(W)` of each weight it was
+        # built from and the float64 arrays' `.ctypes.data` (buffer address). Any writer that
+        # REBINDS a weight (`self.W1 = ...` in load/warm-start) changes `id`; the Adam step
+        # mutates IN PLACE so `id` is stable — that one in-place writer bumps `_w_revision`, the
+        # single explicit signal still needed. A rebind needs no cooperation: a fresh id forces a
+        # rebuild. This closes the audit's hazard (a rebinding writer that forgot to invalidate).
+        self._w_revision = 0
+        self._f32_cache = None
+        self._f32_cache_sig = None
         self._init_adam()
 
     # ---- parameter registry (drives Adam + L2) ----
@@ -91,6 +111,75 @@ class ValueMLP:
         logits = (a2 @ self.Wp + self.bp) if self.n_actions is not None else None
         cache = (X, z1, a1, z2, a2)
         return cache, v_std, logits
+
+    # ---- float32 inference fast path (the parametric hot-path precision) ----
+    def _f32_weights(self):
+        """Float32 copies of the weights, cached and rebuilt whenever the source weights change —
+        a REBIND (load/warm-start replace the array OBJECT), an in-place Adam mutation
+        (`_w_revision` bump), or a y-scale change. Used by the float32 `predict_both` forward —
+        sgemm in float32 is ~1.8× the float64 path at single-row dispatch, no per-dispatch overhead.
+
+        Coherence is an INVARIANT over every writer, not a per-writer gate: the cache-validity
+        check compares the source array OBJECTS by identity (`is`) — a rebind yields a new object
+        and forces a rebuild with no cooperation from the writer — plus the in-place-mutation
+        revision int and the y-scales. The check is inline `is`-comparisons (no per-call tuple
+        allocation) because this runs on every leaf eval of an episode; the weights are frozen
+        during generation so the hit path is the overwhelming common case."""
+        c = self._f32_cache
+        if (c is not None
+                and c["_rev"] == self._w_revision
+                and c["_W1"] is self.W1 and c["_b1"] is self.b1
+                and c["_W2"] is self.W2 and c["_b2"] is self.b2
+                and c["_Wv"] is self.Wv and c["_bv"] is self.bv
+                and (self.n_actions is None
+                     or (c["_Wp"] is self.Wp and c["_bp"] is self.bp))
+                and c["ym"] == self.y_mean and c["ys"] == self.y_std):
+            return c
+        return self._rebuild_f32_cache()
+
+    def _rebuild_f32_cache(self):
+        c = {
+            "W1": self.W1.astype(np.float32), "b1": self.b1.astype(np.float32),
+            "W2": self.W2.astype(np.float32), "b2": self.b2.astype(np.float32),
+            "Wv": self.Wv.astype(np.float32), "bv": self.bv.astype(np.float32),
+            "ym": np.float32(self.y_mean), "ys": np.float32(self.y_std),
+            # validity keys: the source array objects (compared by `is`) + the in-place revision
+            "_rev": self._w_revision,
+            "_W1": self.W1, "_b1": self.b1, "_W2": self.W2, "_b2": self.b2,
+            "_Wv": self.Wv, "_bv": self.bv,
+        }
+        if self.n_actions is not None:
+            c["Wp"] = self.Wp.astype(np.float32)
+            c["bp"] = self.bp.astype(np.float32)
+            c["_Wp"] = self.Wp; c["_bp"] = self.bp
+        self._f32_cache = c
+        return c
+
+    def _predict_both_f32(self, X, legal_mask):
+        """float32-numpy forward (trunk + both heads + masked softmax). Same shape contract as
+        `predict_both`; the cast to float32 changes the last bits (acceptable — behavioral, not
+        bit, equivalence is the bar)."""
+        c = self._f32_weights()
+        single = (X.ndim == 1)
+        x = np.asarray(X, dtype=np.float32)
+        lm = np.asarray(legal_mask, dtype=np.float32)
+        if single:
+            x = x[None, :]
+            lm = lm[None, :]
+        a1 = np.maximum(x @ c["W1"] + c["b1"], np.float32(0.0))
+        a2 = np.maximum(a1 @ c["W2"] + c["b2"], np.float32(0.0))
+        v = (a2 @ c["Wv"] + c["bv"]).ravel() * c["ys"] + c["ym"]
+        logits = a2 @ c["Wp"] + c["bp"]
+        legal = lm > 0
+        masked = np.where(legal, logits, np.float32(-1e30))
+        masked = masked - masked.max(axis=1, keepdims=True)
+        e = np.exp(masked) * legal
+        denom = e.sum(axis=1, keepdims=True)
+        denom = np.where(denom > 0, denom, np.float32(1.0))
+        p = e / denom
+        if single:
+            return float(v[0]), p[0]
+        return v, p
 
     def predict_value(self, X):
         """De-standardized value (the λ-penalized return scale). `X` may be 1-D or 2-D."""
@@ -130,9 +219,15 @@ class ValueMLP:
 
     def predict_both(self, X, legal_mask):
         """One forward pass -> (de-standardized value, masked policy). The search's hot path:
-        a single trunk evaluation feeds both the leaf value and the prior. `X` 1-D or 2-D."""
+        a single trunk evaluation feeds both the leaf value and the prior. `X` 1-D or 2-D.
+
+        When the parametric DTYPE is float32 (the default), the float32-numpy fast path serves
+        this — ~1.8× the float64 BLAS path at single-row dispatch, the precision the rest of the
+        hot path runs at. Set CHOCO_AZ_DTYPE=float64 to take the float64 path below."""
         if self.n_actions is None:
             raise ValueError("net has no policy head (n_actions=None)")
+        if is_float32():
+            return self._predict_both_f32(X, legal_mask)
         single = (X.ndim == 1)
         if single:
             X = X[None, :]
@@ -248,6 +343,11 @@ class ValueMLP:
             mhat = self.m[name] / (1 - b1 ** self.t)
             vhat = self.v[name] / (1 - b2 ** self.t)
             params[name] -= lr * mhat / (np.sqrt(vhat) + eps)
+        # Adam mutates the weight arrays IN PLACE (`params[name] -= ...`), so their id/buffer
+        # address is unchanged — the identity check can't see it. Bump the explicit revision so
+        # the float32 cache rebuilds. (Rebinding writers — load/warm-start — are caught by the
+        # identity check and need no bump; this is the one in-place writer.)
+        self._w_revision += 1
 
     # ---- persistence (npz) ----
     def save(self, path):

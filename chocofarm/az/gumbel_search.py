@@ -89,7 +89,7 @@ class GumbelAZSearch:
     """
 
     def __init__(self, net, env, m=12, n_sims=48, c_puct=1.25, c_visit=50.0,
-                 c_scale=1.0, c_outcome=2, max_depth=24):
+                 c_scale=1.0, c_outcome=2, max_depth=24, use_jax_mlp=False):
         self.net = net
         self.env = env
         self.fb = FeatureBuilder(env)
@@ -106,6 +106,23 @@ class GumbelAZSearch:
         # its edge loops; per-call function dispatch was a measurable hot-path cost). Index these
         # directly in the inner loops instead of calling slot_to_action / action_to_slot.
         self._s2a, self._a2s = slot_action_tables(env)
+        # Leaf-eval forward. DEFAULT is net.predict_both — the float32-numpy fast path (sgemm,
+        # ~1.8× the float64 path at single-row dispatch). JAX-CPU LOST here: jit looks fast in a
+        # hot microbench (same on-device array reused, ~34µs) but the search calls predict_both
+        # one leaf at a time with FRESH numpy arrays, paying ~500µs/call of host↔device transfer
+        # + dispatch — ~13× SLOWER than f32-numpy in the real loop (the maintainer's flagged
+        # single-eval-dispatch trap; see docs/results/az-jax-perf.md). JAX only wins batched
+        # (~4µs/item at batch 48), which the sequential tree descent doesn't expose without a
+        # bigger restructure. `use_jax_mlp=True` keeps the jit path selectable for the bench.
+        if use_jax_mlp and net.n_actions is not None:
+            from chocofarm.az.mlp_jax import MlpJaxForward
+            fwd = MlpJaxForward(net)
+            fwd.warmup(net.in_dim, net.n_actions)
+            self._predict_both = fwd.predict_both
+            self._mlp_fwd = fwd
+        else:
+            self._predict_both = net.predict_both
+            self._mlp_fwd = None
 
     # ---- net evaluation (one forward, cached on the node) ----
     def _evaluate(self, node, loc, bw, collected):
@@ -118,7 +135,7 @@ class GumbelAZSearch:
         env = self.env
         feat = self.fb.build(loc, bw, collected)
         mask = legal_mask_from_features(env, feat)
-        v, p = self.net.predict_both(feat, mask)
+        v, p = self._predict_both(feat, mask)
         node.feat = feat
         node.mask = mask
         node.prior = p
