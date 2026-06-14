@@ -180,8 +180,17 @@ def run(args):
     print(f"env: N={env.N} faces={len(env.detectors)} teleports={len(env.teleports)} "
           f"feat_dim={in_dim} action_slots={n_slots}", flush=True)
 
-    # --- net: warm-start value head from E-DECIDE weights if given; policy head random ---
-    if args.init_weights:
+    # --- net: resume full net (--resume), warm-start value head (--init-weights), or cold ---
+    if args.resume:
+        net = ValueMLP.load(args.resume)
+        if net.in_dim != in_dim or net.n_actions != n_slots:
+            raise SystemExit(
+                f"--resume net dims (in_dim={net.in_dim}, n_actions={net.n_actions}) "
+                f"!= env (in_dim={in_dim}, n_slots={n_slots}) — incompatible checkpoint")
+        _res_note = "residual block ON" if net.residual else "no residual block"
+        print(f"RESUMED full net (trunk + {_res_note} + value + policy heads) from "
+              f"{args.resume} (hidden={net.H}); JaxTrainer inits a fresh optax optimizer", flush=True)
+    elif args.init_weights:
         warm = ValueMLP.load(args.init_weights)
         net = ValueMLP(in_dim, hidden=warm.H, n_actions=n_slots, seed=args.seed,
                        y_mean=warm.y_mean, y_std=warm.y_std, residual=args.residual)
@@ -380,6 +389,9 @@ def main():
                          "pre-residual net (a clean ablation axis).")
     ap.add_argument("--init-weights", type=str, default=None,
                     help="E-DECIDE value-net npz to warm-start the value head + trunk")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="full-net npz to RESUME: loads ALL weights (trunk, residual block, value "
+                         "AND policy head), resets Adam. Unlike --init-weights, keeps nothing random.")
     # --- Part A: 4-core actor/learner parallelism ---
     ap.add_argument("--workers", type=int, default=4,
                     help="process-pool workers for the generation+eval fan-out, each pinned to a "
