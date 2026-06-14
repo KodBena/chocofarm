@@ -47,7 +47,7 @@ class ValueMLP:
     """
 
     def __init__(self, in_dim, hidden=256, n_actions=None, seed=0,
-                 y_mean=0.0, y_std=1.0):
+                 y_mean=0.0, y_std=1.0, residual=False):
         rng = np.random.default_rng(seed)
         self.in_dim = int(in_dim)
         self.H = int(hidden)
@@ -55,12 +55,24 @@ class ValueMLP:
         # trunk
         self.W1 = _he_init(rng, in_dim, hidden); self.b1 = np.zeros(hidden)
         self.W2 = _he_init(rng, hidden, hidden); self.b2 = np.zeros(hidden)
+        # OPTIONAL residual block between the trunk output and the two heads (toggle, default OFF →
+        # the net is numerically identical to the pre-residual net, so `residual` is a clean
+        # ablation axis). Block: z = ReLU(h @ Wr1 + br1); z = z @ Wr2 + br2; out = h + z
+        # (pre-activation skip, NO outer ReLU — firewall A/B found this the best CE variant).
+        # Wr1/Wr2 are H×H so the skip dimension matches; the heads read `out` instead of `h`.
+        # The rng is consumed AFTER the heads below precisely so that the trunk + heads draw the
+        # same numbers whether or not the block is built — `residual=False` is bit-identical.
+        self.residual = bool(residual)
         # value head (linear scalar)
         self.Wv = _he_init(rng, hidden, 1) * 0.1; self.bv = np.zeros(1)
         # optional policy head
         if self.n_actions is not None:
             self.Wp = _he_init(rng, hidden, self.n_actions) * 0.1
             self.bp = np.zeros(self.n_actions)
+        # residual-block params (drawn last so they don't perturb the trunk/head rng stream)
+        if self.residual:
+            self.Wr1 = _he_init(rng, hidden, hidden); self.br1 = np.zeros(hidden)
+            self.Wr2 = _he_init(rng, hidden, hidden); self.br2 = np.zeros(hidden)
         # target standardization (stored, applied at train, inverted at predict)
         self.y_mean = float(y_mean)
         self.y_std = float(y_std) if y_std > 1e-8 else 1.0
@@ -88,6 +100,9 @@ class ValueMLP:
     def _params(self):
         p = {"W1": self.W1, "b1": self.b1, "W2": self.W2, "b2": self.b2,
              "Wv": self.Wv, "bv": self.bv}
+        if self.residual:
+            p["Wr1"] = self.Wr1; p["br1"] = self.br1
+            p["Wr2"] = self.Wr2; p["br2"] = self.br2
         if self.n_actions is not None:
             p["Wp"] = self.Wp; p["bp"] = self.bp
         return p
@@ -102,15 +117,55 @@ class ValueMLP:
 
     # ---- forward ----
     def _forward(self, X):
-        """Returns (cache, value_standardized, policy_logits_or_None)."""
+        """Returns (cache, value_standardized, policy_logits_or_None).
+
+        With `residual` ON, a residual block sits between the trunk output `a2` and the heads:
+            zr1 = a2 @ Wr1 + br1;  ar1 = ReLU(zr1)
+            zr2 = ar1 @ Wr2 + br2
+            head_in = a2 + zr2                  # pre-activation skip, no outer ReLU (Wr*: H×H)
+        The heads read `head_in`. With `residual` OFF, `head_in is a2` and the math is the
+        pre-residual net exactly. The cache carries the block intermediates only when ON."""
         z1 = X @ self.W1 + self.b1
         a1 = np.maximum(z1, 0.0)
         z2 = a1 @ self.W2 + self.b2
         a2 = np.maximum(z2, 0.0)
-        v_std = (a2 @ self.Wv + self.bv).ravel()
-        logits = (a2 @ self.Wp + self.bp) if self.n_actions is not None else None
-        cache = (X, z1, a1, z2, a2)
+        if self.residual:
+            zr1 = a2 @ self.Wr1 + self.br1
+            ar1 = np.maximum(zr1, 0.0)
+            zr2 = ar1 @ self.Wr2 + self.br2
+            head_in = a2 + zr2                     # pre-activation skip, NO outer ReLU (firewall A/B: best CE)
+            res_cache = (zr1, ar1, zr2)
+        else:
+            head_in = a2
+            res_cache = None
+        v_std = (head_in @ self.Wv + self.bv).ravel()
+        logits = (head_in @ self.Wp + self.bp) if self.n_actions is not None else None
+        cache = (X, z1, a1, z2, a2, head_in, res_cache)
         return cache, v_std, logits
+
+    # ---- residual-block backward (shared by both train_step paths) ----
+    def _residual_backward(self, dhead, a2, res_cache):
+        """Backprop ∂L/∂head_in (`dhead`) through the residual block to ∂L/∂a2.
+
+        Block forward (see `_forward`):
+            zr1 = a2 @ Wr1 + br1; ar1 = ReLU(zr1); zr2 = ar1 @ Wr2 + br2
+            pre = a2 + zr2;       head_in = ReLU(pre)
+        ∂L/∂a2 collects BOTH paths — the skip (`pre = a2 + zr2`) and the block
+        (`zr1 = a2 @ Wr1 + …`). With the block OFF, `head_in is a2` so this is the identity:
+        `dhead` is already ∂L/∂a2 and there are no block grads."""
+        if res_cache is None:
+            return dhead, {}
+        zr1, ar1, zr2 = res_cache
+        da2 = dhead.copy()                        # skip path: head_in = a2 + zr2 (no outer ReLU)
+        dzr2 = dhead
+        dWr2 = ar1.T @ dzr2
+        dbr2 = dzr2.sum(0)
+        dar1 = dzr2 @ self.Wr2.T
+        dzr1 = dar1 * (zr1 > 0)                   # through ar1 = ReLU(zr1)
+        dWr1 = a2.T @ dzr1
+        dbr1 = dzr1.sum(0)
+        da2 += dzr1 @ self.Wr1.T                  # block path: zr1 = a2 @ Wr1 + br1
+        return da2, {"Wr1": dWr1, "br1": dbr1, "Wr2": dWr2, "br2": dbr2}
 
     # ---- float32 inference fast path (the parametric hot-path precision) ----
     def _f32_weights(self):
@@ -133,6 +188,9 @@ class ValueMLP:
                 and c["_Wv"] is self.Wv and c["_bv"] is self.bv
                 and (self.n_actions is None
                      or (c["_Wp"] is self.Wp and c["_bp"] is self.bp))
+                and (not self.residual
+                     or (c["_Wr1"] is self.Wr1 and c["_br1"] is self.br1
+                         and c["_Wr2"] is self.Wr2 and c["_br2"] is self.br2))
                 and c["ym"] == self.y_mean and c["ys"] == self.y_std):
             return c
         return self._rebuild_f32_cache()
@@ -148,6 +206,11 @@ class ValueMLP:
             "_W1": self.W1, "_b1": self.b1, "_W2": self.W2, "_b2": self.b2,
             "_Wv": self.Wv, "_bv": self.bv,
         }
+        if self.residual:
+            c["Wr1"] = self.Wr1.astype(np.float32); c["br1"] = self.br1.astype(np.float32)
+            c["Wr2"] = self.Wr2.astype(np.float32); c["br2"] = self.br2.astype(np.float32)
+            c["_Wr1"] = self.Wr1; c["_br1"] = self.br1
+            c["_Wr2"] = self.Wr2; c["_br2"] = self.br2
         if self.n_actions is not None:
             c["Wp"] = self.Wp.astype(np.float32)
             c["bp"] = self.bp.astype(np.float32)
@@ -168,8 +231,14 @@ class ValueMLP:
             lm = lm[None, :]
         a1 = np.maximum(x @ c["W1"] + c["b1"], np.float32(0.0))
         a2 = np.maximum(a1 @ c["W2"] + c["b2"], np.float32(0.0))
-        v = (a2 @ c["Wv"] + c["bv"]).ravel() * c["ys"] + c["ym"]
-        logits = a2 @ c["Wp"] + c["bp"]
+        if self.residual:
+            ar1 = np.maximum(a2 @ c["Wr1"] + c["br1"], np.float32(0.0))
+            zr2 = ar1 @ c["Wr2"] + c["br2"]
+            head_in = a2 + zr2                            # NO outer ReLU (matches _forward)
+        else:
+            head_in = a2
+        v = (head_in @ c["Wv"] + c["bv"]).ravel() * c["ys"] + c["ym"]
+        logits = head_in @ c["Wp"] + c["bp"]
         legal = lm > 0
         masked = np.where(legal, logits, np.float32(-1e30))
         masked = masked - masked.max(axis=1, keepdims=True)
@@ -247,15 +316,17 @@ class ValueMLP:
         n = X.shape[0]
         y_std_target = (y - self.y_mean) / self.y_std
         cache, v_std, _ = self._forward(X)
-        X_, z1, a1, z2, a2 = cache
+        X_, z1, a1, z2, a2, head_in, res_cache = cache
         resid = v_std - y_std_target            # (B,)
         loss = float(np.mean(resid ** 2))
 
         # backprop (MSE = mean over batch of resid^2 → dL/dv_std = 2*resid/n)
         dv = (2.0 / n) * resid[:, None]         # (B,1)
-        dWv = a2.T @ dv
+        dWv = head_in.T @ dv
         dbv = dv.sum(0)
-        da2 = dv @ self.Wv.T
+        dhead = dv @ self.Wv.T                   # ∂L/∂head_in
+        # residual block backward → ∂L/∂a2 (and the block param grads), else identity
+        da2, res_grads = self._residual_backward(dhead, a2, res_cache)
         dz2 = da2 * (z2 > 0)
         dW2 = a1.T @ dz2
         db2 = dz2.sum(0)
@@ -265,6 +336,7 @@ class ValueMLP:
         db1 = dz1.sum(0)
 
         grads = {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "Wv": dWv, "bv": dbv}
+        grads.update(res_grads)
         # the value step does not touch the policy head (no gradient flows to it)
         self._adam_apply(grads, lr, l2, betas, eps)
         return loss
@@ -290,7 +362,7 @@ class ValueMLP:
         lm = legal_mask.astype(np.float64)
         # --- forward (shared trunk) ---
         cache, v_std, logits = self._forward(X)
-        X_, z1, a1, z2, a2 = cache
+        X_, z1, a1, z2, a2, head_in, res_cache = cache
 
         # --- value branch (standardized MSE) ---
         y_std_target = (target_v - self.y_mean) / self.y_std
@@ -306,12 +378,14 @@ class ValueMLP:
         # softmax+CE logit gradient: (p − π') on legal slots, masked to legal, mean over batch.
         dlogits = (alpha / n) * ((p - target_pi) * lm)       # (B, n_actions)
 
-        # --- backprop both heads into the trunk ---
-        dWv = a2.T @ dv
+        # --- backprop both heads into head_in, then through the residual block into the trunk ---
+        dWv = head_in.T @ dv
         dbv = dv.sum(0)
-        dWp = a2.T @ dlogits
+        dWp = head_in.T @ dlogits
         dbp = dlogits.sum(0)
-        da2 = dv @ self.Wv.T + dlogits @ self.Wp.T
+        dhead = dv @ self.Wv.T + dlogits @ self.Wp.T     # ∂L/∂head_in (both heads)
+        # residual block backward → ∂L/∂a2 (and block param grads), else identity
+        da2, res_grads = self._residual_backward(dhead, a2, res_cache)
         dz2 = da2 * (z2 > 0)
         dW2 = a1.T @ dz2
         db2 = dz2.sum(0)
@@ -322,6 +396,7 @@ class ValueMLP:
 
         grads = {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2,
                  "Wv": dWv, "bv": dbv, "Wp": dWp, "bp": dbp}
+        grads.update(res_grads)
         self._adam_apply(grads, lr, l2, betas, eps)
         return ce, value_loss
 
@@ -352,8 +427,11 @@ class ValueMLP:
     # ---- persistence (npz) ----
     def save(self, path):
         d = {k: v for k, v in self._params().items()}
+        # _meta carries a 4th field — the residual flag (0/1). Old npz files have only 3 fields;
+        # load() handles that length explicitly (treats absent → residual OFF).
         d["_meta"] = np.array([self.in_dim, self.H,
-                               self.n_actions if self.n_actions is not None else -1],
+                               self.n_actions if self.n_actions is not None else -1,
+                               1 if self.residual else 0],
                               dtype=np.int64)
         d["_yscale"] = np.array([self.y_mean, self.y_std], dtype=np.float64)
         np.savez(path, **d)
@@ -361,13 +439,37 @@ class ValueMLP:
     @classmethod
     def load(cls, path):
         z = np.load(path, allow_pickle=False)
-        in_dim, H, na = (int(x) for x in z["_meta"])
+        meta = [int(x) for x in z["_meta"]]
+        in_dim, H, na = meta[0], meta[1], meta[2]
+        # 4th meta field is the residual flag; absent in pre-residual npz files (length 3).
+        meta_residual = bool(meta[3]) if len(meta) >= 4 else False
         y_mean, y_std = (float(x) for x in z["_yscale"])
         n_actions = None if na < 0 else na
-        net = cls(in_dim, hidden=H, n_actions=n_actions, y_mean=y_mean, y_std=y_std)
+        # A net saved WITH the block carries the Wr*/br* arrays; one saved WITHOUT does not. Build
+        # the net with the block only if BOTH the flag says so AND the params are present — mirrors
+        # the --init-weights dim-mismatch handling (fail informative, not opaque): an old npz loaded
+        # against a residual-meta mismatch keeps the block OFF (random/absent) with a clear log line
+        # rather than crashing deep in the first forward (ADR-0002).
+        have_res_params = all(k in z.files for k in ("Wr1", "br1", "Wr2", "br2"))
+        residual = meta_residual and have_res_params
+        if meta_residual and not have_res_params:
+            print(f"[ValueMLP.load] {path}: _meta says residual=ON but block params "
+                  f"(Wr1/br1/Wr2/br2) are absent — loading with residual OFF", flush=True)
+        net = cls(in_dim, hidden=H, n_actions=n_actions, y_mean=y_mean, y_std=y_std,
+                  residual=residual)
         net.W1, net.b1 = z["W1"], z["b1"]
         net.W2, net.b2 = z["W2"], z["b2"]
         net.Wv, net.bv = z["Wv"], z["bv"]
+        if residual:
+            # validate the block-param shapes at setup (ADR-0002: fail informative HERE, not deep
+            # in the first forward as a raw matmul ValueError). Both Wr* are H×H, both br* are (H,).
+            for k, want in (("Wr1", (H, H)), ("Wr2", (H, H)), ("br1", (H,)), ("br2", (H,))):
+                if z[k].shape != want:
+                    raise ValueError(
+                        f"ValueMLP.load {path}: residual param {k} has shape {z[k].shape}, "
+                        f"expected {want} (hidden={H}) — corrupt/incompatible npz")
+            net.Wr1, net.br1 = z["Wr1"], z["br1"]
+            net.Wr2, net.br2 = z["Wr2"], z["br2"]
         if n_actions is not None:
             net.Wp, net.bp = z["Wp"], z["bp"]
         net._init_adam()

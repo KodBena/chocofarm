@@ -179,7 +179,7 @@ def run(args):
     if args.init_weights:
         warm = ValueMLP.load(args.init_weights)
         net = ValueMLP(in_dim, hidden=warm.H, n_actions=n_slots, seed=args.seed,
-                       y_mean=warm.y_mean, y_std=warm.y_std)
+                       y_mean=warm.y_mean, y_std=warm.y_std, residual=args.residual)
         # copy the second trunk layer + value head; policy head stays random.
         net.W2, net.b2 = warm.W2.copy(), warm.b2.copy()
         net.Wv, net.bv = warm.Wv.copy(), warm.bv.copy()
@@ -195,11 +195,14 @@ def run(args):
             w1_note = (f"input layer RANDOM (warm net in_dim={warm.in_dim} ≠ current {in_dim}; "
                        f"Part C feature change — W1 cannot warm-start)")
         net._init_adam()
+        res_note = "residual block ON (random init)" if net.residual else "no residual block"
         print(f"warm-started 2nd-trunk + value head from {args.init_weights} "
-              f"(hidden={warm.H}); {w1_note}; policy head random", flush=True)
+              f"(hidden={warm.H}); {w1_note}; policy head random; {res_note}", flush=True)
     else:
-        net = ValueMLP(in_dim, hidden=args.hidden, n_actions=n_slots, seed=args.seed)
-        print(f"cold net (hidden={args.hidden}); both heads random", flush=True)
+        net = ValueMLP(in_dim, hidden=args.hidden, n_actions=n_slots, seed=args.seed,
+                       residual=args.residual)
+        res_note = "residual block ON" if net.residual else "no residual block"
+        print(f"cold net (hidden={args.hidden}); both heads random; {res_note}", flush=True)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = None
@@ -356,6 +359,10 @@ def main():
     ap.add_argument("--eval-seed", type=int, default=12345)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--hidden", type=int, default=256)
+    ap.add_argument("--residual", action="store_true",
+                    help="insert a residual block (H×H → H×H, skip+ReLU) between the trunk output "
+                         "and the two heads. Default OFF → numerically identical to the "
+                         "pre-residual net (a clean ablation axis).")
     ap.add_argument("--init-weights", type=str, default=None,
                     help="E-DECIDE value-net npz to warm-start the value head + trunk")
     # --- Part A: 4-core actor/learner parallelism ---

@@ -72,17 +72,21 @@ def _connect():
 
 
 # ---- net (de)serialization as raw bytes (the broadcast payload) ----
-_WEIGHT_KEYS = ("W1", "b1", "W2", "b2", "Wv", "bv", "Wp", "bp")
+# The weight set is enumerated from the net's OWN param registry (`net._params()`), not a hardcoded
+# tuple — so an optional block (e.g. the residual Wr*/br*) is transported without a second edit
+# site. The `residual` flag rides the manifest so `unpack_net` rebuilds the block before binding
+# its arrays (the params can only be set on a net that built the block).
 
 
 def pack_net(net):
     """Pack a ValueMLP into (manifest_json: str, blob: bytes) — raw `tobytes()` of each weight
     concatenated, with a JSON manifest of (name, shape, dtype, byte-length) + the scalar meta. No
-    pickle: the blob is contiguous float64 weight bytes."""
+    pickle: the blob is contiguous float64 weight bytes. The weight set is whatever the net's
+    param registry reports, so optional params (residual block) ride along automatically."""
     parts = []
     layout = []
     off = 0
-    for k in _WEIGHT_KEYS:
+    for k in net._params().keys():
         a = np.ascontiguousarray(getattr(net, k))
         b = a.tobytes()
         layout.append({"name": k, "shape": list(a.shape), "dtype": a.dtype.str,
@@ -91,18 +95,20 @@ def pack_net(net):
         off += len(b)
     manifest = {
         "in_dim": net.in_dim, "H": net.H, "n_actions": net.n_actions,
-        "y_mean": net.y_mean, "y_std": net.y_std, "layout": layout,
+        "y_mean": net.y_mean, "y_std": net.y_std, "residual": net.residual, "layout": layout,
     }
     return json.dumps(manifest), b"".join(parts)
 
 
 def unpack_net(manifest_json, blob):
     """Reconstruct a ValueMLP from `pack_net`'s (manifest, blob). `np.frombuffer` views, copied so
-    the net owns writable arrays. No pickle."""
+    the net owns writable arrays. No pickle. The `residual` flag rebuilds the block so the Wr*/br*
+    layout entries have a slot to bind to (older manifests without the flag → block OFF)."""
     from chocofarm.az.mlp import ValueMLP
     m = json.loads(manifest_json)
     net = ValueMLP(m["in_dim"], hidden=m["H"],
-                   n_actions=m["n_actions"], y_mean=m["y_mean"], y_std=m["y_std"])
+                   n_actions=m["n_actions"], y_mean=m["y_mean"], y_std=m["y_std"],
+                   residual=bool(m.get("residual", False)))
     for e in m["layout"]:
         a = np.frombuffer(blob, dtype=np.dtype(e["dtype"]),
                           count=int(np.prod(e["shape"])) if e["shape"] else 1,
