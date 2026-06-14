@@ -57,7 +57,8 @@ class ValueMLP:
         self.W2 = _he_init(rng, hidden, hidden); self.b2 = np.zeros(hidden)
         # OPTIONAL residual block between the trunk output and the two heads (toggle, default OFF →
         # the net is numerically identical to the pre-residual net, so `residual` is a clean
-        # ablation axis). Block: z = ReLU(h @ Wr1 + br1); z = z @ Wr2 + br2; out = ReLU(h + z).
+        # ablation axis). Block: z = ReLU(h @ Wr1 + br1); z = z @ Wr2 + br2; out = h + z
+        # (pre-activation skip, NO outer ReLU — firewall A/B found this the best CE variant).
         # Wr1/Wr2 are H×H so the skip dimension matches; the heads read `out` instead of `h`.
         # The rng is consumed AFTER the heads below precisely so that the trunk + heads draw the
         # same numbers whether or not the block is built — `residual=False` is bit-identical.
@@ -121,7 +122,7 @@ class ValueMLP:
         With `residual` ON, a residual block sits between the trunk output `a2` and the heads:
             zr1 = a2 @ Wr1 + br1;  ar1 = ReLU(zr1)
             zr2 = ar1 @ Wr2 + br2
-            head_in = ReLU(a2 + zr2)            # skip dimension matches (Wr*: H×H)
+            head_in = a2 + zr2                  # pre-activation skip, no outer ReLU (Wr*: H×H)
         The heads read `head_in`. With `residual` OFF, `head_in is a2` and the math is the
         pre-residual net exactly. The cache carries the block intermediates only when ON."""
         z1 = X @ self.W1 + self.b1
@@ -132,9 +133,8 @@ class ValueMLP:
             zr1 = a2 @ self.Wr1 + self.br1
             ar1 = np.maximum(zr1, 0.0)
             zr2 = ar1 @ self.Wr2 + self.br2
-            pre = a2 + zr2
-            head_in = np.maximum(pre, 0.0)
-            res_cache = (zr1, ar1, zr2, pre)
+            head_in = a2 + zr2                     # pre-activation skip, NO outer ReLU (firewall A/B: best CE)
+            res_cache = (zr1, ar1, zr2)
         else:
             head_in = a2
             res_cache = None
@@ -155,10 +155,9 @@ class ValueMLP:
         `dhead` is already ∂L/∂a2 and there are no block grads."""
         if res_cache is None:
             return dhead, {}
-        zr1, ar1, zr2, pre = res_cache
-        dpre = dhead * (pre > 0)                  # through head_in = ReLU(pre)
-        da2 = dpre.copy()                         # skip path: pre = a2 + zr2
-        dzr2 = dpre
+        zr1, ar1, zr2 = res_cache
+        da2 = dhead.copy()                        # skip path: head_in = a2 + zr2 (no outer ReLU)
+        dzr2 = dhead
         dWr2 = ar1.T @ dzr2
         dbr2 = dzr2.sum(0)
         dar1 = dzr2 @ self.Wr2.T
@@ -235,7 +234,7 @@ class ValueMLP:
         if self.residual:
             ar1 = np.maximum(a2 @ c["Wr1"] + c["br1"], np.float32(0.0))
             zr2 = ar1 @ c["Wr2"] + c["br2"]
-            head_in = np.maximum(a2 + zr2, np.float32(0.0))
+            head_in = a2 + zr2                            # NO outer ReLU (matches _forward)
         else:
             head_in = a2
         v = (head_in @ c["Wv"] + c["bv"]).ravel() * c["ys"] + c["ym"]

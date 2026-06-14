@@ -362,13 +362,14 @@ def test_decide_with_value_returns_finite_bootstrap():
 
 # ---- residual block (toggleable, between trunk output and the heads) ----
 
-def _residual_grad_check(residual, l2, seed=0, eps=1e-4):
+def _residual_grad_check(residual, l2, seed=0, eps=1e-3):
     """Central finite differences vs the analytic grads train_step computes, for the residual
     block. Returns the worst per-param relative error, EXCLUDING ReLU-kink-crossing entries (a
     pre-activation that flips sign across ±eps — the central difference is not a valid gradient
-    there; detected by disagreeing one-sided slopes). eps=1e-4 is the float64 sweet spot: an eps
-    sweep shows the error shrinking as eps GROWS, the signature of roundoff cancellation in
-    (f(+eps)-f(-eps)), not a backprop bug (which would be eps-insensitive / grow from truncation)."""
+    there; detected by disagreeing one-sided slopes). eps=1e-3 is the float64 sweet spot for the
+    pre-activation (no-outer-ReLU) block — the eps sweep gives 2.4e-6 @1e-3, 1.5e-5 @1e-4,
+    1.7e-4 @1e-5, 1.3e-3 @1e-6: error SHRINKS as eps grows, the signature of roundoff cancellation
+    in (f(+eps)-f(-eps)), not a backprop bug (which would be eps-insensitive / grow from truncation)."""
     env = Environment()
     fb = FeatureBuilder(env)
     in_dim, na, B = feature_dim(env), n_action_slots(env), 8
