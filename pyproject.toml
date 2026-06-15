@@ -36,3 +36,9 @@ ignore_missing_imports = true
 # jax:     NO override — jax ships py.typed; its pytree/opt_state/backend-`xp`
 #          friction is a COMMENTED `Any` at each seam site (visible in the diff),
 #          confined to az/{forward,mlp_jax,mlp_jax_train,optimizer,kernels}.py.
+# zmq:     NO override — pyzmq (27.1) ships py.typed + .pyi stubs, so it is NOT a
+#          stub-gap; the Shape B inference modules (az/{inference_wire,net_port,
+#          inference_server,zmq_net_client}.py) annotate against the real stubs
+#          (`zmq.Context[zmq.Socket[bytes]]`, `zmq.Socket[bytes]`) and pass
+#          --strict. An ignore here would be a convenience-relaxation P8 forbids
+#          (and warn_unused_ignores would flag it as unneeded).
