@@ -298,9 +298,21 @@ thin imperative shell, the signature naming every mutation, and the *only*
 sanctioned hidden mutation a *measured* hot-path buffer-reuse routed through an
 explicitly-typed `Workspace`/`Context&` parameter; it outlaws the
 *untyped-effectful void* (a raw-pointer-taking, `void`-returning,
-out-parameter-writing black box — the compiled form of B / P2 / P8), with the
-C++ `NetForward` MLP (`predict(const float* X)`, the `void matvec_bias(…,
-std::vector<float>& out)` internals) as the cautionary instance, review-policed
+out-parameter-writing black box — the compiled form of B / P2 / P8) **and the
+exception** (the purest untyped effect — a control-flow escape absent from the
+signature the caller is not forced to handle): failure is a typed return value,
+`[[nodiscard]] std::expected<T, Error>` returned by value, never thrown (a
+throwing ctor becomes a `create(…) -> std::expected` factory), so the error path
+is declared in the return type and `[[nodiscard]]` makes ignoring it a compile
+error (ADR-0002 fail-loud at its strongest surface), while the functional core
+stays *total* (throw-free, neither throwing nor returning `expected`) and a
+genuine invariant violation (a bug) remains an `assert`/abort, not an `expected`.
+The C++ `NetForward` MLP (`predict(const float* X)`, the `void matvec_bias(…,
+std::vector<float>& out)` internals, the throwing constructor) is the cautionary
+instance — every `cpp/src` throw is at a boundary (redis I/O, instance load, the
+manifest-validating ctor), none on the throw-free forward/search core. P9 is now
+a mix: the error/`[[nodiscard]]` axis is **compile-enforced** (an unhandled
+`std::expected` fails the build), the input/output/mutation rules review-policed
 with the compiler `-Wall -Wextra` and a future `clang-tidy` config as the
 mechanization surface. It composes with rather than
 restates its siblings (0002/0004/0005/0007/0009/0011 cited, not re-derived), and
