@@ -70,10 +70,24 @@ namespace {
 // next leaf value. Both FIFOs are consumed in CALL ORDER and CYCLED modulo their length.
 class ScriptedISMCTSSource final : public chocofarm::ISMCTSSource {
   public:
-    ScriptedISMCTSSource(std::vector<int> idxs, std::vector<double> leaves)
-        : idxs_(std::move(idxs)), leaves_(std::move(leaves)) {}
+    ScriptedISMCTSSource(std::vector<int> idxs, std::vector<double> leaves,
+                         std::vector<int> world_idxs = {})
+        : idxs_(std::move(idxs)), leaves_(std::move(leaves)),
+          world_idxs_(std::move(world_idxs)) {}
 
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override { return bw[0]; }
+    // sample_world: an EMPTY world-index FIFO reproduces the original collapsed behavior (bw[0]),
+    // keeping cpp/parity/ismcts_logic.py byte-compatible. A NON-EMPTY FIFO cycles distinct worlds of
+    // bw by scripted index (bw[idx mod bw.size()]) so the SAME action at a node resolves to DIFFERENT
+    // observation outcomes across iterations -> multiple (action, belief_key) children: the
+    // multi-determinization sub-child split (the ISMCTS-defining property) is then exercised. The
+    // Python multi-world fixture pops the SAME world-index FIFO against the SAME bw ordering, so the
+    // determinizations are identical on both sides.
+    uint32_t sample_world(const std::vector<uint32_t>& bw) override {
+        if (world_idxs_.empty()) return bw[0];
+        int raw = world_idxs_[(widx_++) % world_idxs_.size()];
+        int n = static_cast<int>(bw.size());
+        return bw[((raw % n) + n) % n];  // non-negative modulo; always a legal index into bw
+    }
 
     int expand_index(int n) override {
         // The fixture guarantees a non-empty index table (checked in main); an empty one here would
@@ -95,8 +109,10 @@ class ScriptedISMCTSSource final : public chocofarm::ISMCTSSource {
   private:
     std::vector<int> idxs_;
     std::vector<double> leaves_;
+    std::vector<int> world_idxs_;   // OPTIONAL world-index FIFO (empty -> sample_world = bw[0])
     size_t iidx_ = 0;
     size_t lidx_ = 0;
+    size_t widx_ = 0;
 };
 }  // namespace
 
@@ -160,12 +176,23 @@ int main(int argc, char** argv) {
         double v;
         while (iss >> v) leaves.push_back(v);
     }
+    // OPTIONAL line 3: the world-index FIFO. Absent/empty -> sample_world = bw[0] (back-compatible
+    // with ismcts_logic.py). Present -> cycle bw[idx mod bw.size()] to exercise the multi-belief split.
+    std::vector<int> world_idxs;
+    {
+        std::string line;
+        if (std::getline(std::cin, line)) {
+            std::istringstream iss(line);
+            int v;
+            while (iss >> v) world_idxs.push_back(v);
+        }
+    }
     if (idxs.empty() || leaves.empty()) {
         std::cerr << "ismcts-dump: FATAL: need a non-empty expand-index FIFO (line 1) AND a "
                      "non-empty leaf FIFO (line 2) on stdin\n";
         return 1;
     }
-    ScriptedISMCTSSource src(std::move(idxs), std::move(leaves));
+    ScriptedISMCTSSource src(std::move(idxs), std::move(leaves), std::move(world_idxs));
 
     chocofarm::Action action = policy.run_search(env, loc, bw, collected, lam, src);
 
