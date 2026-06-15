@@ -16,20 +16,24 @@ Flags:
     --runs N        final-eval episodes for the decomp Dinkelbach (default 1500)
     --horizon-sweep also run the macro horizon sweep (1..4)
     --search        also run the shallow/search pack (slow; bounded budgets)
+
+Public Domain (The Unlicense).
 """
 import argparse
 import time
+from typing import Any
 
 from chocofarm.model.env import Environment
-from chocofarm.eval.report import references, print_reference_header
+from chocofarm.references import BeliefRefs
+from chocofarm.eval.report import references, print_reference_header, dink_float
 from chocofarm.solvers.decomp import DecompPolicy
 
 
-def measure_decomp(env, refs, runs, horizon):
+def measure_decomp(env: Environment, refs: BeliefRefs, runs: int, horizon: int) -> dict[str, Any]:
     pol = DecompPolicy(horizon=horizon)
     t0 = time.time()
     res = env.dinkelbach_rate(pol, iters=4, warm_runs=400, final_runs=runs, seed=7)
-    r = res["rate"]
+    r = dink_float(res, "rate")
     return {
         "horizon": horizon, "rate": r, "ER": res["ER"], "ET": res["ET"],
         "lambda": res["lambda"], "exits": res["exits"],
@@ -40,7 +44,7 @@ def measure_decomp(env, refs, runs, horizon):
     }
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=1500)
     ap.add_argument("--horizon-sweep", action="store_true")
@@ -86,7 +90,7 @@ def main():
         print("shallow / search pack (prior finding: all below the floor):", flush=True)
         for name, pol, budget in pack:
             t0 = time.time()
-            r = env.dinkelbach_rate(pol, **budget)["rate"]
+            r = dink_float(env.dinkelbach_rate(pol, **budget), "rate")
             claw = refs.voi_pct(r)
             print(f"   {name:>20} rate={r:.4f} %VoI={claw:>4.0f}% ({time.time()-t0:.0f}s)",
                   flush=True)

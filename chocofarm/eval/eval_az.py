@@ -19,37 +19,46 @@ Also reports E[T] (mean episode time) — the over-collection signature: the GO 
 
 CLI: python -m chocofarm.eval.eval_az --weights w.npz [--it 200] [--n 300] [--seed 7]
 Pin to core 3 under timeout. For the full run use N≥300 (design's <2% SE rule).
+
+Public Domain (The Unlicense).
 """
 import argparse
 import time
+from typing import Any
 
 import numpy as np
 
 from chocofarm.model.env import Environment
+from chocofarm.references import BeliefRefs
+from chocofarm.solvers.base import Policy
 from chocofarm.solvers.ismcts import ISMCTSPolicy
 from chocofarm.solvers.decomp import DecompPolicy
 from chocofarm.az.netvalue_ismcts import NetValueISMCTS
-from chocofarm.eval.harness import DECOMP_ANCHOR
+from chocofarm.eval.harness import DECOMP_ANCHOR, dink_float
 from chocofarm.eval.report import references, print_reference_header
 
 LAM0 = 0.0855  # static-floor rate; the fixed training/operating λ (design §4.1)
 
 
-def measure(env, pol, refs, n, seed, dink_iters=2, warm=10):
+def measure(env: Environment, pol: Policy, refs: BeliefRefs, n: int, seed: int,
+            dink_iters: int = 2, warm: int = 10) -> dict[str, Any]:
     """Returns (dinkelbach-rate row, fixed-λ₀ row) for `pol`, both with E[T] and %VoI."""
     # the policy's own Dinkelbach fixed point
     res = env.dinkelbach_rate(pol, iters=dink_iters, warm_runs=warm, final_runs=n, seed=seed)
     # the rate at fixed λ₀ (the operating point the value was trained at)
     r0, ER0, ET0, exits0 = env.rate(pol, LAM0, n, seed=seed)
     return {
-        "dink_rate": res["rate"], "dink_lam": res["lambda"], "dink_ET": res["ET"],
-        "dink_voi": refs.voi_pct(res["rate"]),
+        "dink_rate": dink_float(res, "rate"), "dink_lam": dink_float(res, "lambda"),
+        "dink_ET": dink_float(res, "ET"),
+        "dink_voi": refs.voi_pct(dink_float(res, "rate")),
         "fix_rate": r0, "fix_ET": ET0, "fix_ER": ER0,
         "fix_voi": refs.voi_pct(r0), "fix_exits": exits0,
     }
 
 
-def stream_compare(env, net_pol, base_pol, refs, n, chunk, seed, logdir):
+def stream_compare(env: Environment, net_pol: Policy, base_pol: Policy | None, refs: BeliefRefs,
+                   n: int, chunk: int, seed: int,
+                   logdir: str) -> dict[str, list[float]]:
     """Interleaved paired comparison at FIXED λ₀, streaming cumulative rate curves to TB.
 
     Net-value and playout-leaf are run on the SAME seed each chunk (paired → variance reduction),
@@ -60,8 +69,8 @@ def stream_compare(env, net_pol, base_pol, refs, n, chunk, seed, logdir):
     from tensorboardX import SummaryWriter
     static, ceil = refs.static_floor, refs.clairvoyant_ceiling   # the reference lines for TB/display
     w = SummaryWriter(logdir)
-    acc = {"net": [0.0, 0.0, 0], "playout": [0.0, 0.0, 0]}    # sumR, sumT, episodes
-    pols = {"net": net_pol, "playout": base_pol}
+    acc: dict[str, list[float]] = {"net": [0.0, 0.0, 0], "playout": [0.0, 0.0, 0]}  # sumR, sumT, eps
+    pols: dict[str, Policy | None] = {"net": net_pol, "playout": base_pol}
     done, s = 0, seed
     while done < n:
         c = min(chunk, n - done)
@@ -103,7 +112,7 @@ def stream_compare(env, net_pol, base_pol, refs, n, chunk, seed, logdir):
     return acc
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="E-DECIDE Stage-2: learned-value vs playout leaf.")
     ap.add_argument("--weights", type=str, required=True, help="trained value-net npz")
     ap.add_argument("--it", type=int, default=200, help="ISMCTS iteration budget (matched)")
@@ -133,7 +142,7 @@ def main():
            f"{'fixλ_ET':>7} {'fixλ_%VoI':>9} {'sec':>5}")
     print(hdr, flush=True)
 
-    def row(name, m, sec):
+    def row(name: str, m: dict[str, Any], sec: float) -> None:
         print(f"{name:>22} {m['dink_rate']:>9.4f} {m['dink_ET']:>7.1f} "
               f"{m['fix_rate']:>9.4f} {m['fix_ET']:>7.1f} {m['fix_voi']:>8.0f}% {sec:>5.0f}",
               flush=True)

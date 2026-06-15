@@ -26,6 +26,8 @@ the Monte-Carlo standard error is explicit. Run subsets to bound wall-time, e.g.
 
 An optional trailing `N=<int>` overrides every row's final_runs (handy for shrinking under a
 tight timeout): e.g. `python -m chocofarm.eval.eval_uct 1600 N=20`.
+
+Public Domain (The Unlicense).
 """
 import sys
 
@@ -33,6 +35,7 @@ import numpy as np
 
 from chocofarm.model.env import Environment
 from chocofarm.solvers.uct import UCTPolicy
+from chocofarm.solvers.base import Policy
 from chocofarm.eval.report import references, print_reference_header, run_plan
 
 
@@ -49,10 +52,10 @@ PLAN = [
 ]
 
 
-def main():
+def main() -> None:
     args = sys.argv[1:]
-    n_override = None
-    wanted = set()
+    n_override: int | None = None
+    wanted: set[int] = set()
     for tok in args:
         if tok.startswith("N="):
             n_override = int(tok[2:])
@@ -63,7 +66,7 @@ def main():
     refs = references(env)
     print_reference_header(refs)
 
-    plan = []
+    plan: list[tuple[str, Policy, dict[str, int]]] = []
     for name, iters, budget in PLAN:
         if (not wanted) or (iters in wanted):
             if n_override is not None:

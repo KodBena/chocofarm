@@ -17,17 +17,20 @@ the printed run count makes explicit.
 
 Run a single level to bound wall-time:  python eval_nmcs.py 1   /   python eval_nmcs.py 2
 No argument runs both (longer).
+
+Public Domain (The Unlicense).
 """
 import sys
 
 from chocofarm.model.env import Environment
 from chocofarm.solvers.nmcs import NMCSPolicy
+from chocofarm.solvers.base import Policy
 from chocofarm.eval.report import references, print_reference_header, run_plan
 
 
 # (label, policy, dinkelbach budget) -- tuned so each level finishes within a bounded
 # wall-time. Level 2 uses tighter branching/sampling and fewer runs than level 1.
-def make_plan(env):
+def make_plan(env: Environment) -> dict[int, tuple[str, Policy, dict[str, int]]]:
     return {
         1: ("nmcs(level=1)",
             NMCSPolicy(level=1, playout_samples=3, step_samples=2,
@@ -40,7 +43,7 @@ def make_plan(env):
     }
 
 
-def main():
+def main() -> None:
     levels = [int(a) for a in sys.argv[1:]] or [1, 2]
 
     env = Environment()                      # unit values, the project's reference regime

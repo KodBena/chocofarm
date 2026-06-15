@@ -9,6 +9,8 @@ iteration budget: the rate, the % of the clairvoyant ceiling reached, and the % 
 gap (ceiling − static) clawed back. Budgets are deliberately small — ISMCTS spends
 `iterations` belief playouts per decision and a dozen-ish decisions per episode, so evaluation
 run counts are kept modest and every measurement sits under a wall-clock timeout in the driver.
+
+Public Domain (The Unlicense).
 """
 import numpy as np
 from chocofarm.model.env import Environment
@@ -16,7 +18,7 @@ from chocofarm.solvers.ismcts import ISMCTSPolicy
 from chocofarm.eval.report import references, print_reference_header, run_plan
 
 
-def main():
+def main() -> None:
     env = Environment()                                  # unit values
     refs = references(env)
     print_reference_header(refs)

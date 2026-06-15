@@ -23,10 +23,12 @@ from chocofarm.solvers.uct import UCTPolicy, UCTConfig
 from chocofarm.solvers.ismcts import ISMCTSPolicy, ISMCTSConfig
 from chocofarm.solvers.nmcs import NMCSPolicy, NMCSConfig
 from chocofarm.solvers.decomp import DecompPolicy
-from chocofarm.solvers.base import RandomPolicy, RolloutConfig, SparseSamplingConfig
+from chocofarm.solvers.base import Policy, RandomPolicy, RolloutConfig, SparseSamplingConfig
 
-# name -> Policy class. The SINGLE source for "which class is this solver".
-SOLVERS = {
+# name -> Policy class. The SINGLE source for "which class is this solver". Typed `type[Policy]`
+# (not the bare-dict's inferred `type[ABCMeta]`) so a `SOLVERS[name](**kwargs)` construction is a
+# `Policy`, not `Any` — the registry's documented contract, made honest at its one home (P8/P1).
+SOLVERS: dict[str, type[Policy]] = {
     "random": RandomPolicy,
     "uct": UCTPolicy,
     "ismcts": ISMCTSPolicy,

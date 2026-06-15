@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-arrangement.py — the planar arrangement of the detection polygons.
+chocofarm/model/arrangement.py — the planar arrangement of the detection polygons.
 
 The detector cover is a *position-dependent* fact, not a per-region one.  Standing
 at a point p, you read the disjunction over exactly the regions that contain p:
@@ -16,6 +16,8 @@ over-approximation (docs/consults/consult-002-detector-misspec-report.md §(4)).
 A Face is a value:  (cover, rep_point, area, polygon_wkt).  Nothing here knows
 about solvers, beliefs, or travel; see facemodel.py for the sense-action that
 consumes a Face.
+
+Public Domain (The Unlicense).
 """
 from __future__ import annotations
 import json
@@ -23,6 +25,7 @@ import os
 from dataclasses import dataclass
 from shapely import wkt
 from shapely.geometry import Point
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import polygonize, unary_union
 
 INSTANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "instance.json")
@@ -32,8 +35,8 @@ FACES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "
 @dataclass(frozen=True)
 class Face:
     """An atomic arrangement face: the cover function is constant on it."""
-    cover: frozenset       # {j : Δ_j ⊇ this face}
-    rep_point: tuple       # an interior point (x, y) — see representative_point()
+    cover: frozenset[int]            # {j : Δ_j ⊇ this face}
+    rep_point: tuple[float, float]   # an interior point (x, y) — see representative_point()
     area: float
     polygon_wkt: str
 
@@ -42,19 +45,19 @@ class Face:
         return sum(1 << j for j in self.cover)
 
 
-def detection_regions(instance_path: str = INSTANCE) -> dict:
+def detection_regions(instance_path: str = INSTANCE) -> dict[int, BaseGeometry]:
     """{j : Δ_j} as shapely geometries, keyed by treasure index."""
     data = json.load(open(instance_path))
     return {int(i): wkt.loads(w) for i, w in data["regions_wkt"].items()}
 
 
-def cover_of(geom, regions: dict, probe: Point) -> frozenset:
+def cover_of(geom: BaseGeometry, regions: dict[int, BaseGeometry], probe: Point) -> frozenset[int]:
     """The cover set of a face, decided at an interior probe point (works for
     non-convex faces, where the centroid may fall outside)."""
     return frozenset(j for j, Dj in regions.items() if Dj.contains(probe))
 
 
-def arrangement(regions: dict) -> list:
+def arrangement(regions: dict[int, BaseGeometry]) -> list[Face]:
     """Faces of the planar arrangement of the region boundaries.
 
     polygonize(unary_union(boundaries)) yields every bounded atomic region the
@@ -77,7 +80,7 @@ def arrangement(regions: dict) -> list:
     return faces
 
 
-def persist(faces: list, path: str = FACES) -> None:
+def persist(faces: list[Face], path: str = FACES) -> None:
     json.dump(
         {"faces": [
             {"cover": sorted(f.cover), "rep_point": list(f.rep_point),
@@ -86,7 +89,7 @@ def persist(faces: list, path: str = FACES) -> None:
         open(path, "w"), indent=2)
 
 
-def load(path: str = FACES) -> list:
+def load(path: str = FACES) -> list[Face]:
     return [Face(frozenset(d["cover"]), tuple(d["rep_point"]), d["area"], d["polygon_wkt"])
             for d in json.load(open(path))["faces"]]
 

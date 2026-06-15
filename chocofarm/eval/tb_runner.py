@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Long-running, core-pinnable, memory-capped evaluator that streams a policy's converging
-rate to TensorBoard. Bounded BY CONSTRUCTION: it holds only running sums + a writer (no
-per-episode retention; the policies discard their search trees per decision), and it
+chocofarm/eval/tb_runner.py — long-running, core-pinnable, memory-capped evaluator that streams a
+policy's converging rate to TensorBoard. Bounded BY CONSTRUCTION: it holds only running sums + a
+writer (no per-episode retention; the policies discard their search trees per decision), and it
 self-guards on RSS — if its resident set exceeds --rss_cap_mb it logs and exits. Pin it to a
 core with `taskset -c <n>` at launch.
 
@@ -10,6 +10,8 @@ Per config it logs the cumulative running rate (totR/totT) vs episodes, so the e
 TIGHTENS indefinitely; multiple configs (e.g. ISMCTS iteration budgets) each get their own
 curve, so the budget→rate relationship emerges. ref/static and ref/ceiling are the floor and
 the clairvoyant ceiling for reference.
+
+Public Domain (The Unlicense).
 """
 import sys
 import os
@@ -17,12 +19,13 @@ import time
 import argparse
 import numpy as np
 from chocofarm.model.env import Environment
+from chocofarm.solvers.base import Policy
 from chocofarm.eval.report import references
 from chocofarm.solvers import SOLVERS
 from tensorboardX import SummaryWriter
 
 
-def rss_mb():
+def rss_mb() -> float:
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -38,17 +41,17 @@ def rss_mb():
 _CFG_KW = {"nmcs": "level", "ismcts": "iterations", "uct": "iterations"}
 
 
-def make_policy(method, cfg):
+def make_policy(method: str, cfg: str) -> Policy:
     if method not in _CFG_KW or method not in SOLVERS:
         raise SystemExit("unknown method " + method)
     return SOLVERS[method](**{_CFG_KW[method]: int(cfg)})
 
 
-def label(method, cfg):
+def label(method: str, cfg: str) -> str:
     return ("L%d" % int(cfg)) if method == "nmcs" else ("it%d" % int(cfg))
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--method", required=True)         # nmcs | ismcts
     ap.add_argument("--configs", required=True)         # comma list (levels or iteration budgets)
