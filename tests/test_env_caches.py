@@ -90,3 +90,37 @@ def test_copy_on_write_isolation_feature_layout():
     # fewer detectors → smaller feature_dim (the dims differ, so this is a real isolation check).
     assert lay_sub.dim != lay_env.dim
     assert lay_sub.dim < lay_env.dim
+
+
+def test_keep_accessor_full_and_restricted():
+    """Environment.keep (audit item H) is the PUBLIC read of the legal-action treasure-id hook
+    (`_treasure_ids`), so cross-module readers (bounds/eval_bound.py) stop reaching the private
+    name. For a FULL env it is tuple(range(N)) = every treasure; for a restrict()-ed env it is the
+    sorted `keep` tuple the restriction stored — byte-identical to what those readers got from the
+    private `_treasure_ids` before. The internal hook is untouched (still what legal_actions
+    iterates); `keep` is the read-only public alias."""
+    env = Environment()
+    assert tuple(env.keep) == tuple(range(env.N))     # full env: all N treasures
+
+    sub = env.restrict((8, 9, 10, 11, 12), 2)
+    assert sub.keep == (8, 9, 10, 11, 12)             # restricted: the sorted keep tuple
+
+    # restrict sorts its `keep` arg; the accessor reflects that (sorted tuple regardless of input).
+    assert env.restrict((12, 8, 11, 9, 10), 2).keep == (8, 9, 10, 11, 12)
+
+    # byte-equivalent to the private hook it reads (tuple of `_treasure_ids`) — the equality the
+    # eval_bound repoint relies on (set/len/display/clairvoyant arg all unchanged).
+    assert env.keep == tuple(env._treasure_ids)
+    assert sub.keep == tuple(sub._treasure_ids)
+
+
+def test_keep_is_read_only():
+    """`keep` is a read-only property: it must not become a second writer of the treasure-id hook
+    (the one writer stays restrict/__init__ via `_treasure_ids`). Assigning to it raises."""
+    env = Environment()
+    try:
+        env.keep = (1, 2, 3)
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("Environment.keep should be read-only (no setter)")
