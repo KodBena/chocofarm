@@ -33,7 +33,10 @@ itself lives with the caller (`actions.py` / `gumbel_search.py`), kept in one pl
 """
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
+import numpy.typing as npt
 
 from chocofarm.az.dtypes import DTYPE, is_float32
 from chocofarm.az.forward import forward_core
@@ -50,8 +53,11 @@ from chocofarm.az.weights import WeightContainer, is_weight  # noqa: F401  (re-e
 __all__ = ["ValueMLP", "is_weight"]
 
 
-def _he_init(rng, fan_in, fan_out):
-    return rng.standard_normal((fan_in, fan_out)) * np.sqrt(2.0 / fan_in)
+def _he_init(rng: np.random.Generator, fan_in: int, fan_out: int) -> npt.NDArray[np.float64]:
+    # the He-scaled standard-normal draw is float64; the cast states that contract (numpy's
+    # standard_normal stub returns Any under the `*`-broadcast — same array, no runtime change).
+    return cast("npt.NDArray[np.float64]",
+                rng.standard_normal((fan_in, fan_out)) * np.sqrt(2.0 / fan_in))
 
 
 class ValueMLP:
@@ -61,8 +67,9 @@ class ValueMLP:
     E-DECIDE probe leaves it None. Inference-only — the JaxTrainer owns the optimizer.
     """
 
-    def __init__(self, in_dim, hidden=256, n_actions=None, seed=0,
-                 y_mean=0.0, y_std=1.0, residual=False):
+    def __init__(self, in_dim: int, hidden: int = 256, n_actions: int | None = None,
+                 seed: int = 0, y_mean: float = 0.0, y_std: float = 1.0,
+                 residual: bool = False) -> None:
         rng = np.random.default_rng(seed)
         self.in_dim = int(in_dim)
         self.H = int(hidden)
@@ -108,21 +115,21 @@ class ValueMLP:
         # IN-PLACE weight writer would bump (the numpy Adam step was the one such writer; it moved
         # to the JaxTrainer, which rebinds, so nothing bumps it today — it stays at 0).
         self._w_revision = 0
-        self._f32_cache = None
-        self._f32_cache_sig = None
+        self._f32_cache: dict[str, Any] | None = None
+        self._f32_cache_sig: Any | None = None
 
     # ---- parameter registry (drives L2; consumed by save/load + the JaxTrainer + the transport) ----
     # The registry ORDER, the L2 MASK, and the (de)serialization all live in WeightContainer (audit
     # item J — ONE owner of the layout). These delegate, reading the arrays live off `self` so the
     # public API (`net._params()` for the trainer/forward, `net._is_weight(name)`) is unchanged.
-    def _params(self):
+    def _params(self) -> dict[str, npt.NDArray[Any]]:
         return WeightContainer.params(self)
 
-    def _is_weight(self, name):
+    def _is_weight(self, name: str) -> bool:
         return WeightContainer.is_weight(name)  # L2 on weight matrices only, not biases (one SSOT)
 
     # ---- forward ----
-    def _forward(self, X):
+    def _forward(self, X: npt.NDArray[Any]) -> tuple[None, npt.NDArray[Any], npt.NDArray[Any] | None]:
         """Returns (None, value_standardized, policy_logits_or_None) — numpy float64.
 
         Delegates to the ONE precision-agnostic `forward.forward_core` (audit R11): the residual
@@ -149,7 +156,7 @@ class ValueMLP:
     # path — use `JaxTrainer`.
 
     # ---- float32 inference fast path (the parametric hot-path precision) ----
-    def _f32_weights(self):
+    def _f32_weights(self) -> dict[str, Any]:
         """Float32 copies of the weights, cached and rebuilt whenever the source weights change —
         a REBIND (load/warm-start replace the array OBJECT), an in-place Adam mutation
         (`_w_revision` bump), or a y-scale change. Used by the float32 `predict_both` forward —
@@ -176,8 +183,8 @@ class ValueMLP:
             return c
         return self._rebuild_f32_cache()
 
-    def _rebuild_f32_cache(self):
-        c = {
+    def _rebuild_f32_cache(self) -> dict[str, Any]:
+        c: dict[str, Any] = {
             "W1": self.W1.astype(np.float32), "b1": self.b1.astype(np.float32),
             "W2": self.W2.astype(np.float32), "b2": self.b2.astype(np.float32),
             "Wv": self.Wv.astype(np.float32), "bv": self.bv.astype(np.float32),
@@ -199,7 +206,7 @@ class ValueMLP:
         self._f32_cache = c
         return c
 
-    def _f32_params(self, c):
+    def _f32_params(self, c: dict[str, Any]) -> dict[str, npt.NDArray[np.float32]]:
         """The float32 cache `c`'s weights as a flat params dict keyed like `_params()` — the input
         `forward_core` consumes. The residual block is included iff `self.residual` (so
         `forward_core`'s `"Wr1" in params` toggle matches the cache's contents), and the policy head
@@ -211,7 +218,8 @@ class ValueMLP:
             p["Wr2"] = c["Wr2"]; p["br2"] = c["br2"]
         return p
 
-    def _predict_both_f32(self, X, legal_mask):
+    def _predict_both_f32(self, X: npt.NDArray[Any], legal_mask: npt.NDArray[Any]
+                          ) -> tuple[float, npt.NDArray[Any]] | tuple[npt.NDArray[Any], npt.NDArray[Any]]:
         """float32-numpy forward (trunk + both heads + masked softmax). Same shape contract as
         `predict_both`; the cast to float32 changes the last bits (acceptable — behavioral, not
         bit, equivalence is the bar).
@@ -242,7 +250,7 @@ class ValueMLP:
             return float(v[0]), p[0]
         return v, p
 
-    def predict_value(self, X):
+    def predict_value(self, X: npt.NDArray[Any]) -> float | npt.NDArray[Any]:
         """De-standardized value (the λ-penalized return scale). `X` may be 1-D or 2-D."""
         single = (X.ndim == 1)
         if single:
@@ -253,7 +261,8 @@ class ValueMLP:
 
     # ---- policy-head inference (masked softmax over the fixed slot space) ----
     @staticmethod
-    def _masked_softmax(logits, legal_mask):
+    def _masked_softmax(logits: npt.NDArray[Any],
+                        legal_mask: npt.NDArray[Any]) -> npt.NDArray[np.float64]:
         """Softmax over the legal slots only. `logits`,`legal_mask`: (B, n_actions); mask is
         {0,1}. Illegal slots get probability exactly 0 (masked in log-space with -inf), legal
         slots normalize among themselves. Numerically stable (subtract per-row legal max)."""
@@ -263,9 +272,12 @@ class ValueMLP:
         exp = np.exp(masked) * (legal_mask > 0)
         denom = exp.sum(axis=1, keepdims=True)
         denom = np.where(denom > 0, denom, 1.0)
-        return exp / denom
+        # the normalized probabilities are float64 (exp over the float64-promoted masked logits);
+        # the cast states that contract (numpy's `/` returns Any — same array, no runtime change).
+        return cast("npt.NDArray[np.float64]", exp / denom)
 
-    def predict_policy(self, X, legal_mask):
+    def predict_policy(self, X: npt.NDArray[Any],
+                       legal_mask: npt.NDArray[Any]) -> npt.NDArray[Any]:
         """Masked-softmax policy P(s,·) over the fixed slot space. `X`: (in_dim,) or (B,in_dim);
         `legal_mask`: matching {0,1} over n_actions slots. Returns the same leading shape."""
         if self.n_actions is None:
@@ -275,10 +287,14 @@ class ValueMLP:
             X = X[None, :]
             legal_mask = legal_mask[None, :]
         _, _, logits = self._forward(X)
+        # the policy head was confirmed present above (n_actions not None), so forward_core returned
+        # the logits head (not None) — assert it to narrow honestly (ADR-0002 fail-loud, not a None-deref).
+        assert logits is not None
         p = self._masked_softmax(logits, legal_mask.astype(np.float64))
         return p[0] if single else p
 
-    def predict_both(self, X, legal_mask):
+    def predict_both(self, X: npt.NDArray[Any], legal_mask: npt.NDArray[Any]
+                     ) -> tuple[float, npt.NDArray[Any]] | tuple[npt.NDArray[Any], npt.NDArray[Any]]:
         """One forward pass -> (de-standardized value, masked policy). The search's hot path:
         a single trunk evaluation feeds both the leaf value and the prior. `X` 1-D or 2-D.
 
@@ -296,33 +312,37 @@ class ValueMLP:
         else:
             lm = legal_mask
         _, v_std, logits = self._forward(X)
+        # the policy head was confirmed present above (n_actions not None), so logits is not None —
+        # assert to narrow honestly (ADR-0002 fail-loud, not a None-deref).
+        assert logits is not None
         v = v_std * self.y_std + self.y_mean
         p = self._masked_softmax(logits, lm.astype(np.float64))
         if single:
             return float(v[0]), p[0]
         return v, p
 
-    def set_value_scale(self, y_mean, y_std):
+    def set_value_scale(self, y_mean: float, y_std: float) -> None:
         """Re-pin the value-target standardization (the ExIt loop sets it from the replay
         buffer's running target statistics; design §3 standardize-targets)."""
         self.y_mean = float(y_mean)
         self.y_std = float(y_std) if y_std > 1e-8 else 1.0
 
     # ---- persistence (npz) — DELEGATED to WeightContainer (audit item J: one owner of the layout) ----
-    def save(self, path):
+    def save(self, path: str) -> None:
         """Write params + meta to an npz. The byte layout (param order, `_meta` = [in_dim, H,
         n_actions, residual], `_yscale` = [y_mean, y_std]) is the container's — byte-identical to the
         pre-J encoder."""
         WeightContainer.save_npz(self, path)
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path: Any) -> "ValueMLP":
         """Reconstruct a net from an npz — DELEGATED to `WeightContainer.load`, which opens the file
         once, reads the meta, decides the residual toggle (block ON only if the flag says so AND the
         Wr*/br* arrays are present — fail-informative on a mismatch, ADR-0002), binds the weight arrays
         and validates the block shapes. Construction stays here: the container calls back this `cls`
         via the constructor adapter, so the public `ValueMLP.load(path)` signature is unchanged."""
-        def _ctor(in_dim, H, n_actions, y_mean, y_std, residual):
+        def _ctor(in_dim: int, H: int, n_actions: int | None, y_mean: float, y_std: float,
+                  residual: bool) -> "ValueMLP":
             return cls(in_dim, hidden=H, n_actions=n_actions, y_mean=y_mean, y_std=y_std,
                        residual=residual)
         return WeightContainer.load(_ctor, path)

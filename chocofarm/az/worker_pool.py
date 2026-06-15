@@ -26,6 +26,7 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import os
+from typing import Any, Callable, Literal
 
 
 # Per-result timeout for the fan-out drain (deadlock fix H1 / Fix A). An episode is ~0.2–0.4s of
@@ -34,7 +35,7 @@ import os
 _RESULT_TIMEOUT_S = float(os.environ.get("CHOCO_RESULT_TIMEOUT", "600"))
 
 
-def _drain_imap(it, n_expected, phase, run):
+def _drain_imap(it: Any, n_expected: int, phase: str, run: str) -> list[Any]:
     """Drive a Pool `imap_unordered` iterator to exhaustion with a PER-RESULT timeout, instead of
     the unbounded `list(imap_unordered(...))` that blocks forever on a wedged worker.
 
@@ -46,7 +47,7 @@ def _drain_imap(it, n_expected, phase, run):
     how many of the expected results were collected before the stall. A per-iteration checkpoint
     means a restart loses nothing."""
     import multiprocessing
-    out = []
+    out: list[Any] = []
     while True:
         try:
             out.append(it.next(_RESULT_TIMEOUT_S))
@@ -71,7 +72,8 @@ class WorkerPool:
     `map(task_fn, tasks, phase, run)` each fan-out (it runs `imap_unordered` under the bounded
     per-result drain); `close()` at the end (bounded teardown) or use as a context manager."""
 
-    def __init__(self, n_workers, cores, base_seed, m, n_sims):
+    def __init__(self, n_workers: int, cores: list[int], base_seed: int, m: int,
+                 n_sims: int) -> None:
         import multiprocessing as mp
         from chocofarm.az.worker import _worker_init
         self.n_workers = int(n_workers)
@@ -85,14 +87,15 @@ class WorkerPool:
             initargs=(list(cores), base_seed, m, n_sims),
         )
 
-    def map(self, task_fn, tasks, phase, run):
+    def map(self, task_fn: Callable[..., Any], tasks: list[Any], phase: str,
+            run: str) -> list[Any]:
         """Fan `tasks` across the pool via `imap_unordered` and drain under the bounded per-result
         timeout (Fix A): a wedged worker aborts LOUD, never deadlocks. Returns the worker results in
         completion order (the caller reassembles by the idx the task carries)."""
         it = self.pool.imap_unordered(task_fn, tasks, chunksize=1)
         return _drain_imap(it, len(tasks), phase, run)
 
-    def close(self):
+    def close(self) -> None:
         # Bounded teardown (completes the "parent never waits unbounded" invariant — see Fix A).
         # `Pool.join()` takes NO timeout, so a worker wedged at end-of-run would hang close()
         # forever exactly as the hot loop could. Instead: close (no new tasks), then join each
@@ -112,9 +115,9 @@ class WorkerPool:
         except Exception:
             pass
 
-    def __enter__(self):
+    def __enter__(self) -> "WorkerPool":
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: Any) -> Literal[False]:
         self.close()
         return False

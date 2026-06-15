@@ -48,11 +48,49 @@ both residual settings).
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, Any, Callable, Protocol, TypeVar, cast
 
 import numpy as np
 
+if TYPE_CHECKING:
+    import numpy.typing as npt
 
-def is_weight(name):
+# `load`/`unpack_into` are generic over the concrete net type: `ctor` builds it and the same object
+# is returned, so the caller (`ValueMLP.load`) keeps its `ValueMLP` static type rather than widening
+# to the `_Net` Protocol. Bound to `_Net` so the body may still read the layout-bearing scalars.
+_NetT = TypeVar("_NetT", bound="_Net")
+
+
+class _Net(Protocol):
+    """The structural net surface `WeightContainer` reads/writes — the layout-bearing scalars
+    (`residual`/`n_actions`/`in_dim`/`H`/`y_mean`/`y_std`) plus the weight arrays held as attributes
+    (read live via `getattr`, rebound on load via direct assignment). `ValueMLP` satisfies it without
+    an import cycle (mlp imports weights), and the stateless container takes the net it operates on as
+    this Protocol. The optional residual-block / policy-head arrays are present only when the net built
+    that block — `params`/`load` gate on `residual`/`n_actions` before touching them, so they are
+    declared here (the layout the container owns) but accessed only on the right toggle."""
+
+    residual: bool
+    n_actions: int | None
+    in_dim: int
+    H: int
+    y_mean: float
+    y_std: float
+    W1: "npt.NDArray[Any]"
+    b1: "npt.NDArray[Any]"
+    W2: "npt.NDArray[Any]"
+    b2: "npt.NDArray[Any]"
+    Wv: "npt.NDArray[Any]"
+    bv: "npt.NDArray[Any]"
+    Wr1: "npt.NDArray[Any]"
+    br1: "npt.NDArray[Any]"
+    Wr2: "npt.NDArray[Any]"
+    br2: "npt.NDArray[Any]"
+    Wp: "npt.NDArray[Any]"
+    bp: "npt.NDArray[Any]"
+
+
+def is_weight(name: str) -> bool:
     """THE L2-scope predicate (audit R11, single source): a param is L2-penalized iff it is a weight
     MATRIX — its registry name starts 'W' (W1/W2/Wr1/Wr2/Wv/Wp), not a bias 'b*'. The JaxTrainer's
     loss (`mlp_jax_train._l2_sumsq`) and `ValueMLP._is_weight` route here so there is ONE definition,
@@ -70,7 +108,7 @@ class WeightContainer:
     is_weight = staticmethod(is_weight)
 
     @staticmethod
-    def param_order(residual, has_policy):
+    def param_order(residual: bool, has_policy: bool) -> list[str]:
         """THE canonical param-key ORDER — the only place the sequence is spelled. Trunk, then the
         value head, then (iff `residual`) the residual block, then (iff `has_policy`) the policy head:
 
@@ -87,21 +125,26 @@ class WeightContainer:
         return keys
 
     @classmethod
-    def params(cls, net):
+    def params(cls, net: _Net) -> dict[str, npt.NDArray[Any]]:
         """The param registry as an ORDERED dict {key: net's array}, read live off the net's attributes
         (drives L2; consumed by save/load, the transport, the trainer, and `forward_core`). The residual
         block is included iff `net.residual`; the policy head iff `net.n_actions is not None` — the same
         two toggles `param_order` keys on."""
         keys = cls.param_order(net.residual, net.n_actions is not None)
+        # the weight arrays are held as net attributes reached by name; getattr's `Any` is the
+        # array-internals `NDArray[Any]` the layout deals in (no runtime change — same arrays).
         return {k: getattr(net, k) for k in keys}
 
     # ---- npz persistence ----
     @classmethod
-    def save_npz(cls, net, path):
+    def save_npz(cls, net: _Net, path: str) -> None:
         """Write the net's params + meta to an npz at `path`. `_meta` carries 4 fields ([in_dim, H,
         n_actions-or-(-1), residual-0/1]); `_yscale` carries [y_mean, y_std]. Old npz files have only
         3 meta fields — `load_into` handles that length explicitly (absent → residual OFF)."""
-        d = {k: v for k, v in cls.params(net).items()}
+        # the splat into np.savez(**d) is the heterogeneous npz key->array map; typed `Any` (the
+        # array-internals leakage the layout deals in) so the keyword-unpack matches savez's stub
+        # (its `**kwds: ArrayLike` vs `allow_pickle: bool` overload rejects a narrowed array value).
+        d: dict[str, Any] = {k: v for k, v in cls.params(net).items()}
         d["_meta"] = np.array([net.in_dim, net.H,
                                net.n_actions if net.n_actions is not None else -1,
                                1 if net.residual else 0],
@@ -110,7 +153,7 @@ class WeightContainer:
         np.savez(path, **d)
 
     @classmethod
-    def load(cls, ctor, path):
+    def load(cls, ctor: Callable[..., _NetT], path: Any) -> _NetT:
         """Reconstruct a net from an npz, opening the file EXACTLY ONCE (so a stream/BytesIO `path`
         round-trips — the original `ValueMLP.load` opened it once). `ctor(in_dim, hidden, n_actions,
         y_mean, y_std, residual) -> net` is the net constructor (the `ValueMLP` classmethod hands its
@@ -151,7 +194,7 @@ class WeightContainer:
 
     # ---- transport: raw-bytes (de)serialization (the redis broadcast payload, no pickle) ----
     @classmethod
-    def pack(cls, net):
+    def pack(cls, net: _Net) -> tuple[str, bytes]:
         """Pack `net` into (manifest_json: str, blob: bytes) — raw `tobytes()` of each weight in the
         canonical `params(net)` order, concatenated, plus a JSON manifest of (name, shape, dtype,
         offset, byte-length) and the scalar meta (in_dim, H, n_actions, y_mean, y_std, residual). NO
@@ -174,14 +217,16 @@ class WeightContainer:
         return json.dumps(manifest), b"".join(parts)
 
     @staticmethod
-    def unpack_meta(manifest_json):
+    def unpack_meta(manifest_json: str) -> dict[str, Any]:
         """The construction meta from a `pack`'d manifest (no array data touched): a dict with `in_dim`,
         `H`, `n_actions`, `y_mean`, `y_std`, `residual`. `parallel.unpack_net` uses this to construct the
         net (older manifests without `residual` → block OFF), then `unpack_into` binds the arrays."""
-        return json.loads(manifest_json)
+        # json.loads is Any; the pack'd manifest is always a JSON object — the cast states that
+        # contract (no runtime change — same parsed dict).
+        return cast("dict[str, Any]", json.loads(manifest_json))
 
     @classmethod
-    def unpack_into(cls, net, manifest_json, blob):
+    def unpack_into(cls, net: _NetT, manifest_json: str, blob: bytes) -> _NetT:
         """Bind `pack`'s (manifest, blob) onto an already-constructed `net` (its residual/n_actions
         already match the manifest, so the Wr*/br* layout entries have a slot to bind to). `np.frombuffer`
         views, copied so the net owns writable arrays. REBINDS each attribute (f32-cache coherence,

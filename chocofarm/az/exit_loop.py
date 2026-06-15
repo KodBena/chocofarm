@@ -37,10 +37,12 @@ import argparse
 import json
 import os
 import time
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import Environment, TERMINATE
+from chocofarm.model.env import Collected, Environment, Loc, WorldSet, is_terminate
 from chocofarm.az.features import FeatureBuilder, feature_dim
 from chocofarm.az.actions import n_action_slots, legal_mask_from_features
 from chocofarm.az.mlp import ValueMLP
@@ -48,15 +50,26 @@ from chocofarm.az.gumbel_search import GumbelAZSearch, GumbelPolicy
 from chocofarm.az.value_target import blended_returns_to_go
 from chocofarm.references import BeliefRefs
 
+if TYPE_CHECKING:
+    from chocofarm.az.optimizer import AdamHParams
+    from chocofarm.az.mlp_jax_train import JaxTrainer
+    from chocofarm.hp.schema import ExperimentConfig
 
-def r2_score(y_true, y_pred):
+# The per-decision training record the generation loop emits: (feature vector, improved-policy row,
+# legal mask, value target). The features/π/mask are numpy arrays; the value target is a float.
+_Record = tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any], float]
+
+
+def r2_score(y_true: npt.NDArray[Any], y_pred: npt.NDArray[Any]) -> float:
     ss_res = float(np.sum((y_true - y_pred) ** 2))
     ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
-def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_steps=None,
-                     lam_blend=1.0, n_step=None):
+def generate_episode(env: Environment, search: GumbelAZSearch, fb: FeatureBuilder, world: int,
+                     lam: float, rng: np.random.Generator, n_explore_plies: int,
+                     max_steps: int | None = None, lam_blend: float = 1.0,
+                     n_step: int | None = None) -> list[_Record]:
     """One self-play episode driven by the Gumbel search. Records, per decision,
     (features, improved-pi, legal-mask, value-target). The value target is the Part B blended
     return-to-go (lower-variance TD(λ)/n-step over the realized λ-return and the search's root-value
@@ -70,8 +83,14 @@ def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_step
     precedence if set). λ_blend=1 / n=∞ → pure MC (prior behavior). See value_target.py."""
     if max_steps is None:
         max_steps = env.max_steps              # the single episode-horizon home (env.py)
-    loc, bw, collected = ("w", env.entry), env.worlds, set()
-    feats, pis, masks, step_rt, boots = [], [], [], [], []
+    loc: Loc = ("w", env.entry)
+    bw: WorldSet = env.worlds
+    collected: Collected = set()
+    feats: list[npt.NDArray[Any]] = []
+    pis: list[npt.NDArray[Any]] = []
+    masks: list[npt.NDArray[Any]] = []
+    step_rt: list[tuple[float, float]] = []
+    boots: list[float] = []
     for ply in range(max_steps):
         if len(bw) == 0:
             break
@@ -84,7 +103,7 @@ def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_step
         # (marginals are served by build's per-belief cache, so we don't pre-compute them here)
         feat = fb.build(loc, bw, collected)
         mask = legal_mask_from_features(env, feat)
-        if action == TERMINATE:
+        if is_terminate(action):     # the seam's TypeIs guard narrows `action` to MoveAction below
             # the TERMINATE decision executes no step; its target is the continuation (exit toll),
             # which the blend supplies as boot_term. We record it with the MC tail value below by
             # NOT appending a step — but we DO want a training target for the terminate state. Keep
@@ -104,7 +123,7 @@ def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_step
     # value = exit toll (the boot_term boundary), matching the prior code's last-decision handling.
     g_steps = blended_returns_to_go(step_rt, boots[:n_dec], exit_c, lam,
                                     lam_blend=lam_blend, n_step=n_step)
-    out = []
+    out: list[_Record] = []
     for j in range(n_rec):
         if j < n_dec:
             g = g_steps[j]
@@ -119,16 +138,20 @@ class ReplayBuffer:
     """Last-W-iterations replay (design §6: window 4–6 iters; the policy drifts, drop ancient
     data). Stores per-iteration blocks; `sample_arrays` returns the concatenation."""
 
-    def __init__(self, window):
+    def __init__(self, window: int) -> None:
         self.window = int(window)
-        self.blocks = []   # list of (X, PI, M, Y) per iteration
+        # list of (X, PI, M, Y) per iteration — each a stacked float32 array block
+        self.blocks: list[tuple[npt.NDArray[Any], npt.NDArray[Any],
+                                npt.NDArray[Any], npt.NDArray[Any]]] = []
 
-    def add(self, X, PI, M, Y):
+    def add(self, X: npt.NDArray[Any], PI: npt.NDArray[Any], M: npt.NDArray[Any],
+            Y: npt.NDArray[Any]) -> None:
         self.blocks.append((X, PI, M, Y))
         if len(self.blocks) > self.window:
             self.blocks.pop(0)
 
-    def arrays(self):
+    def arrays(self) -> tuple[npt.NDArray[Any], npt.NDArray[Any],
+                              npt.NDArray[Any], npt.NDArray[Any]]:
         X = np.concatenate([b[0] for b in self.blocks], 0)
         PI = np.concatenate([b[1] for b in self.blocks], 0)
         M = np.concatenate([b[2] for b in self.blocks], 0)
@@ -136,7 +159,7 @@ class ReplayBuffer:
         return X, PI, M, Y
 
 
-def adam_hparams_from(cfg):
+def adam_hparams_from(cfg: "ExperimentConfig") -> "AdamHParams":
     """ACL (audit item M, training-optimization-refactor.md §2.4): translate the registry's
     `TrainConfig` (the SSOT) into the optimizer's runtime `AdamHParams` (the optimizer's own
     vocabulary). The ONE place `TrainConfig.{lr,beta1,beta2,eps}` crosses into the optimizer — read
@@ -148,7 +171,10 @@ def adam_hparams_from(cfg):
     return AdamHParams(lr=cfg.train.lr, b1=cfg.train.beta1, b2=cfg.train.beta2, eps=cfg.train.eps)
 
 
-def train_epochs(trainer, X, PI, M, Y, epochs, batch, hp, l2, alpha, beta, rng):
+def train_epochs(trainer: "JaxTrainer", X: npt.NDArray[Any], PI: npt.NDArray[Any],
+                 M: npt.NDArray[Any], Y: npt.NDArray[Any], epochs: int, batch: int,
+                 hp: "AdamHParams", l2: float, alpha: float, beta: float,
+                 rng: np.random.Generator) -> tuple[float, float, float]:
     """Adam epochs over the buffer via the JAX/optax trainer (`mlp_jax_train.JaxTrainer`);
     autodiff over the jit'd forward replaces the manual numpy backprop. Re-pins the value
     standardization to the buffer's Y stats (design §3) before training so the MSE stays O(1) as
@@ -179,7 +205,7 @@ def train_epochs(trainer, X, PI, M, Y, epochs, batch, hp, l2, alpha, beta, rng):
     return ce_tot / max(1, cnt), v_tot / max(1, cnt), r2_score(Y, pv)
 
 
-def policy_entropy(pis):
+def policy_entropy(pis: list[npt.NDArray[Any]]) -> float:
     """Mean entropy of the improved-policy targets (executed-policy diversity diagnostic)."""
     ent = 0.0
     for p in pis:
@@ -188,7 +214,7 @@ def policy_entropy(pis):
     return ent / max(1, len(pis))
 
 
-def run(args):
+def run(args: argparse.Namespace) -> None:
     env = Environment()
     # the single source for the %VoI reference lines (derived floor/ceiling + documented anchor)
     refs = BeliefRefs(env)
@@ -364,9 +390,13 @@ def run(args):
         # below — and in the worker on each version bump — so a manual change to these lands live,
         # hp-registry §3.4). `m`/`n_sims`/`use_jax_mlp` are RESTART (cfg0): they size the SH bracket /
         # bind the forward fn and are baked at launch.
-        hot_search = dict(c_puct=snap.cfg.search.c_puct, c_visit=snap.cfg.search.c_visit,
-                          c_scale=snap.cfg.search.c_scale, c_outcome=snap.cfg.search.c_outcome,
-                          max_depth=snap.cfg.search.max_depth)
+        # the HOT search-knob bag is heterogeneous (c_* are floats, c_outcome/max_depth ints), so it
+        # is typed dict[str, Any] — the same kwargs bag splatted into GumbelAZSearch and threaded to
+        # the worker; Any keeps the int/float params honest under the splat (no runtime change).
+        hot_search: dict[str, Any] = dict(
+            c_puct=snap.cfg.search.c_puct, c_visit=snap.cfg.search.c_visit,
+            c_scale=snap.cfg.search.c_scale, c_outcome=snap.cfg.search.c_outcome,
+            max_depth=snap.cfg.search.max_depth)
 
         # the parent draws the per-episode true worlds so the world sequence is reproducible
         # regardless of worker count (parallel≈serial): same worlds → same episodes given seeds.
@@ -483,7 +513,7 @@ def run(args):
               flush=True)
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="AZ Gumbel Expert-Iteration loop (design §6).")
     ap.add_argument("-I", "--iters", type=int, default=40, help="outer ExIt iterations")
     ap.add_argument("-E", "--episodes", type=int, default=300, help="self-play episodes/iter")

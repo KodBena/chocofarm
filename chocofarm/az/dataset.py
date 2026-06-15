@@ -33,16 +33,22 @@ from __future__ import annotations
 
 import argparse
 import time
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import Environment, TERMINATE
+from chocofarm.model.env import Collected, Environment, Loc, WorldSet, is_terminate
+from chocofarm.solvers.base import Policy
 from chocofarm.solvers.decomp import DecompPolicy
 from chocofarm.az.features import FeatureBuilder, feature_dim
 from chocofarm.az.value_target import suffix_returns_to_go
 
 
-def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=None):
+def _episode_transitions(env: Environment, policy: Policy, fb: FeatureBuilder, world: int,
+                         lam: float, rng: np.random.Generator,
+                         max_steps: int | None = None
+                         ) -> list[tuple[npt.NDArray[Any], float]]:
     """Run ONE decomp episode against `world`, logging (features, per-step (r,dt)) at each
     decision point. Returns a list of (feat, return_to_go) for the visited states.
 
@@ -50,12 +56,14 @@ def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=None):
     policy's fresh-episode detection (full belief at entry) triggers its per-episode reset."""
     if max_steps is None:
         max_steps = env.max_steps              # the single episode-horizon home (env.py)
-    loc, bw, collected = ("w", env.entry), env.worlds, set()
-    feats = []          # feature vector logged BEFORE each executed action
-    step_rt = []        # (r, dt) of each executed action
+    loc: Loc = ("w", env.entry)
+    bw: WorldSet = env.worlds
+    collected: Collected = set()
+    feats: list[npt.NDArray[Any]] = []          # feature vector logged BEFORE each executed action
+    step_rt: list[tuple[float, float]] = []     # (r, dt) of each executed action
     for _ in range(max_steps):
         a = policy.decide(env, loc, bw, collected, lam, rng)
-        if a == TERMINATE:
+        if is_terminate(a):     # the seam's TypeIs guard narrows `a` to the MoveAction subset below
             break
         # log the state we DECIDED from (build's fused kernel derives the marginals in one pass, F7)
         feats.append(fb.build(loc, bw, collected))
@@ -71,11 +79,13 @@ def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=None):
     return list(zip(feats, g))
 
 
-def generate(env, n_episodes, lam, seed, report_every=50):
+def generate(env: Environment, n_episodes: int, lam: float, seed: int, report_every: int = 50
+             ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], int]:
     fb = FeatureBuilder(env)
     pol = DecompPolicy(horizon=1)
     rng = np.random.default_rng(seed)
-    X, Y = [], []
+    X: list[npt.NDArray[Any]] = []
+    Y: list[float] = []
     t0 = time.time()
     for ep in range(n_episodes):
         w = int(rng.choice(env.worlds))
@@ -84,12 +94,12 @@ def generate(env, n_episodes, lam, seed, report_every=50):
         if report_every and (ep + 1) % report_every == 0:
             print(f"  ...{ep + 1}/{n_episodes} episodes, {len(X)} transitions "
                   f"({time.time() - t0:.0f}s)", flush=True)
-    X = np.asarray(X, dtype=np.float32)
-    Y = np.asarray(Y, dtype=np.float32)
-    return X, Y, fb.dim
+    Xa = np.asarray(X, dtype=np.float32)
+    Ya = np.asarray(Y, dtype=np.float32)
+    return Xa, Ya, fb.dim
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Generate AZ value-target dataset (decomp teacher).")
     ap.add_argument("--episodes", type=int, default=300, help="decomp episodes to roll out")
     ap.add_argument("--out", type=str, required=True, help="output .npz path")

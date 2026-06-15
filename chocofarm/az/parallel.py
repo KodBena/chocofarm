@@ -79,6 +79,7 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING, Any, Literal
 
 from chocofarm.az import transport
 from chocofarm.az import worker as _worker
@@ -86,6 +87,10 @@ from chocofarm.az import worker_pool
 from chocofarm.az.transport import connect as _connect, pack_net, unpack_net
 from chocofarm.az.worker import Worker, _eval_task, _gen_task, _worker_init
 from chocofarm.az.worker_pool import _RESULT_TIMEOUT_S, _drain_imap
+
+if TYPE_CHECKING:
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.az.transport import _Record
 
 __all__ = [
     "ParallelExecutor", "pack_net", "unpack_net", "_connect", "_drain_imap",
@@ -103,7 +108,8 @@ class ParallelExecutor:
     redis key strings and no pool internals — only the per-iteration choreography (publish → fan-out →
     gather) and the public surface the loop depends on."""
 
-    def __init__(self, n_workers, cores, base_seed, m, n_sims):
+    def __init__(self, n_workers: int, cores: list[int] | None, base_seed: int, m: int,
+                 n_sims: int) -> None:
         self.n_workers = int(n_workers)
         self.cores = list(cores)[:self.n_workers] if cores else list(range(self.n_workers))
         self.run = uuid.uuid4().hex[:12]            # namespace this run's redis keys
@@ -111,20 +117,22 @@ class ParallelExecutor:
         self.pool = worker_pool.WorkerPool(self.n_workers, self.cores, base_seed, m, n_sims)
 
     @property
-    def r(self):
+    def r(self) -> Any:
         """The parent's redis connection — preserved as a public attribute (it was `self.r` before
         the split). It lives on the transport collaborator now; this property keeps the name."""
         return self.transport.r
 
-    def publish_weights(self, net, version, phase="gen"):
+    def publish_weights(self, net: "ValueMLP", version: int, phase: str = "gen") -> None:
         """Pack the net to raw bytes and publish to redis `az:w:<run>:<phase>:<version>` (no pickle,
         no disk).  Workers reload it when the worker-side `(phase, version)` gate changes.  `phase`
         (R14) namespaces gen vs eval within one iteration; it defaults to "gen" so a bare
         `publish_weights(net, version)` (back-compat) still publishes the gen-phase key."""
         self.transport.publish_weights(net, phase, version, self.run)
 
-    def generate(self, net, version, worlds, lam, explore_plies, lam_blend, n_step,
-                 hot_search=None, max_steps=40):
+    def generate(self, net: "ValueMLP", version: int, worlds: list[int], lam: float,
+                 explore_plies: int, lam_blend: float, n_step: int | None,
+                 hot_search: dict[str, Any] | None = None,
+                 max_steps: int = 40) -> list["_Record"]:
         """Publish `net` at `("gen", version)`, fan E generation episodes across the pool, read the
         raw-byte results back from redis and reshape into one flat list of (feat, pi, mask, g)
         records.  The parent draws `worlds` so the world sequence is reproducible regardless of worker
@@ -147,7 +155,9 @@ class ParallelExecutor:
         metas = self.pool.map(_worker.TASK_SPECS["gen"].callable, tasks, "generate", self.run)
         return self.transport.read_and_delete_results(res_token, metas)
 
-    def evaluate(self, net, version, worlds, lam, hot_search=None, max_steps=40):
+    def evaluate(self, net: "ValueMLP", version: int, worlds: list[int], lam: float,
+                 hot_search: dict[str, Any] | None = None,
+                 max_steps: int = 40) -> tuple[float, float, list[float]]:
         """Publish `net` at `("eval", version)`, fan N eval episodes across the pool; return (totR,
         totT, list_of_T).  Eval results are scalars (R, T) so they ride the pipe directly — no redis
         blob needed (the array transport is only for the large generation records).
@@ -163,13 +173,13 @@ class ParallelExecutor:
         hs = dict(hot_search) if hot_search else {}
         tasks = [(self.run, version, int(w), lam, i, hs, max_steps) for i, w in enumerate(worlds)]
         totR = totT = 0.0
-        ets = []
+        ets: list[float] = []
         # bounded drain (Fix A): per-result timeout so a wedged worker aborts loud, not deadlocks
         for R, T in self.pool.map(_worker.TASK_SPECS["eval"].callable, tasks, "evaluate", self.run):
             totR += R; totT += T; ets.append(T)
         return totR, totT, ets
 
-    def close(self):
+    def close(self) -> None:
         # Bounded teardown (the "parent never waits unbounded" invariant — Fix A) lives on the
         # WorkerPool; the parent's redis connection is closed here after the pool is reaped.
         self.pool.close()
@@ -178,9 +188,9 @@ class ParallelExecutor:
         except Exception:
             pass
 
-    def __enter__(self):
+    def __enter__(self) -> "ParallelExecutor":
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: Any) -> Literal[False]:
         self.close()
         return False

@@ -40,8 +40,18 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
+
+if TYPE_CHECKING:
+    from chocofarm.az.mlp import ValueMLP
+
+# The transport's record shape: one (feat, pi, mask, g) training record reassembled from the redis
+# raw-byte blobs. Redis client / pipeline objects are `Any` — redis is an ignore_missing_imports
+# stub-gap (the deliberately duck-typed bytes-store; the ADR-0012 P7 role, design §7).
+_Record = tuple["npt.NDArray[Any]", "npt.NDArray[Any]", "npt.NDArray[Any]", float]
 
 
 # ---- net (de)serialization as raw bytes — DELEGATED to WeightContainer (audit item J) ----
@@ -54,7 +64,7 @@ import numpy as np
 # pre-J encoder (the param order is the container's canonical order, which is the historical order).
 
 
-def pack_net(net):
+def pack_net(net: "ValueMLP") -> tuple[str, bytes]:
     """Pack a ValueMLP into (manifest_json: str, blob: bytes) — DELEGATED to
     `WeightContainer.pack` (the one owner of the weight layout, audit item J). Raw `tobytes()` of each
     weight concatenated, a JSON manifest of (name, shape, dtype, offset, byte-length) + the scalar
@@ -64,7 +74,7 @@ def pack_net(net):
     return WeightContainer.pack(net)
 
 
-def unpack_net(manifest_json, blob):
+def unpack_net(manifest_json: str, blob: bytes) -> "ValueMLP":
     """Reconstruct a ValueMLP from `pack_net`'s (manifest, blob). The container reads the manifest's
     construction meta (so older manifests without `residual` → block OFF); this builds the net via the
     `ValueMLP` constructor (so the Wr*/br* layout entries have a slot to bind to), then the container
@@ -84,7 +94,7 @@ def unpack_net(manifest_json, blob):
 # the on-the-wire protocol: a key change is a one-site change, and the worker side (worker.py) builds
 # its read/write keys through the SAME helpers, so the parent and child can never disagree.
 
-def weight_keys(run, phase, version):
+def weight_keys(run: str, phase: str, version: int) -> tuple[str, str]:
     """The two weight keys for (run, phase, version): (manifest_key, blob_key) =
     `az:w:<run>:<phase>:<version>:m`, `az:w:<run>:<phase>:<version>:b`.  The `phase` segment
     (∈ {"gen","eval"}) is the R14 namespacing that lets the two phases of one iteration `it` publish
@@ -93,7 +103,7 @@ def weight_keys(run, phase, version):
     return base + ":m", base + ":b"
 
 
-def result_keys(res_token, idx):
+def result_keys(res_token: str, idx: int) -> tuple[str, str, str, str]:
     """The four result-blob keys for (res_token, idx): (X, PI, M, Y) =
     `az:res:<token>:<idx>:X|PI|M|Y`. Byte-identical to the pre-split f-strings."""
     base = f"az:res:{res_token}:{idx}"
@@ -101,7 +111,7 @@ def result_keys(res_token, idx):
 
 
 # ---- redis connection (raw-bytes transport; no pickle) ----
-def _redis_params():
+def _redis_params() -> dict[str, str | int]:
     """TRANSPORT connection facts from chocofarm/config.py — the ephemeral allkeys-lru instance
     (127.0.0.1:6380 db 0 by default), deliberately distinct from the registry's disk-persisted
     noeviction instance. Env-overridable via the `CHOCO_TRANSPORT_REDIS_*` family."""
@@ -109,7 +119,9 @@ def _redis_params():
     return config.transport_redis_params()
 
 
-def connect():
+def connect() -> Any:
+    # returns Any: redis is a documented ignore_missing_imports stub-gap (the duck-typed bytes-store,
+    # ADR-0012 P7), so the `redis.Redis` client is Any at this seam — not a convenience widening.
     import redis  # local import so a serial (workers=0) run needs no redis at all
     # Bound EVERY socket op (ADR-0002 / deadlock fix H2). The default `socket_timeout=None`
     # makes every r.get / pipe.execute block FOREVER if the TCP socket stalls — a stalled
@@ -119,10 +131,17 @@ def connect():
     # are per-iteration) instead of a silent permanent hang. Loopback redis under no memory
     # pressure never trips 60s, so this is a safety net, not a happy-path behavior change.
     from chocofarm import config
+    # redis-py (8.x) ships py.typed, so Redis(**dict[str, str | int]) fails the precise kwarg types
+    # (host:str / port:int / db:int). Pass the three connection facts explicitly-typed — the params
+    # dict's runtime keys are exactly these (config.transport_redis_params()), no behavior change
+    # (the same pattern hp/registry.py already uses for its strict-clean redis construction).
+    params = _redis_params()
     r = redis.Redis(
+        host=str(params["host"]),
+        port=int(params["port"]),
+        db=int(params["db"]),
         socket_timeout=config.redis_socket_timeout(),
         socket_connect_timeout=config.redis_connect_timeout(),
-        **_redis_params(),
     )
     r.ping()   # fail loud now if redis is unreachable (ADR-0002), not mid-iteration
     return r
@@ -134,7 +153,7 @@ def connect():
 # post-mortem found ~980 such leaked az:res:* keys, TTL=-1). A 1h TTL bounds that leak without
 # affecting the happy path (read+deleted within seconds). `ex=` sets the expiry in the same SET
 # round-trip (no extra command). Env-overridable.
-def _result_ttl():
+def _result_ttl() -> int:
     return int(os.environ.get("CHOCO_RESULT_TTL", "3600"))
 
 
@@ -149,11 +168,11 @@ class RedisTransport:
     key strings, the TTLs, and the (un)packing all route through this module either way, so there is
     exactly one wire protocol."""
 
-    def __init__(self, conn):
+    def __init__(self, conn: Any) -> None:
         self.r = conn
 
     # ---- weights: parent publishes, worker reads ----
-    def publish_weights(self, net, phase, version, run):
+    def publish_weights(self, net: "ValueMLP", phase: str, version: int, run: str) -> None:
         """Pack the net to raw bytes and publish to redis `az:w:<run>:<phase>:<version>` (no pickle,
         no disk).  Workers `read_weights` it when the `(phase, version)` changes.  Weight keys carry a
         1h expiry.  The `phase` segment (R14) namespaces gen vs eval within one iteration, so the two
@@ -168,14 +187,15 @@ class RedisTransport:
         pipe.execute()
 
     # ---- results: worker writes, parent reads+deletes ----
-    def read_and_delete_results(self, res_token, metas):
+    def read_and_delete_results(self, res_token: str,
+                                metas: list[tuple[int, int, int, int]]) -> list[_Record]:
         """Read the raw-byte result blobs the workers wrote for `metas` (a list of (idx, n, feat_dim,
         n_slots)) back into one flat list of (feat, pi, mask, g) records, then DELETE the keys (raw
         bytes can be large; don't leak across iterations). The happy-path cleanup that pairs with
         `write_results`' TTL safety net."""
-        out = []
+        out: list[_Record] = []
         pipe = self.r.pipeline(transaction=False)
-        order = []
+        order: list[tuple[int, int, int, int, str, str, str, str]] = []
         for (idx, n, fd, ns) in metas:
             if n == 0:
                 continue
@@ -200,7 +220,7 @@ class RedisTransport:
         return out
 
 
-def read_weights(conn, run, phase, version):
+def read_weights(conn: Any, run: str, phase: str, version: int) -> tuple[str, bytes]:
     """Worker-side weight READ: fetch the raw-bytes payload for (run, phase, version) over `conn` and
     return (manifest_str, blob_bytes). A missing payload is a loud RuntimeError (ADR-0002: never a
     silent stale-net serve). The bytes feed `unpack_net`; the (un)packing stays the WeightContainer's.
@@ -213,7 +233,8 @@ def read_weights(conn, run, phase, version):
     return manifest.decode("utf-8"), blob
 
 
-def write_results(conn, res_token, idx, X, PI, M, Y):
+def write_results(conn: Any, res_token: str, idx: int, X: npt.NDArray[Any], PI: npt.NDArray[Any],
+                  M: npt.NDArray[Any], Y: npt.NDArray[Any]) -> None:
     """Worker-side result WRITE: pipeline the four contiguous float32 blocks (X/PI/M/Y) under the
     per-task result keys, each with the result TTL set in the same SET round-trip (the aborted-iteration
     self-clean safety net). No pickle — `tobytes()` of contiguous arrays."""

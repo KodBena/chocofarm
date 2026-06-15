@@ -43,10 +43,12 @@ from __future__ import annotations
 
 import math
 import weakref
+from typing import Any, cast
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import Environment
+from chocofarm.model.env import Collected, Environment, Loc, WorldSet
 from chocofarm.solvers.ismcts import _belief_key
 from chocofarm.az.dtypes import DTYPE
 from chocofarm.az.kernels import belief_marg_cover
@@ -184,7 +186,7 @@ class FeatureLayout:
 # entry tied to the object's lifetime (not its address) cannot alias a different env at a reused
 # CPython address (the old id(env) address-reuse hazard). See actions._SLOT_TABLES for the full R9
 # rationale, including the deviation from the audit's literal "env attribute" (it would cycle).
-_LAYOUTS = weakref.WeakKeyDictionary()
+_LAYOUTS: "weakref.WeakKeyDictionary[Environment, FeatureLayout]" = weakref.WeakKeyDictionary()
 
 
 def feature_layout(env: Environment) -> "FeatureLayout":
@@ -206,6 +208,13 @@ def feature_dim(env: Environment) -> int:
     per-detector is nD×3; global is (6 + n_teleports) (the +1 over the prior 5 is the global
     Σ_uncollected unc scalar). On the live env: 20·5 + 44·3 + (6+3) = 241."""
     return feature_layout(env).dim
+
+
+# The per-loc static distance block: (dist_t, dist_d, dist_w, exit_cost_norm) — three normalized
+# distance arrays plus the scalar exit-cost. The belief-derived bundle `_belief_feats` returns:
+# (marg, p_pos, informative, marg_sum, sharpness, nb).
+_LocBlock = tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any], float]
+_BeliefFeat = tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any], float, float, int]
 
 
 class FeatureBuilder:
@@ -241,7 +250,7 @@ class FeatureBuilder:
         "dist_w",
     })
 
-    def __init__(self, env: Environment):
+    def __init__(self, env: Environment) -> None:
         self.env = env
         self.N = env.N
         self.K = env.K
@@ -256,8 +265,10 @@ class FeatureBuilder:
         # block, so reordering a block in FeatureLayout moves the write here in lockstep.
         self.layout = FeatureLayout(env)
         self.dim = self.layout.dim
-        self._loc_cache = {}      # loc -> (dist_block (N+nD+n_tel,), exit_cost_norm)
-        self._belief_cache = {}   # _belief_key -> list of (bw_ref, BeliefFeat)
+        # loc -> (dist_t, dist_d, dist_w, exit_cost_norm) (the per-loc static distance block)
+        self._loc_cache: dict[Loc, _LocBlock] = {}
+        # _belief_key -> list of (bw_ref, BeliefFeat), bucketed for collision verification
+        self._belief_cache: dict[Any, list[tuple[WorldSet, _BeliefFeat]]] = {}
         self._belief_cache_n = 0  # entry count, for the safety-net cap below
         # Safety cap: callers that drive the cache as an episode-scoped store (GumbelAZSearch
         # resets it per episode) keep it small, but a caller that never resets (e.g. an ISMCTS
@@ -266,7 +277,7 @@ class FeatureBuilder:
         # ANY caller — far above one episode's distinct-belief count (hundreds).
         self._belief_cache_cap = 50000
 
-    def reset_belief_cache(self):
+    def reset_belief_cache(self) -> None:
         """Drop the per-belief cache (call between unrelated search lifetimes if memory matters;
         correctness does not depend on it — the cache only ever returns features of a belief that
         compared equal)."""
@@ -274,7 +285,7 @@ class FeatureBuilder:
         self._belief_cache_n = 0
 
     # ---- per-loc static distance block (structural memo) ----
-    def _loc_block(self, loc):
+    def _loc_block(self, loc: Loc) -> _LocBlock:
         cached = self._loc_cache.get(loc)
         if cached is not None:
             return cached
@@ -292,7 +303,7 @@ class FeatureBuilder:
         return block
 
     # ---- belief-derived intermediates (cached by belief, verified on collision) ----
-    def _belief_feats(self, bw):
+    def _belief_feats(self, bw: WorldSet) -> _BeliefFeat:
         """Returns (marg, p_pos, informative, marg_sum, sharpness, nb) — all functions of `bw`
         alone. Cached by `_belief_key`; a hit is verified with `np.array_equal` so a key
         collision never returns another belief's features."""
@@ -310,7 +321,11 @@ class FeatureBuilder:
         # so it folds the separate `env.marginals(bw)` call into the same pass. The kernel is
         # int/float64 internally (bit-exact); the dtype cast to DTYPE happens in `build`.
         if nb:
-            marg, cnt = belief_marg_cover(bw, self.cover, self.N)
+            # the numba @njit kernel is Any-typed (numba is an ignore_missing_imports stub-gap); the
+            # cast states the (marg float64, cnt int) contract the single-pass kernel produces — a
+            # commented Any-seam cast, no runtime change (same arrays the kernel returns).
+            marg, cnt = cast("tuple[npt.NDArray[Any], npt.NDArray[Any]]",
+                             belief_marg_cover(bw, self.cover, self.N))
             p_pos = cnt / nb
             informative = ((cnt > 0) & (cnt < nb)).astype(np.float64)
             sharpness = math.log(nb) / self.log_nworlds
@@ -331,7 +346,7 @@ class FeatureBuilder:
         self._belief_cache_n += 1
         return feats
 
-    def build(self, loc, bw, collected) -> np.ndarray:
+    def build(self, loc: Loc, bw: WorldSet, collected: Collected) -> npt.NDArray[Any]:
         """Build the §2.2 feature vector at `(loc, bw, collected)`. The fused numba kernel computes
         the marginals AND the detector counts in one pass (kernels.belief_marg_cover), so the
         builder always derives its own marginals here — the kernel's marg is bit-identical to
