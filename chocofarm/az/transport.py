@@ -27,9 +27,13 @@ Weight (un)packing STAYS delegated to `WeightContainer` (audit item J): this mod
 byte-identical to the pre-split encoder (R14 changes only the weight KEY shape — the phase segment —
 not the payload bytes, the float32 wire representation, or the result protocol).
 
-Connection facts come from `chocofarm/config.py` (`redis_params()` / `redis_socket_timeout()` /
-`redis_connect_timeout()`), defaulting to 127.0.0.1:6379 db 0 — DO NOT change which instance/db this
-targets (the module is shared with the registry's `redis_params()`).
+Connection facts come from `chocofarm/config.py` (`transport_redis_params()` / `redis_socket_timeout()`
+/ `redis_connect_timeout()`), defaulting to 127.0.0.1:6380 db 0 — the EPHEMERAL memory-cache instance
+(`allkeys-lru`, a `maxmemory` cap), DELIBERATELY DISTINCT from the registry's disk-persisted 6379
+`noeviction` instance (`registry_redis_params()`). The transport's churn (versioned weight blobs,
+per-task result blobs) is short-lived — 1h TTLs, read+deleted within the iteration — so it belongs on
+the LRU-evicting instance, not the persisted one. Override the transport instance independently via
+`CHOCO_TRANSPORT_REDIS_HOST`/`CHOCO_TRANSPORT_REDIS_PORT`/`CHOCO_TRANSPORT_REDIS_DB`.
 
 Public Domain (The Unlicense).
 """
@@ -98,10 +102,11 @@ def result_keys(res_token, idx):
 
 # ---- redis connection (raw-bytes transport; no pickle) ----
 def _redis_params():
-    """Shared connection facts from chocofarm/config.py (the registry uses the same), so transport
-    and registry address one redis instance by default."""
+    """TRANSPORT connection facts from chocofarm/config.py — the ephemeral allkeys-lru instance
+    (127.0.0.1:6380 db 0 by default), deliberately distinct from the registry's disk-persisted
+    noeviction instance. Env-overridable via the `CHOCO_TRANSPORT_REDIS_*` family."""
     from chocofarm import config
-    return config.redis_params()
+    return config.transport_redis_params()
 
 
 def connect():
