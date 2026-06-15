@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-chocofarm AZ — the value-target rule (suffix MC return-to-go + the Part B lower-variance blend).
+chocofarm AZ — the AZ training-target rules: the VALUE-target (suffix MC return-to-go + the Part B
+lower-variance blend) AND the POLICY-target (the Danihelka improved policy + v_mix completion).
+
+Public Domain (The Unlicense).
 
 ONE place for the λ-penalized return-to-go computation. It used to be duplicated across
 `exit_loop.generate_episode` and `dataset.py:_episode_transitions` (the az-exit-loop §(f) audit
@@ -54,8 +57,41 @@ so an optimism regression is observable. See docs/results/az-parallel-exp.md §P
 Both knobs are mutually exclusive at the loop CLI; this module accepts whichever is set. When both
 defaults hold (`n_step is None`, `lam_blend == 1.0`) the output is bit-identical to the prior
 suffix-only rule (asserted by tests) — Part B is opt-in.
+
+POLICY-target rule (the Danihelka improved policy, audit item C)
+----------------------------------------------------------------
+The other half of the AZ target — the improved-policy target π′ the apprentice regresses onto —
+also lives here, as PURE functions of explicit inputs (`v_mix`, `improved_policy`). They were
+previously welded into `gumbel_search.py` as `_v_mix`/`_improved_policy`, side-reading the live
+tree's node statistics so they could not be called or unit-tested outside a search. The math is
+Danihelka et al. 2022 §3, UNCHANGED — only the inputs are now explicit:
+
+  * `v_mix(root_value, visited_q, visited_n, prior, legal_slots)`  — §3 value completion for
+    unvisited actions: the net leaf value blended with the PRIOR-weighted (not visit-weighted) mean
+    of the visited actions' Q. The prior-weighting matters precisely because Sequential Halving
+    makes the visit counts deliberately unequal (`tests/test_az_loop.py::test_vmix_prior_weighted`).
+
+  * `improved_policy(logits, visited_q, visited_n, root_value, prior, legal_slots, c_visit, c_scale)`
+    — π′ = softmax(logit + σ(completedQ)) over the legal slots, where σ(q) = (c_visit + max_a N(a))
+    · c_scale · q is the paper's monotone transform and unvisited actions have their Q completed by
+    `v_mix`. Returns an (n_slots,) probability row (exactly zero on illegal slots).
+
+`GumbelAZSearch` collects the per-root-action (Q, N) etc. from the live node and CALLS these; its
+`_v_mix`/`_improved_policy`/`_sigma_scale` are now thin wrappers that gather the node stats and
+delegate. The math, the call order, and the byte-identical outputs are unchanged.
 """
 from __future__ import annotations
+
+import numpy as np
+
+# The policy-target rule's final step is the masked softmax over the legal slots. It has ONE home —
+# `ValueMLP._masked_softmax`, a pure numpy staticmethod with no net state (the SAME function the
+# welded rule called as `net._masked_softmax`). We bind it here rather than re-implement it, so the
+# extraction does not spawn a fourth copy of the masked-softmax math. `mlp` is a light numpy module
+# (no JAX) and does not import this module, so there is no import cycle and no heavy dependency.
+from chocofarm.az.mlp import ValueMLP as _ValueMLP
+
+_masked_softmax = _ValueMLP._masked_softmax
 
 
 def suffix_returns_to_go(step_rt, exit_c, lam):
@@ -145,3 +181,86 @@ def blended_returns_to_go(step_rt, boot, exit_c, lam, lam_blend=1.0, n_step=None
         g_next = g_j
         boot_next = boot[j]
     return out
+
+
+# ========================================================================================
+# POLICY-target rule (Danihelka et al. 2022 §3 improved policy + v_mix) — audit item C
+#
+# Pure functions of explicit per-root-action inputs. `GumbelAZSearch` gathers the live node's
+# statistics (root.value / root.prior / root.q / root.N over the legal slots) and CALLS these;
+# the math is byte-for-byte the rule that used to live in `gumbel_search._v_mix`/`_improved_policy`.
+#
+# Per-slot input convention: `prior` is the (n_slots,) net-prior array (= root.prior, float32 by
+# default); `visited_q`/`visited_n` are slot-indexed SEQUENCES (length ≥ max legal slot) and
+# `legal_slots` is the list of legal slot indices. For a legal slot `s`:
+#   * prior[s]      = the net's masked-softmax prior P(s,·) (= root.prior[s]),
+#   * visited_n[s]  = N(s), the root selection count of slot s (0 if unvisited),
+#   * visited_q[s]  = Q(s), the running λ-penalized return mean of slot s (read only when N(s)>0).
+# This mirrors exactly what the search side-read from the node (root.prior[s], root.N[a], root.q(a)
+# with a = slot_to_action(s)), now passed in explicitly so the rule is unit-testable without a tree.
+#
+# BYTE-IDENTITY NOTE: the caller passes `visited_q`/`visited_n` as PLAIN PYTHON float/int sequences
+# (not numpy arrays). The welded rule multiplied the float32 `prior[s]` by `root.q(a)` (a Python
+# float, weak under numpy promotion) → float32, while `σ·Q` in the completion used Q's full float64
+# magnitude. Python scalars reproduce both; a numpy array would upcast (float64) or truncate
+# (float32) the prior-weighted product and break byte-identity. `prior`, `logits` stay numpy.
+# ========================================================================================
+
+def sigma_scale(visited_n, legal_slots, c_visit, c_scale):
+    """The Danihelka §3 monotone Q-transform scale σ-prefactor: (c_visit + max_a N(a)) · c_scale.
+
+    `max_a N(a)` is taken over the root's selection counts; matches `GumbelAZSearch._sigma_scale`
+    (= (c_visit + max(root.N.values())) * c_scale, with max 0 when no action was visited)."""
+    max_n = max((visited_n[s] for s in legal_slots), default=0)
+    return (c_visit + max_n) * c_scale
+
+
+def v_mix(root_value, visited_q, visited_n, prior, legal_slots):
+    """Danihelka §3 value-completion for unvisited actions:
+
+        v_mix = (v_net + ΣN · v̄) / (1 + ΣN),
+        v̄ = Σ_{b:N(b)>0} π(b)·Q(b) / Σ_{b:N(b)>0} π(b)   (PRIOR-weighted, not visit-weighted)
+
+    `root_value` = v_net (the net leaf value at the root); ΣN = Σ_s visited_n[s] over legal slots.
+    Returns `root_value` unchanged when no action was visited (ΣN == 0) or all visited priors are 0
+    — the degenerate fallback the search uses. Byte-identical to the former `_v_mix`.
+
+    `sum_n` is forced to a plain Python `int` (as `sum(root.N.values())` was): a numpy int here would
+    upcast the float32 `v_bar` to float64 in `sum_n * v_bar`, breaking the float32 promotion of the
+    welded rule. The weak Python int keeps `sum_n * v_bar` at `v_bar`'s dtype — the original."""
+    sum_n = int(sum(visited_n[s] for s in legal_slots))
+    pw_num = pw_den = 0.0
+    for s in legal_slots:
+        if visited_n[s] > 0:
+            pw_num += prior[s] * visited_q[s]
+            pw_den += prior[s]
+    if sum_n > 0 and pw_den > 0:
+        v_bar = pw_num / pw_den
+        return (root_value + sum_n * v_bar) / (1 + sum_n)
+    return root_value
+
+
+def improved_policy(logits, visited_q, visited_n, root_value, prior, legal_slots,
+                    c_visit, c_scale):
+    """π′ = softmax(logit + σ(completedQ)) over the legal slots (Danihelka et al. 2022 §3).
+
+    Unvisited legal actions have their Q "completed" by `v_mix` (the prior-weighted value estimate);
+    σ(q) = (c_visit + max_a N(a)) · c_scale · q is the paper's monotone transform. `logits`/`prior`
+    are (n_slots,) slot-indexed arrays (the root logit log P(s,·) and the prior). Returns an
+    (n_slots,) probability row, exactly zero on illegal slots. Byte-identical to the former
+    `_improved_policy` (same operation order; the masked softmax IS `mlp.ValueMLP._masked_softmax`,
+    the same staticmethod the welded rule called — bound at module load, not re-implemented)."""
+    n_slots = len(logits)
+    sigma = sigma_scale(visited_n, legal_slots, c_visit, c_scale)
+    vm = v_mix(root_value, visited_q, visited_n, prior, legal_slots)
+
+    completed = np.full(n_slots, -1e30)
+    for s in legal_slots:
+        q = visited_q[s] if visited_n[s] > 0 else vm
+        completed[s] = logits[s] + sigma * q
+    # softmax over the legal slots — the SAME masked-softmax the welded rule called
+    # (`net._masked_softmax`). `_masked_softmax` is a pure numpy staticmethod with no net state, so
+    # we call it directly: ONE home for the masked-softmax (no copy), byte-identical by construction.
+    legal_arr = np.zeros(n_slots)
+    legal_arr[legal_slots] = 1.0
+    return _masked_softmax(completed[None, :], legal_arr[None, :])[0]

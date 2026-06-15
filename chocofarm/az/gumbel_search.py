@@ -2,6 +2,8 @@
 """
 chocofarm AZ — Gumbel-AlphaZero low-simulation search over chance nodes (design §5).
 
+Public Domain (The Unlicense).
+
 The guided "expert" of the ExIt loop (design §6). It layers Gumbel-AlphaZero root selection
 (Danihelka et al. 2022) on the SO-ISMCTS information-set tree (Cowling et al. 2012; the same
 belief-as-node / chance-node-as-observation scaffold `solvers/ismcts.py` implements), with the
@@ -54,6 +56,9 @@ from chocofarm.az.actions import (n_action_slots, action_to_slot, slot_to_action
                                   legal_mask_from_features, slot_action_tables)
 from chocofarm.solvers.ismcts import _belief_key
 from chocofarm.solvers.base import Policy
+from chocofarm.az.value_target import (improved_policy as _improved_policy_rule,
+                                       v_mix as _v_mix_rule,
+                                       sigma_scale as _sigma_scale_rule)
 
 
 class _Node:
@@ -381,55 +386,56 @@ class GumbelAZSearch:
         return best_a
 
     # ---- improved policy + σ transform (Danihelka et al. 2022) ----
+    #
+    # The RULE lives in `value_target.improved_policy`/`v_mix`/`sigma_scale` (audit item C — the AZ
+    # policy-target rule as pure, unit-testable functions of explicit inputs). The methods below are
+    # thin adapters: they gather the live node's per-slot statistics (root.prior / root.value / N /
+    # Q over the legal slots) into slot-indexed containers and delegate. The math and call order are
+    # unchanged — byte-identical outputs (verified by the audit-item-C byte-identity check).
+
+    def _node_visited_lists(self, root, legal_slots):
+        """Project the node's per-action W/N stats onto slot-indexed (visited_q, visited_n) lists
+        over the legal slots — the explicit per-root-action inputs the value_target rule consumes.
+        `visited_n[s]` = N(slot s) (0 if unvisited); `visited_q[s]` = Q(slot s) = root.q(action).
+
+        These are PLAIN PYTHON lists of Python float / Python int — deliberately NOT numpy arrays.
+        The welded rule arithmetised `root.q(a)` (a Python float, W[a]/n) and `root.N[a]` (a Python
+        int) against the float32 `root.prior[s]`; numpy treats a Python float as a WEAK operand, so
+        `prior[s] * root.q(a)` stays float32 while keeping Q's full float64 magnitude in the σ·q
+        completion. A numpy float64 array would force the prior-weighted product to float64, and a
+        float32 array would truncate Q — either way diverging from the welded rule. Python floats
+        reproduce both exactly. This is the byte-identity seam (audit item C)."""
+        env = self.env
+        visited_q = [0.0] * self.n_slots
+        visited_n = [0] * self.n_slots
+        for s in legal_slots:
+            a = slot_to_action(env, s)
+            n = root.N.get(a, 0)
+            if n > 0:
+                visited_n[s] = n
+                visited_q[s] = root.q(a)
+        return visited_q, visited_n
+
     def _sigma_scale(self, root):
-        max_n = max(root.N.values()) if root.N else 0
-        return (self.c_visit + max_n) * self.c_scale
+        # max_a N(a) over the visited root actions; the legal slots cover every visited action
+        # (root.N keys are always legal), so the max over legal slots equals max(root.N.values()).
+        legal_slots = [action_to_slot(self.env, a) for a in root.legal]
+        _, visited_n = self._node_visited_lists(root, legal_slots)
+        return _sigma_scale_rule(visited_n, legal_slots, self.c_visit, self.c_scale)
 
     def _v_mix(self, root, legal_slots):
-        """Danihelka §3 value-completion for unvisited actions:
-
-            v_mix = (v_net + ΣN · v̄) / (1 + ΣN),
-            v̄ = Σ_{b:N(b)>0} π(b)·Q(b) / Σ_{b:N(b)>0} π(b)   (PRIOR-weighted, not visit-weighted)
-
-        Pure given the node — extracted so the prior-weighting invariant is directly unit-tested."""
-        env = self.env
-        prior = root.prior
-        sum_n = sum(root.N.values())
-        pw_num = pw_den = 0.0
-        for s in legal_slots:
-            a = slot_to_action(env, s)
-            if root.N.get(a, 0) > 0:
-                pw_num += prior[s] * root.q(a)
-                pw_den += prior[s]
-        if sum_n > 0 and pw_den > 0:
-            v_bar = pw_num / pw_den
-            return (root.value + sum_n * v_bar) / (1 + sum_n)
-        return root.value
+        """Thin adapter: gather the node stats and call `value_target.v_mix` (Danihelka §3 value
+        completion — the PRIOR-weighted blend the search uses for unvisited actions)."""
+        visited_q, visited_n = self._node_visited_lists(root, legal_slots)
+        return _v_mix_rule(root.value, visited_q, visited_n, root.prior, legal_slots)
 
     def _improved_policy(self, root, logits, legal_slots):
-        """π′ = softmax(logit + σ(completedQ)) over the legal slots (Danihelka et al. 2022 §3).
-
-        Unvisited legal actions have their Q "completed" by `v_mix`, the paper's value estimate:
-
-            v_mix = (1/(1 + ΣN)) · ( v_net  +  (ΣN / Σ_{b:N(b)>0} π(b)) · Σ_{b:N(b)>0} π(b)·Q(b) )
-
-        where the visited-Q term is the PRIOR-weighted mean of visited actions' Q (the net's prior
-        π over LEGAL slots = root.prior), NOT the visit-weighted mean. This matters under Sequential
-        Halving, where visit counts are deliberately unequal. Returns a (n_slots,) probability row
-        (zero on illegal)."""
-        env = self.env
-        sigma = self._sigma_scale(root)
-        v_mix = self._v_mix(root, legal_slots)
-
-        completed = np.full(self.n_slots, -1e30)
-        for s in legal_slots:
-            a = slot_to_action(env, s)
-            q = root.q(a) if root.N.get(a, 0) > 0 else v_mix
-            completed[s] = logits[s] + sigma * q
-        # softmax over legal slots
-        legal_arr = np.zeros(self.n_slots)
-        legal_arr[legal_slots] = 1.0
-        return self.net._masked_softmax(completed[None, :], legal_arr[None, :])[0]
+        """Thin adapter: gather the node stats and call `value_target.improved_policy`
+        (π′ = softmax(logit + σ(completedQ)) over the legal slots, Danihelka et al. 2022 §3).
+        Returns a (n_slots,) probability row (zero on illegal)."""
+        visited_q, visited_n = self._node_visited_lists(root, legal_slots)
+        return _improved_policy_rule(logits, visited_q, visited_n, root.value, root.prior,
+                                     legal_slots, self.c_visit, self.c_scale)
 
 
 class GumbelPolicy(Policy):
