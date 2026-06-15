@@ -27,41 +27,52 @@ SenseAction's filter/observe/informative — see ENV_ADOPTION (bottom).
 Public Domain (The Unlicense).
 """
 from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from typing import cast
+
 import numpy as np
+import numpy.typing as npt
+
 from chocofarm.model import arrangement as A
+
+# The belief world-set the env threads through the seam (env.WorldSet) — a bitmask array, always
+# int64. Spelled locally so facemodel does not import env (env imports facemodel, not the reverse).
+WorldSet = npt.NDArray[np.int64]
 
 
 class SenseAction:
     """A single 'go to face F' action: where to stand, and what it tells you."""
-    def __init__(self, face: A.Face):
+    def __init__(self, face: A.Face) -> None:
         self.face = face
-        self.bitmask = face.bitmask          # cover as bits
-        self.cover = face.cover
-        self.rep_point = face.rep_point
+        self.bitmask: int = face.bitmask          # cover as bits
+        self.cover: frozenset[int] = face.cover
+        self.rep_point: tuple[float, float] = face.rep_point
 
     # --- cost: travel to the face's interior representative point ---
-    def cost(self, loc, dist) -> float:
+    def cost(self, loc: tuple[float, float],
+             dist: Callable[[tuple[float, float], tuple[float, float]], float]) -> float:
         return dist(loc, self.rep_point)
 
     # --- belief update: the disjunction over the cover, against a world-set ---
-    def filter(self, bw: np.ndarray, positive: bool) -> np.ndarray:
+    def filter(self, bw: WorldSet, positive: bool) -> WorldSet:
         hit = (bw & self.bitmask) != 0
-        return bw[hit if positive else ~hit]
+        return cast(WorldSet, bw[hit if positive else ~hit])
 
     def observe(self, world: int) -> bool:
         """The true reading at this face for a concrete world."""
         return bool(world & self.bitmask)
 
-    def informative(self, bw: np.ndarray) -> bool:
+    def informative(self, bw: WorldSet) -> bool:
         """Outcome still uncertain over the current belief — both polarities live."""
         hit = (bw & self.bitmask) != 0
         return bool(hit.any() and (~hit).any())
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Sense{{{','.join(map(str, sorted(self.cover)))}}}@{self.rep_point}"
 
 
-def sense_actions(faces=None):
+def sense_actions(faces: Sequence[A.Face] | None = None) -> list[SenseAction]:
     """The face sense-action set.  Singleton faces are exact single-treasure
     probes (τ_j? — 70% of area); the genuine disjunctive VoI lives in the k≥2
     faces.  Callers may prune dominated/singleton faces; the model does not
