@@ -25,14 +25,17 @@ each the sole owner of one concern that used to be fused into this god-object:
   * `worker_pool.WorkerPool` (`chocofarm/az/worker_pool.py`) — the SOLE owner of the multiprocessing
     lifecycle: the spawn pool built with `worker._worker_init`, the per-result bounded drain, the
     `imap_unordered` fan-out under that drain (`map`), and the bounded `close()` teardown.
-  * `worker` + `worker.TaskSpec` (`chocofarm/az/worker.py`) — the unit of work: `_gen_task`/`_eval_task`
-    as the two work-kinds (DATA in `TASK_SPECS`), the version-gated `_ensure_net`, the seed fold
-    `_task_rng`, and the per-worker `_W` global (item L will promote `_W` to a `Worker` object).
+  * `worker.Worker` + `worker.TaskSpec` (`chocofarm/az/worker.py`) — the unit of work: the `Worker`
+    object (item L / R14 — promoted from the per-process `_W` dict) owning env/feature-builder/net/
+    search/current-(phase,version)/redis/base_seed, with `_gen_task`/`_eval_task` as the two
+    module-level work-kind entrypoints (DATA in `TASK_SPECS`) that delegate to the per-process
+    singleton `_WORKER`, the `(phase, version)`-gated `Worker.ensure_net`, and the seed fold
+    `Worker.task_rng`.  The child is JAX-free (the numpy-only contract that removes the deadlock root
+    cause), LOCKED by a fail-loud guard in `Worker.__init__`.
 
 For back-compat (and because the test suite + the weights/registry docstrings reference these names
 on `parallel`), the collaborators' public callables are re-exported here: `pack_net` / `unpack_net` /
-`_connect` / `_drain_imap` / `_worker_init` / `_ensure_net` / `_task_rng` / `_gen_task` / `_eval_task`
-/ `_W`.
+`_connect` / `_drain_imap` / `_worker_init` / `_gen_task` / `_eval_task` / `Worker`.
 
 Why redis transport, not the pool pipe (pickle)
 -----------------------------------------------
@@ -44,8 +47,9 @@ both a CPU cost (pickle is slow on many small arrays) and a serialization point 
 So neither weights nor results travel as pickle:
   * WEIGHTS broadcast — the parent packs the net's arrays as RAW bytes (`ndarray.tobytes()`, no
     pickle) plus a tiny JSON manifest (shapes/dtypes/scalars) into a single redis key
-    `az:w:<run>:<version>`. Workers reconstruct via `np.frombuffer` and rebuild the net only when
-    the version changes (the actor/learner contract). No disk, no pickle.
+    `az:w:<run>:<phase>:<version>`. Workers reconstruct via `np.frombuffer` and rebuild the net only
+    when the `(phase, version)` changes (the actor/learner contract; the R14 phase segment lets gen
+    and eval of one iteration use distinct keys at the same real `version`). No disk, no pickle.
   * RESULTS return — each worker packs its episode's records into CONTIGUOUS raw-byte blocks (feats,
     pis, masks, targets stacked into float32 arrays via `tobytes()`) under a per-task redis key; the
     task returns only the small (idx, n_rows) tuple through the pipe. The parent reads the raw bytes
@@ -77,14 +81,12 @@ from chocofarm.az import transport
 from chocofarm.az import worker as _worker
 from chocofarm.az import worker_pool
 from chocofarm.az.transport import connect as _connect, pack_net, unpack_net
-from chocofarm.az.worker import (
-    _W, _ensure_net, _eval_task, _gen_task, _task_rng, _worker_init,
-)
+from chocofarm.az.worker import Worker, _eval_task, _gen_task, _worker_init
 from chocofarm.az.worker_pool import _RESULT_TIMEOUT_S, _drain_imap
 
 __all__ = [
     "ParallelExecutor", "pack_net", "unpack_net", "_connect", "_drain_imap",
-    "_worker_init", "_ensure_net", "_task_rng", "_gen_task", "_eval_task", "_W",
+    "_worker_init", "_gen_task", "_eval_task", "Worker",
 ]
 
 
@@ -111,21 +113,28 @@ class ParallelExecutor:
         the split). It lives on the transport collaborator now; this property keeps the name."""
         return self.transport.r
 
-    def publish_weights(self, net, version):
-        """Pack the net to raw bytes and publish to redis `az:w:<run>:<version>` (no pickle, no
-        disk). Workers `_ensure_net` read it when the version changes."""
-        self.transport.publish_weights(net, version, self.run)
+    def publish_weights(self, net, version, phase="gen"):
+        """Pack the net to raw bytes and publish to redis `az:w:<run>:<phase>:<version>` (no pickle,
+        no disk).  Workers reload it when the worker-side `(phase, version)` gate changes.  `phase`
+        (R14) namespaces gen vs eval within one iteration; it defaults to "gen" so a bare
+        `publish_weights(net, version)` (back-compat) still publishes the gen-phase key."""
+        self.transport.publish_weights(net, phase, version, self.run)
 
     def generate(self, net, version, worlds, lam, explore_plies, lam_blend, n_step,
                  hot_search=None, max_steps=40):
-        """Publish `net` at `version`, fan E generation episodes across the pool, read the raw-byte
-        results back from redis and reshape into one flat list of (feat, pi, mask, g) records. The
-        parent draws `worlds` so the world sequence is reproducible regardless of worker count.
+        """Publish `net` at `("gen", version)`, fan E generation episodes across the pool, read the
+        raw-byte results back from redis and reshape into one flat list of (feat, pi, mask, g)
+        records.  The parent draws `worlds` so the world sequence is reproducible regardless of worker
+        count.
+
+        Phase is set internally to "gen" (the public signature stays `(net, version, ...)` — R14): the
+        gen weights land at `az:w:<run>:gen:<version>`, distinct from the eval phase's key for the
+        SAME `version`, so the worker reloads correctly at the gen→eval transition.
 
         `hot_search`/`max_steps` (hp-registry §3.4): the live HOT search knobs + rollout cap for
         this iteration, threaded into each task so the worker rebuilds its search with the live
-        values on the version bump (which happens every iteration)."""
-        self.publish_weights(net, version)
+        values on the `(phase, version)` change (which happens every phase/iteration)."""
+        self.publish_weights(net, version, phase="gen")
         res_token = uuid.uuid4().hex[:12]
         hs = dict(hot_search) if hot_search else {}
         tasks = [(self.run, version, int(w), lam, explore_plies, lam_blend, n_step, i, res_token,
@@ -136,13 +145,18 @@ class ParallelExecutor:
         return self.transport.read_and_delete_results(res_token, metas)
 
     def evaluate(self, net, version, worlds, lam, hot_search=None, max_steps=40):
-        """Publish `net` at `version`, fan N eval episodes across the pool; return (totR, totT,
-        list_of_T). Eval results are scalars (R, T) so they ride the pipe directly — no redis blob
-        needed (the array transport is only for the large generation records).
+        """Publish `net` at `("eval", version)`, fan N eval episodes across the pool; return (totR,
+        totT, list_of_T).  Eval results are scalars (R, T) so they ride the pipe directly — no redis
+        blob needed (the array transport is only for the large generation records).
+
+        Phase is set internally to "eval" (the public signature stays `(net, version, ...)` — R14):
+        the POST-TRAIN eval weights land at `az:w:<run>:eval:<version>` at the SAME real `version` the
+        gen phase used, NOT a faked `version + 1_000_000`.  The worker's `(phase, version)` gate
+        reloads the trained weights at the gen→eval transition because the phase changed.
 
         `hot_search`/`max_steps` (hp-registry §3.4): the live HOT search knobs + rollout cap,
         threaded as in `generate`."""
-        self.publish_weights(net, version)
+        self.publish_weights(net, version, phase="eval")
         hs = dict(hot_search) if hot_search else {}
         tasks = [(self.run, version, int(w), lam, i, hs, max_steps) for i, w in enumerate(worlds)]
         totR = totT = 0.0

@@ -6,14 +6,26 @@ wire protocol (audit item K, the Transport ⊥ Pool ⊥ Task split out of `paral
 This module owns EVERYTHING about how weights and results travel over redis and nothing about the
 process pool (that is `worker_pool.py`) or what one worker computes (that is `worker.py`). Concretely
 it owns: the bounded-timeout connection construction + fail-loud ping (ADR-0002 / deadlock fix H2),
-the ONE place the `az:w:<run>:<version>:m|:b` weight keys and the `az:res:<token>:<idx>:X|PI|M|Y`
-result keys are spelled (`weight_keys()` / `result_keys()` — no f-strings scattered across
-publish/ensure_net/gen_task/collect anymore), the weight publish/read, the result blob write, and the
-result blob read+delete. The TTLs live here too (weights 3600s; results `CHOCO_RESULT_TTL`).
+the ONE place the `az:w:<run>:<phase>:<version>:m|:b` weight keys and the
+`az:res:<token>:<idx>:X|PI|M|Y` result keys are spelled (`weight_keys()` / `result_keys()` — no
+f-strings scattered across publish/ensure_net/gen_task/collect anymore), the weight publish/read, the
+result blob write, and the result blob read+delete. The TTLs live here too (weights 3600s; results
+`CHOCO_RESULT_TTL`).
+
+Weight-key PHASE dimension (R14 — kills the `it + 1_000_000` hack).  The weight key carries a
+`phase ∈ {"gen", "eval"}` segment between run and version, so the gen and eval phases of ONE
+iteration `it` publish to DISTINCT keys (`az:w:<run>:gen:<it>` vs `az:w:<run>:eval:<it>`) using the
+REAL iteration `it` as `version` — the eval phase no longer fakes a distinct version via
+`it + 1_000_000`.  `publish_weights` / `read_weights` / `weight_keys` all take `phase`.  RESULT keys
+do NOT carry phase: results exist only for the gen phase, and each `generate` call namespaces them
+under a fresh per-call `res_token` (a uuid), so there is no phase collision to disambiguate — adding
+phase there would be dead symmetry (stated choice; ADR-0008: don't fabricate a dimension a key
+doesn't need).
 
 Weight (un)packing STAYS delegated to `WeightContainer` (audit item J): this module calls
-`pack_net`/`unpack_net` and never re-encodes the layout. The key STRINGS and the on-the-wire bytes are
-byte-identical to the pre-split encoder — the protocol is unchanged, only its ownership is.
+`pack_net`/`unpack_net` and never re-encodes the layout. The blob/manifest WIRE BYTES are
+byte-identical to the pre-split encoder (R14 changes only the weight KEY shape — the phase segment —
+not the payload bytes, the float32 wire representation, or the result protocol).
 
 Connection facts come from `chocofarm/config.py` (`redis_params()` / `redis_socket_timeout()` /
 `redis_connect_timeout()`), defaulting to 127.0.0.1:6379 db 0 — DO NOT change which instance/db this
@@ -68,10 +80,12 @@ def unpack_net(manifest_json, blob):
 # the on-the-wire protocol: a key change is a one-site change, and the worker side (worker.py) builds
 # its read/write keys through the SAME helpers, so the parent and child can never disagree.
 
-def weight_keys(run, version):
-    """The two weight keys for (run, version): (manifest_key, blob_key) =
-    `az:w:<run>:<version>:m`, `az:w:<run>:<version>:b`. Byte-identical to the pre-split f-strings."""
-    base = f"az:w:{run}:{version}"
+def weight_keys(run, phase, version):
+    """The two weight keys for (run, phase, version): (manifest_key, blob_key) =
+    `az:w:<run>:<phase>:<version>:m`, `az:w:<run>:<phase>:<version>:b`.  The `phase` segment
+    (∈ {"gen","eval"}) is the R14 namespacing that lets the two phases of one iteration `it` publish
+    to distinct keys at the SAME real `version=it` — replacing the `it + 1_000_000` version hack."""
+    base = f"az:w:{run}:{phase}:{version}"
     return base + ":m", base + ":b"
 
 
@@ -126,19 +140,21 @@ _WEIGHT_TTL_S = 3600
 class RedisTransport:
     """The SOLE owner of the AZ parallel-loop redis raw-bytes protocol. Construct on the parent (with
     a `connect()`'d client) for weight publish + result read; the worker side calls the module-level
-    read/write functions with its OWN connection (kept in `_W`, item L) — but the key strings, the
-    TTLs, and the (un)packing all route through this module either way, so there is exactly one wire
-    protocol."""
+    read/write functions with its OWN connection (kept on the `Worker` singleton, item L) — but the
+    key strings, the TTLs, and the (un)packing all route through this module either way, so there is
+    exactly one wire protocol."""
 
     def __init__(self, conn):
         self.r = conn
 
     # ---- weights: parent publishes, worker reads ----
-    def publish_weights(self, net, version, run):
-        """Pack the net to raw bytes and publish to redis `az:w:<run>:<version>` (no pickle, no disk).
-        Workers `read_weights` it when the version changes. Weight keys carry a 1h expiry."""
+    def publish_weights(self, net, phase, version, run):
+        """Pack the net to raw bytes and publish to redis `az:w:<run>:<phase>:<version>` (no pickle,
+        no disk).  Workers `read_weights` it when the `(phase, version)` changes.  Weight keys carry a
+        1h expiry.  The `phase` segment (R14) namespaces gen vs eval within one iteration, so the two
+        phases of `it` publish to distinct keys at `version=it`."""
         manifest, blob = pack_net(net)
-        mk, bk = weight_keys(run, version)
+        mk, bk = weight_keys(run, phase, version)
         pipe = self.r.pipeline(transaction=False)
         pipe.set(mk, manifest)
         pipe.set(bk, blob)
@@ -179,15 +195,16 @@ class RedisTransport:
         return out
 
 
-def read_weights(conn, run, version):
-    """Worker-side weight READ: fetch the raw-bytes payload for (run, version) over `conn` and return
-    (manifest_str, blob_bytes). A missing payload is a loud RuntimeError (ADR-0002: never a silent
-    stale-net serve). The bytes feed `unpack_net`; the (un)packing stays the WeightContainer's."""
-    mk, bk = weight_keys(run, version)
+def read_weights(conn, run, phase, version):
+    """Worker-side weight READ: fetch the raw-bytes payload for (run, phase, version) over `conn` and
+    return (manifest_str, blob_bytes). A missing payload is a loud RuntimeError (ADR-0002: never a
+    silent stale-net serve). The bytes feed `unpack_net`; the (un)packing stays the WeightContainer's.
+    The `phase` (R14) selects gen vs eval weights at the same real `version`."""
+    mk, bk = weight_keys(run, phase, version)
     manifest = conn.get(mk)
     blob = conn.get(bk)
     if manifest is None or blob is None:
-        raise RuntimeError(f"weight payload az:w:{run}:{version} missing from redis")
+        raise RuntimeError(f"weight payload az:w:{run}:{phase}:{version} missing from redis")
     return manifest.decode("utf-8"), blob
 
 

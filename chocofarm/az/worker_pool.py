@@ -5,15 +5,21 @@ lifecycle (audit item K, the Pool third of the Transport ⊥ Pool ⊥ Task split
 
 This module owns the process-pool lifecycle and nothing about the redis wire protocol (that is
 `transport.py`) or what one worker computes (that is `worker.py`). Concretely it owns: the
-`mp.get_context("spawn")` pool built with `worker._worker_init` (NOT fork — a clean child, no
-inherited numba/jax state), the per-result bounded drain `_drain_imap` (the deadlock-RCA load-bearing
-piece: a per-`it.next(timeout)` bound, NOT a whole-fan-out bound, → a LOUD diagnosable RuntimeError),
-the `imap_unordered` fan-out under that drain (`map(...)`), and the bounded `close()` teardown (close →
-per-proc `join(grace)` → `terminate()` stragglers → reap) plus the context-manager.
+`mp.get_context("spawn")` pool built with `worker._worker_init` (NOT fork — a clean child; R14 makes
+this MORE load-bearing, see below), the per-result bounded drain `_drain_imap` (the deadlock-RCA
+load-bearing piece: a per-`it.next(timeout)` bound, NOT a whole-fan-out bound, → a LOUD diagnosable
+RuntimeError), the `imap_unordered` fan-out under that drain (`map(...)`), and the bounded `close()`
+teardown (close → per-proc `join(grace)` → `terminate()` stragglers → reap) plus the context-manager.
 
-Every band-aid from the jaxtrain-deadlock RCA is preserved here verbatim: spawn (not fork), the
-per-result timeout with the exact loud message naming phase/run/collected-count/SIGUSR1 hint, and the
-bounded teardown so the parent never waits unbounded anywhere.
+The deadlock-RCA band-aids owned HERE are KEPT byte-for-byte and re-justified on orthogonal grounds
+(R14 — the root cause, JAX-in-the-spawn-child, was removed in `worker.py`, but these guards address
+wedge modes that remain reachable in the numpy/numba child): spawn (not fork) — now MORE justified,
+since fork would copy the parent's live JAX/XLA runtime state into the child and VIOLATE the
+numpy-only contract `worker.py` now enforces; the per-result timeout with the exact loud message
+naming phase/run/collected-count/SIGUSR1 hint — fail-loud (ADR-0002) for ANY worker wedge (a numba
+lock or a socket stall, both still possible); and the bounded teardown so the parent never waits
+unbounded anywhere.  (The `XLA_FLAGS` setdefault — the ONE band-aid R14 retired as moot — lived in
+`worker.py`'s `_worker_init`, not here.)
 
 Public Domain (The Unlicense).
 """
@@ -69,7 +75,10 @@ class WorkerPool:
         import multiprocessing as mp
         from chocofarm.az.worker import _worker_init
         self.n_workers = int(n_workers)
-        ctx = mp.get_context("spawn")               # spawn: clean process, no inherited numba/jax state
+        # spawn (KEPT, MORE justified by R14): a clean fresh-interpreter child. fork would COPY the
+        # parent's live JAX/XLA runtime + its native threads into the child, violating the numpy-only
+        # contract worker.py enforces (and re-creating the deadlock-prone cross-runtime residue).
+        ctx = mp.get_context("spawn")
         self.pool = ctx.Pool(
             processes=self.n_workers,
             initializer=_worker_init,

@@ -350,3 +350,74 @@ Worst acceptable outcome is a loud, timestamped abort that a restart recovers fr
   address this. A belt-and-suspenders follow-up: give result blobs a short TTL at write time
   (`_gen_task`), so an aborted iteration self-cleans. Noted, not done here (out of the minimal
   deadlock scope; flagged).
+
+---
+
+## 6. Amendment 2026-06-15 — R14 removed the ROOT CAUSE (JAX in the spawn child)
+
+This section is a DATED append (ADR-0005 Rule 8: amend point-in-time records, never silently
+rewrite them). The original RCA above (the H1a hypothesis, Fixes A–F) is left intact. R14 fires the
+follow-up §3/§5 flagged but deferred: it removes the *root cause* H1a fingered, rather than only
+bounding its symptom.
+
+**What §5 left open, now resolved.** §5 named, as the sole way to *positively pin* H1a, a worker-side
+dump showing a worker parked in a native-threading-init lock under the JAX-poisoned-allocator residue
+— a dump never obtained (the run could not be reproduced without contending with the live arm). R14
+takes the orthogonal route the §3 Fix C was a *defensive half-measure* toward: instead of proving
+which residue wedged the JAX-tainted child, **make the child JAX-free by construction**, so the
+entire H1a chain (JAX imported in the parent → spawn child inherits its environment/allocator/
+thread-count residue → numba+socket race wedges) has no first link. H1a is now *unreachable*, not
+merely *unconfirmed*.
+
+**Measured before acting (ADR-0011 measure-first).** Before changing anything, a 1-worker
+`ParallelExecutor.generate` was run with a probe inside the worker process dumping `sys.modules`:
+`jax`, `jaxlib`, `optax`, `chocofarm.az.mlp_jax`, `chocofarm.az.mlp_jax_train`, and
+`chocofarm.az.optimizer` were **all absent**. So the child was ALREADY JAX-free — the worker's import
+graph (env, FeatureBuilder, the belief kernel, `GumbelAZSearch`/`GumbelPolicy`, the numpy `ValueMLP`
+via `transport.unpack_net`, `generate_episode`) routes only through the numpy forward
+(`forward.forward_core` over numpy), and the two jax entry points it is one edge from
+(`exit_loop`'s `JaxTrainer`, `gumbel_search`'s `MlpJaxForward`) are both function-local lazy imports.
+R14 therefore **formalizes and LOCKS** the pre-existing numpy-only property rather than severing a
+live leak: `worker._worker_init` calls a fail-loud guard (`Worker._assert_jax_free`, ADR-0002) that
+raises a `RuntimeError` if `jax`/`jaxlib` is in `sys.modules` in the spawn child after the
+initializer's imports — so a future top-level `import jax` in a worker-reachable module, or a
+once-lazy jax import made eager, fails at worker startup instead of silently re-opening this wedge
+mode. (The guard runs in `_worker_init`, which executes ONLY in the spawn child, not in
+`Worker.__init__` — an in-process `Worker(...)` built by a jax-importing test harness is about a
+different process's import graph and must not trip it.) The numpy-only contract is documented
+in `worker.py`'s header and pinned by `tests/test_numpy_worker_r14.py` (a real spawn-Pool probe).
+
+**The band-aid ledger (per §3 Fixes, conservatively retired/kept).** Removing the root cause makes
+exactly ONE band-aid moot; it does NOT make the fail-loud robustness guards moot, because the numba
+belief kernel and the redis sockets remain in the child, so the numba-lock and socket-stall wedge
+modes are still reachable in the now-numpy-only child:
+
+- **RETIRED — `os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")`** (was in
+  `_worker_init`, deadlock Fix C). XLA is now absent from the child, so this knob is dead — it pinned
+  a runtime the JAX-free child never starts. Removed. (The single-thread BLAS/OpenMP/numba
+  `setdefault`s stay — see below.)
+- **KEPT, re-justified — OMP/OPENBLAS/MKL/NUMEXPR/NUMBA single-thread `setdefault`s.** Not a JAX
+  band-aid at all: correctness/perf for the *core-pinned numba+BLAS child*, which wants exactly one
+  native thread per math runtime regardless of JAX. Independent of the root cause.
+- **KEPT, re-justified — `faulthandler` + SIGUSR1.** A numba threading-init lock or a redis socket
+  stall is still possible in the numpy/numba child; the cheap worker-side instrument that
+  discriminates them survives untouched.
+- **KEPT, re-justified — bounded socket/connect timeout + `ping()` (Fix B).** Socket stalls are
+  orthogonal to JAX; loopback redis can still wedge a `recv`. Unchanged.
+- **KEPT byte-for-byte — `_drain_imap` per-result timeout → loud RuntimeError (Fix A).** The
+  load-bearing fail-loud (ADR-0002) for ANY worker wedge. The exact loud message
+  (phase/run/collected-count/SIGUSR1 hint) is unchanged.
+- **KEPT — bounded `close()` teardown (Fix F).** The "parent never waits unbounded" invariant.
+- **KEPT, NOW MORE JUSTIFIED — `mp.get_context("spawn")`.** Fork would COPY the parent's live JAX/XLA
+  runtime + native threads into the child, violating the numpy-only contract R14 now enforces (and
+  re-creating exactly the cross-runtime residue this RCA traced). Spawn is the mechanism that lets
+  the child come up clean.
+
+**Also in R14 (same change set, item L / R14):** the `_W` per-worker module-global dict was promoted
+to a `Worker` object (the guard lives in its constructor); and the `it + 1_000_000` eval-version hack
+was replaced by a real `(run, phase, version)` weight-key namespace
+(`az:w:<run>:<phase>:<version>`), so the eval phase reloads the post-train weights at the *real*
+iteration `it` under `phase="eval"`. Neither touches the deadlock guards above. The `_task_rng` seed
+fold is byte-for-byte unchanged (phase namespaces the weight KEY only, never the rng), so the
+parallel≈serial bit-identity this loop depends on is preserved (verified: 1-worker `generate` is
+byte-identical to the serial path on the float32 wire).
