@@ -54,12 +54,19 @@ audit surfaces both registers in chocofarm.
 
 ### Substrate — negative register (fabricate a category under ambiguity)
 
-- **The fossil arrays in `instance.json`.** The instance file still carries
+- **The fossil arrays in `instance.json`.** The instance file carried
   the superseded 16-region `overlaps` / `delta_treasures` arrays the face
   arrangement replaced (audit §3.1, appendix). A reader cannot tell which
   fields are live and which are fossils; an edit to `overlaps` silently does
   nothing. This is the negative-register failure: stale categorisation left
   in the canonical vocabulary, which the next reader reads as authoritative.
+  *(Amended 2026-06-15: the two fossil arrays were subsequently stripped from
+  `instance.json` — both are derivable from the live geometry (`overlaps` ==
+  the arrangement co-coverage edge set, `delta_treasures` == the treasures no
+  face covers), and the one remaining reader, `scripts/verify_faces.py`, now
+  re-derives the old cover_mask from `regions_wkt` rather than the frozen array.
+  The instance now carries only live, non-derivable facts. The example above is
+  preserved as the motivating instance for this register.)*
 - **The audit's own band/severity vocabulary.** The audit classifies findings
   `critical`/`major`/`minor` and modules `sound`/`messy`. It is disciplined
   about the failure mode this register names: severity is calibrated by the
