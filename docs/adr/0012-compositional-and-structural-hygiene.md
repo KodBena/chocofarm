@@ -100,7 +100,7 @@ this shape, the named principle forbids it."
 | **H** — Defensive band-aids stacked against a hostile substrate | a new mitigation layered on an un-diagnosed cause; a reliability strategy that *is* a stack of patches | **P5** (fail loud; remove the root cause) — distinguish a justified guard from a band-aid masking an undiagnosed cause |
 | **(new, cross-language)** — two writers of one cross-boundary truth | a hand-mirrored type, offset, key, or codec on the far side of the language boundary that re-authors a fact the near side already defines (a hardcoded weight offset; a second result-blob codec) | **P7** (cross-language wire discipline) — a cross-boundary fact has exactly one authoritative definition and every side *derives* its view (reads it at runtime or generates it at build time), never re-authors it by hand; mechanically enforced at the strongest feasible level (generate/compile-from-one-source > build-time lint > runtime parity backstop). Schema-driven codegen (one schema → N derived readers) is SSOT and is encouraged, not banned |
 | **(new, call-boundary)** — a contract carried only by an unenforced or dishonest signature | an untyped function/method/dataclass signature (the contract lives nowhere checkable), or a *lying* one whose body does not honor its annotation (`hp: AdamHParams = None` whose body accepts `None`; `lr/b1/b2/eps: float` populated with jax `Array`s) | **P8** (typed signatures are the contract's SSOT) — the signature is the single source of truth of the input/output contract, honored by the body, at the **strict-where-achievable** bar, with each relaxation a named stub-gap (not a convenience); mechanically enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing baseline (ADR-0011 Rule 1) |
-| **(new, compiled-component)** — an untyped-effectful-void / black-box mutation in a compiled (C++/new-language) component | a function taking raw pointers (`const float*`, a `T*, size_t` pair) and returning `void` while writing its result through an output parameter or mutating hidden/global state (`void matvec_bias(const float* in, …, std::vector<float>& out)`; `void require_matrix(…, int& rows, int& cols, std::vector<float>& out)`) — a black box you cannot unit-test (it mutates rather than returns), cannot compose (it is not a value-function to chain), and whose contract is invisible (the `void` + raw-pointer signature names neither the bounds, the const-ness, nor what it mutates); or **signaling failure by throwing an exception** (an untyped control-flow escape absent from the signature, which the caller is not forced to handle); or **signaling a legitimately-absent result with a nullable raw pointer or a sentinel** (`const char* opt(…)` returning `nullptr` for "not found"; a `-1` / `""` magic return) — an **untyped optional** whose absence is invisible in the type, so a missed null-check is undefined behavior, the C++ form of ADR-0002's sentinel-instead-of-raise red flag | **P9** (functional core, imperative shell) — a computation is a pure function of typed, bounds-carrying, const-correct inputs **and outputs** (`std::span<const T>` / `std::string_view` over a raw `T*`, in *either* direction) **returning its result by value**; every effect is named in the signature, the only sanctioned hidden mutation is a measured hot-path buffer-reuse routed through an explicitly-typed `Workspace`/`Context&` parameter, **a legitimately-absent result is a `[[nodiscard]] std::optional<T>`** and **a failure is a `[[nodiscard]] std::expected<T, Error>`, never a sentinel, a nullable pointer, or a throw** (a throwing ctor becomes a `create(…) -> std::expected` factory) — the compiled-component form of B (a second/hidden writer), of P2 (hidden state / a lying signature), and of P8 (an untyped/dishonest contract), enforced by the compiler (`-Wall -Wextra`, the nodiscard warning treated as an error) and a future `clang-tidy` config (ADR-0011 Rule 1) |
+| **(new, compiled-component)** — an untyped-effectful-void / black-box mutation in a compiled (C++/new-language) component | a function taking raw pointers (`const float*`, a `T*, size_t` pair) and returning `void` while writing its result through an output parameter or mutating hidden/global state (`void matvec_bias(const float* in, …, std::vector<float>& out)`; `void require_matrix(…, int& rows, int& cols, std::vector<float>& out)`) — a black box you cannot unit-test (it mutates rather than returns), cannot compose (it is not a value-function to chain), and whose contract is invisible (the `void` + raw-pointer signature names neither the bounds, the const-ness, nor what it mutates); or **signaling failure by throwing an exception** (an untyped control-flow escape absent from the signature, which the caller is not forced to handle); or **signaling a legitimately-absent result with a nullable raw pointer or a sentinel** (`const char* opt(…)` returning `nullptr` for "not found"; a `-1` / `""` magic return) — an **untyped optional** whose absence is invisible in the type, so a missed null-check is undefined behavior, the C++ form of ADR-0002's sentinel-instead-of-raise red flag; or, more generally, **a reliquary anti-pattern where a designed-replacement modern feature exists, used out of habit** (a raw `new`/`delete` where RAII / a smart pointer fits; a C-style cast where a named cast says which conversion; a `#define` constant where `constexpr` does; `strcmp`/`strcpy` where `std::string_view` does; `NULL` where `nullptr` does; a `typedef` where `using` does; an unscoped `enum` where `enum class` does) — the modern feature is the standard answer to that construct's hazard at zero runtime cost, so the legacy form needs a *measured* justification, never a habit one | **P9** (functional core, imperative shell) — a computation is a pure function of typed, bounds-carrying, const-correct inputs **and outputs** (`std::span<const T>` / `std::string_view` over a raw `T*`, in *either* direction) **returning its result by value**; every effect is named in the signature, the only sanctioned hidden mutation is a measured hot-path buffer-reuse routed through an explicitly-typed `Workspace`/`Context&` parameter, **a legitimately-absent result is a `[[nodiscard]] std::optional<T>`** and **a failure is a `[[nodiscard]] std::expected<T, Error>`, never a sentinel, a nullable pointer, or a throw** (a throwing ctor becomes a `create(…) -> std::expected` factory). P9 is the **modern-C++ discipline**: these five rules are the catalog, not the whole — for any reliquary construct, prefer the standard (C++11–23) feature designed to ameliorate it at zero runtime cost, the legacy form forbidden absent a measured reason (a profile or a real, named constraint), never habit. The compiled-component form of B (a second/hidden writer), of P2 (hidden state / a lying signature), and of P8 (an untyped/dishonest contract), enforced by the compiler (`-Wall -Wextra`, the nodiscard warning treated as an error) and a future `clang-tidy` config — its `modernize-*` family the purpose-built net for the reliquary→modern substitutions (ADR-0011 Rule 1) |
 
 ### The nine principles
 
@@ -451,8 +451,52 @@ performance**: it is built on **zero-cost abstractions** (a `std::span<const T>`
 compiles to the same pointer+length a hand-rolled pair would; **guaranteed copy
 elision / (N)RVO** makes return-by-value free), so the honest signature is not a
 tax paid for cleanliness — it is the same machine code with the contract
-restored. Five **checkable rules a reviewer enforces yes/no from the signature
-alone**:
+restored.
+
+**The general posture (P9 is the modern-C++ discipline).** The five rules below
+are specific instances of one general principle, and P9 states that principle
+explicitly so the discipline extends past the enumerated five. For any **legacy
+/ C-with-classes / pre-modern construct** — a *reliquary* form carried forward
+out of habit — there is usually a **standard C++ (11–23) feature designed
+precisely to make it safer, clearer, or both at zero runtime cost**, and that
+feature is **preferred**; the reliquary form is **forbidden absent a measured
+reason**. *Check (general): for the construct under review, is there a standard
+modern feature designed to replace it? If so, the legacy form needs a measured
+justification — a profile showing the modern form costs runtime here, or a real,
+named constraint (a fixed C ABI to interoperate with, a toolchain that genuinely
+lacks the feature) — never a habit one.* The carve-out is exact: **only a
+profile or a real, named constraint** licenses the reliquary form. *That's how
+it's always been done* / *it's how I learned C++* / *the old way is fine here* is
+**habit, not a reason** — the same lazy-argument shape as the scale-excuse P7/P8
+already reject (the discipline declined "just this once" is precisely how the
+cancers grew), and P9 rejects it in the same words: a *measured* reason justifies
+the legacy form, a habit one never does.
+
+The five rules below are **the current catalog of this principle, not an
+exhaustive list** — the principle is general and extensible, and a reliquary
+construct outside the five is governed by the general check above just as the
+five are governed by their specific forms. A **representative (explicitly
+non-exhaustive) catalog** of the same move beyond the five — in each row the rule
+is "use the designed replacement," and the list is only its illustration: raw
+`new`/`delete` → RAII / value semantics / smart pointers (`std::unique_ptr`,
+`std::make_unique`); C-style casts → named casts (`static_cast` /
+`reinterpret_cast`, which say *which* conversion and are greppable); `#define`
+constants and function-like macros → `constexpr` / `consteval` / templates
+(typed, scoped, debuggable); C-string functions (`strcmp` / `strcpy` / `strlen`)
+→ `std::string_view` / `std::string` (bounds-carrying, no manual terminator);
+`NULL` → `nullptr` (a typed null, no `int`-conversion ambiguity); `typedef` →
+`using` (reads left-to-right, and aliases templates); unscoped `enum` →
+`enum class` (scoped, no implicit-int decay); a hand-rolled index loop →
+range-based-`for` / `<algorithm>` / ranges where clearer; a manual
+acquire/release resource pair → an RAII handle whose destructor releases. In
+every row the modern feature is the standard library's or language's answer to
+the exact hazard the legacy form leaves open, at no runtime cost — so the
+reliquary form, not the modern one, is what carries the burden of a measured
+justification.
+
+Five **checkable rules a reviewer enforces yes/no from the signature
+alone** — the catalog of the general principle at the call/computation
+boundary:
 
 1. **Inputs *and outputs* are typed, bounds-carrying, const-correct — no raw
    or nullable pointer crosses the signature in either direction.** Favor
@@ -952,18 +996,32 @@ write-time data constraint / run-time invariant / review-only):
   **unhandled error a build failure** — a strictly stronger surface than the
   review-only structural rules, and the same compile-time-over-runtime move ADR-
   0011 Rule 1 ranks highest. Rules 1–4 are policed against their checkable form
-  at C++ review, with the **compiler (`-Wall -Wextra`)** and a **future
-  `clang-tidy` config** as the mechanization surface. The compiler already raises
-  some of the relevant signals (an unused parameter, a const-violation); the
-  `clang-tidy` config is the ADR-0011 Rule-2 conversion trigger — **when a P9
-  violation recurs after this record, mint the `clang-tidy` check** that catches
-  it (e.g. a check against out-parameters or raw-pointer arithmetic where a
-  `std::span` belongs, or `-Werror` on a thrown exception escaping a function the
-  contract says should return `expected`) rather than re-stating the rule in
-  prose. Until that recurrence, rules 1–4 are review-only — and settling for
+  at C++ review, with the **compiler (`-Wall -Wextra`)** as the standing floor
+  and a **future `clang-tidy` config** as the mechanization surface. The compiler
+  already raises some of the relevant signals (an unused parameter, a
+  const-violation); the `clang-tidy` config is the ADR-0011 Rule-2 conversion
+  trigger — **when a P9 violation recurs after this record, mint the `clang-tidy`
+  check** that catches it (e.g. a check against out-parameters or raw-pointer
+  arithmetic where a `std::span` belongs, or `-Werror` on a thrown exception
+  escaping a function the contract says should return `expected`) rather than
+  re-stating the rule in prose. The **general modern-C++ posture** has a
+  concrete, purpose-built mechanization surface: clang-tidy's **`modernize-*`
+  check family** exists *precisely* to catch the reliquary→modern substitutions,
+  so the ADR-0011 Rule-2 trigger for the general principle is to **enable the
+  `modernize-*` (or `cppcoreguidelines-*`) check that catches the recurring
+  reliquary form** — `modernize-use-nullptr` (`NULL` → `nullptr`),
+  `modernize-use-using` (`typedef` → `using`), `modernize-avoid-c-arrays`,
+  `modernize-loop-convert`, `modernize-make-unique`/`-make-shared` (raw `new` →
+  smart pointers), and `cppcoreguidelines-pro-bounds-pointer-arithmetic` /
+  `-pro-type-cstyle-cast` for the bounds/cast rows — each the standing answer to
+  one catalog row. Until the check for a given recurrence is enabled, that
+  construct is review-policed against the **general check** (is there a designed
+  modern replacement?), with the compiler the floor. Until those recurrences
+  fire, rules 1–4 and the general posture are review-only — and settling for
   review-only is *not* justified by a scale / "one compiled component" / "for
-  now" argument (that argument shape is the tell P7/P8 reject); it is the honest
-  ADR-0011 Rule-1 level for a discipline whose recurrence has not yet fired.
+  now" / "that's how it's always been done" argument (that argument shape is the
+  tell P7/P8 reject); it is the honest ADR-0011 Rule-1 level for a discipline
+  whose recurrence has not yet fired.
 
 This tenet's own Rule-1 declaration: **review-and-audit-policed**, with the
 architectural audit as the absence-detector — exactly as ADR-0011 declares for
