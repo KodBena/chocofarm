@@ -21,22 +21,36 @@ cpp/
   include/chocofarm/
     instance.hpp            instance geometry: treasures/teleports/K + the DERIVED faces (cover+rep_point)
     env.hpp                 the env port: belief world-set, legal actions, apply, filters, distances
-    policy.hpp              the composable Policy interface (P2) + RandomPolicy (the trivial drop-in)
+    policy.hpp              the SHARED base unit (mirrors solvers/base.py): the Policy seam + RandomPolicy
+                            + GreedyBase/GreedyStopBase + UCB_C + candidate_actions + base_value + the
+                            generic WorldSource sample_world seam — the one home both searches include
     nmcs.hpp                the NMCS Policy (nested Monte-Carlo search) — a drop-in alongside RandomPolicy
+    ismcts.hpp              the ISMCTS Policy (single-observer Information Set MCTS) — a drop-in too
     features.hpp            §2.2 featurization + the action↔slot legality mask (all dims DERIVED)
     transport.hpp           the redis wire client (the SOLE contract; manifest-driven weight read)
     runner.hpp              the runner: read weights → run E episodes → write (X,PI,M,Y)
   src/
-    instance.cpp env.cpp features.cpp transport.cpp nmcs.cpp runner.cpp
-    main.cpp                the runner entrypoint (live scalars as CLI args; --policy random|nmcs)
+    instance.cpp env.cpp features.cpp transport.cpp policy.cpp nmcs.cpp ismcts.cpp runner.cpp
+    main.cpp                the runner entrypoint (live scalars as CLI args; --policy random|nmcs|ismcts)
     mask_dump.cpp           a tiny PARITY fixture (replay → dump mask/features); not the runner (P3)
     nmcs_dump.cpp           a tiny PARITY fixture (scripted-source NMCS search → selected action); not the runner (P3)
+    ismcts_dump.cpp         a tiny PARITY fixture (scripted-source ISMCTS search → selected action); not the runner (P3)
   parity/
     parity.py              the ADR-0012 P6/P7 behavioral-parity harness (RandomPolicy)
     nmcs_logic.py          the NMCS deterministic logic check (same action on scripted leaf returns)
     nmcs_parity.py         the NMCS aggregate behavioral parity (aggregates within MC CI)
+    ismcts_logic.py        the ISMCTS deterministic logic check (same action on scripted world/expand/leaf)
+    ismcts_parity.py       the ISMCTS aggregate behavioral parity (aggregates within MC CI)
   README.md
 ```
+
+The `policy.hpp` / `policy.cpp` unit is the **shared base** mirroring the Python
+layout: `chocofarm/solvers/base.py` holds the search-agnostic primitives
+(`GreedyPolicy`, `GreedyStopBase`, `candidate_actions`, `_base_value`, `UCB_C`)
+and `nmcs.py` / `ismcts.py` each **import** from it. The C++ mirrors that exactly
+— `nmcs.cpp` and `ismcts.cpp` both `#include "chocofarm/policy.hpp"` for those
+primitives, neither re-authors a base/sampling/leaf, and `ismcts.cpp` does **not**
+include `nmcs.hpp` (ADR-0012 P1: one home, derive-don't-duplicate).
 
 ## Build
 
@@ -134,6 +148,79 @@ behavioral bar. Two harnesses:
 
 Both are gated in `tests/test_cpp_runner.py` (skip when the fixture / redis is
 absent), and `NMCSPolicy is a Policy subclass registered in SOLVERS` is an
+always-on pin.
+
+## The ISMCTS Policy (single-observer Information Set MCTS)
+
+`--policy ismcts` selects the **ISMCTS** Policy (`ismcts.hpp` / `ismcts.cpp`), a
+faithful port of `chocofarm/solvers/ismcts.py` behind the **same env↔Policy
+seam** — **zero edits to the runner / env core** (the same P2 seam: `main.cpp`'s
+`--policy random|nmcs|ismcts` strategy selection is the one place a policy is
+chosen). It is **DRY against the shared base** (`policy.hpp`): it reuses
+`base_value` (the leaf utility), `GreedyStopBase` (its default leaf base),
+`UCB_C`, and the generic `WorldSource` `sample_world` draw — exactly as
+`ismcts.py` imports `_base_value` / `UCB_C` / `GreedyStopBase` from
+`solvers.base`. It does **not** include `nmcs.hpp`.
+
+It mirrors `ismcts.py` exactly:
+
+- **Information-set node** (`ISMCTSNode`): per-action `reward[a]` / `visits[a]`
+  (n_j) / `avail[a]` (n'_j) **aggregated over the info-set**, children keyed by
+  `(action, belief_key)` where `belief_key = (count, bw[0], bw[-1])` (the
+  ISMCTS-specific `_belief_key` fingerprint, kept local).
+- **Per `decide()`**: `iterations` (default 300) determinized walks; each samples
+  one world `w ~ bw` and recurses `iterate` in that fixed world.
+- **`iterate`**: depth≥`max_depth` (24) → `−λ·exit_cost`; `actions = legal + [TERMINATE]`;
+  **bump `avail[a]` for every action** (subset-armed bandit §IV-B); if any untried,
+  expand one uniformly (the source's expansion-index draw), play the base to the
+  end for the leaf (`base_value` with `GreedyStopBase`), `_update`, return; else
+  **UCB1-select** (eq. 7, subset-armed denominator), route the determinization to
+  the `(action, belief_key)` child, recurse, backprop.
+- **UCB1** (eq. 7): `exploit = reward[a]/n_j`; `navail = avail.get(a, n_j)`;
+  `explore = c·sqrt(log(navail)/n_j) if navail>1 else c`; **strict `>`, first-wins
+  tie over INSERTION order** — the parity-critical detail (the same hazard the NMCS
+  strict-`>`/first-wins cleared). The TERMINATE edge value is `−λ·exit_cost`; a
+  step value is `r − λ·dt`.
+- **Final**: the **most-visited** root action (first-wins tie over insertion
+  order); TERMINATE if nothing was tried.
+
+`ISMCTSConfig` (`iterations=300`, `c=UCB_C`, `max_depth=24`) is the frozen scalar
+config; `base` (the `GreedyStopBase` leaf) is a separate construction param. The
+knobs are live CLI scalars (P4):
+
+```sh
+cpp/build/chocofarm-cpp-runner --policy ismcts \
+    --instance chocofarm/data/instance.json --faces chocofarm/data/faces.json \
+    --run R --res-token T --episodes 120 --lam 0.1 --max-steps 24 \
+    --ismcts-iterations 300 --ismcts-c 0.7 --ismcts-max-depth 24
+```
+
+### ISMCTS parity (ADR-0012 P6 — behavioral, not byte-identity)
+
+The C++ ISMCTS has its **own** RNG (`std::mt19937_64 ≠ numpy`), so parity is the
+behavioral bar. Two harnesses, mirroring the NMCS pair:
+
+- **Deterministic logic check** (`cpp/parity/ismcts_logic.py`, needs
+  `chocofarm-ismcts-dump`, **no redis**). ISMCTS's THREE RNG draws are scripted
+  RNG-free on both sides — `sample_world → bw[0]`, `expand_index → a fixed FIFO
+  mod n`, the leaf value → **a fixed table cycled in call order**. The descent is
+  structurally identical, so the FIFOs are consumed identically; feeding **both**
+  the **same** scripted draws on fixed `(loc, belief)` inputs, the two **select
+  the same most-visited action** — asserted across iteration counts (1/4/16/64/300)
+  that cover **pure expansion**, **UCB selection**, and **the availability
+  denominator**, plus the TERMINATE edge and the most-visited final, over a grid
+  of states / `c` / `max_depth` / λ. This validates the selection + nesting logic
+  (the part that *must* be exact) independent of RNG.
+- **Aggregate behavioral parity** (`cpp/parity/ismcts_parity.py`, needs the
+  runner + redis). The C++ ISMCTS runner and the Python `ISMCTSPolicy` over
+  matched-seed episodes agree on every aggregate — mean length, λ-return,
+  action-type distribution, belief-shrinkage — within Monte-Carlo CI (every
+  `|z| = |Δ|/SE < 3`), with the MC SE **reported**. ISMCTS runs many iterations
+  per decision, so N is moderate (120 episodes × 2 seeds at iterations=80); the
+  full default `iterations=300` selection is covered exactly by the logic check.
+
+Both are gated in `tests/test_cpp_runner.py` (skip when the fixture / redis is
+absent), and `ISMCTSPolicy is a Policy subclass registered in SOLVERS` is an
 always-on pin.
 
 ## How the env port mirrors `env.py` / `facemodel.py`

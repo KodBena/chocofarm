@@ -22,6 +22,16 @@ The NMCS Policy (the nested Monte-Carlo search ported behind the SAME seam) adds
     (cpp/parity/nmcs_parity.py) — NMCS aggregates within MC CI. Both SKIPPED when the fixture/redis
     is absent.
 
+The ISMCTS Policy (single-observer Information Set MCTS, ported behind the SAME seam) adds the same
+three layers:
+  * ALWAYS-ON: ISMCTSPolicy is a Policy subclass registered in SOLVERS (the seam invariant).
+  * OPT-IN (needs chocofarm-ismcts-dump): the DETERMINISTIC logic check (cpp/parity/ismcts_logic.py)
+    — same selected action on identical scripted world/expansion/leaf draws, across iteration counts
+    (expansion, UCB select, the availability denominator). NO redis (pure env + scripted source).
+  * OPT-IN (needs chocofarm-cpp-runner + redis): the AGGREGATE behavioral parity
+    (cpp/parity/ismcts_parity.py) — ISMCTS aggregates within MC CI. Both SKIPPED when the
+    fixture/redis is absent.
+
 Public Domain (The Unlicense).
 """
 import os
@@ -42,10 +52,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CPP_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-cpp-runner")
 NET_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-net-dump")
 NMCS_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-nmcs-dump")
+ISMCTS_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-ismcts-dump")
 PARITY = os.path.join(REPO, "cpp", "parity", "parity.py")
 NET_PARITY = os.path.join(REPO, "cpp", "parity", "net_parity.py")
 NMCS_LOGIC = os.path.join(REPO, "cpp", "parity", "nmcs_logic.py")
 NMCS_PARITY = os.path.join(REPO, "cpp", "parity", "nmcs_parity.py")
+ISMCTS_LOGIC = os.path.join(REPO, "cpp", "parity", "ismcts_logic.py")
+ISMCTS_PARITY = os.path.join(REPO, "cpp", "parity", "ismcts_parity.py")
 
 # OPT-IN gate. The binary-dependent cpp parity tests run only with CHOCO_RUN_CPP=1 (and a freshly
 # built binary). They are slow integration checks driven by a MANUALLY-built C++ binary: a stale
@@ -72,6 +85,15 @@ def test_nmcs_policy_is_a_policy_subclass():
     from chocofarm.solvers.nmcs import NMCSPolicy
     assert issubclass(NMCSPolicy, Policy)
     assert SOLVERS["nmcs"] is NMCSPolicy
+
+
+def test_ismcts_policy_is_a_policy_subclass():
+    """P2: the single-observer ISMCTS search is a `Policy` subclass registered in SOLVERS — the SAME
+    seam invariant the C++ ISMCTSPolicy mirrors (a drop-in alongside RandomPolicy / NMCSPolicy with
+    zero env/runner core edits)."""
+    from chocofarm.solvers.ismcts import ISMCTSPolicy
+    assert issubclass(ISMCTSPolicy, Policy)
+    assert SOLVERS["ismcts"] is ISMCTSPolicy
 
 
 def test_random_policy_only_picks_legal_actions():
@@ -192,4 +214,36 @@ def test_cpp_nmcs_aggregate_parity():
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=1200)
     assert out.returncode == 0, f"NMCS aggregate parity FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(ISMCTS_BIN)), reason=_CPP_SKIP)
+def test_cpp_ismcts_logic_parity():
+    """The DETERMINISTIC ISMCTS logic check (cpp/parity/ismcts_logic.py): with the RNG abstracted
+    behind a scripted, RNG-free ISMCTSSource (sample_world->bw[0]; expand_index->a fixed FIFO mod n;
+    leaf_value->a fixed cycled table), the C++ ISMCTS and the Python ISMCTS SELECT THE SAME ACTION on
+    fixed (loc, belief) inputs — across iteration counts that cover pure expansion, UCB selection, and
+    the availability denominator. This validates the selection + nesting logic, the part that MUST be
+    exact, independent of RNG (ADR-0012 P6). No redis needed (pure env + scripted source)."""
+    out = subprocess.run([sys.executable, ISMCTS_LOGIC], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"ISMCTS logic check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(CPP_BIN)), reason=_CPP_SKIP)
+def test_cpp_ismcts_aggregate_parity():
+    """The AGGREGATE ISMCTS behavioral parity (cpp/parity/ismcts_parity.py): the C++ ISMCTS runner
+    (`--policy ismcts`) and the Python ISMCTSPolicy over matched-seed episodes agree on every
+    aggregate (mean length, λ-return, action-type distribution, belief-shrinkage) within Monte-Carlo
+    CI, with the MC SE reported — the ADR-0012 P6 behavioral bar (NOT byte-identity; the RNGs differ).
+    ISMCTS runs many iterations per decision, so N is moderate. Skips (does not fail) when redis is
+    down."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    out = subprocess.run([sys.executable, ISMCTS_PARITY], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=1200)
+    assert out.returncode == 0, f"ISMCTS aggregate parity FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout

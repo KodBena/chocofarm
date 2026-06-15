@@ -4,10 +4,11 @@
 //   CHOCO_TRANSPORT_REDIS_* env contract, reads weights for (run, phase, version) — exercising the weight-
 //   read seam (P7) — and runs E episodes of an INJECTED Policy (the env<->Policy seam, P2), writing
 //   the (X, PI, M, Y) result blocks. lam / m-as-episodes / max_steps arrive as LIVE CLI scalars (P4),
-//   never baked in. The policy is a clean strategy selection over `--policy random|nmcs`: RandomPolicy
-//   (the seam-proof baseline) or NMCSPolicy (the nested Monte-Carlo search, nmcs.hpp). The runner
-//   never names a concrete Policy — adding NMCS is ZERO runner-core edits (the P2 seam). The Gumbel
-//   search and MLP forward remain deferred (ADR-0012's C++ section + scaling-and-cpp-seam.md Shape A).
+//   never baked in. The policy is a clean strategy selection over `--policy random|nmcs|ismcts`:
+//   RandomPolicy (the seam-proof baseline), NMCSPolicy (the nested Monte-Carlo search, nmcs.hpp), or
+//   ISMCTSPolicy (the single-observer ISMCTS, ismcts.hpp). The runner never names a concrete Policy —
+//   adding a search is ZERO runner-core edits (the P2 seam). The Gumbel search and MLP forward remain
+//   deferred (ADR-0012's C++ section + scaling-and-cpp-seam.md Shape A).
 //
 //   ADR-0012 P9: the imperative shell. argv (the untyped char** the OS hands main) is decoded ONCE
 //   into a typed std::vector<std::string_view> — the Port/ACL translate-at-the-edge (P2) — and the
@@ -32,6 +33,7 @@
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/instance.hpp"
+#include "chocofarm/ismcts.hpp"
 #include "chocofarm/nmcs.hpp"
 #include "chocofarm/policy.hpp"
 #include "chocofarm/runner.hpp"
@@ -52,13 +54,16 @@ void usage(std::string_view prog) {
         "  --max-steps <int>   live episode horizon (default 40)\n"
         "  --seed <uint>       per-episode RNG seed base (default 0)\n"
         "  --res-token <id>    result-key namespace token (required)\n"
-        "  --policy <name>     search policy: random | nmcs (default random)\n"
+        "  --policy <name>     search policy: random | nmcs | ismcts (default random)\n"
         "  --nmcs-level <int>      NMCS nesting level (default 1; 2 is the milestone)\n"
         "  --nmcs-playouts <int>   worlds per level-0 playout (default 3)\n"
         "  --nmcs-step-samples <i> worlds per per-move eval (default 2)\n"
         "  --nmcs-cand-det <int>   nearest informative detectors kept (default 4)\n"
         "  --nmcs-cand-tre <int>   nearest uncollected treasures kept (default 4)\n"
         "  --nmcs-max-steps <int>  hard cap on a search line (default 24)\n"
+        "  --ismcts-iterations <i> ISMCTS determinized walks per decision (default 300)\n"
+        "  --ismcts-c <float>      ISMCTS UCB1 exploration constant (default UCB_C=0.7)\n"
+        "  --ismcts-max-depth <i>  ISMCTS recursion depth cap (default 24)\n"
         "  --parity-stats <p>  ALSO write per-episode aggregate stats (JSON lines) to <p>\n"
         "Connection: CHOCO_TRANSPORT_REDIS_HOST/PORT/DB env (default 127.0.0.1:6380 db0).\n";
 }
@@ -126,10 +131,16 @@ int main(int argc, char** argv) {
         if (auto v = opt(args, "--nmcs-cand-tre")) nc.cand_tre = to_int(*v);
         if (auto v = opt(args, "--nmcs-max-steps")) nc.max_steps = to_int(*v);
         policy = std::make_unique<chocofarm::NMCSPolicy>(nc);  // nested Monte-Carlo search (P2 drop-in)
+    } else if (policy_name == "ismcts") {
+        chocofarm::ISMCTSConfig ic;  // defaults match ISMCTSConfig (iterations=300, c=UCB_C, depth=24)
+        if (auto v = opt(args, "--ismcts-iterations")) ic.iterations = to_int(*v);
+        if (auto v = opt(args, "--ismcts-c")) ic.c = to_double(*v);
+        if (auto v = opt(args, "--ismcts-max-depth")) ic.max_depth = to_int(*v);
+        policy = std::make_unique<chocofarm::ISMCTSPolicy>(ic);  // single-observer ISMCTS (P2 drop-in)
     } else {
         // ADR-0002 / P5: an unknown policy is a loud abort at the boundary (a CLI misuse).
         std::cerr << prog << ": FATAL: unknown --policy: " << policy_name
-                  << " (expected random | nmcs)\n";
+                  << " (expected random | nmcs | ismcts)\n";
         return 1;
     }
 
