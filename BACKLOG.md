@@ -32,6 +32,11 @@ control vs 0/240 on the old `bw[0]` check). Remaining is test-only; production `
 
 - A shared `Sampler` (just `sample_world`) under `WorldSource` (NMCS) and `ISMCTSSource` (ISMCTS),
   which currently each declare it. Review-clean as-is; extract only if a third search wants it.
+- **Audit `using` type aliases for phantom/strong types.** Review where the cpp uses `using` for bare
+  aliases — especially the many `int` indices (action slot, world index, `action.i`, `belief_key`
+  fields) — and consider whether a phantom-like type template (a tagged newtype, e.g.
+  `template<class Tag> struct Idx { int v; };`) is more appropriate, so semantically-distinct ints
+  can't be silently mixed. Postponed for token-saving; revisit when the cpp type surface is next open.
 
 ## Retired
 
