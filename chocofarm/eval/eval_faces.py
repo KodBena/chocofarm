@@ -27,7 +27,6 @@ Monte-Carlo standard error is explicit. Run subsets to bound wall-time:
     python eval_faces.py                        # all (longest)
 """
 import sys
-import time
 
 import numpy as np
 
@@ -36,7 +35,7 @@ from chocofarm.solvers.base import (GreedyPolicy, CertaintyEquivalentPolicy, Rol
                       SparseSamplingPolicy)
 from chocofarm.solvers.nmcs import NMCSPolicy
 from chocofarm.solvers.ismcts import ISMCTSPolicy
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.eval.report import references, print_reference_header, run_plan
 
 
 def build_plan(env):
@@ -75,25 +74,15 @@ def main():
     want_refs = (not groups) or ("refs" in groups)
     env = Environment()                      # unit values, honest face detectors
 
-    static = realizable_static(env)
-    ceil = clairvoyant_rate(env)
-    headroom = (ceil - static) / static * 100
-    print(f"static floor        : {static:.4f}   (detector-independent; expect ~0.0855)")
-    print(f"clairvoyant ceiling : {ceil:.4f}   (detector-independent; expect ~0.1454, "
-          f"VoI headroom +{headroom:.0f}%)\n", flush=True)
+    refs = references(env)
+    print_reference_header(refs, faces=True)
     if groups == {"refs"}:
         return
 
     plan = [row for row in build_plan(env)
             if (not groups) or (row[0] in groups)]
-    print(f"{'policy':>20} {'rate':>8} {'%ceiling':>9} {'VoI clawed':>11} "
-          f"{'runs':>6} {'sec':>7}", flush=True)
-    for _group, name, pol, budget in plan:
-        t0 = time.time()
-        r = env.dinkelbach_rate(pol, **budget)["rate"]
-        claw = (r - static) / (ceil - static) * 100
-        print(f"{name:>20} {r:>8.4f} {r / ceil * 100:>8.0f}% {claw:>10.0f}% "
-              f"{budget['final_runs']:>6} {time.time() - t0:>7.0f}", flush=True)
+    run_plan(env, refs, [(name, pol, budget) for _group, name, pol, budget in plan],
+             seed=7, columns="faces")
 
 
 if __name__ == "__main__":

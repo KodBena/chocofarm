@@ -17,10 +17,8 @@ import time
 import argparse
 import numpy as np
 from chocofarm.model.env import Environment
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate
-from chocofarm.solvers.nmcs import NMCSPolicy
-from chocofarm.solvers.ismcts import ISMCTSPolicy
-from chocofarm.solvers.uct import UCTPolicy
+from chocofarm.eval.report import references
+from chocofarm.solvers import SOLVERS
 from tensorboardX import SummaryWriter
 
 
@@ -35,14 +33,15 @@ def rss_mb():
     return 0.0
 
 
+# per-method constructor kwarg: nmcs configs are search LEVELS, ismcts/uct are ITERATION budgets.
+# The CLASS comes from the SOLVERS registry; only the kwarg name is method-specific.
+_CFG_KW = {"nmcs": "level", "ismcts": "iterations", "uct": "iterations"}
+
+
 def make_policy(method, cfg):
-    if method == "nmcs":
-        return NMCSPolicy(level=int(cfg))
-    if method == "ismcts":
-        return ISMCTSPolicy(iterations=int(cfg))
-    if method == "uct":
-        return UCTPolicy(iterations=int(cfg))
-    raise SystemExit("unknown method " + method)
+    if method not in _CFG_KW or method not in SOLVERS:
+        raise SystemExit("unknown method " + method)
+    return SOLVERS[method](**{_CFG_KW[method]: int(cfg)})
 
 
 def label(method, cfg):
@@ -60,8 +59,10 @@ def main():
     a = ap.parse_args()
 
     env = Environment()
-    static = realizable_static(env)
-    ceil = clairvoyant_rate(env)
+    refs = references(env)                       # floor/ceiling from the BeliefRefs SSOT
+    static = refs.static_floor
+    ceil = refs.clairvoyant_ceiling              # NB: the TB scalar below logs the 0..1 VoI
+    #                                              FRACTION (no ×100), distinct from refs.voi_pct.
     configs = [c.strip() for c in a.configs.split(",") if c.strip()]
     pols = {c: make_policy(a.method, c) for c in configs}
     writer = SummaryWriter(os.path.join(a.logroot, a.tag))

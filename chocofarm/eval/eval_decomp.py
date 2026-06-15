@@ -21,11 +21,11 @@ import argparse
 import time
 
 from chocofarm.model.env import Environment
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.eval.report import references, print_reference_header
 from chocofarm.solvers.decomp import DecompPolicy
 
 
-def measure_decomp(env, static, ceil, runs, horizon):
+def measure_decomp(env, refs, runs, horizon):
     pol = DecompPolicy(horizon=horizon)
     t0 = time.time()
     res = env.dinkelbach_rate(pol, iters=4, warm_runs=400, final_runs=runs, seed=7)
@@ -33,8 +33,8 @@ def measure_decomp(env, static, ceil, runs, horizon):
     return {
         "horizon": horizon, "rate": r, "ER": res["ER"], "ET": res["ET"],
         "lambda": res["lambda"], "exits": res["exits"],
-        "pct_ceiling": r / ceil * 100,
-        "pct_voi": (r - static) / (ceil - static) * 100,
+        "pct_ceiling": r / refs.clairvoyant_ceiling * 100,
+        "pct_voi": refs.voi_pct(r),
         "on_demand_solves": pol.fallbacks,
         "sec": time.time() - t0,
     }
@@ -48,15 +48,13 @@ def main():
     args = ap.parse_args()
 
     env = Environment()
-    static = realizable_static(env)
-    ceil = clairvoyant_rate(env)
-    print(f"static floor        : {static:.4f}")
-    print(f"clairvoyant ceiling : {ceil:.4f}   (VoI headroom +{(ceil-static)/static*100:.0f}%)")
-    print(f"clairvoyant per-excursion: knows the present set, takes the tight route\n",
-          flush=True)
+    refs = references(env)
+    print_reference_header(
+        refs,
+        extra_lines=("clairvoyant per-excursion: knows the present set, takes the tight route",))
 
     # the headline: the exact-decomposition policy (myopic macro)
-    d = measure_decomp(env, static, ceil, args.runs, horizon=1)
+    d = measure_decomp(env, refs, args.runs, horizon=1)
     print(f"{'policy':>22} {'rate':>8} {'%ceiling':>9} {'%of+70%VoI':>11} "
           f"{'ER':>5} {'ET':>6} {'sec':>5}", flush=True)
     print(f"{'decomp (exact, h=1)':>22} {d['rate']:>8.4f} {d['pct_ceiling']:>8.0f}% "
@@ -69,7 +67,7 @@ def main():
         print("macro horizon sweep (h=1 is exact + simplest; deeper is within MC noise):",
               flush=True)
         for h in (2, 3, 4):
-            dh = measure_decomp(env, static, ceil, max(600, args.runs // 2), horizon=h)
+            dh = measure_decomp(env, refs, max(600, args.runs // 2), horizon=h)
             print(f"   h={h}: rate={dh['rate']:.4f} %VoI={dh['pct_voi']:.0f}% "
                   f"ER={dh['ER']:.2f} ET={dh['ET']:.1f}", flush=True)
         print(flush=True)
@@ -89,7 +87,7 @@ def main():
         for name, pol, budget in pack:
             t0 = time.time()
             r = env.dinkelbach_rate(pol, **budget)["rate"]
-            claw = (r - static) / (ceil - static) * 100
+            claw = refs.voi_pct(r)
             print(f"   {name:>20} rate={r:.4f} %VoI={claw:>4.0f}% ({time.time()-t0:.0f}s)",
                   flush=True)
 
