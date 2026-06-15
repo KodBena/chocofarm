@@ -382,3 +382,32 @@ recommendation only *proposes* the cycled-multi-world case.
 - fix: Optional: write the raw per-episode rows under ~/w/vdc (not /tmp) so a skeptic can re-test at a tighter tolerance / inspect an outlier without re-running the expensive search. Mitigated by the harness being reproducible-by-construction (fixed seeds 11/23, fixed cfg); the /tmp file is genuinely an IPC channel (C++ subprocess -> Python parent), so this is low-stakes housekeeping, not a defect of the parity logic.
 
 *Public Domain (The Unlicense).*
+
+
+---
+
+## CLOSED (2026-06-16) — the collapsed-determinization is now assuaged with an executed test
+
+The Correction above said the multi-belief split was verified by **inspection only** and would not be
+assuaged until a cycled-multi-world fixture exercised it as an exact-action C++-vs-Python assertion.
+**That fixture now exists and passes** (test-only; production `ismcts.cpp` untouched; committed on the
+ISMCTS branch at `4fded0b`):
+
+- `cpp/src/ismcts_dump.cpp` gains an OPTIONAL world-index FIFO; `cpp/parity/ismcts_multiworld.py`
+  scripts `sample_world` to CYCLE distinct worlds of `bw` (identical on both sides), so a single action
+  edge resolves to different observation outcomes across iterations → multiple `belief_key` children —
+  the split the `bw[0]` check could never produce.
+- **Result: `[parity] 192/192`** (committed C++ == correct Python, exact action) **and
+  `[discrimination] 40/192`** (a `belief_key`-collapse Python mutant DIVERGES from correct Python).
+  The discrimination is the non-vacuity proof the old `bw[0]` check lacked: there, mutating
+  `belief_key` changed **0/240** (vacuous); here it changes **40/192**, so these inputs genuinely
+  depend on the multi-belief sub-child routing — and the 192/192 agreement therefore *verifies* it,
+  rather than passing trivially.
+
+**Both coverage holes the review found are now closed with discriminating, executed tests:** the
+`_ucb_select` insertion-order tie-break (the synthesis's integer-leaf run, 128/128 with a 14/128 mutant
+control) and the multi-belief sub-child split (this run, 192/192 with a 40/192 mutant control). The
+ISMCTS-defining property is verified by an executed exact-action test, not by inspection. The
+`trustworthy-mergeable` verdict no longer rests on inspection for the multi-belief routing.
+
+*Public Domain (The Unlicense).*
