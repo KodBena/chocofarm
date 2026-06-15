@@ -7,90 +7,15 @@ References (bounds, not deployable policies):
   - realizable static : a fixed value-aware NN route, best expected-rate prefix (the floor).
   - clairvoyant       : free perfect knowledge of the present set (the ceiling / max VoI).
 """
-import itertools
 import time
-import numpy as np
 from chocofarm.model.env import Environment
 from chocofarm.solvers.base import GreedyPolicy, CertaintyEquivalentPolicy, RolloutPolicy, SparseSamplingPolicy
 
-# The documented exact-decomposition rate (decomp exact, h=1) — the empirical decomp anchor
-# reference line. Source: docs/agents/decomp-solver-report.md ("decomp (exact, h=1) 0.0941")
-# and docs/results/decomp-rate.md. Hardcoded by maintainer decision (NOT env-derived): unlike the
-# floor/ceiling it is a measured policy rate, not a function of the env geometry.
-DECOMP_ANCHOR = 0.0941
-
-
-def realizable_static(env):
-    loc, unv, route, t, best = ("w", env.entry), set(range(env.N)), [], 0.0, (-1.0, 0)
-    while unv:
-        i = max(unv, key=lambda j: env.value[j] / (env.d(loc, ("t", j)) + 1e-9))
-        t += env.d(loc, ("t", i)); loc = ("t", i); route.append(i); unv.discard(i)
-        rate = (env.K / env.N) * sum(env.value[r] for r in route) / (t + env.exit_cost(loc))
-        if rate > best[0]:
-            best = (rate, len(route))
-    return best[0]
-
-
-def clairvoyant_rate(env):
-    def ev(lam, runs, seed):
-        rng = np.random.default_rng(seed)
-        totR = totT = 0.0
-        for _ in range(runs):
-            w = int(rng.choice(env.worlds))
-            present = [t for t in range(env.N) if (w >> t) & 1]
-            base = env.exit_cost(("w", env.entry))
-            bv, bR, bT = -lam * base, 0.0, base
-            for s in range(1, len(present) + 1):
-                for sub in itertools.combinations(present, s):
-                    R = sum(env.value[i] for i in sub)
-                    bt = min(env.route_time(("w", env.entry), list(p))
-                             for p in itertools.permutations(sub))
-                    v = R - lam * bt
-                    if v > bv:
-                        bv, bR, bT = v, R, bt
-            totR += bR; totT += bT
-        return totR / totT
-    lam = 0.0
-    for _ in range(5):
-        lam = ev(lam, 1000, 1)
-    return ev(lam, 3000, 7)
-
-
-class BeliefRefs:
-    """Single source for the three %VoI reference lines and the %VoI map itself.
-
-    These are the Tier-4 DERIVED reference lines the project plots %VoI against:
-      - `static_floor`        = realizable_static(env)  — DERIVED from the env (the floor).
-      - `clairvoyant_ceiling` = clairvoyant_rate(env)   — DERIVED from the env (the ceiling).
-      - `decomp_anchor`       = DECOMP_ANCHOR            — the ONE documented constant (anchor),
-                                                          the exact-decomposition rate (not env-derived).
-
-    The floor and ceiling are a few seconds each to compute, so they are computed LAZILY on first
-    access and MEMOIZED (never recomputed per call). This is the single source for %VoI: route every
-    display reference-line site and every (rate → %VoI) conversion through here so they cannot drift.
-    """
-
-    def __init__(self, env):
-        self.env = env
-        self._static_floor = None
-        self._clairvoyant_ceiling = None
-        self.decomp_anchor = DECOMP_ANCHOR
-
-    @property
-    def static_floor(self):
-        if self._static_floor is None:
-            self._static_floor = realizable_static(self.env)
-        return self._static_floor
-
-    @property
-    def clairvoyant_ceiling(self):
-        if self._clairvoyant_ceiling is None:
-            self._clairvoyant_ceiling = clairvoyant_rate(self.env)
-        return self._clairvoyant_ceiling
-
-    def voi_pct(self, rate):
-        """% of the clairvoyant value-of-information gap a `rate` claws back over the static floor."""
-        return (rate - self.static_floor) / (self.clairvoyant_ceiling - self.static_floor) * 100
+# The env-derived %VoI reference lines (floor/ceiling/anchor + the BeliefRefs SSOT) now live in the
+# NEUTRAL module `chocofarm/references.py` so both `az` (training) and `eval` can depend on them
+# without `az` reaching backwards into the eval harness (roadmap item F). Re-exported here verbatim
+# for back-compat: existing `from chocofarm.eval.harness import ...` sites keep working unchanged.
+from chocofarm.references import BeliefRefs, realizable_static, clairvoyant_rate, DECOMP_ANCHOR
 
 
 def main():
