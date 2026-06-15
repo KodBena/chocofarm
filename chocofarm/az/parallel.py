@@ -56,9 +56,12 @@ So neither weights nor results travel as pickle:
     back with `np.frombuffer` and reshapes — zero pickle of array data. Keys are namespaced by a
     per-call run-token and deleted after read so redis doesn't accumulate.
 
-Connection facts come from `chocofarm/config.py` (`redis_params()`, env-overridable via
-`CHOCO_REDIS_HOST`/`CHOCO_REDIS_PORT`/`CHOCO_REDIS_DB`), defaulting to 127.0.0.1:6379 db 0 — the
-disk-persisted instance (`noeviction`, no `maxmemory` cap). Redis being unreachable is a loud
+Connection facts come from `chocofarm/config.py` (`transport_redis_params()`, env-overridable via
+`CHOCO_TRANSPORT_REDIS_HOST`/`CHOCO_TRANSPORT_REDIS_PORT`/`CHOCO_TRANSPORT_REDIS_DB`), defaulting to
+127.0.0.1:6380 db 0 — the EPHEMERAL memory-cache instance (`allkeys-lru`, a `maxmemory` cap), whose
+LRU eviction is the safety net for the transport's short-lived weight/result churn. This is
+deliberately a DIFFERENT instance from the registry's disk-persisted 6379 `noeviction` redis
+(`registry_redis_params()`). Redis being unreachable is a loud
 failure (ADR-0002) — the loop must not silently fall back to a slow path the operator didn't ask
 for. Weights carry a 1h TTL and are read-validated (a missing payload is a loud RuntimeError, never
 a silent stale-net serve), and result blobs are read + deleted in the same iteration they're

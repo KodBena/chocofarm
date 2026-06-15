@@ -2,18 +2,28 @@
 """
 chocofarm/config.py — infrastructure configuration surface.
 
-One place for the runtime connection facts the codebase needs. Today that is the
-single redis instance shared by the AZ transport (`chocofarm/az/parallel.py`) and
-the hyperparameter registry (`chocofarm/hp/registry.py`): both call
-`redis_params()` here instead of re-reading `os.environ` themselves, so "which
-redis" is decided once rather than drifting across modules.
+One place for the runtime connection facts the codebase needs. chocofarm runs TWO redis instances by
+design — one per role — and this module is the single owner of "which redis" for each, so the facts
+are decided once here rather than drifting across modules:
 
-The default is **127.0.0.1:6379 db 0** — the DISK-PERSISTED redis (RDB `save`
-enabled, `maxmemory-policy noeviction`, no `maxmemory` cap). Registry blobs there
-survive a restart and are never evicted, so no eviction workaround is needed (the
-6380 memory-cache instance, an `allkeys-lru` store, was the reason the registry
-once nudged `volatile-lru`; on 6379 that is moot). Each value is env-overridable
-for an operator who wants a different instance.
+  * TRANSPORT (the AZ parallel-loop weight broadcast + result blobs — `chocofarm/az/transport.py`,
+    orchestrated by `chocofarm/az/parallel.py`) → **127.0.0.1:6380 db 0**, the EPHEMERAL memory-cache
+    instance (`allkeys-lru`, a `maxmemory` cap). The transport's churn — versioned weight blobs and
+    per-task result blobs — is short-lived; the keys carry 1h TTLs and are read+deleted within the
+    iteration, and the LRU policy is the safety-net that evicts anything left behind. Nothing here
+    needs to survive a restart.
+
+  * REGISTRY (the hp config blobs — `chocofarm/hp/registry.py`) → **127.0.0.1:6379 db 0**, the
+    DISK-PERSISTED instance (RDB `save` enabled, `maxmemory-policy noeviction`, no `maxmemory` cap).
+    Registry blobs carry NO TTL: they must survive a restart and must never be evicted, so they live
+    on the noeviction instance. The `allkeys-lru` eviction the 6380 transport instance applies would
+    silently drop a registry blob — which is exactly why the two roles are deliberately distinct
+    instances, not one shared store.
+
+Each role's connection facts are env-overridable independently, via DISTINCT env-var families
+(`CHOCO_TRANSPORT_REDIS_*` vs `CHOCO_REGISTRY_REDIS_*`) so an operator can point one role at a
+different instance without touching the other. The socket/connect timeouts are NOT role-specific (a
+stall is a stall on either instance), so they stay shared across both roles under one env contract.
 
 Public Domain (Unlicense).
 """
@@ -21,29 +31,52 @@ from __future__ import annotations
 
 import os
 
-# Canonical defaults — the disk-persisted redis. Env vars override at runtime.
-DEFAULT_REDIS_HOST = "127.0.0.1"
-DEFAULT_REDIS_PORT = 6379
-DEFAULT_REDIS_DB = 0
+# Transport role — the EPHEMERAL memory-cache redis (allkeys-lru). Env vars override at runtime.
+DEFAULT_TRANSPORT_REDIS_HOST = "127.0.0.1"
+DEFAULT_TRANSPORT_REDIS_PORT = 6380
+DEFAULT_TRANSPORT_REDIS_DB = 0
+
+# Registry role — the DISK-PERSISTED redis (noeviction). Env vars override at runtime.
+DEFAULT_REGISTRY_REDIS_HOST = "127.0.0.1"
+DEFAULT_REGISTRY_REDIS_PORT = 6379
+DEFAULT_REGISTRY_REDIS_DB = 0
+
+# Shared across both roles — a stall is a stall on either instance, so the timeouts are not
+# role-specific (one env contract for both).
 DEFAULT_REDIS_SOCKET_TIMEOUT = 60.0
 DEFAULT_REDIS_CONNECT_TIMEOUT = 10.0
 
 
-def redis_params() -> dict:
-    """Connection facts (host/port/db) for the shared redis, env-overridable. The transport and the
-    registry both call this so they address one instance by default."""
+def transport_redis_params() -> dict:
+    """Connection facts (host/port/db) for the TRANSPORT redis — the ephemeral allkeys-lru instance
+    at 127.0.0.1:6380 db 0 that carries the AZ parallel-loop weight/result blobs. Env-overridable via
+    `CHOCO_TRANSPORT_REDIS_HOST`/`CHOCO_TRANSPORT_REDIS_PORT`/`CHOCO_TRANSPORT_REDIS_DB`, independent
+    of the registry's family."""
     return dict(
-        host=os.environ.get("CHOCO_REDIS_HOST", DEFAULT_REDIS_HOST),
-        port=int(os.environ.get("CHOCO_REDIS_PORT", str(DEFAULT_REDIS_PORT))),
-        db=int(os.environ.get("CHOCO_REDIS_DB", str(DEFAULT_REDIS_DB))),
+        host=os.environ.get("CHOCO_TRANSPORT_REDIS_HOST", DEFAULT_TRANSPORT_REDIS_HOST),
+        port=int(os.environ.get("CHOCO_TRANSPORT_REDIS_PORT", str(DEFAULT_TRANSPORT_REDIS_PORT))),
+        db=int(os.environ.get("CHOCO_TRANSPORT_REDIS_DB", str(DEFAULT_TRANSPORT_REDIS_DB))),
+    )
+
+
+def registry_redis_params() -> dict:
+    """Connection facts (host/port/db) for the REGISTRY redis — the disk-persisted noeviction instance
+    at 127.0.0.1:6379 db 0 that holds the hp config blobs (no TTL, must survive a restart).
+    Env-overridable via `CHOCO_REGISTRY_REDIS_HOST`/`CHOCO_REGISTRY_REDIS_PORT`/`CHOCO_REGISTRY_REDIS_DB`,
+    independent of the transport's family."""
+    return dict(
+        host=os.environ.get("CHOCO_REGISTRY_REDIS_HOST", DEFAULT_REGISTRY_REDIS_HOST),
+        port=int(os.environ.get("CHOCO_REGISTRY_REDIS_PORT", str(DEFAULT_REGISTRY_REDIS_PORT))),
+        db=int(os.environ.get("CHOCO_REGISTRY_REDIS_DB", str(DEFAULT_REGISTRY_REDIS_DB))),
     )
 
 
 def redis_socket_timeout() -> float:
-    """Per-op socket timeout (ADR-0002: a stall becomes a loud error, not a silent hang)."""
+    """Per-op socket timeout, shared across both roles (ADR-0002: a stall becomes a loud error, not a
+    silent hang)."""
     return float(os.environ.get("CHOCO_REDIS_SOCKET_TIMEOUT", str(DEFAULT_REDIS_SOCKET_TIMEOUT)))
 
 
 def redis_connect_timeout() -> float:
-    """Connection-establish timeout for the redis client."""
+    """Connection-establish timeout for the redis client, shared across both roles."""
     return float(os.environ.get("CHOCO_REDIS_CONNECT_TIMEOUT", str(DEFAULT_REDIS_CONNECT_TIMEOUT)))

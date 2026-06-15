@@ -353,12 +353,18 @@ wire as numbers (see §3).
 
 `chocofarm/az/transport.py` is the **SOLE owner** of the wire protocol (audit
 item K). The C++ runner builds its read/write keys and parses/emits bytes to
-match it **exactly**. Connection: via the transport's `config.redis_params()`
-— default `127.0.0.1:6379` db 0, env-overridable through `CHOCO_REDIS_HOST`/
-`CHOCO_REDIS_PORT`/`CHOCO_REDIS_DB`. The C++ runner reads the **same
-`CHOCO_REDIS_*` contract**, so it lands on whatever instance the operator points
-the Python transport at; `config.py` is the one owner of "which redis" (P1), not
-a port re-typed here. The protocol, verbatim from `transport.py`:
+match it **exactly**. The C++ runner is a **transport** component, so its
+connection is via the transport role's `config.transport_redis_params()` —
+default `127.0.0.1:6380` db 0, the **ephemeral** memory-cache instance
+(`allkeys-lru`), env-overridable through `CHOCO_TRANSPORT_REDIS_HOST`/
+`CHOCO_TRANSPORT_REDIS_PORT`/`CHOCO_TRANSPORT_REDIS_DB`. This is explicitly
+**NOT** the registry's disk-persisted `127.0.0.1:6379` `noeviction` instance
+(`config.registry_redis_params()`, the `CHOCO_REGISTRY_REDIS_*` family) — the
+two roles are deliberately distinct instances. The C++ runner reads the **same
+`CHOCO_TRANSPORT_REDIS_*` contract**, so it lands on whatever instance the
+operator points the Python transport at; `config.py` is the one owner of "which
+redis" per role (P1), not a port re-typed here. The protocol, verbatim from
+`transport.py`:
 
 **Weight keys (`weight_keys(run, phase, version)`).** Two keys per published
 net, namespaced by `run`, `phase ∈ {"gen","eval"}`, and `version`:

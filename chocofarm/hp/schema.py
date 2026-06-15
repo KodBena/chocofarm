@@ -213,9 +213,12 @@ class ParallelConfig:
 
     workers: int = hp(4, Mut.RESTART, "process-pool size; pool built once before the loop")
     cores: str = hp("0,1,2,3", Mut.RESTART, "core-pin list; set in the pool initializer")
-    redis_host: str = hp(config.DEFAULT_REDIS_HOST, Mut.RESTART, "CHOCO_REDIS_HOST")
-    redis_port: int = hp(config.DEFAULT_REDIS_PORT, Mut.RESTART, "CHOCO_REDIS_PORT")
-    redis_db: int = hp(config.DEFAULT_REDIS_DB, Mut.RESTART, "CHOCO_REDIS_DB")
+    # parallel.py is the TRANSPORT side: these provenance fields record the transport redis (the
+    # ephemeral allkeys-lru 6380 instance — `config.transport_redis_params()`), env-overridable via
+    # the `CHOCO_TRANSPORT_REDIS_*` family. NOT the registry's persisted 6379 noeviction instance.
+    redis_host: str = hp(config.DEFAULT_TRANSPORT_REDIS_HOST, Mut.RESTART, "CHOCO_TRANSPORT_REDIS_HOST")
+    redis_port: int = hp(config.DEFAULT_TRANSPORT_REDIS_PORT, Mut.RESTART, "CHOCO_TRANSPORT_REDIS_PORT")
+    redis_db: int = hp(config.DEFAULT_TRANSPORT_REDIS_DB, Mut.RESTART, "CHOCO_TRANSPORT_REDIS_DB")
 
 
 @dataclass

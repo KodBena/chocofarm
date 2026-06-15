@@ -16,10 +16,12 @@ One JSON blob per experiment, addressed by an operator-meaningful `experiment_id
 The single-blob-per-experiment choice (over key-per-field) is design §5.2: a read is one GET + one
 strict decode (atomic + whole-config-validated by construction); a write is a read-modify-write of
 the one small (<4 KB) blob under a WATCH/MULTI/EXEC optimistic guard (§5.4). Registry keys carry
-NO TTL (a bare SET — design §2.1), so they never sit on a clock; on the disk-persisted redis
-(127.0.0.1:6379, `noeviction` — see `chocofarm/config.py`) they survive a restart and are never
-evicted, so the §2.2/§2.3 `volatile-lru` eviction workaround the 6380 memory-cache instance needed
-is moot here.
+NO TTL (a bare SET — design §2.1), so they never sit on a clock; the registry therefore lives on the
+DISK-PERSISTED redis (127.0.0.1:6379, `noeviction` — `config.registry_redis_params()`) so the blobs
+survive a restart and are never evicted. This is deliberately a DIFFERENT instance from the
+transport's ephemeral 6380 memory-cache (`allkeys-lru`): that instance's LRU eviction would silently
+drop a TTL-less registry blob under memory pressure, so the registry is kept off it on the noeviction
+instance.
 
 Namespacing (design §5.1): distinct ids → disjoint key prefixes → concurrent experiments never
 clobber, mirroring the transport's per-run token (parallel.py) under a human name.
@@ -73,7 +75,8 @@ from chocofarm.hp.schema import (
 )
 
 # ---------------------------------------------------------------------------
-# Key namespace (design §5.1) and connection facts (mirror parallel.py's env-driven params)
+# Key namespace (design §5.1) and connection facts (the registry's own env-driven params —
+# `config.registry_redis_params()`, the disk-persisted noeviction instance; NOT the transport's)
 # ---------------------------------------------------------------------------
 KEY_PREFIX = "choco:hp:"
 
@@ -90,10 +93,12 @@ def _meta_key(experiment_id: str) -> str:
 
 
 def _redis_params() -> dict:
-    """Shared connection facts from chocofarm/config.py (the transport in parallel.py uses the same),
-    so the registry and the transport address one redis instance by default."""
+    """REGISTRY connection facts from chocofarm/config.py — the disk-persisted noeviction instance
+    (127.0.0.1:6379 db 0 by default), DELIBERATELY DISTINCT from the transport's ephemeral
+    allkeys-lru 6380 instance so TTL-less registry blobs are never evicted. Env-overridable via the
+    `CHOCO_REGISTRY_REDIS_*` family."""
     from chocofarm import config
-    return config.redis_params()
+    return config.registry_redis_params()
 
 
 # ---------------------------------------------------------------------------
@@ -452,8 +457,9 @@ def seed_registry(experiment_id: str, cfg: ExperimentConfig, env=None,
     A --resume of an existing experiment re-binds to the existing blob (does NOT clobber operator
     overrides) unless `overwrite=True`. If `env` is given, the derived dims + INSTANCE facts are
     recorded for the drift check (design §7): arch.in_dim/n_actions and the env constants the net
-    was fit to. On the disk-persisted 6379 redis (`noeviction`) registry keys never expire or evict,
-    so no eviction-policy nudge is needed (the 6380 memory-cache instance once required one).
+    was fit to. The registry lives on the disk-persisted 6379 redis (`noeviction`), where TTL-less
+    keys never expire or evict — deliberately NOT the transport's ephemeral 6380 allkeys-lru instance,
+    whose LRU eviction would silently drop a registry blob.
 
     Returns the config now in the registry (the freshly-seeded one, or the existing one on a
     re-bind). This is also the post-restart recovery path (design §2.3)."""
