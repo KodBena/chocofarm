@@ -38,36 +38,8 @@ early-exit option that the clairvoyant ceiling shows is where most of the +70% l
 """
 import math
 import numpy as np
-from chocofarm.solvers.base import Policy, _base_value
+from chocofarm.solvers.base import Policy, _base_value, UCB_C, GreedyStopBase
 from chocofarm.model.env import TERMINATE
-
-
-class GreedyStopBase(Policy):
-    """Default ISMCTS playout policy: a λ-rational greedy that stops cleanly.
-
-    Plain `GreedyPolicy` (the obvious base) over-collects under a renewal-reward penalty — it
-    keeps a treasure as long as `marg·value − λ·travel > 0`, ignoring that reaching it also
-    *relocates the exit*, so it sweeps low-marginal treasures across the map and the playout
-    return understates the rate (the over-collection signature in docs/results). This base nets
-    the exit relocation into the step value: move to the best treasure only when
-
-        marg·value − λ·(go_there + exit(there) − exit(here)) > 0,
-
-    else TERMINATE. That single correction turns the playout into a tighter renewal cycle, so
-    leaf estimates reward banking a reachable basket and exiting — the behaviour the clairvoyant
-    ceiling rewards — rather than an exhaustive sweep."""
-    def decide(self, env, loc, bw, collected, lam, rng=None):
-        marg = env.marginals(bw)
-        cur_exit = env.exit_cost(loc)
-        best, act = 0.0, TERMINATE
-        for i in range(env.N):
-            if i in collected or marg[i] <= 0:
-                continue
-            go = env.d(loc, ("t", i))
-            net = marg[i] * env.value[i] - lam * (go + env.exit_cost(("t", i)) - cur_exit)
-            if net > best:
-                best, act = net, ("t", i)
-        return act
 
 
 def _belief_key(bw):
@@ -107,7 +79,7 @@ class ISMCTSPolicy(Policy):
     default (pass a `policies.GreedyPolicy()` to use the plainer greedy) — cheap, and the search
     supplies the contingent depth the base lacks."""
 
-    def __init__(self, iterations=300, c=0.7, base=None, max_depth=24):
+    def __init__(self, iterations=300, c=UCB_C, base=None, max_depth=24):
         self.iterations = int(iterations)
         self.c = float(c)
         self.base = base if base is not None else GreedyStopBase()

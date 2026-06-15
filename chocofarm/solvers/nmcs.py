@@ -43,7 +43,7 @@ caches the belief space (per the project's bounded-safety rule).
 import numpy as np
 
 from chocofarm.model.env import TERMINATE
-from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value
+from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value, candidate_actions
 
 
 class NMCSPolicy(Policy):
@@ -87,17 +87,9 @@ class NMCSPolicy(Policy):
 
     # ---- candidate generation (bounded branching) -------------------------------------
     def _candidates(self, env, loc, bw, collected):
-        marg = env.marginals(bw)
-        dets = sorted(
-            (i for i in env.detectors
-             if np.any((bw & env.cover_mask[i]) != 0) and np.any((bw & env.cover_mask[i]) == 0)),
-            key=lambda i: env.d(loc, ("d", i)))[:self.cand_det]
-        tres = sorted(
-            (i for i in range(env.N) if i not in collected and marg[i] > 0),
-            key=lambda i: env.d(loc, ("t", i)))[:self.cand_tre]
-        cands = [("d", i) for i in dets] + [("t", i) for i in tres]
-        cands.append(TERMINATE)            # bank-and-exit is always an option
-        return cands
+        # shared bounded-branching pruner; NMCS appends TERMINATE (bank-and-exit is always an option).
+        return candidate_actions(env, loc, bw, collected, self.cand_det, self.cand_tre,
+                                 include_terminate=True)
 
     # ---- level-0: determinized base playout from a state ------------------------------
     def _playout(self, env, loc, bw, collected, lam, rng):

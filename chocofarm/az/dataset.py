@@ -42,12 +42,14 @@ from chocofarm.az.features import FeatureBuilder, feature_dim
 from chocofarm.az.value_target import suffix_returns_to_go
 
 
-def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=40):
+def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=None):
     """Run ONE decomp episode against `world`, logging (features, per-step (r,dt)) at each
     decision point. Returns a list of (feat, return_to_go) for the visited states.
 
     Mirrors env.simulate exactly (same loc/bw/collected init and update), so the decomp
     policy's fresh-episode detection (full belief at entry) triggers its per-episode reset."""
+    if max_steps is None:
+        max_steps = env.max_steps              # the single episode-horizon home (env.py)
     loc, bw, collected = ("w", env.entry), env.worlds, set()
     feats = []          # feature vector logged BEFORE each executed action
     step_rt = []        # (r, dt) of each executed action
@@ -55,9 +57,8 @@ def _episode_transitions(env, policy, fb, world, lam, rng, max_steps=40):
         a = policy.decide(env, loc, bw, collected, lam, rng)
         if a == TERMINATE:
             break
-        # log the state we DECIDED from (one cached marginals call per node, F7)
-        marg = env.marginals(bw)
-        feats.append(fb.build(loc, bw, collected, marg=marg))
+        # log the state we DECIDED from (build's fused kernel derives the marginals in one pass, F7)
+        feats.append(fb.build(loc, bw, collected))
         r, loc, bw, collected, dt = env.apply(loc, bw, collected, a, world)
         step_rt.append((r, dt))
     exit_c = env.exit_cost(loc)

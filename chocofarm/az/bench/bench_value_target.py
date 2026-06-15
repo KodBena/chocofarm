@@ -40,10 +40,12 @@ from chocofarm.az.gumbel_search import GumbelAZSearch
 from chocofarm.az.value_target import blended_returns_to_go
 
 
-def roll_episode_raw(env, search, fb, world, lam, rng, max_steps=40):
+def roll_episode_raw(env, search, fb, world, lam, rng, max_steps=None):
     """Roll ONE net-guided episode, returning (feats, step_rt, boots, exit_c) — everything the
     value-target rule needs, recorded ONCE so multiple blends reuse the identical trajectory.
     Mirrors generate_episode's recording but does NOT compute the target."""
+    if max_steps is None:
+        max_steps = env.max_steps              # the single episode-horizon home (env.py)
     loc, bw, collected = ("w", env.entry), env.worlds, set()
     feats, step_rt, boots = [], [], []
     for _ in range(max_steps):

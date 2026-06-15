@@ -473,7 +473,7 @@ def empirical_penalty_mean(env: Environment, pc: PenalizedClairvoyant, policy, l
         world = int(rng.choice(env.worlds))
         loc, bw, collected = ("w", env.entry), env.worlds, set()
         zsum = 0.0
-        for _step in range(40):
+        for _step in range(env.max_steps):           # the single episode-horizon home (env.py)
             a = policy.decide(env, loc, bw, collected, lam, rng)
             if a == TERMINATE:
                 break

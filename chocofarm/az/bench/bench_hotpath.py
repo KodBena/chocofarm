@@ -66,8 +66,7 @@ def bench(net_path, states_path, repeat=5):
     S = len(states)
 
     # pre-build feats + masks for components that need them
-    margs = [env.marginals(bw) for bw in bws]
-    feats = [fb.build(locs[k], bws[k], colls[k], marg=margs[k]) for k in range(S)]
+    feats = [fb.build(locs[k], bws[k], colls[k]) for k in range(S)]
     masks = [legal_mask_from_features(env, f) for f in feats]
     # a legal node-state for _puct_select: emulate a partially-visited node
     from chocofarm.az.gumbel_search import _Node, GumbelAZSearch
@@ -81,13 +80,13 @@ def bench(net_path, states_path, repeat=5):
         env.marginals(bws[i["k"]])
     results["env.marginals"] = _time(f_marg, S, repeat)
 
-    # --- features.build (marg supplied; isolates the build itself) ---
+    # --- features.build (the fused kernel derives marginals; isolates the build itself) ---
     i["k"] = 0
 
     def f_build():
         i["k"] = (i["k"] + 1) % S
         k = i["k"]
-        fb.build(locs[k], bws[k], colls[k], marg=margs[k])
+        fb.build(locs[k], bws[k], colls[k])
     results["features.build"] = _time(f_build, S, repeat)
 
     # --- belief reductions (the (nb x nD) detector block in build) ---

@@ -51,7 +51,7 @@ def rollout(env, pol, n_episodes, lam, seed):
         w = int(rng.choice(env.worlds))
         # mirror env.simulate but tally the executed actions
         loc, bw, collected, R, T = ("w", env.entry), env.worlds, set(), 0.0, 0.0
-        for _step in range(40):
+        for _step in range(env.max_steps):          # the single episode-horizon home (env.py)
             a = pol.decide(env, loc, bw, collected, lam, rng)
             counts[action_to_slot(env, a)] += 1
             from chocofarm.model.env import TERMINATE
