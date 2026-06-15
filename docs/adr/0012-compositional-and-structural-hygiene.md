@@ -77,7 +77,7 @@ adjacent concerns:
 We adopt **Compositional and Structural Hygiene** as a codebase-wide tenet for
 new structure. It is stated in two registers: first **the anti-pattern
 checklist** (each audit cancer → the rule that prevents it — the index a
-contributor scans before authoring), then **the seven principles** (each a
+contributor scans before authoring), then **the eight principles** (each a
 checkable rule, with a worked example from this codebase and the cancer it
 prevents), then a **dedicated concrete section for a new-language (C++)
 component**.
@@ -99,8 +99,9 @@ this shape, the named principle forbids it."
 | **G** — Load-bearing knowledge offloaded to unenforceable prose | a convention that lives only in a comment/doc the code cannot check or that does not resolve | **P5** + **ADR-0011** — encode in code or a real registry; cite the derivation, not volatile prose (ADR-0011 owns the mechanization) |
 | **H** — Defensive band-aids stacked against a hostile substrate | a new mitigation layered on an un-diagnosed cause; a reliability strategy that *is* a stack of patches | **P5** (fail loud; remove the root cause) — distinguish a justified guard from a band-aid masking an undiagnosed cause |
 | **(new, cross-language)** — two writers of one cross-boundary truth | a hand-mirrored type, offset, key, or codec on the far side of the language boundary that re-authors a fact the near side already defines (a hardcoded weight offset; a second result-blob codec) | **P7** (cross-language wire discipline) — a cross-boundary fact has exactly one authoritative definition and every side *derives* its view (reads it at runtime or generates it at build time), never re-authors it by hand; mechanically enforced at the strongest feasible level (generate/compile-from-one-source > build-time lint > runtime parity backstop). Schema-driven codegen (one schema → N derived readers) is SSOT and is encouraged, not banned |
+| **(new, call-boundary)** — a contract carried only by an unenforced or dishonest signature | an untyped function/method/dataclass signature (the contract lives nowhere checkable), or a *lying* one whose body does not honor its annotation (`hp: AdamHParams = None` whose body accepts `None`; `lr/b1/b2/eps: float` populated with jax `Array`s) | **P8** (typed signatures are the contract's SSOT) — the signature is the single source of truth of the input/output contract, honored by the body, at the **strict-where-achievable** bar, with each relaxation a named stub-gap (not a convenience); mechanically enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing baseline (ADR-0011 Rule 1) |
 
-### The seven principles
+### The eight principles
 
 #### P1 — Single source of truth / derive-don't-duplicate
 
@@ -110,7 +111,8 @@ quantity — a dimension, a layout, a count, the feature/weight layout, the
 at the point of use (or cached on the object that owns the source)**, never
 hand-copied as a literal or re-encoded in a second place. The check: *grep the
 tree for the value; if it appears as an independent literal in two places that
-must agree, the rule is violated.*
+must agree, the rule is violated.* (P8 is this same single-home rule at the
+call boundary: a function's contract has one home — its typed signature.)
 
 **Worked example (this codebase).** `feature_dim(env)` and
 `n_action_slots(env)` are derived from the instance with **zero drift** — the
@@ -172,7 +174,8 @@ error** the moment two envs differ in N (and leak one never-evicted entry per
 env). A parameter the receiver cannot honor
 (`train_epochs(lr, l2)` ignored; `build(marg)` ignored; `restrict_faces` gates
 `pass`) is a *lying signature* — P2 forbids it: **a parameter the receiver
-cannot honor is not in the signature.**
+cannot honor is not in the signature** (and P8 at the call boundary: an
+annotation the body does not honor is the same lie surfaced at the type layer).
 
 #### P3 — No god-objects
 
@@ -377,6 +380,61 @@ format knowledge left in an unenforceable runtime-only convention instead of
 generated/compiled/linted from one source) and C (shared mutable state across
 processes).** A cross-boundary fact has one authoritative home; every side
 derives its view and none re-authors it.
+
+#### P8 — Typed signatures are the single source of truth of a function's contract
+
+**Rule (checkable).** A function, method, or dataclass **signature is the
+single source of truth of its input/output contract** — the call-boundary twin
+of P1 (one home per fact) and of ADR-0002's no-lying-signature, P2's "a
+parameter the receiver cannot honor is not in the signature." An annotation the
+body does not honor is a **lying signature** — the type-layer form of the same
+lie: `hp: AdamHParams = None` whose body proves `None` is an accepted value;
+`lr/b1/b2/eps: float` fields populated with traced jax `Array`s (the exact two
+defects the from-scratch strict run surfaced — assessment §3). The bar is
+**strict-where-achievable**: `mypy --strict`-clean at the maximal real
+strictness a module can reach, where array internals annotated `NDArray[Any]` /
+`Any` *satisfy* strict without any relaxation (they are honest types, not
+escapes). The check: *(a) does every function/method/dataclass field carry a
+param+return annotation? (b) does the body honor each — no value the annotation
+forbids reaches a consumer? (c) does the module pass the strict gate, or is it
+a documented backlog entry on the way in (see Self-application)?*
+
+**Named-relaxation posture (constraint, not excuse).** A per-module
+`ignore_missing_imports` is legitimate **only** for a genuine stub-gap — a
+library that ships **no** `py.typed` and no stubs (numba's `@njit` erases the
+decorated signature; optax's `GradientTransformation`; tensorboardX's logging
+sink). A library that **is** typed (jax ships `py.typed`) must **not** be
+blanket-ignored — silencing a checkable library is a convenience-relaxation, so
+its friction is instead a **commented `Any` at the use site**, visible in the
+diff, distinguishing constraint from excuse in the source itself. Each escape
+stays honest by `warn_unused_ignores` (a relaxation that stops being needed
+fails CI). And — **reusing P7's no-scale-excuse rule verbatim** — *never*
+justify a weaker bar with a scale / "one maintainer" / "for now" / minimality /
+YAGNI argument; that argument shape is the tell P7 already named and rejected
+(the discipline applied once at small scale is exactly how the cancers grew). A
+weaker bar is justified only by a named, verified stub-gap, never by extent.
+
+**Worked example (this codebase).** The single genuine bug cluster the
+from-scratch strict run found is `az/mlp_jax_train.py`'s `AdamHParams` path
+(assessment §3): the `hp: AdamHParams = None` default whose body
+(`hp = self._default_hp if hp is None else hp`) *proves* `None` is accepted —
+a P2 / ADR-0002 **lying signature** surfaced at the type layer (fix:
+`AdamHParams | None`) — and the `NamedTuple` declaring `lr/b1/b2/eps: float`
+while `_hp_arrays` constructs it with `jnp.asarray(...)` traced Arrays (fix:
+widen to `float | jax.Array`, the two forms it genuinely holds). The
+contrasting **clean documented `Any`** is `forward_core`'s backend-polymorphic
+`xp` (numpy-or-jax module) — an honest, commented use-site `Any` at a real
+backend-polymorphism seam, not a relaxation: it is what an annotation looks like
+when the type genuinely *is* "either backend," distinguished from the lie by
+being honored.
+
+**Cancer prevented: untyped / lying-signature contracts.** A contract carried
+only by an unenforced signature lives nowhere checkable (the call-boundary form
+of G — load-bearing knowledge in unenforceable convention); a contract carried
+by a *dishonest* signature is worse — it asserts a guarantee the body breaks,
+the call-boundary form of B's two-writers (the signature says one thing, the
+body another) and of ADR-0002's silently-accepted lie. P8 makes the signature
+the one honored authority, checked by the gate below.
 
 ---
 
@@ -628,6 +686,18 @@ write-time data constraint / run-time invariant / review-only):
   codegen/lint is minted, that gap is **review-only** — but settling for the
   runtime-test-only backstop is *not* justified by a scale / minimality / "for
   now" argument (that argument shape is the tell P7 rejects).
+- **P8 (typed signatures):** **test/CI gate** — the **mypy `--strict` CI gate**
+  (`pyproject.toml` `[tool.mypy]` + `tests/test_mypy_strict.py`) is the
+  ADR-0011 Rule-1 mechanism that converts "typed signatures" from review-only
+  prose into an enforced contract. It runs `mypy --strict` against an explicit
+  `STRICT_CLEAN` set and asserts zero errors, ratcheting a
+  **monotonically-decreasing baseline module-by-module** (assessment §5,
+  Stages 0–4): a module joins the gated set as it is typed, and a regression in
+  any gated module's annotations fails CI. A module is **review-only** until it
+  joins that set — and that join is the ADR-0011 Rule-2 conversion trigger (the
+  recurrence that converts review-only prose to a mechanism), here a scheduled
+  monotonic rollout rather than a defect. `warn_unused_ignores` keeps each
+  named relaxation honest at the same gate.
 
 This tenet's own Rule-1 declaration: **review-and-audit-policed**, with the
 architectural audit as the absence-detector — exactly as ADR-0011 declares for
@@ -723,9 +793,11 @@ prose.
   boundary.
 - **ADR-0011 (mechanization discipline).** This tenet is upstream of it:
   structure born clean is structure ADR-0011 never converts. ADR-0011's worked
-  mechanisms (`FeatureLayout`, `BeliefRefs`, the param-registry serializer) are
-  this tenet's worked examples; its Rule 1 governs this tenet's enforcement-
-  surface declaration above.
+  mechanisms (`FeatureLayout`, `BeliefRefs`, the param-registry serializer, and
+  the **mypy `--strict` CI gate** that backs P8) are this tenet's worked
+  examples; its Rule 1 governs this tenet's enforcement-surface declaration
+  above, and its Rule 2 (recurrence → mechanism) is the trigger by which a
+  module joins P8's gated set.
 - **The 2026-06-15 architectural audit** (`docs/notes/audit/`). The source
   substrate — every anti-pattern A–H here inverts one of its §2 cancers, and
   the R-series roadmap is the remediation of existing code this ADR's

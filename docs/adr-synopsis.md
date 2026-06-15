@@ -267,7 +267,7 @@ Rule 2 (recurrence → mechanism).
 
 **Decision.** A structural-design tenet for all *new* code — the incoming C++
 runner first, the future async actor-learner second — stated as the positive
-inverse of the 2026-06-15 audit's eight "architectural cancers." Seven checkable
+inverse of the 2026-06-15 audit's eight "architectural cancers." Eight checkable
 principles: **P1** single-source-of-truth / derive-don't-duplicate; **P2**
 seam/port discipline (the env↔Policy inversion of control as template; derived
 state owned on the object whose lifetime it shares, never a module global keyed
@@ -284,7 +284,12 @@ schema-driven codegen is encouraged; mechanically enforced at the strongest
 feasible level — generate/compile-from-one-source > build-time lint > runtime
 parity backstop — separating the serialization contract from the transport/
 coordination mechanism, a bytes-store for state vs a messaging fabric for
-coordination). It composes with rather than
+coordination); **P8** typed signatures are the SSOT of a function's contract
+(the call-boundary twin of P1 and of ADR-0002's no-lying-signature — an
+annotation the body does not honor is a *lying signature*; the bar is
+strict-where-achievable, each relaxation a named stub-gap not a convenience,
+enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing
+baseline). It composes with rather than
 restates its siblings (0002/0004/0005/0007/0009/0011 cited, not re-derived), and
 carries a dedicated concrete C++ wire contract (the `transport.py` keys/dtypes,
 parity under the P6 bar).
