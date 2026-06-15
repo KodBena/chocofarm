@@ -31,31 +31,16 @@ import numpy as np
 
 from chocofarm.model.env import Environment
 from chocofarm.az.mlp import ValueMLP
-from chocofarm.az.features import feature_dim
+from chocofarm.az.features import feature_dim, FeatureLayout
 
 
 def feature_names(env):
     """Human-readable name + block tag for each of the `feature_dim(env)` features, in layout
-    order (mirrors features.py exactly)."""
-    N, nD = env.N, len(env.detectors)
-    names, blocks = [], []
-    # per-treasure block (N×5): the `unc` sub-block (Bernoulli variance, Part C belief-resolution)
-    # is the 5th, AFTER dist — mirrors features.py build order exactly.
-    for sub, tag in [("marg", "treasure/marg"), ("collected", "treasure/collected"),
-                     ("available", "treasure/available"), ("dist", "treasure/dist"),
-                     ("unc", "treasure/unc")]:
-        for i in range(N):
-            names.append(f"t{i}.{sub}"); blocks.append(tag)
-    for sub, tag in [("informative", "detector/informative"), ("p_pos", "detector/p_pos"),
-                     ("dist", "detector/dist")]:
-        for j in range(nD):
-            names.append(f"d{j}.{sub}"); blocks.append(tag)
-    # global block (6 + n_tele): sum_unc (Σ_uncollected unc, Part C) is the 6th, after nonempty.
-    gnames = ["log|bw|", "n_collected", "sum_marg", "exit_cost", "nonempty", "sum_unc"]
-    for g in gnames:
-        names.append(f"global.{g}"); blocks.append("global")
-    for k in range(len(env.teleports)):
-        names.append(f"global.tele_dist{k}"); blocks.append("global")
+    order. Reads both straight from `FeatureLayout` (the one owner of the §2.2 layout, audit R6),
+    so the names/tags can no longer drift from the builder's write order."""
+    layout = FeatureLayout(env)
+    names = layout.element_names()
+    blocks = layout.block_tags()
     assert len(names) == feature_dim(env), (len(names), feature_dim(env))
     return names, blocks
 
