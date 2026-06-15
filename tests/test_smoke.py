@@ -29,10 +29,11 @@ from chocofarm.model import arrangement, facemodel
 from chocofarm.analysis.analyzer import analyze, real_instance
 from chocofarm.solvers.base import (
     Policy, GreedyPolicy, CertaintyEquivalentPolicy,
-    RolloutPolicy, SparseSamplingPolicy,
+    RolloutPolicy, SparseSamplingPolicy, RolloutConfig, SparseSamplingConfig,
 )
-from chocofarm.solvers.nmcs import NMCSPolicy
-from chocofarm.solvers.ismcts import ISMCTSPolicy
+from chocofarm.solvers.nmcs import NMCSPolicy, NMCSConfig
+from chocofarm.solvers.ismcts import ISMCTSPolicy, ISMCTSConfig
+from chocofarm.solvers.uct import UCTPolicy, UCTConfig
 from chocofarm.solvers.decomp import DecompPolicy
 from chocofarm.eval.harness import realizable_static, clairvoyant_rate, BeliefRefs
 
@@ -86,6 +87,39 @@ def test_search_solvers_construct():
     assert isinstance(ISMCTSPolicy(iterations=10), Policy)
     assert isinstance(RolloutPolicy(greedy, n_samples=4), Policy)
     assert isinstance(SparseSamplingPolicy(1, 2, ce), Policy)
+
+
+def test_searchconfig_matches_kwargs():
+    """Audit item I: a per-family SearchConfig-built solver decides IDENTICALLY to the same
+    solver built the back-compat kwargs way, on a fixed-seed decision. Behaviour-preserving:
+    `cfg=` is just a frozen grouping of the same scalar __init__ knobs (defaults unchanged)."""
+    env = Environment()
+    loc, bw, coll, lam = ("w", env.entry), env.worlds, set(), 0.08
+
+    def dec(pol, seed=12345):
+        return pol.decide(env, loc, bw, coll, lam, np.random.default_rng(seed))
+
+    # small fixed budgets to keep the gate bounded; the values are arbitrary but matched.
+    cases = [
+        (UCTPolicy(iterations=40, c=0.7, horizon=24),
+         UCTPolicy(cfg=UCTConfig(iterations=40, c=0.7, horizon=24))),
+        (ISMCTSPolicy(iterations=40, c=0.7, max_depth=24),
+         ISMCTSPolicy(cfg=ISMCTSConfig(iterations=40, c=0.7, max_depth=24))),
+        (NMCSPolicy(level=1, playout_samples=2, step_samples=1, cand_det=1, cand_tre=2, max_steps=18),
+         NMCSPolicy(cfg=NMCSConfig(level=1, playout_samples=2, step_samples=1,
+                                   cand_det=1, cand_tre=2, max_steps=18))),
+        (RolloutPolicy(GreedyPolicy(), n_samples=6, near_det=2, near_tre=3),
+         RolloutPolicy(GreedyPolicy(), cfg=RolloutConfig(n_samples=6, near_det=2, near_tre=3))),
+        (SparseSamplingPolicy(2, 3, CertaintyEquivalentPolicy()),
+         SparseSamplingPolicy(leaf=CertaintyEquivalentPolicy(), cfg=SparseSamplingConfig(depth=2, width=3))),
+    ]
+    for kw_pol, cfg_pol in cases:
+        assert dec(kw_pol) == dec(cfg_pol)
+
+    # the kwargs path must build exactly the documented frozen config (defaults preserved).
+    assert UCTPolicy(iterations=200).cfg == UCTConfig(iterations=200, c=0.7, horizon=24)
+    assert ISMCTSPolicy().cfg == ISMCTSConfig()
+    assert NMCSPolicy().cfg == NMCSConfig()
 
 
 def test_reference_lines_unmoved():

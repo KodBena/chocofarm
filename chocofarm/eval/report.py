@@ -21,9 +21,14 @@ reproduces what the scripts already printed, and the metric flows through `Belie
 so it cannot drift. The bespoke evals (eval_decomp / eval_az) keep their own formatting and
 only repoint the metric through `references()`.
 
-DEFERRED (out of R10 scope, noted): a per-solver `SearchConfig` dataclass. The solvers'
-frozen `__init__` is only truly made configurable by a per-call cfg object — a larger change
-than this dedup, so the PLAN literals stay inline in each script for now.
+SEARCHCONFIG (audit item I, landed): each classical search solver now has a frozen per-family
+`SearchConfig` dataclass (`UCTConfig`, `ISMCTSConfig`, `NMCSConfig`, `RolloutConfig`,
+`SparseSamplingConfig`), accepted at construction via `cfg=` alongside the back-compat kwargs
+(`solvers.SOLVER_CONFIGS` maps name -> config class). The PLAN literals here stay inline: this
+runner constructs no policies (the scripts do), and the schedule dicts it threads
+(`iters`/`warm_runs`/`final_runs`) are `dinkelbach_rate` args, not solver hyperparameters.
+DEFERRED (still): a per-`decide()` cfg override (the Tier-3 live-cell shape) so c/budget can
+anneal per call — deferred to keep `decide()` byte-identical when no override is passed.
 
 Fail-loud (ADR-0002): unknown `columns` raises rather than silently printing a wrong table.
 
