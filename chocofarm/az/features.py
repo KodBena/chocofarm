@@ -42,6 +42,7 @@ encode it (design §2.2).
 from __future__ import annotations
 
 import math
+import weakref
 
 import numpy as np
 
@@ -169,21 +170,31 @@ class FeatureLayout:
         return tags
 
 
-# Env-keyed memo for the layout descriptor. The layout is a fixed env-derived table (same idiom as
-# actions._SLOT_TABLES), so build it once per env and serve O(1) — hot-path callers
-# (legal_mask_from_features, run once per search node) get the named slices without re-building the
-# 15-block table every call (the path the docstrings call "only array slicing — no env calls").
-_LAYOUTS = {}
+# Env-keyed memo for the layout descriptor — a WeakKeyDictionary keyed by the ENV OBJECT itself
+# (audit R9). The layout is a fixed env-derived table (same idiom as actions._SLOT_TABLES), so
+# build it once per env and serve O(1) — hot-path callers (legal_mask_from_features, run once per
+# search node) get the named slices without re-building the 15-block table every call (the path the
+# docstrings call "only array slicing — no env calls").
+#
+# The key is the env object (a weak reference), NOT id(env). Environment instances are
+# weak-referenceable (no __slots__) and identity-hashable (Environment defines no __eq__), so each
+# distinct env object — including every copy-on-write restrict()/with_scenario view (a restricted
+# env has fewer detectors → a SMALLER feature_dim) — gets its OWN correctly-computed layout, not the
+# parent's. Weak refs evict the entry on GC (no leak — the old id(env) dict never evicted), and an
+# entry tied to the object's lifetime (not its address) cannot alias a different env at a reused
+# CPython address (the old id(env) address-reuse hazard). See actions._SLOT_TABLES for the full R9
+# rationale, including the deviation from the audit's literal "env attribute" (it would cycle).
+_LAYOUTS = weakref.WeakKeyDictionary()
 
 
 def feature_layout(env: Environment) -> "FeatureLayout":
-    """Return the cached `FeatureLayout` for `env`, building+caching on first use (keyed by
-    id(env)). Same env-derived-table memo idiom as actions.slot_action_tables."""
-    key = id(env)
-    lay = _LAYOUTS.get(key)
+    """Return the cached `FeatureLayout` for `env`, building+caching on first use (keyed by the env
+    OBJECT in a WeakKeyDictionary — audit R9). Same env-derived-table memo idiom as
+    actions.slot_action_tables."""
+    lay = _LAYOUTS.get(env)
     if lay is None:
         lay = FeatureLayout(env)
-        _LAYOUTS[key] = lay
+        _LAYOUTS[env] = lay
     return lay
 
 

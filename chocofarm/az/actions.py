@@ -23,6 +23,8 @@ was already built. `legal_mask_from_features` does exactly that, by slicing the 
 """
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 
 from chocofarm.model.env import TERMINATE
@@ -39,22 +41,37 @@ def term_slot(env) -> int:
     return env.N + len(env.detectors)
 
 
-# Slot<->action lookup tables, keyed by id(env). The mapping is a fixed env-derived bijection
-# (design §3), computed once per env and served by O(1) lookup — eliminating the ~3.5M
-# per-element function-body executions the search's edge loops incurred (hot-path profile). The
-# tables encode EXACTLY the same bijection the original branch logic did (asserted by
-# tests/test_az_loop.py::test_action_slot_bijection), so this is a structural memoization, not a
-# behavioral change. Hot loops that convert millions of times should hoist the tables once via
-# `slot_action_tables(env)` and index them directly, rather than calling the wrapper per element.
-_SLOT_TABLES = {}
+# Slot<->action lookup tables, a WeakKeyDictionary keyed by the ENV OBJECT itself (audit R9).
+# The mapping is a fixed env-derived bijection (design §3), computed once per env and served by
+# O(1) lookup — eliminating the ~3.5M per-element function-body executions the search's edge loops
+# incurred (hot-path profile). The tables encode EXACTLY the same bijection the original branch
+# logic did (asserted by tests/test_az_loop.py::test_action_slot_bijection), so this is a
+# structural memoization, not a behavioral change.
+#
+# The key is the env object (a weak reference), NOT id(env). Environment instances are
+# weak-referenceable (no __slots__) and identity-hashable (Environment defines no __eq__), so each
+# distinct env object — including every copy-on-write restrict()/with_scenario view — gets its OWN
+# entry. Weak refs mean the entry is dropped automatically when the env is GC'd (no leak — the old
+# id(env) dict never evicted), and an entry tied to the object's lifetime (not its address) can
+# never alias a different env at a reused CPython address (the old id(env) address-reuse hazard).
+# A restrict()-ed env (smaller detector subset → smaller n_action_slots) is a distinct object, so
+# it gets its OWN correctly-computed tables, not the parent's — the copy-on-write correctness the
+# id() global accidentally had, which a naive env.__init__ attribute would have broken.
+#
+# DEVIATION (audit R9 literal "env.slot_tables attribute"): an env attribute would require env to
+# compute these AZ tables, a features→env→features import cycle; this WeakKeyDictionary keyed by env
+# achieves R9's intent (kill the leak + the address-reuse hazard) WITHOUT the cycle.
+#
+# Hot loops that convert millions of times should hoist the tables once via `slot_action_tables(env)`
+# and index them directly, rather than calling the wrapper per element.
+_SLOT_TABLES = weakref.WeakKeyDictionary()
 
 
 def slot_action_tables(env):
     """Return (slot_to_action_tuple, action_to_slot_dict) for `env`, building+caching on first
     use. `slot_to_action_tuple[s]` is the action for slot s; `action_to_slot_dict[a]` the slot
     for action a (TERMINATE included)."""
-    key = id(env)
-    tabs = _SLOT_TABLES.get(key)
+    tabs = _SLOT_TABLES.get(env)
     if tabs is None:
         N, nD = env.N, len(env.detectors)
         s2a = (tuple(("t", i) for i in range(N))
@@ -62,7 +79,7 @@ def slot_action_tables(env):
                + (TERMINATE,))
         a2s = {a: s for s, a in enumerate(s2a)}
         tabs = (s2a, a2s)
-        _SLOT_TABLES[key] = tabs
+        _SLOT_TABLES[env] = tabs
     return tabs
 
 
