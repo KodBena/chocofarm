@@ -71,6 +71,7 @@ add_library(chocofarm_core
   src/features.cpp
   src/transport.cpp
   src/net.cpp
+  src/nmcs.cpp
   src/runner.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -96,3 +97,12 @@ target_compile_options(chocofarm-mask-dump PRIVATE -Wall -Wextra)
 add_executable(chocofarm-net-dump src/net_dump.cpp)
 target_link_libraries(chocofarm-net-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-net-dump PRIVATE -Wall -Wextra)
+
+# A third tiny parity fixture (NOT the runner): runs NMCSPolicy::search with a SCRIPTED, RNG-free
+# WorldSource (sample_world -> bw[0]; playout_value -> a stdin FIFO) and prints the selected action,
+# so the harness can feed the C++ NMCS and the Python NMCS the SAME leaf returns on a fixed
+# (loc, belief) and assert the SAME action — the DETERMINISTIC nesting+selection logic check (ADR-0012
+# P6), independent of RNG. Separate from the runner (P3, one-owner).
+add_executable(chocofarm-nmcs-dump src/nmcs_dump.cpp)
+target_link_libraries(chocofarm-nmcs-dump PRIVATE chocofarm_core)
+target_compile_options(chocofarm-nmcs-dump PRIVATE -Wall -Wextra)
