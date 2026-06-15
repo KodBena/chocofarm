@@ -115,6 +115,20 @@ class Environment:
             for kb, (x2, y2) in coord_items:
                 self._dist[(ka, kb)] = math.hypot(x1 - x2, y1 - y2)
 
+    # ---- public read of the legal-action treasure-id hook ----
+    @property
+    def keep(self):
+        """The treasure ids this env proposes as ('t', i) collects: the kept subset for a
+        restricted sub-instance (Environment.restrict), or all N for a full env. Public read
+        of the legal-action treasure-id hook (_treasure_ids).
+
+        For a full env this is tuple(range(N)) = every treasure; for a restricted env it is the
+        sorted `keep` tuple `restrict` already stored. `_treasure_ids` stays the internal hook
+        `legal_actions` iterates — this is the read-only public name for cross-module readers
+        (bounds/eval_bound.py) so the private name is not reached across the module boundary.
+        """
+        return tuple(self._treasure_ids)
+
     # ---- scenario (copy-on-write) ----
     def with_scenario(self, scenario):
         """Return a NEW Environment that SHARES this env's immutable Tier-1 geometry

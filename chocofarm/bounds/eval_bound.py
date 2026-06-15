@@ -85,7 +85,7 @@ def achievable_on_mini(mini, vl=0.10):
     Uses the mini's reduced prior (K/|keep| present-fraction)."""
     env = mini
     loc = ("w", env.entry)
-    keep = mini._treasure_ids        # the restricted env's kept treasure ids (sorted tuple)
+    keep = mini.keep                 # the restricted env's kept treasure ids (sorted tuple)
     unv = set(keep)
     route, t, best = [], 0.0, -1.0
     while unv:
@@ -110,13 +110,13 @@ def validate():
     # `env.restrict` is the one belief-mechanics impl (audit R8) — the bound certifies
     # against the EXACT apply/filter the learner uses.
     mini = env.restrict(keep=(8, 9, 10, 11, 12), k_local=2)
-    print(f"\nsub-instance: NW cluster keep={mini._treasure_ids} K={mini.K}  "
+    print(f"\nsub-instance: NW cluster keep={mini.keep} K={mini.K}  "
           f"worlds={len(mini.worlds)}  faces={len(mini.detectors)}  "
           f"(real geometry/faces/costs)\n", flush=True)
 
     # --- reference rates on this sub-instance ---
     t0 = time.time()
-    clair_ref = clairvoyant_on_worlds(env, mini._treasure_ids, mini.worlds)
+    clair_ref = clairvoyant_on_worlds(env, mini.keep, mini.worlds)
     achiev = achievable_on_mini(mini)
     print(f"reference: clairvoyant(z≡0) = {clair_ref:.4f}   "
           f"achievable(static-NN) = {achiev:.4f}   ({time.time()-t0:.1f}s)\n", flush=True)
