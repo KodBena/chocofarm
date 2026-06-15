@@ -133,13 +133,13 @@ static uint64_t fold_seed(uint64_t seed, int idx) {
     return z ^ (z >> 31);
 }
 
-int run(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
-        RedisClient& redis, const RunnerConfig& cfg, std::ostream* stats_out) {
+std::expected<int, Error> run(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
+                              RedisClient& redis, const RunnerConfig& cfg, std::ostream* stats_out) {
     // EXERCISE the weight-read seam (P7) even though RandomPolicy ignores the weights: this proves
-    // the manifest-driven read path (parse by manifest, abort loud on missing). A missing payload
-    // throws std::runtime_error here (mirrors read_weights), which is the loud abort, not a stale serve.
-    WeightPayload wp = redis.read_weights(cfg.run, cfg.phase, cfg.version);
-    (void)wp;  // RandomPolicy is search-free; the read is the seam proof, not a consumer
+    // the manifest-driven read path (parse by manifest, abort loud on missing). A missing payload is
+    // a typed Error here (mirrors read_weights), the loud abort the shell reports — not a stale serve.
+    auto wp = redis.read_weights(cfg.run, cfg.phase, cfg.version);
+    if (!wp) return std::unexpected(wp.error());  // RandomPolicy is search-free; the read is the seam proof
 
     const std::vector<uint32_t>& worlds = env.worlds();
     int written = 0;
@@ -170,8 +170,10 @@ int run(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
             (*stats_out) << "]}\n";
         }
         if (ep.n == 0) continue;  // no records (empty belief immediately) — nothing to write
-        redis.write_results(cfg.res_token, idx, ep.X, ep.n, ep.feat_dim, ep.PI, ep.M, ep.Y,
-                            ep.n_slots);
+        // spans bind from the EpisodeBlocks vectors (bounds-carrying, no raw pointer/len pair — P9).
+        auto wr = redis.write_results(cfg.res_token, idx, ep.X, ep.n, ep.feat_dim, ep.PI, ep.M, ep.Y,
+                                      ep.n_slots);
+        if (!wr) return std::unexpected(wr.error());
         ++written;
     }
     return written;

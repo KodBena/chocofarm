@@ -6,6 +6,9 @@
 //   the runner (P3, one-owner): the runner's job is the wire, this tool's job is the mask-replay
 //   parity fixture; neither carries the other's concern. No redis: pure env + features.
 //
+//   ADR-0012 P9: the imperative shell. argv is decoded once into typed views; `opt` returns a
+//   std::optional<std::string_view>; load_instance returns a typed std::expected reported loudly.
+//
 //   Protocol: argv gives --instance / --faces / --world <uint32>; stdin gives one line of
 //   space-separated slot indices (the action sequence, TERMINATE = the last slot ends it). For each
 //   action, BEFORE applying it, print the mask as `n_slots` space-separated 0/1 values on one line;
@@ -14,43 +17,49 @@
 // Public Domain (The Unlicense).
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
+#include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/instance.hpp"
 
-static const char* opt(int argc, char** argv, const char* name) {
-    for (int i = 1; i + 1 < argc; ++i)
-        if (std::strcmp(argv[i], name) == 0) return argv[i + 1];
-    return nullptr;
+namespace {
+[[nodiscard]] std::optional<std::string_view> opt(std::span<const std::string_view> args,
+                                                  std::string_view name) {
+    for (size_t i = 1; i + 1 < args.size(); ++i)
+        if (args[i] == name) return args[i + 1];
+    return std::nullopt;
 }
-
-static bool has_flag(int argc, char** argv, const char* name) {
-    for (int i = 1; i < argc; ++i)
-        if (std::strcmp(argv[i], name) == 0) return true;
+[[nodiscard]] bool has_flag(std::span<const std::string_view> args, std::string_view name) {
+    for (size_t i = 1; i < args.size(); ++i)
+        if (args[i] == name) return true;
     return false;
 }
+}  // namespace
 
 int main(int argc, char** argv) {
-    const char* instance = opt(argc, argv, "--instance");
-    const char* faces = opt(argc, argv, "--faces");
-    const char* world_s = opt(argc, argv, "--world");
+    std::vector<std::string_view> args(argv, argv + argc);
+    std::optional<std::string_view> instance = opt(args, "--instance");
+    std::optional<std::string_view> faces = opt(args, "--faces");
+    std::optional<std::string_view> world_s = opt(args, "--world");
     if (!instance || !faces || !world_s) {
         std::cerr << "usage: mask-dump --instance <p> --faces <p> --world <uint32>  (seq on stdin)\n";
         return 2;
     }
-    uint32_t world = static_cast<uint32_t>(std::strtoul(world_s, nullptr, 10));
+    uint32_t world = static_cast<uint32_t>(std::strtoul(std::string(*world_s).c_str(), nullptr, 10));
 
-    const bool dump_feats = has_flag(argc, argv, "--features");
+    const bool dump_feats = has_flag(args, "--features");
 
-    chocofarm::Instance inst = chocofarm::load_instance(instance, faces);
-    chocofarm::Environment env(inst);
+    auto inst = chocofarm::load_instance(*instance, *faces);
+    if (!inst) { std::cerr << "mask-dump: FATAL: " << inst.error().message << "\n"; return 1; }
+    chocofarm::Environment env(*inst);
     chocofarm::FeatureBuilder fb(env);
     const int n_slots = chocofarm::n_action_slots(env);
     const int term = chocofarm::term_slot(env);

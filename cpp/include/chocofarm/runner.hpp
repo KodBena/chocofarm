@@ -15,11 +15,13 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <ostream>
 #include <random>
 #include <string>
 
 #include "chocofarm/env.hpp"
+#include "chocofarm/error.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/policy.hpp"
 #include "chocofarm/transport.hpp"
@@ -62,8 +64,9 @@ struct EpisodeBlocks {
 // per-episode RNG (seeded by the caller). `max_steps` is the live horizon (P4). Mirrors
 // generate_episode: record (feat, pi, mask, g) per decision incl. a trailing TERMINATE decision,
 // with g the pure-MC suffix return-to-go.
-EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
-                          uint32_t world, double lam, std::mt19937_64& rng, int max_steps);
+[[nodiscard]] EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb,
+                                        const Policy& policy, uint32_t world, double lam,
+                                        std::mt19937_64& rng, int max_steps);
 
 // Configuration for a runner pass (all live scalars; P4). `run`/`phase`/`version` select the weights
 // to read; `episodes` is E; `lam`/`max_steps` are the live knobs; `seed` seeds the per-episode RNG
@@ -80,14 +83,17 @@ struct RunnerConfig {
 };
 
 // The runner entrypoint: read weights (exercising the weight-read seam), then for each episode draw
-// a world from the belief and run+write it. Returns the number of episodes written. The episode i
-// world + RNG are drawn from a seed fold over (cfg.seed, i) so the harness can match worlds.
+// a world from the belief and run+write it. Returns the number of episodes written, OR a typed Error
+// (ADR-0012 P9 rule 5: a missing weight payload / a failed redis write is a recoverable boundary
+// failure returned by value, never a throw). The episode i world + RNG are drawn from a seed fold
+// over (cfg.seed, i) so the harness can match worlds.
 //
 // `stats_out` (optional): when non-null, the runner ALSO writes one JSON-object line per episode to
 // it — {"length","lam_return","n_collect","n_sense","n_terminate","belief_shrinkage"} — the
 // aggregate-stat sink the ADR-0012 P6 parity harness reads. This is purely additive to the redis
 // result write (the wire proof); it does not change what crosses the wire.
-int run(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
-        RedisClient& redis, const RunnerConfig& cfg, std::ostream* stats_out = nullptr);
+[[nodiscard]] std::expected<int, Error> run(const Environment& env, const FeatureBuilder& fb,
+                                            const Policy& policy, RedisClient& redis,
+                                            const RunnerConfig& cfg, std::ostream* stats_out = nullptr);
 
 }  // namespace chocofarm

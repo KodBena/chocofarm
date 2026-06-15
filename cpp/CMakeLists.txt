@@ -1,6 +1,7 @@
 # cpp/CMakeLists.txt
 # Purpose: build the chocofarm C++ search/sim runner (the dumb-random seam-proof MVP, ADR-0012's
-#   C++ section / scaling-and-cpp-seam.md Shape A). C++20. Dependencies are self-contained:
+#   C++ section / scaling-and-cpp-seam.md Shape A). C++23 (for std::expected — ADR-0012 P9 rule 5).
+#   Dependencies are self-contained:
 #   nlohmann/json is fetched via FetchContent (no system install needed); hiredis is found via
 #   pkg-config (a system package: libhiredis-dev / hiredis-devel — the one documented system dep).
 #
@@ -12,7 +13,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(chocofarm_cpp_runner LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

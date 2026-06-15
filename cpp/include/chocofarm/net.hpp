@@ -20,12 +20,21 @@
 //   `Wp`. Parity is the ADR-0012 P6 behavioral bar (float32-equivalence < 1e-4 vs forward_core), not
 //   byte-identity.
 //
+//   ADR-0012 P9: the forward core is a pure value-function — `predict(std::span<const float>)`
+//   takes a typed, bounds-carrying input and RETURNS its result by value (NetPrediction), no raw
+//   pointers, no out-parameters. The throwing manifest-validating constructor becomes the static
+//   factory `NetForward::create(const WeightPayload&) -> std::expected<NetForward, Error>` over a
+//   private noexcept ctor (a throwing ctor cannot return a value; a malformed manifest is a
+//   recoverable boundary failure, not a throw — rule 5).
+//
 // Public Domain (The Unlicense).
 #pragma once
 
-#include <string>
+#include <expected>
+#include <span>
 #include <vector>
 
+#include "chocofarm/error.hpp"
 #include "chocofarm/transport.hpp"
 
 namespace chocofarm {
@@ -45,22 +54,28 @@ class NetForward {
     // Build from the manifest-bound payload (transport.read_weights). Validates that the required
     // params (W1/b1/W2/b2/Wv/bv) are present and shape-consistent, and derives in_dim, hidden,
     // n_actions, the residual toggle, and the policy-head presence from the layout/meta — never
-    // hardcoded (ADR-0012 P1). A missing required param or a shape mismatch is a loud std::runtime_error
-    // (ADR-0002 / P5: translate-and-validate, do not coerce).
-    explicit NetForward(const WeightPayload& payload);
+    // hardcoded (ADR-0012 P1). A missing required param or a shape mismatch is a typed Error
+    // (ADR-0002 / P5 + ADR-0012 P9 rule 5: translate-and-validate, do not coerce; a returned value,
+    // not a throw). Construction is a factory over a private noexcept ctor.
+    [[nodiscard]] static std::expected<NetForward, Error> create(const WeightPayload& payload);
 
     // Run forward_core's graph once on a length-`in_dim()` float32 feature vector and return the
-    // de-standardized value + the policy logits (the search's leaf-evaluator entry point).
-    NetPrediction predict(const float* X) const;
-    NetPrediction predict(const std::vector<float>& X) const;
+    // de-standardized value + the policy logits (the search's leaf-evaluator entry point). The input
+    // is a typed bounds-carrying view (std::span<const float>) — a std::vector<float> binds
+    // implicitly — and the result is returned BY VALUE (P9 rules 1 & 2). The caller guarantees
+    // x.size() == in_dim() (an invariant the manifest-validating ctor already reconciled); a mismatch
+    // is a programmer bug (an assert), not a boundary Error.
+    [[nodiscard]] NetPrediction predict(std::span<const float> x) const;
 
-    int in_dim() const { return in_dim_; }
-    int hidden() const { return hidden_; }
-    int n_actions() const { return n_actions_; }     // 0 when value-only (no policy head)
-    bool residual() const { return residual_; }
-    bool has_policy() const { return n_actions_ > 0; }
+    [[nodiscard]] int in_dim() const { return in_dim_; }
+    [[nodiscard]] int hidden() const { return hidden_; }
+    [[nodiscard]] int n_actions() const { return n_actions_; }     // 0 when value-only (no policy head)
+    [[nodiscard]] bool residual() const { return residual_; }
+    [[nodiscard]] bool has_policy() const { return n_actions_ > 0; }
 
   private:
+    NetForward() noexcept = default;  // the factory fills the fields; construction never throws
+
     // Row-major weight matrices/biases in float32 (the manifest blob is float64; cast once at build,
     // matching the Python f32 inference cache — float32-equivalence is the bar, not byte-identity).
     struct Mat { int rows = 0, cols = 0; std::vector<float> v; };  // row-major, v[r*cols + c]

@@ -10,6 +10,10 @@
 //   transport.read_weights seam (no hardcoded offsets — P1) so the forward runs on the real
 //   manifest-bound weights, residual ON or OFF per what the manifest carries.
 //
+//   ADR-0012 P9: the imperative shell. argv is decoded once into typed views; `opt` returns a
+//   std::optional<std::string_view>; the boundary failures (a dead redis, a missing payload, a
+//   malformed manifest) arrive as typed std::expected and are reported loudly, never thrown.
+//
 //   Protocol:
 //     argv:  --run <run> --phase <gen|eval> --version <int>
 //     stdin: one feature vector per line, `in_dim` space-separated float values
@@ -19,62 +23,67 @@
 //   can sanity-check the derived dims match the Python net.
 //
 // Public Domain (The Unlicense).
-#include <cstring>
+#include <cstdlib>
 #include <iostream>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "chocofarm/net.hpp"
 #include "chocofarm/transport.hpp"
 
-static const char* opt(int argc, char** argv, const char* name) {
-    for (int i = 1; i + 1 < argc; ++i)
-        if (std::strcmp(argv[i], name) == 0) return argv[i + 1];
-    return nullptr;
+namespace {
+[[nodiscard]] std::optional<std::string_view> opt(std::span<const std::string_view> args,
+                                                  std::string_view name) {
+    for (size_t i = 1; i + 1 < args.size(); ++i)
+        if (args[i] == name) return args[i + 1];
+    return std::nullopt;
 }
+}  // namespace
 
 int main(int argc, char** argv) {
-    const char* run = opt(argc, argv, "--run");
-    const char* phase = opt(argc, argv, "--phase");
-    const char* version_s = opt(argc, argv, "--version");
+    std::vector<std::string_view> args(argv, argv + argc);
+    std::optional<std::string_view> run = opt(args, "--run");
+    std::optional<std::string_view> phase = opt(args, "--phase");
+    std::optional<std::string_view> version_s = opt(args, "--version");
     if (!run || !phase || !version_s) {
         std::cerr << "usage: net-dump --run <run> --phase <gen|eval> --version <int>  "
                      "(feature vectors on stdin)\n";
         return 2;
     }
-    int version = std::atoi(version_s);
+    int version = std::atoi(std::string(*version_s).c_str());
 
-    try {
-        chocofarm::RedisClient cli;  // the CHOCO_TRANSPORT_REDIS_* contract (6380), fail-loud on connect
-        // read the published net via the manifest (no hardcoded offsets — P1), then build the forward.
-        chocofarm::WeightPayload payload = cli.read_weights(run, phase, version);
-        chocofarm::NetForward net(payload);
+    auto cli = chocofarm::RedisClient::create();  // the CHOCO_TRANSPORT_REDIS_* contract (6380)
+    if (!cli) { std::cerr << "net-dump: " << cli.error().message << "\n"; return 1; }
+    // read the published net via the manifest (no hardcoded offsets — P1), then build the forward.
+    auto payload = cli->read_weights(*run, *phase, version);
+    if (!payload) { std::cerr << "net-dump: " << payload.error().message << "\n"; return 1; }
+    auto net = chocofarm::NetForward::create(*payload);
+    if (!net) { std::cerr << "net-dump: " << net.error().message << "\n"; return 1; }
 
-        std::cout << "# in_dim=" << net.in_dim() << " n_actions=" << net.n_actions()
-                  << " residual=" << (net.residual() ? 1 : 0) << "\n";
-        std::cout.precision(9);  // float32 has ~7 sig digits; 9 round-trips the value exactly
+    std::cout << "# in_dim=" << net->in_dim() << " n_actions=" << net->n_actions()
+              << " residual=" << (net->residual() ? 1 : 0) << "\n";
+    std::cout.precision(9);  // float32 has ~7 sig digits; 9 round-trips the value exactly
 
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            if (line.empty()) continue;
-            std::istringstream iss(line);
-            std::vector<float> X;
-            float x;
-            while (iss >> x) X.push_back(x);
-            if (static_cast<int>(X.size()) != net.in_dim()) {
-                std::cerr << "net-dump: input row has " << X.size() << " values, expected in_dim "
-                          << net.in_dim() << "\n";
-                return 3;
-            }
-            chocofarm::NetPrediction pred = net.predict(X);
-            std::cout << pred.value;
-            for (float l : pred.logits) std::cout << ' ' << l;
-            std::cout << "\n";
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        std::istringstream iss(line);
+        std::vector<float> X;
+        float x;
+        while (iss >> x) X.push_back(x);
+        if (static_cast<int>(X.size()) != net->in_dim()) {
+            std::cerr << "net-dump: input row has " << X.size() << " values, expected in_dim "
+                      << net->in_dim() << "\n";
+            return 3;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "net-dump: " << e.what() << "\n";
-        return 1;
+        chocofarm::NetPrediction pred = net->predict(X);  // std::vector<float> binds to std::span
+        std::cout << pred.value;
+        for (float l : pred.logits) std::cout << ' ' << l;
+        std::cout << "\n";
     }
     return 0;
 }
