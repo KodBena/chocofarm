@@ -469,7 +469,7 @@ def seed_registry(experiment_id: str, cfg: ExperimentConfig, env=None,
             # the blob was seeded against a different env or precision — re-binding to it would run a
             # net shaped for one env under another. Fail loud rather than decode-into-wrong.
             if env is not None:
-                _assert_no_derived_drift(experiment_id, recorded=existing, live=cfg)
+                _assert_no_derived_drift(experiment_id, recorded=existing, live=cfg, env=env)
             print(f"[hp-registry] experiment {experiment_id!r} already seeded — re-binding to the "
                   f"existing blob (idempotent; operator overrides preserved)", flush=True)
             return existing
@@ -500,13 +500,95 @@ def _record_derived(cfg: ExperimentConfig, env) -> None:
     cfg.env.present_k = int(env.K)
     cfg.env.teleport_overhead = float(env.tp)
     cfg.env.entry = str(env.entry)
+    # audit item G: the moment we record the env-derived dims, also pin the FeatureConfig per-group
+    # provenance counts to the live FeatureLayout (the SSOT). This runs on BOTH the fresh-seed and
+    # re-bind paths (seed_registry calls _record_derived before the exists-check branch), so a
+    # layout change that left the schema's provenance copy stale is caught when the net is FIRST
+    # bound to that env — not only on a later re-bind. Fail loud (ADR-0002) naming the group(s).
+    pin_drifts = _assert_feature_config_pins(cfg, env)
+    if pin_drifts:
+        raise RegistrySchemaDrift(
+            f"FeatureConfig per-group pins disagree with the FeatureLayout SSOT (audit item G): "
+            + "; ".join(pin_drifts)
+            + ". features.py's layout changed but hp/schema.py's FeatureConfig provenance counts did "
+            "not. Update FeatureConfig to match FeatureLayout (the single source of truth).")
+
+
+def _feature_group_channels(env) -> dict:
+    """Derive the per-group channel counts the live FeatureLayout (features.py — the SSOT for the
+    feature-vector layout after audit R6) actually produces, WITHOUT re-hardcoding 5/3/6. Each
+    FeatureLayout block belongs to a `group` ("treasure"/"detector"/"global"/"teleport"); a treasure
+    block is N-wide (one channel per treasure), a detector block nD-wide (one per detector), a global
+    block 1-wide (one global scalar). So the count of CHANNELS in a group == the number of blocks in
+    that group — but ONLY when every block in the group carries that group's per-unit width. We
+    assert that width invariant here (fail-loud, ADR-0002) rather than assume "1 block == 1 channel":
+    a future width-N block mislabeled group="global" would otherwise inflate global_channels and the
+    pin check would be silently satisfiable by a wrong count. Returns
+    {per_treasure_channels, per_detector_channels, global_channels} — the same three FeatureConfig
+    pins, read off the layout's block table so they cannot disagree with the SSOT silently.
+
+    The "+n_tele" the FeatureConfig.global_channels doc names is the per-teleport block: it is NOT a
+    fixed channel count (it scales with len(env.teleports)), so it stays folded into the global doc's
+    parenthetical rather than a pinned count — global_channels is the count of the fixed-1-wide global
+    scalars only (the per-teleport block is its own group and already covered by arch.in_dim)."""
+    from chocofarm.az.features import FeatureLayout
+    layout = FeatureLayout(env)
+    N = env.N
+    nD = len(env.detectors)
+    # the per-channel unit width each group's blocks MUST have for the block-count to equal the
+    # channel-count (treasure → one value per treasure, detector → one per detector, global → one
+    # scalar). teleport is excluded from the pins (varying width — see the docstring).
+    unit = {"treasure": N, "detector": nD, "global": 1}
+    counts = {"treasure": 0, "detector": 0, "global": 0, "teleport": 0}
+    for key, width, group, _display in layout.blocks:
+        if group in unit and width != unit[group]:
+            raise RegistrySchemaDrift(
+                f"FeatureLayout block {key!r} is tagged group={group!r} but has width {width} "
+                f"(expected {unit[group]} for a {group} channel) — the block-count→channel-count "
+                f"derivation for the FeatureConfig per-group pins (audit item G) is no longer valid "
+                f"for this layout; the per-group channel definition changed in features.py and the "
+                f"derivation in hp/registry._feature_group_channels must be updated to match.")
+        counts[group] += 1
+    return {
+        "per_treasure_channels": counts["treasure"],
+        "per_detector_channels": counts["detector"],
+        "global_channels": counts["global"],
+    }
+
+
+def _assert_feature_config_pins(cfg: ExperimentConfig, env) -> list:
+    """Audit item G: check the FeatureConfig per-group provenance counts (cfg.feat.*) against the
+    per-group channel widths the live FeatureLayout (features.py — the SSOT) actually produces for
+    `env`. Returns a list of human-readable drift strings (empty == in sync). The in_dim check pins
+    only the TOTAL feature dim (241); a layout change that updated FeatureLayout but not these
+    provenance counts could keep the total equal while a per-group width drifted (e.g. -1 treasure,
+    +1 global) and the total-only check would miss it. Deriving the widths from FeatureLayout.blocks
+    (not re-hardcoding 5/3/6) closes that — a mismatched group is named. This runs on BOTH the
+    fresh-seed path (via _record_derived) and the re-bind drift report, so the drift is caught the
+    moment the schema's pin disagrees with the layout, not only on a later re-bind."""
+    drifts = []
+    derived = _feature_group_channels(env)
+    for fld, want in derived.items():
+        have = getattr(cfg.feat, fld)
+        if have != want:
+            drifts.append(
+                f"feat.{fld} (FeatureConfig provenance) = {have} but FeatureLayout (the SSOT, "
+                f"features.py) produces {want} channels for this env — the layout changed and the "
+                f"schema's provenance pin did not; update FeatureConfig.{fld} to {want}")
+    return drifts
 
 
 def _assert_no_derived_drift(experiment_id: str, recorded: ExperimentConfig,
-                             live: ExperimentConfig) -> None:
+                             live: ExperimentConfig, env=None) -> None:
     """Fail loud (design §7) if a re-bound blob's recorded env-derived facts disagree with the
     running process's. These define the net shape / precision the blob was fit to; re-binding under
-    a different env or dtype would run a mismatched net silently."""
+    a different env or dtype would run a mismatched net silently.
+
+    Also (audit item G) verifies the live FeatureConfig PER-GROUP channel counts against the live
+    FeatureLayout (the layout SSOT — features.py) via `_assert_feature_config_pins`. The in_dim
+    check above pins only the TOTAL feature dim (241); the per-group pin catches a layout change
+    that kept the total equal while a per-group width drifted. (The same pin also runs on the
+    fresh-seed path via `_record_derived`, so this is not the only place it fires.)"""
     drifts = []
     if recorded.arch.in_dim is not None and recorded.arch.in_dim != live.arch.in_dim:
         drifts.append(f"arch.in_dim recorded={recorded.arch.in_dim} live={live.arch.in_dim}")
@@ -520,6 +602,10 @@ def _assert_no_derived_drift(experiment_id: str, recorded: ExperimentConfig,
         drifts.append(f"arch.dtype recorded={recorded.arch.dtype!r} live={live.arch.dtype!r}")
     if recorded.env.present_k != live.env.present_k:
         drifts.append(f"env.present_k recorded={recorded.env.present_k} live={live.env.present_k}")
+    # audit item G — per-group FeatureConfig pins vs the FeatureLayout SSOT (see the helper). The
+    # live (running-schema) FeatureConfig counts are checked against what FeatureLayout emits.
+    if env is not None:
+        drifts.extend(_assert_feature_config_pins(live, env))
     if drifts:
         raise RegistrySchemaDrift(
             f"env/precision drift on re-bind to experiment {experiment_id!r} (design §7): "

@@ -14,6 +14,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+
 from chocofarm.model.env import Environment
 from chocofarm.az.features import FeatureLayout, feature_dim
 
@@ -92,3 +94,98 @@ def test_full_element_names_and_tags_pin_every_block():
 
     assert layout.element_names() == exp_names
     assert layout.block_tags() == exp_tags
+
+
+# ---------------------------------------------------------------------------
+# FeatureConfig per-group pins vs the FeatureLayout SSOT (audit item G)
+# ---------------------------------------------------------------------------
+# hp/schema.py's FeatureConfig holds a fourth, provenance-only copy of the per-group channel counts
+# (per_treasure=5 / per_detector=3 / global=6). FeatureLayout (features.py) is the SSOT after R6;
+# the registry's drift check pinned only the TOTAL in_dim (241), so a layout change that updated
+# FeatureLayout but not FeatureConfig could keep the total equal while a per-group width drifted —
+# silently. Item G derives the per-group widths from FeatureLayout.blocks (not a second hardcode of
+# 5/3/6) and fails loud if FeatureConfig disagrees, on BOTH the fresh-seed path (_record_derived)
+# and the re-bind drift check. These tests gate it.
+def test_feature_group_channels_derived_from_layout_match_schema():
+    """(a) The per-group widths derived from FeatureLayout.blocks equal both the FeatureConfig
+    provenance counts AND the expected 5/3/6 — and the pin check passes on the real, in-sync config
+    (returns no drift)."""
+    from chocofarm.hp.schema import ExperimentConfig
+    from chocofarm.hp import registry as reg
+    env = Environment()
+    derived = reg._feature_group_channels(env)
+    assert derived == {
+        "per_treasure_channels": 5, "per_detector_channels": 3, "global_channels": 6,
+    }
+    cfg = ExperimentConfig(experiment_id="g")
+    # the provenance copy in the schema matches what the layout produces
+    assert cfg.feat.per_treasure_channels == derived["per_treasure_channels"]
+    assert cfg.feat.per_detector_channels == derived["per_detector_channels"]
+    assert cfg.feat.global_channels == derived["global_channels"]
+    # the pin check reports no drift on the in-sync config, and the re-bind drift assertion (env in
+    # hand triggers the per-group check) passes without raising.
+    assert reg._assert_feature_config_pins(cfg, env) == []
+    reg._assert_no_derived_drift("g", recorded=cfg, live=cfg, env=env)
+
+
+@pytest.mark.parametrize("field_name", [
+    "per_treasure_channels", "per_detector_channels", "global_channels",
+])
+def test_feature_group_channel_drift_fires_loud_on_rebind(field_name):
+    """(b) A FeatureConfig per-group count deliberately out of sync with the FeatureLayout SSOT
+    fires the loud RegistrySchemaDrift (ADR-0002) on the re-bind drift check, naming the mismatched
+    group — the silent drift the total-only in_dim check would miss."""
+    from chocofarm.hp.schema import ExperimentConfig
+    from chocofarm.hp import registry as reg
+    env = Environment()
+    good = ExperimentConfig(experiment_id="g")
+    bad = ExperimentConfig(experiment_id="g")
+    setattr(bad.feat, field_name, getattr(bad.feat, field_name) + 1)  # monkeypatch one count
+    with pytest.raises(reg.RegistrySchemaDrift) as ei:
+        reg._assert_no_derived_drift("g", recorded=good, live=bad, env=env)
+    assert f"feat.{field_name}" in str(ei.value)
+
+
+@pytest.mark.parametrize("field_name", [
+    "per_treasure_channels", "per_detector_channels", "global_channels",
+])
+def test_feature_group_channel_drift_fires_loud_on_fresh_seed(field_name):
+    """(c) The fresh-seed path: _record_derived (which runs on the FIRST seed of an experiment, not
+    only on re-bind) ALSO fires the loud RegistrySchemaDrift when a FeatureConfig per-group pin is
+    stale — so a layout change shipped against a stale schema is caught when the net is first bound
+    to the env, not silently written and only caught on a later re-bind."""
+    from chocofarm.hp.schema import ExperimentConfig
+    from chocofarm.hp import registry as reg
+    env = Environment()
+    bad = ExperimentConfig(experiment_id="g")
+    setattr(bad.feat, field_name, getattr(bad.feat, field_name) + 1)  # monkeypatch one count
+    with pytest.raises(reg.RegistrySchemaDrift) as ei:
+        reg._record_derived(bad, env)   # the fresh-seed (and re-bind) derived-fact recorder
+    assert f"feat.{field_name}" in str(ei.value)
+
+
+def test_feature_group_width_mislabel_fires_loud():
+    """The block-count→channel-count derivation assumes each group's blocks carry that group's unit
+    width (treasure=N, detector=nD, global=1). A block mislabeled with the wrong group (here a
+    width-N block tagged global) would otherwise inflate the count and let a wrong pin satisfy the
+    check silently. The derive asserts the width invariant and fails loud (ADR-0002) instead."""
+    import chocofarm.az.features as feat
+    from chocofarm.hp import registry as reg
+    env = Environment()
+    orig_init = feat.FeatureLayout.__init__
+
+    def mislabel_init(self, e):
+        orig_init(self, e)
+        # append a width-N block but tag it group="global" — a per-treasure-sized quantity
+        # masquerading as one global scalar; the count-only derive would report global_channels+1.
+        self.blocks.append(("rogue", e.N, "global", "rogue"))
+
+    feat.FeatureLayout.__init__ = mislabel_init
+    feat._LAYOUTS.clear()   # the layout is memoized per-env; drop the cached good one
+    try:
+        with pytest.raises(reg.RegistrySchemaDrift) as ei:
+            reg._feature_group_channels(env)
+        assert "rogue" in str(ei.value) and "width" in str(ei.value)
+    finally:
+        feat.FeatureLayout.__init__ = orig_init
+        feat._LAYOUTS.clear()   # evict the mislabeled layout so other tests see the real one
