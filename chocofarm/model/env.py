@@ -14,6 +14,7 @@ import math
 import numpy as np
 
 from chocofarm.model import arrangement as A
+from chocofarm.model import facemodel
 from chocofarm.model.instance import load_instance, world_array
 
 TERMINATE = ("term", None)
@@ -41,18 +42,50 @@ class Environment:
         self.max_steps = 40
 
         # detectors: arrangement faces (docs/consults/consult-002-detector-misspec-report.md §(4)
-        # "The correct model and remedy" / facemodel.ENV_ADOPTION). A sense action
-        # is "stand at face F's representative point and read the disjunction over F's cover" —
-        # cover and position are consistent BY CONSTRUCTION (the face is the single carrier of
-        # both). This replaces the old `cover_mask[i] = {i} ∪ overlap-neighbours`, which read
-        # the union over every face in Δ_i (a k=5 semantics) at one face's rep-point (a k≤2
-        # position) — an over-approximation that handed out information no real sensor could.
-        # The detector abstraction is re-keyed from regions to faces; the ('d', id) action shape
-        # and every method below are UNCHANGED IN FORM — only the underlying data are faces.
-        faces = A.load()                                          # 44 atomic arrangement faces
-        self.detectors = list(range(len(faces)))                 # face ids 0..43 are the sense actions
-        self.det_pt = {k: faces[k].rep_point for k in self.detectors}
-        self.cover_mask = {k: faces[k].bitmask for k in self.detectors}
+        # "The correct model and remedy"). A sense action is "stand at face F's representative
+        # point and read the disjunction over F's cover" — cover and position are consistent BY
+        # CONSTRUCTION (the face is the single carrier of both). This replaces the old
+        # `cover_mask[i] = {i} ∪ overlap-neighbours`, which read the union over every face in Δ_i
+        # (a k=5 semantics) at one face's rep-point (a k≤2 position) — an over-approximation that
+        # handed out information no real sensor could.
+        #
+        # SINGLE FACE-CARRIER (audit item E). `facemodel.SenseAction` is now the env's ONE carrier
+        # of a face's position+cover+observe/filter/informative — THE ENV no longer reimplements
+        # those four methods inline beside a dead copy. `filter_detector`/`legal_actions`/`apply`
+        # below all DELEGATE to the SenseAction (see those methods). The ('d', id) action shape is
+        # UNCHANGED — only the underlying carrier is now the SenseAction object, not three loose
+        # dicts kept in sync by nobody.
+        #   SCOPE: this ends the env's OWN dead-vs-live duplication (the item-E target). `det_pt` /
+        #   `cover_mask` remain public, so a handful of EXTERNAL readers (solvers/, bounds/, az/)
+        #   still index `cover_mask[i]` and re-derive the disjunction inline; routing those onto
+        #   `senses[i]` too is a larger cross-file follow-up beyond this byte-identity-bounded item,
+        #   not regressed by it (those dicts are now DERIVED from the senses, so they cannot drift).
+        #
+        # GEOMETRIC DERIVABILITY (maintainer's binding constraint — preserved). A face is a DERIVED
+        # object, never a frozen opaque table: it is the intersection-refinement of the atomic
+        # detectors, computed from the geometric data and reproducible end-to-end via the pipeline
+        #   scripts/chocobo_geometry.py   (parse chocobo.ggb -> the atomic detector regions Δ_j,
+        #                                  data/instance.json's regions_wkt)
+        #   arrangement.arrangement(...)  (polygonize(unary_union({∂Δ_j})) -> the atomic faces;
+        #                                  each face's cover = {j : Δ_j ⊇ face}, read at an interior
+        #                                  rep-point — a REFINEMENT of the Δ_j, not a change:
+        #                                  per region, ⋃(covers of its faces) == the old cover_mask)
+        #     -> arrangement.persist()  ->  data/faces.json  ->  arrangement.load()  (loaded below)
+        #   scripts/{build_faces_ggb,verify_faces}.py  (the visual round-trip + the self-check that
+        #                                  the per-region union equality holds; see
+        #                                  docs/design/face-model-verification.md).
+        # `sense_actions(faces)` merely WRAPS that derived face — it freezes nothing the geometry
+        # does not already determine; re-running the pipeline regenerates faces.json and the senses
+        # follow.
+        faces = A.load()                                          # 44 atomic arrangement faces (derived; see above)
+        self.senses = facemodel.sense_actions(faces)             # the single face-carrier, sense[k] wraps faces[k]
+        self.detectors = list(range(len(self.senses)))           # face ids 0..43 are the sense actions
+        # det_pt / cover_mask are now SERVED FROM the senses (the face is the one carrier): the
+        # bitmask/rep_point come from the same SenseAction `filter_detector`/`apply` read below, so
+        # the position-vs-semantics inconsistency consult-002 caught cannot recur. They stay public
+        # attributes because external readers (bounds/, solvers/, az/) index them directly.
+        self.det_pt = {k: self.senses[k].rep_point for k in self.detectors}
+        self.cover_mask = {k: self.senses[k].bitmask for k in self.detectors}
 
         self.coord = {}
         for i, xy in self.treasures.items():
@@ -89,10 +122,10 @@ class Environment:
         `value`/`entry`/`tp` from `scenario`.
 
         The expensive geometry — `_dist` (the ~4.5k-entry distance table), `coord`,
-        `worlds`, `detectors`, `det_pt`, `cover_mask`, `treasures`, `teleports`,
-        `N`, `K` — depends ONLY on the instance, NOT on the scenario knobs (`value`
-        is read only in `apply`, `entry` only in `simulate`, `tp` only in
-        `exit_cost`). So a `copy.copy(self)` (shallow — those attributes are aliased
+        `worlds`, `senses` (the face-carriers), `detectors`, `det_pt`, `cover_mask`,
+        `treasures`, `teleports`, `N`, `K` — depends ONLY on the instance, NOT on the
+        scenario knobs (`value` is read only in `apply`, `entry` only in `simulate`,
+        `tp` only in `exit_cost`). So a `copy.copy(self)` (shallow — those attributes are aliased
         to the original, NOT rebuilt) plus the three overrides is exactly equivalent
         to a fresh `Environment(value=…, entry=…, teleport_overhead=…)`.
 
@@ -161,7 +194,11 @@ class Environment:
         new.worlds = world_array(new.N, new.K, support=keep)
         # detectors: faces whose cover is non-empty and ⊆ keep (rebuilt EXACTLY as the old
         # bounds/minienv.py MiniEnv.__init__ did, folded in here by audit R8 — same filter,
-        # same iteration order, same det_pt/cover_mask values, so the bound is unchanged)
+        # same iteration order, same det_pt/cover_mask values, so the bound is unchanged).
+        # `new.senses` stays the parent's full list by alias (copy.copy): a SenseAction is a
+        # derived, immutable face-carrier keyed by face id, and `new.detectors` only ever holds
+        # kept face ids, so `new.senses[fid]` is always the right (and identical) carrier — the
+        # restricted dynamics delegate to the SAME face objects as the parent (audit item E + R8).
         new.detectors = []
         new.cover_mask = {}
         new.det_pt = {}
@@ -211,8 +248,9 @@ class Environment:
         return bw[bit == (1 if present else 0)]
 
     def filter_detector(self, bw, i, pos):
-        hit = (bw & self.cover_mask[i]) != 0
-        return bw[hit if pos else ~hit]
+        # Delegates to the face's single carrier (audit item E): SenseAction.filter is the same
+        # `bw[(bw & bitmask)!=0]` disjunction, now owned in one place rather than re-inlined here.
+        return self.senses[i].filter(bw, pos)
 
     def sample_world(self, bw, rng):
         return int(rng.choice(bw))
@@ -222,9 +260,8 @@ class Environment:
         marg = self.marginals(bw)
         acts = [("t", i) for i in self._treasure_ids if i not in collected and marg[i] > 0]
         for i in self.detectors:
-            cm = self.cover_mask[i]
-            if np.any((bw & cm) != 0) and np.any((bw & cm) == 0):     # outcome still uncertain
-                acts.append(("d", i))
+            if self.senses[i].informative(bw):     # outcome still uncertain (both polarities live)
+                acts.append(("d", i))              # delegated to the face's single carrier (item E)
         return acts
 
     def apply(self, loc, bw, collected, action, world):
@@ -236,7 +273,7 @@ class Environment:
             r = self.value[i] if (pres and i not in collected) else 0.0
             nc = collected | {i} if pres else collected
             return r, (kind, i), self.filter_treasure(bw, i, pres), nc, dt
-        pos = bool(world & self.cover_mask[i])
+        pos = self.senses[i].observe(world)        # the face's reading at this world (item E carrier)
         return 0.0, (kind, i), self.filter_detector(bw, i, pos), collected, dt
 
     # ---- simulation / evaluation (solver-agnostic) ----
