@@ -394,7 +394,8 @@ _ARGPARSE_MAP = (
     # search
     ("m", "search", "m"),
     ("n_sims", "search", "n_sims"),
-    # train (the jit-boundary knobs; lr/l2 are RESTART)
+    # train (the jit-boundary knobs; lr/l2 are HOT as of audit R13 — live via inject_hyperparams /
+    # traced-l2; betas/eps remain RESTART)
     ("lr", "train", "lr"),
     ("l2", "train", "l2"),
     ("alpha", "train", "alpha"),

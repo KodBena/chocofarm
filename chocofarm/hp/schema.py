@@ -147,17 +147,22 @@ class ArchConfig:
 
 @dataclass
 class TrainConfig:
-    """chocofarm/az/mlp_jax_train.py — the jit boundary (design C4). `lr`/`l2`/`betas`/`eps` are
-    BAKED into `optax.adam` at JaxTrainer construction (RESTART — the design §3.5 finding, and the
-    reason a registry lr-drop is a recorded+one-command-`--resume` adoption, not a live change).
-    `alpha`/`beta` are traced call-args read fresh each step (HOT). `epochs`/`batch` are loop
-    bounds read at iter start (HOT)."""
+    """chocofarm/az/mlp_jax_train.py — the jit boundary (design C4). `lr`/`l2` are LIVE (HOT) as of
+    audit R13 (training-optimization-refactor.md §4.1, the frozen-config headline): `lr` is injected
+    via `optax.inject_hyperparams`, so it lives in `opt_state.hyperparams` as a traced value and is
+    set per step from the live snapshot (no rebuild — Adam's moments persist across a live anneal);
+    `l2` is a traced loss coefficient (joins `alpha`/`beta` as a `value_and_grad` arg). So a registry
+    lr-drop / L2-retune now lands LIVE on the running experiment, not as a `--resume` adoption.
+    `betas`/`eps` are STILL baked into `optax.adam` at construction (RESTART — R13 is the minimal
+    lr/l2 slice; the betas/eps live-injection + the full Optimizer⊥Trainer object split are the
+    deferred follow-up, design note §2.1). `alpha`/`beta` are traced call-args (HOT). `epochs`/
+    `batch` are loop bounds read at iter start (HOT)."""
 
-    lr: float = hp(1e-3, Mut.RESTART, "Adam lr — BAKED into optax.adam at construction (design §4.5)")
-    l2: float = hp(1e-4, Mut.RESTART, "L2 — closed over by the jit update closure (design §4.5)")
-    beta1: float = hp(0.9, Mut.RESTART, "Adam b1 — baked into optax.adam")
-    beta2: float = hp(0.999, Mut.RESTART, "Adam b2 — baked into optax.adam")
-    eps: float = hp(1e-8, Mut.RESTART, "Adam eps — baked into optax.adam")
+    lr: float = hp(1e-3, Mut.HOT, "Adam lr — LIVE via optax.inject_hyperparams, set per step (audit R13)")
+    l2: float = hp(1e-4, Mut.HOT, "L2 — LIVE traced loss coefficient, read per step (audit R13)")
+    beta1: float = hp(0.9, Mut.RESTART, "Adam b1 — baked into optax.adam (R13 defers betas/eps)")
+    beta2: float = hp(0.999, Mut.RESTART, "Adam b2 — baked into optax.adam (R13 defers betas/eps)")
+    eps: float = hp(1e-8, Mut.RESTART, "Adam eps — baked into optax.adam (R13 defers betas/eps)")
     alpha: float = hp(1.0, Mut.HOT, "policy CE weight — traced call-arg, read each step")
     beta: float = hp(1.0, Mut.HOT, "value MSE weight — traced call-arg, read each step")
     epochs: int = hp(2, Mut.HOT, "train epochs over the buffer per iter (loop bound)")

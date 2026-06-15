@@ -205,14 +205,17 @@ def test_every_leaf_has_a_facet():
 
 
 def test_known_facet_split():
-    """Spot-check the design §4 facet reading: lr is RESTART (baked into optax.adam), alpha is HOT
-    (traced call-arg), the env constants are INSTANCE."""
+    """Spot-check the design §4 facet reading: lr/l2 are HOT (audit R13 — live via
+    optax.inject_hyperparams / traced loss arg), alpha is HOT (traced call-arg), betas/eps stay
+    RESTART (R13 defers them), the env constants are INSTANCE."""
     facets = {}
     a = ExperimentConfig(experiment_id="f")
     for g, mut, fld, _av, _bv in reg._iter_facet_diffs(a, a):
         facets[f"{g}.{fld}"] = mut
-    assert facets["train.lr"] is Mut.RESTART
-    assert facets["train.l2"] is Mut.RESTART
+    assert facets["train.lr"] is Mut.HOT       # audit R13: injected via inject_hyperparams, live
+    assert facets["train.l2"] is Mut.HOT       # audit R13: traced loss coefficient, live per step
+    assert facets["train.beta1"] is Mut.RESTART  # betas/eps stay baked (R13 is the lr/l2 slice)
+    assert facets["train.eps"] is Mut.RESTART
     assert facets["train.alpha"] is Mut.HOT
     assert facets["train.beta"] is Mut.HOT
     assert facets["search.m"] is Mut.RESTART
@@ -393,18 +396,37 @@ def test_seed_registry_idempotent(isolated_id):
 # RESTART-refusal (design §3.4) — the heart of the mutability facet
 # ---------------------------------------------------------------------------
 def test_restart_refusal_fires_on_baked_field(isolated_id):
-    """A RESTART field (lr) changed mid-run vs the launched_with shadow fires the loud refusal."""
+    """A RESTART field (train.beta1 — Adam b1, baked into optax.adam at construction; R13 made lr/l2
+    HOT but defers betas/eps) changed mid-run vs the launched_with shadow fires the loud refusal."""
     r = _redis_or_skip()
     try:
         launched = ExperimentConfig(experiment_id=isolated_id)
         reg.write_config(isolated_id, launched, r=r)
         snap = reg.ConfigSnapshot.launch(isolated_id, launched_with=launched, r=r)
-        # operator drops lr in the registry (a RESTART field)
-        reg.set_fields(isolated_id, {"train.lr": "1e-4"}, r=r)
+        # operator changes a baked Adam beta in the registry (a RESTART field)
+        reg.set_fields(isolated_id, {"train.beta1": "0.95"}, r=r)
         with pytest.raises(reg.RestartRequired) as ei:
             snap.refresh(iteration=1, r=r)
-        assert "train.lr" in str(ei.value)
+        assert "train.beta1" in str(ei.value)
         assert "--resume" in str(ei.value)
+    finally:
+        r.close()
+
+
+def test_lr_l2_hot_change_applied_not_refused(isolated_id):
+    """Audit R13 (the frozen-config headline): lr/l2 are now HOT — a mid-run change via the registry
+    snapshot is APPLIED at the next refresh, NOT refused. This is the registry-integration half of
+    R13's GATE 3 (the trainer-side live-lr scaling is verified in test_az_loop)."""
+    r = _redis_or_skip()
+    try:
+        launched = ExperimentConfig(experiment_id=isolated_id)
+        reg.write_config(isolated_id, launched, r=r)
+        snap = reg.ConfigSnapshot.launch(isolated_id, launched_with=launched, r=r)
+        # operator anneals lr and retunes l2 on the running experiment (both HOT post-R13)
+        reg.set_fields(isolated_id, {"train.lr": "1e-4", "train.l2": "5e-4"}, r=r)
+        snap.refresh(iteration=1, r=r)   # must NOT raise — lr/l2 are HOT
+        assert snap.cfg.train.lr == 1e-4
+        assert snap.cfg.train.l2 == 5e-4
     finally:
         r.close()
 
@@ -478,7 +500,9 @@ def test_resume_rebind_adopts_lr_no_false_refusal(isolated_id):
     """The audit's Finding 2/3 + spec §3.5: an operator drops lr in the registry, then a --resume
     re-binds to that blob; the re-bound config IS the construction-time shadow, so (a) the process
     adopts the dropped lr (the registry value, not the args default) and (b) the iter-0 refresh
-    does NOT false-refuse (shadow == registry)."""
+    does NOT refuse. Post-R13 lr is HOT (so a live drop is applied without --resume too — see
+    test_lr_l2_hot_change_applied_not_refused); this still exercises the re-bind/adopt path that
+    --resume relies on for the genuinely-RESTART fields, with lr as the carrier value."""
     r = _redis_or_skip()
     try:
         # first launch: seed with default lr (1e-3)

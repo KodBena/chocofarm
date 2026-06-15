@@ -380,6 +380,69 @@ def test_jax_train_step_reduces_loss():
     assert ce < ce0, f"policy CE did not reduce: {ce0:.4f} -> {ce:.4f}"
 
 
+def test_jax_train_live_lr_l2():
+    """Audit R13 (the frozen-config headline): lr/l2 are LIVE per step — `optax.inject_hyperparams`
+    puts lr in opt_state.hyperparams (set per step, moments persist) and l2 is a traced loss arg.
+    Pin the new capability: (a) lr=0 leaves params unchanged (proves the injected lr is consumed,
+    not the inject_hyperparams placeholder); (b) 10x lr ⇒ ~10x the first-step update on a fixed
+    gradient (Adam's fresh-moment first step has magnitude ~lr); (c) a changed l2 changes the
+    gradient by exactly l2*W on weight tensors (proves l2 is live, not baked)."""
+    import jax
+    import jax.numpy as jnp
+    from chocofarm.az.mlp_jax_train import JaxTrainer, _az_loss, _JDTYPE
+    from chocofarm.az.mlp import is_weight
+    env = Environment()
+    fb = FeatureBuilder(env)
+    in_dim, na = feature_dim(env), n_action_slots(env)
+    feat = fb.build(("w", env.entry), env.worlds, set())
+    mask = legal_mask_from_features(env, feat)
+    B = 48
+    rng = np.random.default_rng(5)
+    X = (np.stack([feat] * B) + 0.05 * rng.standard_normal((B, in_dim))).astype(np.float32)
+    M = np.stack([mask] * B).astype(np.float32)
+    PI = M * rng.random((B, na)).astype(np.float32)
+    PI = PI / PI.sum(1, keepdims=True)
+    Y = rng.standard_normal(B).astype(np.float32)
+
+    def fresh_net():
+        n = ValueMLP(in_dim, hidden=64, n_actions=na, seed=9, residual=True)
+        n.set_value_scale(float(Y.mean()), float(Y.std()))
+        return n
+
+    def step_linf(lr, l2=1e-4):
+        n = fresh_net()
+        p0 = {k: np.asarray(v, np.float64) for k, v in n._params().items()}
+        tr = JaxTrainer(n, lr=1e-3, l2=l2)
+        tr.train_step(X, PI, M, Y, alpha=1.0, beta=1.0, lr=lr, l2=l2)
+        p1 = {k: np.asarray(v, np.float64) for k, v in n._params().items()}
+        return max(float(np.max(np.abs(p1[k] - p0[k]))) for k in p0)
+
+    # (a) lr=0 ⇒ no update (the injected lr is consumed; not the 1.0 placeholder)
+    d0 = step_linf(0.0)
+    assert d0 < 1e-6, f"lr=0 changed params (placeholder lr leaked?): max|Δ|={d0:.3e}"
+    # (b) 10x lr ⇒ ~10x first-step update magnitude
+    d1, d10 = step_linf(1e-3), step_linf(1e-2)
+    assert 8.0 < d10 / d1 < 12.0, f"10x lr did not ~10x the step: {d1:.3e} -> {d10:.3e}"
+
+    # (c) l2 is a live traced arg: grad@l2=1 - grad@l2=0 == 1.0*W on weight tensors
+    n = fresh_net()
+    params = {k: jnp.asarray(v, _JDTYPE) for k, v in n._params().items()}
+    ys = (jnp.asarray(Y, _JDTYPE) - np.float32(n.y_mean)) / np.float32(n.y_std)
+    gfn = jax.value_and_grad(_az_loss, has_aux=True)
+    a1, b1 = jnp.float32(1.0), jnp.float32(1.0)
+    (_, _), g0 = gfn(params, jnp.asarray(X, _JDTYPE), jnp.asarray(PI, _JDTYPE),
+                     jnp.asarray(M, _JDTYPE), ys, a1, b1, jnp.float32(0.0))
+    (_, _), g1 = gfn(params, jnp.asarray(X, _JDTYPE), jnp.asarray(PI, _JDTYPE),
+                     jnp.asarray(M, _JDTYPE), ys, a1, b1, jnp.float32(1.0))
+    worst = 0.0
+    for k in params:
+        if is_weight(k):
+            expected = np.asarray(params[k], np.float64)   # d(0.5*1.0*||W||^2)/dW = 1.0*W
+            got = np.asarray(g1[k], np.float64) - np.asarray(g0[k], np.float64)
+            worst = max(worst, float(np.max(np.abs(got - expected))))
+    assert worst < 1e-4, f"l2 not applied as a live coupled penalty (weights-only): max|Δ|={worst:.3e}"
+
+
 def test_jax_train_writes_back_numpy_inference():
     """After a JAX train step the net's numpy inference (predict_both) reads the TRAINED weights:
     the trainer rebinds the net's arrays, so the float32 inference cache's identity check rebuilds

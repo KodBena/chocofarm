@@ -142,8 +142,11 @@ def train_epochs(trainer, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
     re-pin propagates. After training, numpy inference (`predict_value`) reads the trained weights
     the trainer wrote back into the net. Returns (mean_ce, mean_value_std_mse, heldout_R2_on_buffer).
 
-    `lr`/`l2` are fixed at trainer construction (the loop varies neither); they are accepted here to
-    keep the prior signature shape but the trainer's configured lr/l2 are authoritative."""
+    `lr`/`l2` are LIVE (audit R13 — the frozen-config headline). The caller passes the per-iteration
+    snapshot values; they flow into each `train_step` so an LR anneal / L2 retune lands on the
+    running experiment WITHOUT a trainer rebuild (the trainer is built once so Adam's moments
+    persist; the injected `lr` changes in `opt_state.hyperparams`, `l2` is a traced loss arg). This
+    was the vestigial accepted-then-ignored channel before R13; it is now wired through."""
     net = trainer.net
     net.set_value_scale(float(Y.mean()), float(Y.std()))
     n = X.shape[0]
@@ -155,7 +158,8 @@ def train_epochs(trainer, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
             b = idx[s * batch:(s + 1) * batch]
             if len(b) == 0:
                 continue
-            ce, vl = trainer.train_step(X[b], PI[b], M[b], Y[b], alpha=alpha, beta=beta)
+            ce, vl = trainer.train_step(X[b], PI[b], M[b], Y[b],
+                                        alpha=alpha, beta=beta, lr=lr, l2=l2)
             ce_tot += ce; v_tot += vl; cnt += 1
     pv = net.predict_value(X.astype(np.float64))
     return ce_tot / max(1, cnt), v_tot / max(1, cnt), r2_score(Y, pv)
@@ -241,13 +245,15 @@ def run(args):
     #     fully-initialised, possibly warm-started) net's weights and writes the trained weights
     #     back into the net after each step — numpy inference (generation/eval) reads them. ---
     from chocofarm.az.mlp_jax_train import JaxTrainer
-    # lr/l2 are RESTART (baked into optax.adam at construction — hp-registry §4.5); read them off
-    # the seeded registry config so a --resume that re-bound to an lr-dropped blob is constructed
-    # with the dropped lr (the §3.5 adopt-on-resume workflow), and so the construction-time truth
-    # the refusal compares against IS the registry value.
+    # lr/l2 are HOT (audit R13 — the frozen-config headline). The trainer is still built ONCE (so
+    # Adam's moments persist), but lr is now injected via optax.inject_hyperparams (lives in
+    # opt_state.hyperparams, changeable per step) and l2 is a traced loss arg — both read LIVE off
+    # the per-iteration snapshot in the TRAIN block below, so an LR anneal / L2 retune via the
+    # registry lands without a --resume / trainer rebuild. The cfg0 values here are just the launch
+    # seed (the first iteration's snapshot supplies the live values, equal to cfg0 at launch).
     trainer = JaxTrainer(net, lr=cfg0.train.lr, l2=cfg0.train.l2)
-    print(f"training: JAX/optax Adam (lr={cfg0.train.lr} l2={cfg0.train.l2}); inference: numpy float32",
-          flush=True)
+    print(f"training: JAX/optax Adam (lr={cfg0.train.lr} l2={cfg0.train.l2}, both HOT — live per "
+          f"iteration via inject_hyperparams/traced-l2); inference: numpy float32", flush=True)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = None
@@ -326,6 +332,8 @@ def run(args):
         batch = snap.cfg.train.batch
         alpha = snap.cfg.train.alpha
         beta = snap.cfg.train.beta
+        lr = snap.cfg.train.lr           # HOT (audit R13): live lr, injected per step (no rebuild)
+        l2 = snap.cfg.train.l2           # HOT (audit R13): live loss coefficient, traced per step
         max_steps = snap.cfg.env.max_steps   # HOT rollout cap (per-call, not instance)
         # HOT search knobs (read off the live snapshot; the search object is rebuilt every iteration
         # below — and in the worker on each version bump — so a manual change to these lands live,
@@ -370,14 +378,14 @@ def run(args):
         t_gen = time.time() - t0
 
         # ---- 2. TRAIN ----
-        # epochs/batch/alpha/beta are HOT (read off the live snapshot); lr/l2 are RESTART (baked
-        # into the trainer's optax.adam at construction — hp-registry §4.5). lr/l2 are passed here
-        # only to preserve train_epochs' signature shape (the trainer's CONFIGURED lr/l2 are
-        # authoritative, per its docstring); they take the construction-time cfg0 value the
-        # snapshot's RESTART-refusal guards, not a second args authority.
+        # epochs/batch/alpha/beta AND lr/l2 are HOT (read off the live snapshot — audit R13). lr is
+        # injected into the trainer's optax state per step (inject_hyperparams) and l2 is a traced
+        # loss arg, so an LR anneal / L2 retune via the registry lands LIVE on the running experiment
+        # (no --resume, no trainer rebuild — Adam's moments persist across the change). This was the
+        # vestigial accepted-then-ignored lr/l2 channel; R13 makes it the live read.
         bX, bPI, bM, bY = buf.arrays()
         ce, vmse, r2 = train_epochs(trainer, bX, bPI, bM, bY, epochs, batch,
-                                    cfg0.train.lr, cfg0.train.l2, alpha, beta, train_rng)
+                                    lr, l2, alpha, beta, train_rng)
         t_train = time.time() - t0 - t_gen
 
         # ---- 3. EVALUATE (greedy argmax-π′ policy on a held-out seed, fixed λ₀) ----
