@@ -98,7 +98,7 @@ this shape, the named principle forbids it."
 | **F** — Magic constants strewn as bare literals | a shared invariant (the episode horizon, UCB `c`, a λ-tolerance) typed at each use site | **P1** — one owner, referenced; not re-typed and trusted to agree |
 | **G** — Load-bearing knowledge offloaded to unenforceable prose | a convention that lives only in a comment/doc the code cannot check or that does not resolve | **P5** + **ADR-0011** — encode in code or a real registry; cite the derivation, not volatile prose (ADR-0011 owns the mechanization) |
 | **H** — Defensive band-aids stacked against a hostile substrate | a new mitigation layered on an un-diagnosed cause; a reliability strategy that *is* a stack of patches | **P5** (fail loud; remove the root cause) — distinguish a justified guard from a band-aid masking an undiagnosed cause |
-| **(new, cross-language)** — a second encoder / shared types across the language boundary | a C++ component sharing Python types, or re-encoding the wire format independently | **P7** (cross-language wire discipline) — the redis raw-bytes protocol is the *only* contract; never a second encoder, never shared types |
+| **(new, cross-language)** — two writers of one cross-boundary truth | a hand-mirrored type, offset, key, or codec on the far side of the language boundary that re-authors a fact the near side already defines (a hardcoded weight offset; a second result-blob codec) | **P7** (cross-language wire discipline) — a cross-boundary fact has exactly one authoritative definition and every side *derives* its view (reads it at runtime or generates it at build time), never re-authors it by hand; mechanically enforced at the strongest feasible level (generate/compile-from-one-source > build-time lint > runtime parity backstop). Schema-driven codegen (one schema → N derived readers) is SSOT and is encouraged, not banned |
 
 ### The seven principles
 
@@ -301,25 +301,82 @@ language port).
 
 #### P7 — Cross-language wire discipline (the new material)
 
-**Rule (checkable).** The language-agnostic boundary is the **redis raw-bytes
-protocol owned by `chocofarm/az/transport.py`** — the **only** contract a
-new-language component shares with the Python stack. A new-language component:
-**(1)** mirrors the env↔Policy seam with a **composable Policy interface** in
-its own language (`RandomPolicy` today, a search/MLP policy later); **(2)**
-treats **the wire as the contract** — it reads and writes the exact keys and
-byte layouts `transport.py` spells, and shares **no types** with Python and
-writes **no second encoder**; **(3)** **reimplements the surface behind the
-seam** (belief mechanics, `forward_core`) against the wire, not by translating
-Python objects; **(4)** is **validated by parity** under the **P6 behavioral-
-equivalence bar** (matched-seed aggregate-stat comparison vs the Python
-reference). The full concrete contract is the dedicated section below.
+**Rule (checkable).** A **cross-boundary fact** — a layout, a key, a byte
+format — has exactly **one authoritative definition**; every side **derives**
+its view from that one definition (reading it at runtime, *or* generating it
+from it at build time) and **never re-authors it by hand**. The violation is
+**two writers of one truth** — a hand-mirrored type or a hand-written codec
+that can drift from the authority — *regardless of representation*. This is
+**P1 applied across the language boundary**: shared types are not the sin
+(schema-driven codegen — one schema → N generated/derived readers — is SSOT
+and is **encouraged**); a second hand-author of the same truth is.
 
-**Cancer prevented: the cross-language form of B (a second encoder / split-
-brain across the language boundary) and C (shared mutable state across
-processes).** A C++ component that shares Python types or re-encodes the wire
-format independently re-creates the split-brain encoder *across a language
-boundary*, where it is hardest to catch and the drift is silent. The wire is
-the one contract; there is no second one.
+The rule is **mechanically enforced at the strongest feasible level**, against
+ADR-0011/ADR-0002's own enforcement hierarchy: **generate-or-compile-from-one-
+source > build-time lint > runtime parity test.** A runtime parity test is a
+**backstop, not the contract** — it catches drift only if it runs, with the
+right fixtures, *after* the drift already exists. Where the contract is
+**static** (a fixed layout with known dtypes/shapes) it should be generated or
+compiled from one schema, or at minimum **build-time linted so a Python/C++
+format disagreement fails the build** — not left to two hand-written codecs
+joined only by a runtime test. This is cancer **G** (load-bearing knowledge in
+unenforceable convention) plus **ADR-0011** (mechanize at the strongest
+feasible surface) applied across the language boundary. *Never* justify
+settling for a weaker mechanism with a scale / minimality / "one X" / "for now"
+/ "unnecessary here" / YAGNI argument — that argument shape is itself the tell
+this tenet exists to reject (the discipline applied once at small scale is
+exactly how the cancers grew).
+
+Separate the **serialization contract** from the **transport/coordination
+mechanism** — the durable rule is mechanism-independent. A shared bytes-store
+(redis today) holds **state/payloads** (the current weight snapshot, late-join,
+large blobs); a **messaging fabric** (ZeroMQ — `scaling-and-cpp-seam.md`
+Shape B — or a broker) carries **events/coordination/streaming**. **Never** use
+a shared bytes-store as a synchronization/coordination primitive (polling a
+key; pub-sub-on-a-store as the backbone) — that is an architectural smell.
+Today the synchronous loop coordinates via the OS process pool with redis as a
+**pure bytes-store** (no sync-via-store is committed); the C++ worker and the
+async actor-learner introduce an explicit fabric for coordination while the
+bytes contract is unchanged. Do not enshrine redis as "the contract," and do
+not enshrine ZeroMQ as "the one way" either — they are instances of
+(bytes-store) and (messaging fabric).
+
+The asymmetry between the two payloads matters: the **weight** payload is a
+**dynamic** layout (residual-block toggles, instance-derived dims), so a
+**self-describing manifest read at runtime is a legitimate mechanism** there —
+the C++ derives `(offset, len, shape, dtype)` each run, so a layout change is
+**absorbed, not drifted**; its residual gap is only that the manifest's *own*
+schema is still two hand-written (de)serializers. The **result** format is
+**static** (four blocks X/PI/M/Y, known dtypes/shapes) — exactly what a
+generated/compiled contract is for, and exactly what is left to hand-codecs
+plus a runtime test today; **this is where codegen/lint is warranted.**
+
+A new-language component then: **(1)** mirrors the env↔Policy seam with a
+**composable Policy interface** in its own language (`RandomPolicy` today, a
+search/MLP policy later); **(2)** **derives** its read/write of the keys and
+byte layouts from the one authority `transport.py` spells — reading the manifest
+at runtime for the dynamic weight layout, and (the floor) a build-time lint
+that fails on a format-constant disagreement for the static result layout —
+authoring **no second hand codec**; **(3)** **reimplements the surface behind
+the seam** (belief mechanics, `forward_core`) against the wire, not by
+translating Python objects; **(4)** is **validated by parity** under the **P6
+behavioral-equivalence bar** (matched-seed aggregate-stat comparison vs the
+Python reference) — as the **backstop**, not the primary guarantee. The full
+concrete contract is the dedicated section below.
+
+**Implementation guidance (examples, not mandate).** For raw float blobs on a
+hot path a **zero-copy IDL** (FlatBuffers / Cap'n Proto) fits better than
+protobuf's parse-and-copy; the **floor** is a build-time lint that fails on a
+format-constant disagreement. The MVP's runtime parity test stays — as the
+backstop.
+
+**Cancer prevented: the cross-language form of B (two writers of one truth —
+a hand-mirrored type or codec that drifts from its authority, across the
+hardest boundary to audit, where the drift is silent) and G (load-bearing
+format knowledge left in an unenforceable runtime-only convention instead of
+generated/compiled/linted from one source) and C (shared mutable state across
+processes).** A cross-boundary fact has one authoritative home; every side
+derives its view and none re-authors it.
 
 ---
 
@@ -349,11 +406,22 @@ holds. `lam` and the budget (`m`, `n_sims`, `max_steps`) arrive as **live
 per-decision scalars** (P4), never baked into the C++ object — they cross the
 wire as numbers (see §3).
 
-### 2. Treat the redis wire as the contract — cite the actual keys/format (P7)
+### 2. Derive from the bytes-store channel — cite the actual keys/format (P7)
 
-`chocofarm/az/transport.py` is the **SOLE owner** of the wire protocol (audit
-item K). The C++ runner builds its read/write keys and parses/emits bytes to
-match it **exactly**. The C++ runner is a **transport** component, so its
+`chocofarm/az/transport.py` is the **SOLE authority** of the serialization
+contract (audit item K): the keys and byte layouts have **one definition**
+there, and the C++ runner **derives** its read/write from it — never re-authors
+it by hand. Keep the **serialization contract** distinct from the
+**transport/coordination mechanism**: redis here is a **pure bytes-store**
+holding state/payloads (the weight snapshot, the per-task result blobs), *not*
+a coordination primitive. **Coordination today** is the OS process pool — no
+sync-via-store is committed (no key-polling, no pub-sub-on-a-store backbone);
+**coordination tomorrow** (the C++ worker, the async actor-learner) is an
+explicit messaging fabric (ZeroMQ — `scaling-and-cpp-seam.md` Shape B — or a
+broker), introduced for events/coordination/streaming **while the bytes
+contract below is unchanged.** Redis is named here as the current instance of
+(bytes-store), not enshrined as "the contract"; do not enshrine the fabric as
+"the one way" either. The C++ runner is a **transport** component, so its
 connection is via the transport role's `config.transport_redis_params()` —
 default `127.0.0.1:6380` db 0, the **ephemeral** memory-cache instance
 (`allkeys-lru`), env-overridable through `CHOCO_TRANSPORT_REDIS_HOST`/
@@ -432,25 +500,41 @@ round-trip — the aborted-iteration self-clean safety net (the post-mortem foun
 **by construction** (`scaling-and-cpp-seam.md` §0.3). There is nothing
 Python-specific on the wire.
 
-### 3. Stay SSOT — no second encoder; reimplement *behind* the seam (P1, P7)
+### 3. Stay SSOT — derive, never re-author; reimplement *behind* the seam (P1, P7)
 
 The C++ runner **reimplements the surface behind the seam** — the belief
 mechanics (`filter_treasure`/`filter_detector`/`sample_world`/`apply`/
-`marginals`) and the single `forward_core(params, X)` — against the wire, **not**
-by sharing Python types and **never** by adding a second encoder of the weight
-or result layout. This is the SSOT rule (P1) applied across the language
-boundary: the layout has **one owner** (`WeightContainer`, surfaced on the wire
-via the manifest), and the C++ side **reads that manifest** rather than
-hardcoding offsets. Two concrete prohibitions:
+`marginals`) and the single `forward_core(params, X)` — against the wire, and
+**derives** its view of every cross-boundary layout from the one authority
+rather than **re-authoring it by hand**. This is the SSOT rule (P1) across the
+language boundary: a cross-boundary fact has **one authoritative definition**,
+and every side reads it (at runtime) or generates it (at build time) — two
+writers of one truth is the violation. The two payloads sit at opposite ends of
+the static↔dynamic axis and warrant different mechanisms:
 
-- **No hardcoded weight offsets in C++.** Read `(offset, len, shape, dtype)`
-  from the manifest JSON. A hardcoded offset is the cross-language form of the
-  three-writer feature-layout cancer (B) — it drifts silently the first time
-  the Python net's param set changes (e.g. the residual block toggles).
-- **No second result encoder.** Emit the four float32 blocks in the exact
-  shapes `read_and_delete_results` expects; do not invent a packed/struct
-  format. The Python parent's `np.frombuffer(...).reshape(n, fd)` *is* the
-  decoder contract; the C++ encoder mirrors it byte-for-byte.
+- **Dynamic weight layout → derive from the runtime manifest (no hardcoded
+  offsets in C++).** The layout has one owner (`WeightContainer`, surfaced on
+  the wire via the manifest), and because the layout is **dynamic** (residual-
+  block toggles, instance-derived dims), a self-describing manifest **read at
+  runtime** is the legitimate mechanism: read `(offset, len, shape, dtype)` per
+  weight from the manifest JSON each run, so a layout change is **absorbed, not
+  drifted**. A hardcoded offset would be the cross-language form of the
+  three-writer feature-layout cancer (B). *Residual gap:* the manifest's **own**
+  schema is still two hand-written (de)serializers (Python pack / C++ parse) —
+  the one place this payload is not yet generated from a single schema.
+- **Static result format → a generated/compiled/linted contract, not two hand
+  codecs.** The four float32 blocks X/PI/M/Y have **fixed, known dtypes/shapes**
+  — a **static** contract, exactly what codegen exists for. Today it is left to
+  two hand-written codecs (the Python `np.frombuffer(...).reshape(n, fd)`
+  reader and the C++ emitter) joined only by the runtime parity test — a
+  **runtime-only convention** (cancer G). At the strongest feasible level it
+  should be **generated/compiled from one schema**; the **floor** is a
+  build-time lint that **fails the build** on a Python/C++ format-constant
+  disagreement. Whichever mechanism is chosen, the C++ side **derives** the four
+  blocks' shapes from the one authority and invents **no** packed/struct format
+  of its own. (For raw float blobs on this hot path a zero-copy IDL —
+  FlatBuffers / Cap'n Proto — fits better than protobuf's parse-and-copy; this
+  is an example, not an ADR mandate.)
 
 R8 collapsed the belief mechanics to **one** implementation
 (`Environment.restrict`, no `MiniEnv` copy) and R11 collapsed the forward to
@@ -460,14 +544,21 @@ surface. Adding a second C++ encoder of a layout the manifest already owns
 would re-create the split-brain encoder the whole SSOT discipline exists to
 prevent — across the hardest boundary to audit.
 
-### 4. Validate by parity — matched-seed aggregate-stat comparison (P6)
+### 4. Validate by parity — the backstop, not the primary guarantee (P6)
 
-Parity is the C++ runner's acceptance test, and it takes the **same behavioral-
-equivalence bar as P6 / ADR-0009** — **not byte-identity.** A C++
-reimplementation of the same math in a different language and compiler **will**
-move the float (float32 is not associative across the C++ reorder, just as it
-moves across the numba/JAX reorder the project already accepts) and may flip a
-near-tied Sequential-Halving choice. So the bar is, exactly:
+Parity is the C++ runner's acceptance test under the **same behavioral-
+equivalence bar as P6 / ADR-0009** — **not byte-identity** — but it is the
+**backstop, not the contract.** A runtime parity test catches a drift only if
+it runs, with the right fixtures, *after* the drift already exists; the primary
+guarantee is the generated/compiled/linted serialization contract of §3 that
+makes a format disagreement **unable to be authored** in the first place
+(strongest-feasible: generate-or-compile-from-one-source > build-time lint >
+this runtime parity test). With that floor in place, parity then certifies the
+*numerics* — a C++ reimplementation of the same math in a different language and
+compiler **will** move the float (float32 is not associative across the C++
+reorder, just as it moves across the numba/JAX reorder the project already
+accepts) and may flip a near-tied Sequential-Halving choice. So the parity bar
+is, exactly:
 
 - **Logic invariants → bit-exact.** Illegal-action-slot mass is `== 0.0`; the
   legality `M` mask the C++ worker emits is bit-identical to the Python one for
@@ -525,11 +616,18 @@ write-time data constraint / run-time invariant / review-only):
 - **P6 (substantiate):** inherits **ADR-0009's** surface (test/CI gate for the
   bit-exact and forward-`ABS_TOL` parts; review-only-with-explicit-absence for
   the behavioral part).
-- **P7 (cross-language wire):** the wire is enforced by **the parity test/CI
-  gate** (matched-seed aggregate comparison) plus the **construction-time** loud
-  failure on a missing/malformed payload (`read_weights`' `RuntimeError`); the
-  no-second-encoder rule is **review-only** until a manifest-round-trip parity
-  test mechanizes it.
+- **P7 (cross-language wire):** enforced at the **strongest feasible level** —
+  the **static** result format wants a **generate/compile-from-one-schema or
+  build-time-lint gate** (a Python/C++ format-constant disagreement fails the
+  build); the **dynamic** weight layout is enforced by the **runtime manifest**
+  the C++ derives `(offset, len, shape, dtype)` from (its residual gap: the
+  manifest's own schema is still two hand-written codecs). Below those sits the
+  **runtime parity test/CI gate** (matched-seed aggregate comparison) as the
+  **backstop**, plus the **construction-time** loud failure on a missing/
+  malformed payload (`read_weights`' `RuntimeError`). Until the static-format
+  codegen/lint is minted, that gap is **review-only** — but settling for the
+  runtime-test-only backstop is *not* justified by a scale / minimality / "for
+  now" argument (that argument shape is the tell P7 rejects).
 
 This tenet's own Rule-1 declaration: **review-and-audit-policed**, with the
 architectural audit as the absence-detector — exactly as ADR-0011 declares for
@@ -550,9 +648,12 @@ prose.
   diagnosis.** The audit is point-in-time and not retro-edited (ADR-0005 Rule
   8); this ADR carries its lessons forward as authoring rules so the next
   contributor scans a list rather than re-deriving the lessons.
-- **The cross-language boundary has exactly one contract.** P7 makes the redis
-  wire the sole seam, so "swap the worker for C++" stays a drop-in and the
-  split-brain encoder cannot form across the language boundary.
+- **Every cross-language fact has exactly one authoritative definition.** P7
+  gives each cross-boundary layout/key/format one home from which every side
+  derives — separating the serialization contract from the transport/
+  coordination mechanism (a bytes-store holds state, a messaging fabric carries
+  coordination) — so "swap the worker for C++" stays a drop-in and a second
+  hand-author of one truth cannot form across the language boundary.
 
 ### Negative
 
@@ -586,9 +687,13 @@ prose.
    clarification here and repoint the contract — `transport.py`'s docstring is
    the live SSOT, this section the rationale.
 3. **A new-language component beyond C++ joins** (a Rust core, a GPU service).
-   P7 is stated over "a new-language component," not C++ specifically; confirm
-   the redis-wire-as-sole-contract rule survives the new component's
-   constraints, or amend.
+   P7 is stated over "a new-language component," not C++ specifically — and a
+   third reader of a static layout is **exactly** the recurrence at which
+   generating/compiling the serialization contract from one schema becomes the
+   right move (ADR-0011 Rule 2). Confirm the one-authoritative-definition /
+   derive-don't-re-author rule survives the new component's constraints, and
+   that the static formats are mechanized at the strongest feasible level
+   rather than gaining a third hand codec; amend if not.
 4. **A principle's review-only enforcement recurs into a defect** (ADR-0011
    Rule 2). The recurrence converts the principle to a mechanism at the
    strongest feasible-and-proportionate surface; record the mechanism here.

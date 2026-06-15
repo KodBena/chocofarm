@@ -277,8 +277,14 @@ where it lives — a swept tunable is a live cell, not a ctor invariant); **P5**
 fail loud / remove-the-root-cause-not-band-aid (distinguish a re-justified guard
 from a patch on an undiagnosed substrate); **P6** substantiate equivalence/perf
 claims (behavioral float32-equivalence, *not* byte-identity, for ML); **P7**
-cross-language wire discipline (the redis raw-bytes protocol is the *only*
-contract — no shared types, no second encoder). It composes with rather than
+cross-language wire discipline (a cross-boundary fact — a layout, key, byte
+format — has *one* authoritative definition; every side *derives* its view,
+never re-authors it: two writers of one truth is the sin, not shared types, so
+schema-driven codegen is encouraged; mechanically enforced at the strongest
+feasible level — generate/compile-from-one-source > build-time lint > runtime
+parity backstop — separating the serialization contract from the transport/
+coordination mechanism, a bytes-store for state vs a messaging fabric for
+coordination). It composes with rather than
 restates its siblings (0002/0004/0005/0007/0009/0011 cited, not re-derived), and
 carries a dedicated concrete C++ wire contract (the `transport.py` keys/dtypes,
 parity under the P6 bar).
