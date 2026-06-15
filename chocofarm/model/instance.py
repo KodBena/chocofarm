@@ -6,7 +6,7 @@ The one place that resolves and parses `data/instance.json` into an immutable
 `Instance` (treasures, teleports, K) and the one home for the exactly-K-of-N
 equiprobable-worlds bitmask array. Replaces the per-file inline `json.load` + the
 hardcoded `K=5` literal (env.py, analyzer.py) and the verbatim world-array
-comprehension duplicated across env.py / bounds/minienv.py / analysis/analyzer.py.
+comprehension duplicated across env.py / analysis/analyzer.py.
 
 Public Domain (The Unlicense).
 """
@@ -83,7 +83,7 @@ def world_array(N: int, K: int, support=None) -> np.ndarray:
     """The C(N,K) equiprobable worlds as a bitmask array (bit t set = τ_t present).
 
     `support=None` enumerates K-subsets of `range(N)`; a `support` iterable
-    enumerates K-subsets of that subset instead (the minienv case), with the bit
+    enumerates K-subsets of that subset instead (the `Environment.restrict` case), with the bit
     positions still the original treasure ids. Reproduces exactly
     `np.array([sum(1 << t for t in c) for c in
     itertools.combinations(<support or range(N)>, K)], dtype=np.int64)` — same

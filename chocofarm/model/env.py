@@ -63,6 +63,12 @@ class Environment:
 
         self.worlds = world_array(self.N, self.K)
 
+        # The treasure ids `legal_actions` iterates as candidate ('t', i) pickups. For the
+        # FULL env this is `range(self.N)` (every treasure); `restrict` overrides it with the
+        # kept-subset for a sub-instance (a perf specialization — restricted worlds never set
+        # non-keep bits, so marg[i]=0 there and range(N)+(marg>0) already excludes them).
+        self._treasure_ids = range(self.N)
+
         # Precomputed inter-node distance table (perf). The coordinate set is STATIC for an
         # instance, so `d(a, b)` is a static function of the two coord keys; recomputing
         # `math.hypot` per call cost ~2M hypot calls per generated episode (the hot-path
@@ -104,6 +110,67 @@ class Environment:
         new.value = list(scenario.value) if scenario.value is not None else [1.0] * new.N
         new.entry = scenario.entry
         new.tp = float(scenario.teleport_overhead)
+        return new
+
+    # ---- restriction (copy-on-write) ----
+    def restrict(self, keep, k_local):
+        """Return a restriction VIEW of this env: a genuinely small sub-instance over a
+        SUBSET of treasures `keep` with a reduced present-count `k_local`, sharing this
+        env's geometry AND belief mechanics by reference (copy-on-write) and overriding
+        ONLY the world-set, the detector subset, K, and the treasure-id hook.
+
+        Because the view reuses the parent's `marginals`/`filter_treasure`/`filter_detector`/
+        `legal_actions`/`apply`, the information-relaxation dual bound certifies against the
+        EXACT same dynamics the learner uses — there is one belief-mechanics implementation,
+        not a copy (audit R8). This is DUAL-BOUND-CRITICAL: a silent divergence between the
+        bound's inner solve and the real env would corrupt the trusted check with no test
+        failure, so this MUST reproduce the dynamics byte-identically.
+
+        Restriction:
+          * treasures restricted to `keep` (a sorted tuple of ORIGINAL treasure ids); bit
+            positions stay the original ids, so `cover_mask`/`d`/`value`/presence bits line
+            up with the parent unchanged;
+          * K = `k_local` present among them (worlds = C(|keep|, k_local) bitmasks over the
+            ORIGINAL bit positions);
+          * `_treasure_ids` = `keep`, so `legal_actions` only proposes kept ('t', i) — a perf
+            specialization (restricted worlds never set non-keep bits, so range(N)+(marg>0)
+            would already exclude them; iterating `keep` just skips the dead candidates);
+          * detectors restricted to faces whose cover is non-empty and ⊆ keep.
+
+        The shared geometry (`_dist`/`coord`/`value`/`entry`/`tp`/`treasures`/`teleports`/`N`)
+        is aliased by a `copy.copy` (copy-on-write), NOT rebuilt; `self` is NOT mutated.
+        """
+        keep = tuple(sorted(keep))
+        keepset = set(keep)
+        # ADR-0002 fail-loud: an empty / over-restricted / out-of-range keep is a config
+        # error, not something to silently clamp into a degenerate sub-instance.
+        if not keep:
+            raise ValueError("restrict: keep is empty (need at least one treasure id).")
+        if any(t < 0 or t >= self.N for t in keep):
+            raise ValueError(
+                f"restrict: keep={keep} has ids outside [0, N={self.N}).")
+        if k_local > len(keep):
+            raise ValueError(
+                f"restrict: k_local={k_local} exceeds |keep|={len(keep)} "
+                f"(cannot have more present than kept).")
+        new = copy.copy(self)
+        new.K = int(k_local)
+        new._treasure_ids = keep
+        # worlds: k_local-of-keep present-sets, as bitmasks over ORIGINAL bit positions
+        new.worlds = world_array(new.N, new.K, support=keep)
+        # detectors: faces whose cover is non-empty and ⊆ keep (rebuilt EXACTLY as the old
+        # bounds/minienv.py MiniEnv.__init__ did, folded in here by audit R8 — same filter,
+        # same iteration order, same det_pt/cover_mask values, so the bound is unchanged)
+        new.detectors = []
+        new.cover_mask = {}
+        new.det_pt = {}
+        for fid in self.detectors:
+            cm = self.cover_mask[fid]
+            cover = [t for t in range(self.N) if (cm >> t) & 1]
+            if cover and set(cover) <= keepset:
+                new.detectors.append(fid)
+                new.cover_mask[fid] = cm
+                new.det_pt[fid] = self.det_pt[fid]
         return new
 
     # ---- geometry ----
@@ -152,7 +219,7 @@ class Environment:
     # ---- dynamics ----
     def legal_actions(self, loc, bw, collected):
         marg = self.marginals(bw)
-        acts = [("t", i) for i in range(self.N) if i not in collected and marg[i] > 0]
+        acts = [("t", i) for i in self._treasure_ids if i not in collected and marg[i] > 0]
         for i in self.detectors:
             cm = self.cover_mask[i]
             if np.any((bw & cm) != 0) and np.any((bw & cm) == 0):     # outcome still uncertain

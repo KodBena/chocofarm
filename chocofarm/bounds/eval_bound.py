@@ -26,7 +26,6 @@ import time
 import numpy as np
 
 from chocofarm.model.env import Environment
-from chocofarm.bounds.minienv import nw_cluster_mini
 from chocofarm.bounds.info_relaxation import (
     PenalizedClairvoyant, dual_bound_rate, empirical_penalty_mean,
     vhat_analytic, DecompVhat, ExactBeliefVhat,
@@ -84,14 +83,15 @@ def achievable_on_mini(mini, vl=0.10):
     Uses the mini's reduced prior (K/|keep| present-fraction)."""
     env = mini
     loc = ("w", env.entry)
-    unv = set(mini.keep)
+    keep = mini._treasure_ids        # the restricted env's kept treasure ids (sorted tuple)
+    unv = set(keep)
     route, t, best = [], 0.0, -1.0
     while unv:
         i = max(unv, key=lambda j: env.value[j] / (env.d(loc, ("t", j)) + 1e-9))
         t += env.d(loc, ("t", i)); loc = ("t", i); route.append(i); unv.discard(i)
         # expected reward of this prefix under the mini prior: each kept treasure is
         # present with prob K/|keep|
-        p = mini.K / len(mini.keep)
+        p = mini.K / len(keep)
         rate = p * sum(env.value[r] for r in route) / (t + env.exit_cost(loc))
         best = max(best, rate)
     return best
@@ -105,14 +105,16 @@ def validate():
 
     # Sub-instance: the NW sense-cluster {8,9,10,11,12}, k_local=2 present → C(5,2)=10
     # worlds, a microscopic belief-MDP. Real geometry/faces/costs (honest numbers).
-    mini = nw_cluster_mini(env, k_local=2)
-    print(f"\nsub-instance: NW cluster keep={mini.keep} K={mini.K}  "
+    # `env.restrict` is the one belief-mechanics impl (audit R8) — the bound certifies
+    # against the EXACT apply/filter the learner uses.
+    mini = env.restrict(keep=(8, 9, 10, 11, 12), k_local=2)
+    print(f"\nsub-instance: NW cluster keep={mini._treasure_ids} K={mini.K}  "
           f"worlds={len(mini.worlds)}  faces={len(mini.detectors)}  "
           f"(real geometry/faces/costs)\n", flush=True)
 
     # --- reference rates on this sub-instance ---
     t0 = time.time()
-    clair_ref = clairvoyant_on_worlds(env, mini.keep, mini.worlds)
+    clair_ref = clairvoyant_on_worlds(env, mini._treasure_ids, mini.worlds)
     achiev = achievable_on_mini(mini)
     print(f"reference: clairvoyant(z≡0) = {clair_ref:.4f}   "
           f"achievable(static-NN) = {achiev:.4f}   ({time.time()-t0:.1f}s)\n", flush=True)
