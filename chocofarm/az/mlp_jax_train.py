@@ -45,6 +45,8 @@ import jax.numpy as jnp
 import optax
 
 from chocofarm.az.dtypes import DTYPE
+from chocofarm.az.forward import forward_core
+from chocofarm.az.mlp import is_weight
 
 # The equivalence safeguard is a FLOAT32 contract (the inference precision the search runs at and
 # the precision the equivalence test pins). Train in float32 so the weights numpy inference reads
@@ -58,30 +60,15 @@ _JDTYPE = jnp.float32 if np.dtype(DTYPE) == np.dtype(np.float32) else jnp.float6
 # Functional forward (params pytree -> (value_standardized, policy_logits))
 # ---------------------------------------------------------------------------
 def _forward_jax(params, X):
-    """Mirror of `ValueMLP._forward` (the residual form on feat/az-residual): trunk
-    in→H→ReLU→H→ReLU, then the no-outer-ReLU pre-activation residual block when its params are
-    present, then the linear value head (standardized scalar) and the policy head (n_actions
-    logits). Returns (v_std, logits) with `v_std` shape (B,) and `logits` shape (B, n_actions).
+    """The jax forward = the ONE `forward.forward_core` evaluated under `jax.numpy` (audit R11).
 
-    `params` is a flat dict: W1 b1 W2 b2 [Wr1 br1 Wr2 br2] Wv bv [Wp bp]. The residual block is
-    applied iff "Wr1" is in `params` — the same toggle as the numpy net's `self.residual`. The
-    policy head is computed iff "Wp" is in `params` (a value-only Stage-1 net has none); when
-    absent, `logits` is None. This is a pure function of (params, X) so
-    `jax.value_and_grad(loss)` differentiates it exactly."""
-    z1 = X @ params["W1"] + params["b1"]
-    a1 = jnp.maximum(z1, 0.0)
-    z2 = a1 @ params["W2"] + params["b2"]
-    a2 = jnp.maximum(z2, 0.0)
-    if "Wr1" in params:
-        zr1 = a2 @ params["Wr1"] + params["br1"]
-        ar1 = jnp.maximum(zr1, 0.0)
-        zr2 = ar1 @ params["Wr2"] + params["br2"]
-        head_in = a2 + zr2                       # pre-activation skip, NO outer ReLU (matches numpy)
-    else:
-        head_in = a2
-    v_std = (head_in @ params["Wv"] + params["bv"]).ravel()
-    logits = (head_in @ params["Wp"] + params["bp"]) if "Wp" in params else None
-    return v_std, logits
+    Returns (v_std, logits) with `v_std` shape (B,) and `logits` shape (B, n_actions). `params` is
+    a flat dict: W1 b1 W2 b2 [Wr1 br1 Wr2 br2] Wv bv [Wp bp]. The residual block is applied iff
+    "Wr1" is in `params` (the same toggle as the numpy net's `self.residual`); the policy head iff
+    "Wp" is present (a value-only Stage-1 net has none → `logits` is None). It is the SAME function
+    `forward_jax_jit` jit-compiles and `_az_loss`/`_value_loss` differentiate, so the weights are
+    trained under exactly the forward numpy inference reads (the equivalence-test contract)."""
+    return forward_core(params, X, jnp)
 
 
 def _masked_softmax_jax(logits, legal_mask):
@@ -104,9 +91,10 @@ forward_jax_jit = jax.jit(_forward_jax)
 
 
 def _l2_sumsq(params):
-    """Σ‖W‖² over WEIGHT MATRICES only (names starting 'W'), matching `ValueMLP._is_weight`. The
-    `l2` coefficient is applied by the loss (closed over at trace time as a Python float, so a
-    `l2==0` short-circuit need not be a traced branch).
+    """Σ‖W‖² over WEIGHT MATRICES only — the L2 scope is `mlp.is_weight` (audit R11: ONE definition,
+    imported here, not a re-derived `name.startswith('W')`). The `l2` coefficient is applied by the
+    loss (closed over at trace time as a Python float, so a `l2==0` short-circuit need not be a
+    traced branch).
 
     NB this is COUPLED L2 (the penalty is in the loss, so its gradient flows through Adam's
     preconditioner) — NOT optax's decoupled `add_decayed_weights`. That is deliberate: it
@@ -115,7 +103,7 @@ def _l2_sumsq(params):
     that penalty to the loss gives autodiff the identical contribution."""
     s = jnp.asarray(0.0, dtype=_JDTYPE)
     for name, arr in params.items():
-        if name.startswith("W"):
+        if is_weight(name):
             s = s + jnp.sum(arr * arr)
     return s
 
