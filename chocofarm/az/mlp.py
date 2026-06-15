@@ -37,18 +37,16 @@ import numpy as np
 
 from chocofarm.az.dtypes import DTYPE, is_float32
 from chocofarm.az.forward import forward_core
+# The net's weight LAYOUT — the param-key registry/order, the L2-mask predicate, the residual flag,
+# the y-scale meta, the npz save/load AND the transport's raw-bytes pack/unpack — has ONE owner now
+# (audit item J): `weights.WeightContainer`. This file holds the arrays as attributes (the f32 cache
+# and the trainer's write-back read them there) and DELEGATES `_params`/`_is_weight`/`save`/`load` to
+# the container. `is_weight` is re-exported here unchanged so `mlp_jax_train`'s import still resolves.
+from chocofarm.az.weights import WeightContainer, is_weight  # noqa: F401  (re-export: the L2 SSOT)
 
 
 def _he_init(rng, fan_in, fan_out):
     return rng.standard_normal((fan_in, fan_out)) * np.sqrt(2.0 / fan_in)
-
-
-def is_weight(name):
-    """THE L2-scope predicate (audit R11, single source): a param is L2-penalized iff it is a
-    weight MATRIX — its registry name starts 'W' (W1/W2/Wr1/Wr2/Wv/Wp), not a bias 'b*'. The
-    JaxTrainer's loss (`mlp_jax_train._l2_sumsq`) imports this so there is ONE definition, not a
-    re-derived `name.startswith('W')` per consumer."""
-    return name.startswith("W")
 
 
 class ValueMLP:
@@ -108,19 +106,15 @@ class ValueMLP:
         self._f32_cache = None
         self._f32_cache_sig = None
 
-    # ---- parameter registry (drives L2; consumed by save/load + the JaxTrainer) ----
+    # ---- parameter registry (drives L2; consumed by save/load + the JaxTrainer + the transport) ----
+    # The registry ORDER, the L2 MASK, and the (de)serialization all live in WeightContainer (audit
+    # item J — ONE owner of the layout). These delegate, reading the arrays live off `self` so the
+    # public API (`net._params()` for the trainer/forward, `net._is_weight(name)`) is unchanged.
     def _params(self):
-        p = {"W1": self.W1, "b1": self.b1, "W2": self.W2, "b2": self.b2,
-             "Wv": self.Wv, "bv": self.bv}
-        if self.residual:
-            p["Wr1"] = self.Wr1; p["br1"] = self.br1
-            p["Wr2"] = self.Wr2; p["br2"] = self.br2
-        if self.n_actions is not None:
-            p["Wp"] = self.Wp; p["bp"] = self.bp
-        return p
+        return WeightContainer.params(self)
 
     def _is_weight(self, name):
-        return is_weight(name)  # L2 on weight matrices only, not biases (the one `is_weight` SSOT)
+        return WeightContainer.is_weight(name)  # L2 on weight matrices only, not biases (one SSOT)
 
     # ---- forward ----
     def _forward(self, X):
@@ -309,52 +303,21 @@ class ValueMLP:
         self.y_mean = float(y_mean)
         self.y_std = float(y_std) if y_std > 1e-8 else 1.0
 
-    # ---- persistence (npz) ----
+    # ---- persistence (npz) — DELEGATED to WeightContainer (audit item J: one owner of the layout) ----
     def save(self, path):
-        d = {k: v for k, v in self._params().items()}
-        # _meta carries a 4th field — the residual flag (0/1). Old npz files have only 3 fields;
-        # load() handles that length explicitly (treats absent → residual OFF).
-        d["_meta"] = np.array([self.in_dim, self.H,
-                               self.n_actions if self.n_actions is not None else -1,
-                               1 if self.residual else 0],
-                              dtype=np.int64)
-        d["_yscale"] = np.array([self.y_mean, self.y_std], dtype=np.float64)
-        np.savez(path, **d)
+        """Write params + meta to an npz. The byte layout (param order, `_meta` = [in_dim, H,
+        n_actions, residual], `_yscale` = [y_mean, y_std]) is the container's — byte-identical to the
+        pre-J encoder."""
+        WeightContainer.save_npz(self, path)
 
     @classmethod
     def load(cls, path):
-        z = np.load(path, allow_pickle=False)
-        meta = [int(x) for x in z["_meta"]]
-        in_dim, H, na = meta[0], meta[1], meta[2]
-        # 4th meta field is the residual flag; absent in pre-residual npz files (length 3).
-        meta_residual = bool(meta[3]) if len(meta) >= 4 else False
-        y_mean, y_std = (float(x) for x in z["_yscale"])
-        n_actions = None if na < 0 else na
-        # A net saved WITH the block carries the Wr*/br* arrays; one saved WITHOUT does not. Build
-        # the net with the block only if BOTH the flag says so AND the params are present — mirrors
-        # the --init-weights dim-mismatch handling (fail informative, not opaque): an old npz loaded
-        # against a residual-meta mismatch keeps the block OFF (random/absent) with a clear log line
-        # rather than crashing deep in the first forward (ADR-0002).
-        have_res_params = all(k in z.files for k in ("Wr1", "br1", "Wr2", "br2"))
-        residual = meta_residual and have_res_params
-        if meta_residual and not have_res_params:
-            print(f"[ValueMLP.load] {path}: _meta says residual=ON but block params "
-                  f"(Wr1/br1/Wr2/br2) are absent — loading with residual OFF", flush=True)
-        net = cls(in_dim, hidden=H, n_actions=n_actions, y_mean=y_mean, y_std=y_std,
-                  residual=residual)
-        net.W1, net.b1 = z["W1"], z["b1"]
-        net.W2, net.b2 = z["W2"], z["b2"]
-        net.Wv, net.bv = z["Wv"], z["bv"]
-        if residual:
-            # validate the block-param shapes at setup (ADR-0002: fail informative HERE, not deep
-            # in the first forward as a raw matmul ValueError). Both Wr* are H×H, both br* are (H,).
-            for k, want in (("Wr1", (H, H)), ("Wr2", (H, H)), ("br1", (H,)), ("br2", (H,))):
-                if z[k].shape != want:
-                    raise ValueError(
-                        f"ValueMLP.load {path}: residual param {k} has shape {z[k].shape}, "
-                        f"expected {want} (hidden={H}) — corrupt/incompatible npz")
-            net.Wr1, net.br1 = z["Wr1"], z["br1"]
-            net.Wr2, net.br2 = z["Wr2"], z["br2"]
-        if n_actions is not None:
-            net.Wp, net.bp = z["Wp"], z["bp"]
-        return net
+        """Reconstruct a net from an npz — DELEGATED to `WeightContainer.load`, which opens the file
+        once, reads the meta, decides the residual toggle (block ON only if the flag says so AND the
+        Wr*/br* arrays are present — fail-informative on a mismatch, ADR-0002), binds the weight arrays
+        and validates the block shapes. Construction stays here: the container calls back this `cls`
+        via the constructor adapter, so the public `ValueMLP.load(path)` signature is unchanged."""
+        def _ctor(in_dim, H, n_actions, y_mean, y_std, residual):
+            return cls(in_dim, hidden=H, n_actions=n_actions, y_mean=y_mean, y_std=y_std,
+                       residual=residual)
+        return WeightContainer.load(_ctor, path)

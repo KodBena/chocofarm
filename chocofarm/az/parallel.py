@@ -48,7 +48,6 @@ true serial baseline.
 """
 from __future__ import annotations
 
-import json
 import os
 import uuid
 
@@ -83,49 +82,37 @@ def _connect():
 
 
 # ---- net (de)serialization as raw bytes (the broadcast payload) ----
-# The weight set is enumerated from the net's OWN param registry (`net._params()`), not a hardcoded
-# tuple — so an optional block (e.g. the residual Wr*/br*) is transported without a second edit
-# site. The `residual` flag rides the manifest so `unpack_net` rebuilds the block before binding
-# its arrays (the params can only be set on a net that built the block).
+# The raw-bytes (de)serialization is the WeightContainer's (audit item J): the net's weight LAYOUT —
+# the param-key order, the manifest's name/shape/dtype/offset/len entries, the scalar meta, and the
+# `tobytes()`/`np.frombuffer` round-trip — has ONE owner there, the same owner the npz save/load and
+# the L2-mask route through. The transport NO LONGER re-enumerates `net._params()` into its own
+# manifest (that was the split-brained second encoder R11 deferred); it constructs the net from the
+# manifest's meta and delegates the (un)packing. The blob/manifest bytes are byte-identical to the
+# pre-J encoder (the param order is the container's canonical order, which is the historical order).
 
 
 def pack_net(net):
-    """Pack a ValueMLP into (manifest_json: str, blob: bytes) — raw `tobytes()` of each weight
-    concatenated, with a JSON manifest of (name, shape, dtype, byte-length) + the scalar meta. No
-    pickle: the blob is contiguous float64 weight bytes. The weight set is whatever the net's
-    param registry reports, so optional params (residual block) ride along automatically."""
-    parts = []
-    layout = []
-    off = 0
-    for k in net._params().keys():
-        a = np.ascontiguousarray(getattr(net, k))
-        b = a.tobytes()
-        layout.append({"name": k, "shape": list(a.shape), "dtype": a.dtype.str,
-                       "off": off, "len": len(b)})
-        parts.append(b)
-        off += len(b)
-    manifest = {
-        "in_dim": net.in_dim, "H": net.H, "n_actions": net.n_actions,
-        "y_mean": net.y_mean, "y_std": net.y_std, "residual": net.residual, "layout": layout,
-    }
-    return json.dumps(manifest), b"".join(parts)
+    """Pack a ValueMLP into (manifest_json: str, blob: bytes) — DELEGATED to
+    `WeightContainer.pack` (the one owner of the weight layout, audit item J). Raw `tobytes()` of each
+    weight concatenated, a JSON manifest of (name, shape, dtype, offset, byte-length) + the scalar
+    meta. No pickle: the blob is contiguous float64 weight bytes; optional params (residual block) ride
+    along automatically because the container reports them iff the net built the block."""
+    from chocofarm.az.weights import WeightContainer
+    return WeightContainer.pack(net)
 
 
 def unpack_net(manifest_json, blob):
-    """Reconstruct a ValueMLP from `pack_net`'s (manifest, blob). `np.frombuffer` views, copied so
-    the net owns writable arrays. No pickle. The `residual` flag rebuilds the block so the Wr*/br*
-    layout entries have a slot to bind to (older manifests without the flag → block OFF)."""
+    """Reconstruct a ValueMLP from `pack_net`'s (manifest, blob). The container reads the manifest's
+    construction meta (so older manifests without `residual` → block OFF); this builds the net via the
+    `ValueMLP` constructor (so the Wr*/br* layout entries have a slot to bind to), then the container
+    binds the arrays (`np.frombuffer` views, copied so the net owns writable arrays). No pickle."""
     from chocofarm.az.mlp import ValueMLP
-    m = json.loads(manifest_json)
+    from chocofarm.az.weights import WeightContainer
+    m = WeightContainer.unpack_meta(manifest_json)
     net = ValueMLP(m["in_dim"], hidden=m["H"],
                    n_actions=m["n_actions"], y_mean=m["y_mean"], y_std=m["y_std"],
                    residual=bool(m.get("residual", False)))
-    for e in m["layout"]:
-        a = np.frombuffer(blob, dtype=np.dtype(e["dtype"]),
-                          count=int(np.prod(e["shape"])) if e["shape"] else 1,
-                          offset=e["off"]).reshape(e["shape"]).copy()
-        setattr(net, e["name"], a)
-    return net
+    return WeightContainer.unpack_into(net, manifest_json, blob)
 
 
 # ---- per-worker module-global state (one set per process, built lazily) ----
