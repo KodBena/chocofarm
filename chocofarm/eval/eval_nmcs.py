@@ -19,11 +19,10 @@ Run a single level to bound wall-time:  python eval_nmcs.py 1   /   python eval_
 No argument runs both (longer).
 """
 import sys
-import time
 
 from chocofarm.model.env import Environment
 from chocofarm.solvers.nmcs import NMCSPolicy
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.eval.report import references, print_reference_header, run_plan
 
 
 # (label, policy, dinkelbach budget) -- tuned so each level finishes within a bounded
@@ -45,23 +44,11 @@ def main():
     levels = [int(a) for a in sys.argv[1:]] or [1, 2]
 
     env = Environment()                      # unit values, the project's reference regime
-    static = realizable_static(env)
-    ceil = clairvoyant_rate(env)
-    headroom = (ceil - static) / static * 100
-    print(f"static floor        : {static:.4f}")
-    print(f"clairvoyant ceiling : {ceil:.4f}   (VoI headroom +{headroom:.0f}%)\n", flush=True)
+    refs = references(env)
+    print_reference_header(refs)
 
     plan = make_plan(env)
-    print(f"{'policy':>16} {'rate':>8} {'%ceiling':>9} {'VoI clawed':>11} "
-          f"{'runs':>6} {'sec':>7}", flush=True)
-    for lvl in levels:
-        name, pol, budget = plan[lvl]
-        t0 = time.time()
-        res = env.dinkelbach_rate(pol, **budget)
-        r = res["rate"]
-        claw = (r - static) / (ceil - static) * 100
-        print(f"{name:>16} {r:>8.4f} {r / ceil * 100:>8.0f}% {claw:>10.0f}% "
-              f"{budget['final_runs']:>6} {time.time() - t0:>7.0f}", flush=True)
+    run_plan(env, refs, [plan[lvl] for lvl in levels], seed=7, columns="nmcs")
 
 
 if __name__ == "__main__":

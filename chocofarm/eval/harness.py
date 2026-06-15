@@ -95,10 +95,11 @@ class BeliefRefs:
 
 def main():
     env = Environment()                      # unit values
-    static = realizable_static(env)
-    ceil = clairvoyant_rate(env)
-    print(f"static floor        : {static:.4f}")
-    print(f"clairvoyant ceiling : {ceil:.4f}   (VoI headroom +{(ceil-static)/static*100:.0f}%)\n",
+    refs = BeliefRefs(env)                    # the floor/ceiling/%VoI SSOT (route the metric through it)
+    ceil = refs.clairvoyant_ceiling
+    print(f"static floor        : {refs.static_floor:.4f}")
+    print(f"clairvoyant ceiling : {ceil:.4f}   "
+          f"(VoI headroom +{(ceil-refs.static_floor)/refs.static_floor*100:.0f}%)\n",
           flush=True)
 
     greedy, ce = GreedyPolicy(), CertaintyEquivalentPolicy()
@@ -114,7 +115,7 @@ def main():
     for name, pol, budget in plan:
         t0 = time.time()
         r = env.dinkelbach_rate(pol, **budget)["rate"]
-        claw = (r - static) / (ceil - static) * 100
+        claw = refs.voi_pct(r)
         print(f"{name:>20} {r:>8.4f} {r/ceil*100:>8.0f}% {claw:>10.0f}% {time.time()-t0:>6.0f}",
               flush=True)
 

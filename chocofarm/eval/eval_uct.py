@@ -28,13 +28,12 @@ An optional trailing `N=<int>` overrides every row's final_runs (handy for shrin
 tight timeout): e.g. `python -m chocofarm.eval.eval_uct 1600 N=20`.
 """
 import sys
-import time
 
 import numpy as np
 
 from chocofarm.model.env import Environment
 from chocofarm.solvers.uct import UCTPolicy
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.eval.report import references, print_reference_header, run_plan
 
 
 # (budget label, UCT iterations, Dinkelbach schedule). Matched to the live ISMCTS sweep.
@@ -61,27 +60,16 @@ def main():
             wanted.add(int(tok))
 
     env = Environment()                                  # unit values, honest face detectors
-    static = realizable_static(env)
-    ceil = clairvoyant_rate(env)
-    headroom = (ceil - static) / static * 100
-    print(f"static floor        : {static:.4f}")
-    print(f"clairvoyant ceiling : {ceil:.4f}   (VoI headroom +{headroom:.0f}%)\n", flush=True)
+    refs = references(env)
+    print_reference_header(refs)
 
-    plan = [row for row in PLAN if (not wanted) or (row[1] in wanted)]
-    print(f"{'policy':>14} {'rate':>8} {'%ceiling':>9} {'VoI clawed':>11} "
-          f"{'E[R]':>6} {'E[T]':>7} {'runs':>5} {'sec/ep':>7} {'sec':>6}", flush=True)
-    for name, iters, budget in plan:
-        if n_override is not None:
-            budget = dict(budget, final_runs=n_override)
-        pol = UCTPolicy(iterations=iters)
-        t0 = time.time()
-        res = env.dinkelbach_rate(pol, seed=7, **budget)
-        dt = time.time() - t0
-        r, er, et = res["rate"], res["ER"], res["ET"]
-        claw = (r - static) / (ceil - static) * 100
-        runs = budget["final_runs"]
-        print(f"{name:>14} {r:>8.4f} {r / ceil * 100:>8.0f}% {claw:>10.0f}% "
-              f"{er:>6.2f} {et:>7.1f} {runs:>5} {dt / runs:>7.1f} {dt:>6.0f}", flush=True)
+    plan = []
+    for name, iters, budget in PLAN:
+        if (not wanted) or (iters in wanted):
+            if n_override is not None:
+                budget = dict(budget, final_runs=n_override)
+            plan.append((name, UCTPolicy(iterations=iters), budget))
+    run_plan(env, refs, plan, seed=7, columns="uct")
 
 
 if __name__ == "__main__":

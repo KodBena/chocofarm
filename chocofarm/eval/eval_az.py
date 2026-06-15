@@ -29,12 +29,13 @@ from chocofarm.model.env import Environment
 from chocofarm.solvers.ismcts import ISMCTSPolicy
 from chocofarm.solvers.decomp import DecompPolicy
 from chocofarm.az.netvalue_ismcts import NetValueISMCTS
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate, DECOMP_ANCHOR
+from chocofarm.eval.harness import DECOMP_ANCHOR
+from chocofarm.eval.report import references, print_reference_header
 
 LAM0 = 0.0855  # static-floor rate; the fixed training/operating λ (design §4.1)
 
 
-def measure(env, pol, static, ceil, n, seed, dink_iters=2, warm=10):
+def measure(env, pol, refs, n, seed, dink_iters=2, warm=10):
     """Returns (dinkelbach-rate row, fixed-λ₀ row) for `pol`, both with E[T] and %VoI."""
     # the policy's own Dinkelbach fixed point
     res = env.dinkelbach_rate(pol, iters=dink_iters, warm_runs=warm, final_runs=n, seed=seed)
@@ -42,13 +43,13 @@ def measure(env, pol, static, ceil, n, seed, dink_iters=2, warm=10):
     r0, ER0, ET0, exits0 = env.rate(pol, LAM0, n, seed=seed)
     return {
         "dink_rate": res["rate"], "dink_lam": res["lambda"], "dink_ET": res["ET"],
-        "dink_voi": (res["rate"] - static) / (ceil - static) * 100,
+        "dink_voi": refs.voi_pct(res["rate"]),
         "fix_rate": r0, "fix_ET": ET0, "fix_ER": ER0,
-        "fix_voi": (r0 - static) / (ceil - static) * 100, "fix_exits": exits0,
+        "fix_voi": refs.voi_pct(r0), "fix_exits": exits0,
     }
 
 
-def stream_compare(env, net_pol, base_pol, static, ceil, n, chunk, seed, logdir):
+def stream_compare(env, net_pol, base_pol, refs, n, chunk, seed, logdir):
     """Interleaved paired comparison at FIXED λ₀, streaming cumulative rate curves to TB.
 
     Net-value and playout-leaf are run on the SAME seed each chunk (paired → variance reduction),
@@ -57,6 +58,7 @@ def stream_compare(env, net_pol, base_pol, static, ceil, n, chunk, seed, logdir)
     (floor/ceiling/decomp) are logged alongside. A timeout mid-run still leaves usable curves.
     Returns the accumulators for the final read-out."""
     from tensorboardX import SummaryWriter
+    static, ceil = refs.static_floor, refs.clairvoyant_ceiling   # the reference lines for TB/display
     w = SummaryWriter(logdir)
     acc = {"net": [0.0, 0.0, 0], "playout": [0.0, 0.0, 0]}    # sumR, sumT, episodes
     pols = {"net": net_pol, "playout": base_pol}
@@ -73,7 +75,7 @@ def stream_compare(env, net_pol, base_pol, static, ceil, n, chunk, seed, logdir)
             cumrate = a[0] / a[1] if a[1] > 0 else 0.0
             w.add_scalar(f"rate/{tag}", cumrate, a[2])
             w.add_scalar(f"E_time/{tag}", a[1] / a[2], a[2])
-            w.add_scalar(f"voi_pct/{tag}", (cumrate - static) / (ceil - static) * 100, a[2])
+            w.add_scalar(f"voi_pct/{tag}", refs.voi_pct(cumrate), a[2])
         w.add_scalar("ref/floor", static, done + c)
         w.add_scalar("ref/ceiling", ceil, done + c)
         w.add_scalar("ref/decomp", DECOMP_ANCHOR, done + c)
@@ -89,11 +91,11 @@ def stream_compare(env, net_pol, base_pol, static, ceil, n, chunk, seed, logdir)
 
     rn = acc["net"]; net_rate, net_ET = rn[0] / rn[1], rn[1] / rn[2]
     print(f"\nFINAL fixed-λ₀={LAM0}  net rate={net_rate:.4f}  ET={net_ET:.1f}  "
-          f"%VoI={(net_rate - static) / (ceil - static) * 100:.0f}", flush=True)
+          f"%VoI={refs.voi_pct(net_rate):.0f}", flush=True)
     if base_pol is not None:
         rb = acc["playout"]; b_rate, b_ET = rb[0] / rb[1], rb[1] / rb[2]
         print(f"            playout rate={b_rate:.4f}  ET={b_ET:.1f}  "
-              f"%VoI={(b_rate - static) / (ceil - static) * 100:.0f}", flush=True)
+              f"%VoI={refs.voi_pct(b_rate):.0f}", flush=True)
         print(f"READ-OUT: net − playout Δrate={net_rate - b_rate:+.4f}, ΔET={net_ET - b_ET:+.1f} "
               f"({'shorter→less' if net_ET < b_ET else 'longer→more'} over-collection)", flush=True)
         print(f"  GO iff net beats playout (ideally clears floor {static:.4f}) with shorter ET.",
@@ -115,16 +117,15 @@ def main():
     args = ap.parse_args()
 
     env = Environment()
-    static = realizable_static(env)
-    ceil = clairvoyant_rate(env)
-    print(f"static floor        : {static:.4f}")
-    print(f"clairvoyant ceiling : {ceil:.4f}   (VoI headroom +{(ceil-static)/static*100:.0f}%)")
-    print(f"decomp anchor       : {DECOMP_ANCHOR} (the value teacher)\n", flush=True)
+    refs = references(env)
+    static = refs.static_floor                              # the floor, for the GO read-out display
+    print_reference_header(
+        refs, extra_lines=(f"decomp anchor       : {DECOMP_ANCHOR} (the value teacher)",))
 
     if args.tb_logdir:
         net_pol = NetValueISMCTS(env, args.weights, iterations=args.it)
         base_pol = None if args.no_baseline else ISMCTSPolicy(iterations=args.it)
-        stream_compare(env, net_pol, base_pol, static, ceil, args.n, args.chunk,
+        stream_compare(env, net_pol, base_pol, refs, args.n, args.chunk,
                        args.seed, args.tb_logdir)
         return
 
@@ -140,14 +141,14 @@ def main():
     # 1) the probe: learned-value leaf
     net_pol = NetValueISMCTS(env, args.weights, iterations=args.it)
     t0 = time.time()
-    m_net = measure(env, net_pol, static, ceil, args.n, args.seed)
+    m_net = measure(env, net_pol, refs, args.n, args.seed)
     row(f"net-value (it={args.it})", m_net, time.time() - t0)
 
     # 2) the F4 baseline: determinized-playout leaf at the SAME budget
     if not args.no_baseline:
         base_pol = ISMCTSPolicy(iterations=args.it)
         t0 = time.time()
-        m_base = measure(env, base_pol, static, ceil, args.n, args.seed)
+        m_base = measure(env, base_pol, refs, args.n, args.seed)
         row(f"playout-leaf (it={args.it})", m_base, time.time() - t0)
 
         # the GO/NO-GO read-out (design §9)
