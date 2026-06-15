@@ -180,7 +180,25 @@ def run(args):
     print(f"env: N={env.N} faces={len(env.detectors)} teleports={len(env.teleports)} "
           f"feat_dim={in_dim} action_slots={n_slots}", flush=True)
 
+    # --- hyperparameter registry: SEED FIRST, then construct the process FROM the seeded config
+    #     (hp-registry design §6 — the consolidation). argparse remains the launch CLI; here it
+    #     SEEDS the registry (dataclass defaults = argparse defaults, one source). The registry is
+    #     then the SINGLE authority: the RESTART values the net/trainer/executor/search are built
+    #     with are read off the seeded config (`cfg0`), not args, so the registry blob and the
+    #     construction-time truth cannot disagree (the §3.4 refusal compares against EXACTLY what was
+    #     built). On a --resume that re-binds to an existing blob carrying operator overrides, those
+    #     overrides become the construction-time values too — so the running process adopts them
+    #     (the §3.5 "drop lr in the registry, then --resume to adopt" workflow), not just records
+    #     them. HOT fields are then read LIVE off a per-iteration snapshot below. ---
+    from chocofarm.hp import registry as hpreg
+    experiment_id = args.experiment_id or os.path.basename(os.path.normpath(args.ckpt_dir))
+    cfg0 = hpreg.seed_registry(experiment_id, hpreg.from_argparse(args, experiment_id), env=env)
+    print(f"hp registry: experiment_id={experiment_id!r}; constructed FROM the seeded config; "
+          f"HOT fields read live per iteration (RESTART fields refusal-guarded)", flush=True)
+
     # --- net: resume full net (--resume), warm-start value head (--init-weights), or cold ---
+    # RESTART arch knobs (hidden / residual / init_seed) come from the seeded registry config, so a
+    # --resume that re-bound to an operator-overridden blob is constructed with those overrides.
     if args.resume:
         net = ValueMLP.load(args.resume)
         if net.in_dim != in_dim or net.n_actions != n_slots:
@@ -192,8 +210,8 @@ def run(args):
               f"{args.resume} (hidden={net.H}); JaxTrainer inits a fresh optax optimizer", flush=True)
     elif args.init_weights:
         warm = ValueMLP.load(args.init_weights)
-        net = ValueMLP(in_dim, hidden=warm.H, n_actions=n_slots, seed=args.seed,
-                       y_mean=warm.y_mean, y_std=warm.y_std, residual=args.residual)
+        net = ValueMLP(in_dim, hidden=warm.H, n_actions=n_slots, seed=cfg0.arch.init_seed,
+                       y_mean=warm.y_mean, y_std=warm.y_std, residual=cfg0.arch.residual)
         # copy the second trunk layer + value head; policy head stays random.
         net.W2, net.b2 = warm.W2.copy(), warm.b2.copy()
         net.Wv, net.bv = warm.Wv.copy(), warm.bv.copy()
@@ -212,10 +230,10 @@ def run(args):
         print(f"warm-started 2nd-trunk + value head from {args.init_weights} "
               f"(hidden={warm.H}); {w1_note}; policy head random; {res_note}", flush=True)
     else:
-        net = ValueMLP(in_dim, hidden=args.hidden, n_actions=n_slots, seed=args.seed,
-                       residual=args.residual)
+        net = ValueMLP(in_dim, hidden=cfg0.arch.hidden, n_actions=n_slots, seed=cfg0.arch.init_seed,
+                       residual=cfg0.arch.residual)
         res_note = "residual block ON" if net.residual else "no residual block"
-        print(f"cold net (hidden={args.hidden}); both heads random; {res_note}", flush=True)
+        print(f"cold net (hidden={cfg0.arch.hidden}); both heads random; {res_note}", flush=True)
 
     # --- JAX/optax trainer: autodiff training over the jit'd forward (replaces mlp.py's manual
     #     backprop + hand-rolled Adam). Built ONCE so Adam's running moments persist across
@@ -223,8 +241,12 @@ def run(args):
     #     fully-initialised, possibly warm-started) net's weights and writes the trained weights
     #     back into the net after each step — numpy inference (generation/eval) reads them. ---
     from chocofarm.az.mlp_jax_train import JaxTrainer
-    trainer = JaxTrainer(net, lr=args.lr, l2=args.l2)
-    print(f"training: JAX/optax Adam (lr={args.lr} l2={args.l2}); inference: numpy float32",
+    # lr/l2 are RESTART (baked into optax.adam at construction — hp-registry §4.5); read them off
+    # the seeded registry config so a --resume that re-bound to an lr-dropped blob is constructed
+    # with the dropped lr (the §3.5 adopt-on-resume workflow), and so the construction-time truth
+    # the refusal compares against IS the registry value.
+    trainer = JaxTrainer(net, lr=cfg0.train.lr, l2=cfg0.train.l2)
+    print(f"training: JAX/optax Adam (lr={cfg0.train.lr} l2={cfg0.train.l2}); inference: numpy float32",
           flush=True)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -235,54 +257,105 @@ def run(args):
         # reference lines as flat series (drawn at every iteration so TB renders them)
         print(f"streaming to TensorBoard -> {args.tb_logdir}", flush=True)
 
-    buf = ReplayBuffer(args.window)
-    gen_rng = np.random.default_rng(args.seed + 1)
-    train_rng = np.random.default_rng(args.seed + 2)
+    # RESTART knobs used below (seed / m / n_sims / workers / cores) come from the seeded config
+    # (cfg0), the same single authority the net/trainer were built from. `seed` folds the master RNG
+    # (RESTART — changing it mid-run breaks the parallel≈serial determinism contract).
+    master_seed = cfg0.loop.seed
+    # `window`/`iters` are HOT but read at LOOP CONSTRUCTION (the ReplayBuffer / `range` bound are
+    # built once); source them from cfg0 — the single construction-time authority — so a --resume
+    # that re-bound to an operator-overridden window/iters adopts it consistently with the other
+    # construction-time values, rather than splitting authority back to args.
+    buf = ReplayBuffer(cfg0.loop.window)
+    gen_rng = np.random.default_rng(master_seed + 1)
+    train_rng = np.random.default_rng(master_seed + 2)
     history = []
-    lam = args.lam
-    n_step = args.n_step
-    lam_blend = args.td_lambda
-    if n_step is not None and lam_blend < 1.0:
+    # the launch banner reads the value-target knobs off cfg0; they are HOT and re-read per
+    # iteration off the snapshot below (so a manual change to n_step/td_lambda lands live).
+    if cfg0.value.n_step is not None and cfg0.value.td_lambda < 1.0:
         raise ValueError("set at most one of --n-step / --td-lambda (the other stays at the "
                          "pure-MC default); both were given")  # ADR-0002 fail-loud
-    bmode = (f"n-step={n_step}" if n_step is not None
-             else (f"TD(λ_blend={lam_blend})" if lam_blend < 1.0 else "pure-MC (λ_blend=1)"))
+    bmode = (f"n-step={cfg0.value.n_step}" if cfg0.value.n_step is not None
+             else (f"TD(λ_blend={cfg0.value.td_lambda})" if cfg0.value.td_lambda < 1.0
+                   else "pure-MC (λ_blend=1)"))
     print(f"value target: {bmode}", flush=True)
+
+    # --- bind the live snapshot: cfg0 is BOTH the launched_with shadow (the construction-time truth
+    #     the RESTART-refusal §3.4 compares against — exactly what the net/trainer/executor were
+    #     built from, so the shadow cannot drift from construction) AND the first live read. ---
+    snap = hpreg.ConfigSnapshot.launch(experiment_id, launched_with=cfg0)
+    lam = snap.cfg.loop.lam   # the live HOT λ; refreshed per iteration below
 
     # --- Part A: persistent core-pinned process pool (parallel actor/learner). workers<=0 keeps
     #     the in-process serial path (the true serial baseline for the A/B). ---
     executor = None
-    if args.workers and args.workers > 0:
+    if cfg0.par.workers and cfg0.par.workers > 0:
         from chocofarm.az.parallel import ParallelExecutor
-        cores = [int(c) for c in args.cores.split(",")] if args.cores else None
-        executor = ParallelExecutor(args.workers, cores, args.seed, args.m, args.n_sims)
-        print(f"parallel actor/learner: {args.workers} workers pinned to cores "
+        # workers / cores / seed / m / n_sims are RESTART (the pool is built once before the loop);
+        # read them off the seeded config (cfg0), the single construction-time authority.
+        cores = [int(c) for c in cfg0.par.cores.split(",")] if cfg0.par.cores else None
+        executor = ParallelExecutor(cfg0.par.workers, cores, master_seed,
+                                    cfg0.search.m, cfg0.search.n_sims)
+        print(f"parallel actor/learner: {cfg0.par.workers} workers pinned to cores "
               f"{executor.cores}; weights + transitions over redis (raw bytes, no pickle) "
               f"run={executor.run}", flush=True)
     else:
         print("serial (in-process) generation + eval", flush=True)
 
     try:
-      for it in range(args.iters):
+      # `iters` and `window` are HOT in the schema but read here at LOOP CONSTRUCTION (the `range`
+      # bound and the ReplayBuffer are built once) from cfg0 — the genuinely per-iteration HOT fields
+      # are read off the snapshot inside the loop. A live `iters` change would only matter to a
+      # not-yet-reached bound; consistent with the read-at-point-of-use model (hp-registry §3.1), the
+      # point of use for the loop bound is here, once.
+      for it in range(cfg0.loop.iters):
         t0 = time.time()
+        # ---- 0. REFRESH the live hyperparameter snapshot at the iteration boundary (hp-registry
+        #         design §3.1). This re-reads the registry blob, LOGS any applied HOT change loudly
+        #         (§5.5), and FIRES the loud RESTART/INSTANCE refusal (§3.4) if a baked field moved
+        #         off its construction value. The snapshot is fixed for the whole iteration
+        #         (atomicity, §3.3). HOT fields below are read off snap.cfg, not args. ---
+        snap.refresh(iteration=it)
+        lam = snap.cfg.loop.lam
+        n_step = snap.cfg.value.n_step
+        lam_blend = snap.cfg.value.td_lambda
+        episodes = snap.cfg.loop.episodes
+        explore_plies = snap.cfg.loop.explore_plies
+        eval_n = snap.cfg.eval.eval_n
+        eval_seed = snap.cfg.eval.eval_seed
+        epochs = snap.cfg.train.epochs
+        batch = snap.cfg.train.batch
+        alpha = snap.cfg.train.alpha
+        beta = snap.cfg.train.beta
+        max_steps = snap.cfg.env.max_steps   # HOT rollout cap (per-call, not instance)
+        # HOT search knobs (read off the live snapshot; the search object is rebuilt every iteration
+        # below — and in the worker on each version bump — so a manual change to these lands live,
+        # hp-registry §3.4). `m`/`n_sims`/`use_jax_mlp` are RESTART (cfg0): they size the SH bracket /
+        # bind the forward fn and are baked at launch.
+        hot_search = dict(c_puct=snap.cfg.search.c_puct, c_visit=snap.cfg.search.c_visit,
+                          c_scale=snap.cfg.search.c_scale, c_outcome=snap.cfg.search.c_outcome,
+                          max_depth=snap.cfg.search.max_depth)
+
         # the parent draws the per-episode true worlds so the world sequence is reproducible
         # regardless of worker count (parallel≈serial): same worlds → same episodes given seeds.
-        gen_worlds = [int(gen_rng.choice(env.worlds)) for _ in range(args.episodes)]
-        eval_rng = np.random.default_rng(args.eval_seed)
-        eval_worlds = [int(eval_rng.choice(env.worlds)) for _ in range(args.eval_n)]
+        gen_worlds = [int(gen_rng.choice(env.worlds)) for _ in range(episodes)]
+        eval_rng = np.random.default_rng(eval_seed)
+        eval_worlds = [int(eval_rng.choice(env.worlds)) for _ in range(eval_n)]
 
         # ---- 1. GENERATE ----
         if executor is not None:
             # publishes the frozen weights to redis (raw bytes) + fans the episodes; gathers
-            # transitions back over redis (no pickle of the array payloads)
+            # transitions back over redis (no pickle of the array payloads). The HOT search knobs
+            # ride the call so the worker rebuilds its search with the live values on the version bump.
             recs_all = executor.generate(net, it, gen_worlds, lam,
-                                         args.explore_plies, lam_blend, n_step)
+                                         explore_plies, lam_blend, n_step,
+                                         hot_search=hot_search, max_steps=max_steps)
         else:
-            search = GumbelAZSearch(net, env, m=args.m, n_sims=args.n_sims)
+            search = GumbelAZSearch(net, env, m=cfg0.search.m, n_sims=cfg0.search.n_sims,
+                                    use_jax_mlp=cfg0.search.use_jax_mlp, **hot_search)
             recs_all = []
             for world in gen_worlds:
                 recs_all.extend(generate_episode(env, search, fb, world, lam, gen_rng,
-                                                 args.explore_plies,
+                                                 explore_plies, max_steps=max_steps,
                                                  lam_blend=lam_blend, n_step=n_step))
         Xs, PIs, Ms, Ys, all_pis = [], [], [], [], []
         for feat, pi, mask, g in recs_all:
@@ -297,21 +370,29 @@ def run(args):
         t_gen = time.time() - t0
 
         # ---- 2. TRAIN ----
+        # epochs/batch/alpha/beta are HOT (read off the live snapshot); lr/l2 are RESTART (baked
+        # into the trainer's optax.adam at construction — hp-registry §4.5). lr/l2 are passed here
+        # only to preserve train_epochs' signature shape (the trainer's CONFIGURED lr/l2 are
+        # authoritative, per its docstring); they take the construction-time cfg0 value the
+        # snapshot's RESTART-refusal guards, not a second args authority.
         bX, bPI, bM, bY = buf.arrays()
-        ce, vmse, r2 = train_epochs(trainer, bX, bPI, bM, bY, args.epochs, args.batch,
-                                    args.lr, args.l2, args.alpha, args.beta, train_rng)
+        ce, vmse, r2 = train_epochs(trainer, bX, bPI, bM, bY, epochs, batch,
+                                    cfg0.train.lr, cfg0.train.l2, alpha, beta, train_rng)
         t_train = time.time() - t0 - t_gen
 
         # ---- 3. EVALUATE (greedy argmax-π′ policy on a held-out seed, fixed λ₀) ----
         if executor is not None:
-            # re-publishes the now-trained weights at a distinct version, fans eval episodes
-            totR, totT, ets = executor.evaluate(net, it + 1_000_000, eval_worlds, lam)
+            # re-publishes the now-trained weights at a distinct version, fans eval episodes; the
+            # HOT search knobs ride the call as in generate.
+            totR, totT, ets = executor.evaluate(net, it + 1_000_000, eval_worlds, lam,
+                                                hot_search=hot_search, max_steps=max_steps)
         else:
-            eval_pol = GumbelPolicy(net, env, m=args.m, n_sims=args.n_sims)
-            ev_rng = np.random.default_rng(args.eval_seed)
+            eval_pol = GumbelPolicy(net, env, m=cfg0.search.m, n_sims=cfg0.search.n_sims,
+                                    use_jax_mlp=cfg0.search.use_jax_mlp, **hot_search)
+            ev_rng = np.random.default_rng(eval_seed)
             totR = totT = 0.0; ets = []
             for w in eval_worlds:
-                R, T, _ = env.simulate(eval_pol, w, lam, ev_rng)
+                R, T, _ = env.simulate(eval_pol, w, lam, ev_rng, max_steps=max_steps)
                 totR += R; totT += T; ets.append(T)
         rate = totR / totT if totT > 0 else 0.0
         et = float(np.mean(ets)) if ets else 0.0
@@ -345,7 +426,7 @@ def run(args):
             writer.add_scalar("gen/target_var", y_var, it)   # Part B: value-target variance watch
             writer.flush()
 
-        print(f"iter {it:>3}/{args.iters}  rate={rate:.4f} (%VoI={voi:+.0f}) ET={et:.1f}  "
+        print(f"iter {it:>3}/{cfg0.loop.iters}  rate={rate:.4f} (%VoI={voi:+.0f}) ET={et:.1f}  "
               f"CE={ce:.3f} vMSE={vmse:.3f} R²={r2:.3f} H={ent:.2f} yVar={y_var:.3f}  "
               f"[{X.shape[0]} tr | gen {t_gen:.0f}s train {t_train:.0f}s eval {t_eval:.0f}s]",
               flush=True)
@@ -355,7 +436,7 @@ def run(args):
 
     if writer is not None:
         writer.close()
-    print(f"\nDONE {args.iters} iters. checkpoints + history.json -> {args.ckpt_dir}", flush=True)
+    print(f"\nDONE {cfg0.loop.iters} iters. checkpoints + history.json -> {args.ckpt_dir}", flush=True)
     if history:
         best = max(history, key=lambda r: r["rate"])
         print(f"best eval rate {best['rate']:.4f} (%VoI={best['voi_pct']:+.0f}) at iter {best['iter']}",
@@ -406,6 +487,13 @@ def main():
                          "off the search root value. None/∞ = pure MC. Mutually exclusive with --td-lambda.")
     ap.add_argument("--tb-logdir", type=str, default=None)
     ap.add_argument("--ckpt-dir", type=str, required=True)
+    # --- hyperparameter registry (hp-registry design §5.1): the operator-meaningful namespace this
+    #     run's live hyperparameters live under. Defaults to the ckpt-dir basename (zero new
+    #     ceremony — `--ckpt-dir runs/lr1e4_resume` implies experiment_id=lr1e4_resume), so two
+    #     concurrent experiments with distinct ckpt dirs get disjoint registry namespaces for free. ---
+    ap.add_argument("--experiment-id", type=str, default=None,
+                    help="hp-registry namespace for this run's live hyperparameters "
+                         "(default: the --ckpt-dir basename). Distinct ids never clobber.")
     args = ap.parse_args()
     run(args)
 

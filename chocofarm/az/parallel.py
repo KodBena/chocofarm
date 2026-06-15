@@ -31,13 +31,13 @@ So neither weights nor results travel as pickle:
     back with `np.frombuffer` and reshapes — zero pickle of array data. Keys are namespaced by a
     per-call run-token and deleted after read so redis doesn't accumulate.
 
-Connection facts come from env (`CHOCO_REDIS_HOST`/`CHOCO_REDIS_PORT`/`CHOCO_REDIS_DB`, defaulting
-to 127.0.0.1:6380 db 0 — the memory-cache instance, a 1GB allkeys-lru store). Redis being
-unreachable is a loud failure (ADR-0002) — the loop must not silently fall back to a slow path the
-operator didn't ask for. The instance's `allkeys-lru` eviction can in principle drop a key under
-memory pressure; weights carry a 1h TTL and are read-validated (a missing payload is a loud
-RuntimeError, never a silent stale-net serve), and result blobs are read + deleted in the same
-iteration they're written, so the eviction window is small (≤ a few MB live at once vs 1GB).
+Connection facts come from `chocofarm/config.py` (`redis_params()`, env-overridable via
+`CHOCO_REDIS_HOST`/`CHOCO_REDIS_PORT`/`CHOCO_REDIS_DB`), defaulting to 127.0.0.1:6379 db 0 — the
+disk-persisted instance (`noeviction`, no `maxmemory` cap). Redis being unreachable is a loud
+failure (ADR-0002) — the loop must not silently fall back to a slow path the operator didn't ask
+for. Weights carry a 1h TTL and are read-validated (a missing payload is a loud RuntimeError, never
+a silent stale-net serve), and result blobs are read + deleted in the same iteration they're
+written, so transport keys never accumulate.
 
 Determinism / parallel≈serial: a task's seed is folded from `base_seed`, the weight version, a kind
 tag, and the episode index, so the SAME logical (iteration, kind, episode) draws the SAME stream
@@ -57,11 +57,10 @@ import numpy as np
 
 # ---- redis connection (raw-bytes transport; no pickle) ----
 def _redis_params():
-    return dict(
-        host=os.environ.get("CHOCO_REDIS_HOST", "127.0.0.1"),
-        port=int(os.environ.get("CHOCO_REDIS_PORT", "6380")),   # the memory-cache instance
-        db=int(os.environ.get("CHOCO_REDIS_DB", "0")),
-    )
+    """Shared connection facts from chocofarm/config.py (the registry uses the same), so transport
+    and registry address one redis instance by default."""
+    from chocofarm import config
+    return config.redis_params()
 
 
 def _connect():
@@ -73,9 +72,10 @@ def _connect():
     # turns a stall into a loud redis.TimeoutError (retryable / restart-recoverable; checkpoints
     # are per-iteration) instead of a silent permanent hang. Loopback redis under no memory
     # pressure never trips 60s, so this is a safety net, not a happy-path behavior change.
+    from chocofarm import config
     r = redis.Redis(
-        socket_timeout=float(os.environ.get("CHOCO_REDIS_SOCKET_TIMEOUT", "60")),
-        socket_connect_timeout=float(os.environ.get("CHOCO_REDIS_CONNECT_TIMEOUT", "10")),
+        socket_timeout=config.redis_socket_timeout(),
+        socket_connect_timeout=config.redis_connect_timeout(),
         **_redis_params(),
     )
     r.ping()   # fail loud now if redis is unreachable (ADR-0002), not mid-iteration
@@ -193,9 +193,16 @@ def _worker_init(core_list, base_seed, m, n_sims):
     _kwarm(env.N, len(env.detectors))   # compile the belief kernel once per process
 
 
-def _ensure_net(run, version):
+def _ensure_net(run, version, hot_search=None):
     """Load the net into the worker iff the weight version changed — reading the raw-bytes payload
-    from redis `az:w:<run>:<version>` (no pickle). Rebuilds the GumbelAZSearch on the fresh net."""
+    from redis `az:w:<run>:<version>` (no pickle). Rebuilds the GumbelAZSearch on the fresh net.
+
+    `hot_search` (hp-registry §3.4): the live HOT search knobs (c_puct/c_visit/c_scale/c_outcome/
+    max_depth) for THIS iteration, sized by the parent's per-iteration snapshot. The version bumps
+    every iteration (the parent re-publishes weights each iter), so the worker rebuilds its search
+    on the version change and the live HOT knobs are picked up at that natural refresh point — the
+    seam §3.2 names ('the worker's natural refresh coincides with the parent's poll'). `m`/`n_sims`
+    are RESTART (set once in `_worker_init`)."""
     if _W["version"] == version and _W["net"] is not None:
         return
     from chocofarm.az.gumbel_search import GumbelAZSearch
@@ -206,7 +213,8 @@ def _ensure_net(run, version):
         raise RuntimeError(f"weight payload az:w:{run}:{version} missing from redis")
     net = unpack_net(manifest.decode("utf-8"), blob)
     _W["net"] = net
-    _W["search"] = GumbelAZSearch(net, _W["env"], m=_W["m"], n_sims=_W["n_sims"])
+    hs = dict(hot_search) if hot_search else {}
+    _W["search"] = GumbelAZSearch(net, _W["env"], m=_W["m"], n_sims=_W["n_sims"], **hs)
     _W["version"] = version
 
 
@@ -224,13 +232,16 @@ def _task_rng(version, kind, idx):
 def _gen_task(args):
     """Worker task: generate ONE training episode, write its records to redis as raw bytes, return
     only (idx, n_rows, feat_dim, n_slots). `args` = (run, version, world, lam, explore_plies,
-    lam_blend, n_step, idx, res_token)."""
-    run, version, world, lam, explore_plies, lam_blend, n_step, idx, res_token = args
-    _ensure_net(run, version)
+    lam_blend, n_step, idx, res_token, hot_search, max_steps). `hot_search`/`max_steps` are the live
+    HOT knobs for this iteration (hp-registry §3.4)."""
+    (run, version, world, lam, explore_plies, lam_blend, n_step, idx, res_token,
+     hot_search, max_steps) = args
+    _ensure_net(run, version, hot_search=hot_search)
     from chocofarm.az.exit_loop import generate_episode
     rng = _task_rng(version, "gen", idx)
     recs = generate_episode(_W["env"], _W["search"], _W["fb"], world, lam, rng,
-                            explore_plies, lam_blend=lam_blend, n_step=n_step)
+                            explore_plies, max_steps=max_steps,
+                            lam_blend=lam_blend, n_step=n_step)
     n = len(recs)
     if n == 0:
         return (idx, 0, 0, 0)
@@ -263,13 +274,15 @@ def _gen_task(args):
 
 def _eval_task(args):
     """Worker task: run ONE greedy-eval episode against a held-out world; return (R, T) (scalars —
-    no array payload, so they ride the pipe cheaply). `args` = (run, version, world, lam, idx)."""
-    run, version, world, lam, idx = args
-    _ensure_net(run, version)
+    no array payload, so they ride the pipe cheaply). `args` = (run, version, world, lam, idx,
+    hot_search, max_steps)."""
+    run, version, world, lam, idx, hot_search, max_steps = args
+    _ensure_net(run, version, hot_search=hot_search)
     from chocofarm.az.gumbel_search import GumbelPolicy
-    pol = GumbelPolicy(_W["net"], _W["env"], m=_W["m"], n_sims=_W["n_sims"])
+    hs = dict(hot_search) if hot_search else {}
+    pol = GumbelPolicy(_W["net"], _W["env"], m=_W["m"], n_sims=_W["n_sims"], **hs)
     rng = _task_rng(version, "eval", idx)
-    R, T, _ = _W["env"].simulate(pol, world, lam, rng)
+    R, T, _ = _W["env"].simulate(pol, world, lam, rng, max_steps=max_steps)
     return float(R), float(T)
 
 
@@ -340,13 +353,20 @@ class ParallelExecutor:
         pipe.expire(f"az:w:{self.run}:{version}:b", 3600)
         pipe.execute()
 
-    def generate(self, net, version, worlds, lam, explore_plies, lam_blend, n_step):
+    def generate(self, net, version, worlds, lam, explore_plies, lam_blend, n_step,
+                 hot_search=None, max_steps=40):
         """Publish `net` at `version`, fan E generation episodes across the pool, read the raw-byte
         results back from redis and reshape into one flat list of (feat, pi, mask, g) records. The
-        parent draws `worlds` so the world sequence is reproducible regardless of worker count."""
+        parent draws `worlds` so the world sequence is reproducible regardless of worker count.
+
+        `hot_search`/`max_steps` (hp-registry §3.4): the live HOT search knobs + rollout cap for
+        this iteration, threaded into each task so the worker rebuilds its search with the live
+        values on the version bump (which happens every iteration)."""
         self.publish_weights(net, version)
         res_token = uuid.uuid4().hex[:12]
-        tasks = [(self.run, version, int(w), lam, explore_plies, lam_blend, n_step, i, res_token)
+        hs = dict(hot_search) if hot_search else {}
+        tasks = [(self.run, version, int(w), lam, explore_plies, lam_blend, n_step, i, res_token,
+                  hs, max_steps)
                  for i, w in enumerate(worlds)]
         # bounded drain (Fix A): per-result timeout so a wedged worker aborts loud, not deadlocks
         metas = _drain_imap(self.pool.imap_unordered(_gen_task, tasks, chunksize=1),
@@ -381,12 +401,16 @@ class ParallelExecutor:
         dpipe.execute()
         return out
 
-    def evaluate(self, net, version, worlds, lam):
+    def evaluate(self, net, version, worlds, lam, hot_search=None, max_steps=40):
         """Publish `net` at `version`, fan N eval episodes across the pool; return (totR, totT,
         list_of_T). Eval results are scalars (R, T) so they ride the pipe directly — no redis blob
-        needed (the array transport is only for the large generation records)."""
+        needed (the array transport is only for the large generation records).
+
+        `hot_search`/`max_steps` (hp-registry §3.4): the live HOT search knobs + rollout cap,
+        threaded as in `generate`."""
         self.publish_weights(net, version)
-        tasks = [(self.run, version, int(w), lam, i) for i, w in enumerate(worlds)]
+        hs = dict(hot_search) if hot_search else {}
+        tasks = [(self.run, version, int(w), lam, i, hs, max_steps) for i, w in enumerate(worlds)]
         totR = totT = 0.0
         ets = []
         # bounded drain (Fix A): per-result timeout so a wedged worker aborts loud, not deadlocks
