@@ -7,7 +7,7 @@ WHY THIS FILE EXISTS
 --------------------
 The original hand-analysis (`docs/design/static-shortcuts.md`) was computed on
 the broken `cover_mask` over-approximation — the union-over-faces masquerading
-as a simultaneous disjunction (consult-002).  Its detector-coupled conclusions
+as a simultaneous disjunction (docs/consults/consult-002-detector-misspec-report.md).  Its detector-coupled conclusions
 ("a detector covers {8,9,10,11,12}", "5.16× single-read collapse", "{8,9}/{11,12}
 indistinguishable", "120.7-world floor") are therefore WRONG.  This module
 re-derives every structural quantity under the CORRECTED face model

@@ -2,7 +2,7 @@
 
 The Monte-Carlo solvers re-measured against the **corrected detector model**: the
 planar **arrangement faces** (`arrangement.py` + `chocobo_faces.json`,
-consult-002 §4), wired into `env.py`. The old model keyed sensing to regions with
+`docs/consults/consult-002-detector-misspec-report.md` §(4)), wired into `env.py`. The old model keyed sensing to regions with
 `cover_mask[i] = {i} ∪ overlap-neighbours` — an over-approximation that read the
 union over *every* face in Δ_i (a k=5 semantics) at one face's representative point
 (a k≤2 position). The honest model makes the **face** the sense action: standing at
@@ -85,7 +85,7 @@ present-set for free).
   (NMCS), the deeper-is-worse curse, and the bottleneck being deep contingent
   sensing chains are all *method* properties, not sensor artifacts — and under the
   honest weaker sensor "depth" is *more* demanding (a face read per treasure to
-  corner it, not one cluster read), exactly as consult-002 §4 anticipated.
+  corner it, not one cluster read), exactly as consult-002 §(4) anticipated.
 
 ## Caveats (budgets, action-set size, slowdowns)
 
@@ -132,6 +132,6 @@ present-set for free).
 - Old (contaminated) numbers: `docs/results/pluggable-policies-2026-06-13.md`,
   `docs/results/nmcs-result.md`, `docs/results/ismcts-result.md`,
   `docs/results/voi-ceiling-2026-06-13.md`.
-- Predicted direction of change: `docs/agents/consult-002-detector-misspec-report.md`
-  §3–§4 ("the true sensor is weaker… the gap to the ceiling is, if anything,
+- Predicted direction of change: `docs/consults/consult-002-detector-misspec-report.md`
+  §(3)–§(4) ("the true sensor is weaker… the gap to the ceiling is, if anything,
   understated by the contaminated runs").

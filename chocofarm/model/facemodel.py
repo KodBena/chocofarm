@@ -2,7 +2,8 @@
 """
 facemodel.py — the arrangement-face sense action.
 
-The corrected detector model (consult-002 §4).  Where the old `cover_mask`
+The corrected detector model (docs/consults/consult-002-detector-misspec-report.md
+§(4) "The correct model and remedy").  Where the old `cover_mask`
 asked "enter Δ_i and read {i} ∪ overlap-neighbours simultaneously" — a
 disjunction no single point realises — the face model makes the *position* the
 action:

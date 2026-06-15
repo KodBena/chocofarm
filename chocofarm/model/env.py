@@ -40,7 +40,8 @@ class Environment:
         # this one attribute so the horizon has exactly one source of truth.
         self.max_steps = 40
 
-        # detectors: arrangement faces (consult-002 §4 / facemodel.ENV_ADOPTION). A sense action
+        # detectors: arrangement faces (docs/consults/consult-002-detector-misspec-report.md §(4)
+        # "The correct model and remedy" / facemodel.ENV_ADOPTION). A sense action
         # is "stand at face F's representative point and read the disjunction over F's cover" —
         # cover and position are consistent BY CONSTRUCTION (the face is the single carrier of
         # both). This replaces the old `cover_mask[i] = {i} ∪ overlap-neighbours`, which read

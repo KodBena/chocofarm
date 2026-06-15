@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-verify_faces.py — self-checks for the arrangement face model (consult-002 §4).
+verify_faces.py — self-checks for the arrangement face model
+(docs/consults/consult-002-detector-misspec-report.md §(4)).
 
 Re-derives every figure in docs/design/face-model-verification.md from the
 frozen instance, and validates the chocobo_faces.ggb round-trip. Bounded, read
