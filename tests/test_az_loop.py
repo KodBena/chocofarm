@@ -408,9 +408,12 @@ def test_jax_train_writes_back_numpy_inference():
 
 
 def test_residual_off_bit_identical_to_baseline():
-    """residual=False must be numerically identical to the pre-residual net: head_in IS the trunk
-    output a2 (the identity skip-less path), no block params exist, and the forward is byte-for-byte
-    the explicit pre-residual matmul chain. This is the clean-ablation guarantee."""
+    """residual=False must be numerically identical to the pre-residual net: no block params exist
+    (so the shared `forward_core` skips the block — `head_in` IS the trunk output a2), and the
+    forward is byte-for-byte the explicit pre-residual matmul chain. This is the clean-ablation
+    guarantee. (Post-R11 `_forward` returns `(None, v_std, logits)` — the trunk-intermediate cache
+    that used to back this assertion was vestigial and is gone; the byte-identity check below proves
+    the residual-OFF math observably, which is what the cache-poke proved indirectly.)"""
     env = Environment()
     fb = FeatureBuilder(env)
     in_dim, na = feature_dim(env), n_action_slots(env)
@@ -425,9 +428,7 @@ def test_residual_off_bit_identical_to_baseline():
             f"{k} differs between residual OFF/ON at same seed — block draws perturbed the stream"
     feat = fb.build(("w", env.entry), env.worlds, set())
     X = np.stack([feat] * 4).astype(np.float64)
-    cache, v_got, lg_got = net._forward(X)
-    _, _, _, _, a2, head_in, res_cache = cache
-    assert head_in is a2 and res_cache is None
+    _, v_got, lg_got = net._forward(X)
     # explicit pre-residual math (what the old code computed)
     z1 = X @ net.W1 + net.b1; a1c = np.maximum(z1, 0.0)
     z2 = a1c @ net.W2 + net.b2; a2c = np.maximum(z2, 0.0)

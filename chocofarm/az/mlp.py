@@ -36,10 +36,19 @@ from __future__ import annotations
 import numpy as np
 
 from chocofarm.az.dtypes import DTYPE, is_float32
+from chocofarm.az.forward import forward_core
 
 
 def _he_init(rng, fan_in, fan_out):
     return rng.standard_normal((fan_in, fan_out)) * np.sqrt(2.0 / fan_in)
+
+
+def is_weight(name):
+    """THE L2-scope predicate (audit R11, single source): a param is L2-penalized iff it is a
+    weight MATRIX — its registry name starts 'W' (W1/W2/Wr1/Wr2/Wv/Wp), not a bias 'b*'. The
+    JaxTrainer's loss (`mlp_jax_train._l2_sumsq`) imports this so there is ONE definition, not a
+    re-derived `name.startswith('W')` per consumer."""
+    return name.startswith("W")
 
 
 class ValueMLP:
@@ -111,34 +120,25 @@ class ValueMLP:
         return p
 
     def _is_weight(self, name):
-        return name.startswith("W")  # L2 on weight matrices only, not biases
+        return is_weight(name)  # L2 on weight matrices only, not biases (the one `is_weight` SSOT)
 
     # ---- forward ----
     def _forward(self, X):
-        """Returns (cache, value_standardized, policy_logits_or_None).
+        """Returns (None, value_standardized, policy_logits_or_None) — numpy float64.
 
-        With `residual` ON, a residual block sits between the trunk output `a2` and the heads:
-            zr1 = a2 @ Wr1 + br1;  ar1 = ReLU(zr1)
-            zr2 = ar1 @ Wr2 + br2
-            head_in = a2 + zr2                  # pre-activation skip, no outer ReLU (Wr*: H×H)
-        The heads read `head_in`. With `residual` OFF, `head_in is a2` and the math is the
-        pre-residual net exactly. `res_cache` is always None — it packaged the residual-block
-        intermediates for the (removed) manual backward; inference reads only `v_std`/`logits`."""
-        z1 = X @ self.W1 + self.b1
-        a1 = np.maximum(z1, 0.0)
-        z2 = a1 @ self.W2 + self.b2
-        a2 = np.maximum(z2, 0.0)
-        if self.residual:
-            zr1 = a2 @ self.Wr1 + self.br1
-            ar1 = np.maximum(zr1, 0.0)
-            zr2 = ar1 @ self.Wr2 + self.br2
-            head_in = a2 + zr2                     # pre-activation skip, NO outer ReLU (firewall A/B: best CE)
-        else:
-            head_in = a2
-        v_std = (head_in @ self.Wv + self.bv).ravel()
-        logits = (head_in @ self.Wp + self.bp) if self.n_actions is not None else None
-        cache = (X, z1, a1, z2, a2, head_in, None)
-        return cache, v_std, logits
+        Delegates to the ONE precision-agnostic `forward.forward_core` (audit R11): the residual
+        block, the heads, and the standardized-value/logits math live there once and are shared by
+        every backend (numpy f64/f32, jax). The residual toggle stays keyed by `self.residual`,
+        which controls whether `_params()` includes `Wr1` — `forward_core` applies the block iff
+        `"Wr1"` is present, so this path is numerically the pre-residual net when `residual` is OFF.
+
+        The leading slot is `None`: it used to carry a forward `cache` of trunk intermediates that
+        only the (long-removed) manual backward consumed. With the graph single-sourced in
+        `forward_core` and the numerics pinned by `tests/test_jax_equivalence.py`, the cache is
+        vestigial — dropped. The 3-tuple ARITY is preserved so callers (`predict_value`,
+        `predict_policy`, `predict_both`, the equivalence test) keep unpacking `_, v_std, logits`."""
+        v_std, logits = forward_core(self._params(), X, np)
+        return None, v_std, logits
 
     # Training moved to JAX/optax autodiff in `mlp_jax_train.JaxTrainer`: `jax.value_and_grad`
     # makes the gradient correct-by-construction (no hand-derived residual backward, no finite-diff
@@ -200,10 +200,29 @@ class ValueMLP:
         self._f32_cache = c
         return c
 
+    def _f32_params(self, c):
+        """The float32 cache `c`'s weights as a flat params dict keyed like `_params()` — the input
+        `forward_core` consumes. The residual block is included iff `self.residual` (so
+        `forward_core`'s `"Wr1" in params` toggle matches the cache's contents), and the policy head
+        always (this hot path requires `n_actions`)."""
+        p = {"W1": c["W1"], "b1": c["b1"], "W2": c["W2"], "b2": c["b2"],
+             "Wv": c["Wv"], "bv": c["bv"], "Wp": c["Wp"], "bp": c["bp"]}
+        if self.residual:
+            p["Wr1"] = c["Wr1"]; p["br1"] = c["br1"]
+            p["Wr2"] = c["Wr2"]; p["br2"] = c["br2"]
+        return p
+
     def _predict_both_f32(self, X, legal_mask):
         """float32-numpy forward (trunk + both heads + masked softmax). Same shape contract as
         `predict_both`; the cast to float32 changes the last bits (acceptable — behavioral, not
-        bit, equivalence is the bar)."""
+        bit, equivalence is the bar).
+
+        The forward graph is the ONE `forward.forward_core` (audit R11), run on the float32 cache's
+        weights — byte-identical to the old hand-transcribed float32 body (`forward_core` spells the
+        same `@`/`maximum`/`ravel` ops in the same order; `np.maximum(f32, 0.0)` is bit-identical to
+        the old `np.maximum(f32, np.float32(0.0))` under numpy's weak scalar promotion). The
+        de-standardize (`*ys + ym`) and masked softmax tail stay here — they are this path's, not the
+        shared core's."""
         c = self._f32_weights()
         single = (X.ndim == 1)
         x = np.asarray(X, dtype=np.float32)
@@ -211,16 +230,8 @@ class ValueMLP:
         if single:
             x = x[None, :]
             lm = lm[None, :]
-        a1 = np.maximum(x @ c["W1"] + c["b1"], np.float32(0.0))
-        a2 = np.maximum(a1 @ c["W2"] + c["b2"], np.float32(0.0))
-        if self.residual:
-            ar1 = np.maximum(a2 @ c["Wr1"] + c["br1"], np.float32(0.0))
-            zr2 = ar1 @ c["Wr2"] + c["br2"]
-            head_in = a2 + zr2                            # NO outer ReLU (matches _forward)
-        else:
-            head_in = a2
-        v = (head_in @ c["Wv"] + c["bv"]).ravel() * c["ys"] + c["ym"]
-        logits = head_in @ c["Wp"] + c["bp"]
+        v_std, logits = forward_core(self._f32_params(c), x, np)
+        v = v_std * c["ys"] + c["ym"]
         legal = lm > 0
         masked = np.where(legal, logits, np.float32(-1e30))
         masked = masked - masked.max(axis=1, keepdims=True)

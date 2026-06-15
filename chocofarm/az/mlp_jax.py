@@ -9,11 +9,18 @@ XLA's fused, float32 codegen beats numpy's separate BLAS calls even at single-ro
 float64 backprop, off the hot path — once per iteration, not per leaf); this module is inference
 only.
 
-The jitted function takes the weights as ARGUMENTS (not a closure) so it does not recompile when
-the net is retrained between iterations — XLA caches one compiled kernel per (shape, dtype)
-signature, which is constant across the whole run. `MlpJaxForward` wraps a `ValueMLP`, holds its
-weights as device arrays at the chosen precision, and exposes a numpy-in / numpy-out
-`predict_both` matching the `ValueMLP` signature so it is a drop-in for the search.
+The jitted function takes the weights as a params-dict ARGUMENT (not a closure) so it does not
+recompile when the net is retrained between iterations — XLA caches one compiled kernel per
+(shape, dtype) signature, which is constant across the whole run. `MlpJaxForward` wraps a
+`ValueMLP`, holds its weights as a device-array params dict at the chosen precision, and exposes a
+numpy-in / numpy-out `predict_both` matching the `ValueMLP` signature so it is a drop-in for the
+search.
+
+The forward graph is the ONE `forward.forward_core` (audit R11) — the SAME function the numpy net
+and the jax trainer run — so this wrapper HONORS the net's residual block (applied iff the params
+dict carries `Wr1`) instead of silently dropping it. Before R11 this module hand-transcribed a
+residual-BLIND trunk-only forward; routing it through the shared core makes that drop structurally
+impossible.
 
 float32 by default (the parametric DTYPE). The masked softmax matches `ValueMLP._masked_softmax`
 in form; XLA + float32 will differ in the last bits and may flip near-tied argmax/SH choices —
@@ -33,18 +40,20 @@ import jax
 import jax.numpy as jnp
 
 from chocofarm.az.dtypes import DTYPE
+from chocofarm.az.forward import forward_core
 
 _JDTYPE = jnp.float32 if np.dtype(DTYPE) == np.dtype(np.float32) else jnp.float64
 
 
 @jax.jit
-def _forward_both(x, lm, W1, b1, W2, b2, Wv, bv, Wp, bp, ym, ys):
-    """Trunk in→H→ReLU→H→ReLU, value head (de-standardized) + masked-softmax policy.
-    `x`: (in,) or (B,in); `lm`: matching legal mask. Returns (v, p) with the leading shape."""
-    a1 = jnp.maximum(x @ W1 + b1, 0.0)
-    a2 = jnp.maximum(a1 @ W2 + b2, 0.0)
-    v = (a2 @ Wv + bv).ravel() * ys + ym
-    logits = a2 @ Wp + bp
+def _forward_both(params, x, lm, ym, ys):
+    """Value head (de-standardized) + masked-softmax policy over the ONE `forward.forward_core`
+    (audit R11). `params` is the flat weight dict keyed like `ValueMLP._params()`, so the residual
+    block is applied iff `"Wr1"` is present — exactly as in the numpy/jax-train forwards. There is
+    NO separate residual-blind graph here anymore: this wrapper cannot drop the residual block (the
+    R11 bug is structurally impossible). `x`: (B,in); `lm`: matching legal mask. Returns (v, p)."""
+    v_std, logits = forward_core(params, x, jnp)
+    v = v_std * ys + ym
     neg = jnp.asarray(-1e30, dtype=logits.dtype)
     legal = lm > 0
     masked = jnp.where(legal, logits, neg)
@@ -58,9 +67,11 @@ def _forward_both(x, lm, W1, b1, W2, b2, Wv, bv, Wp, bp, ym, ys):
 
 class MlpJaxForward:
     """JAX-jit inference wrapper over a `ValueMLP`. Drop-in `predict_both(X, legal_mask)` for the
-    search leaf eval. Holds the net's weights as device arrays at `DTYPE`; rebuild via `refresh()`
-    if the underlying net is retrained (the ExIt loop builds a fresh search per iteration, so a
-    fresh wrapper per iteration is the natural seam — but `refresh()` is provided for reuse)."""
+    search leaf eval. Holds the net's weights as a device-array params dict at `DTYPE`; rebuild via
+    `refresh()` if the underlying net is retrained (the ExIt loop builds a fresh search per
+    iteration, so a fresh wrapper per iteration is the natural seam — but `refresh()` is provided
+    for reuse). The forward is `forward.forward_core` (the same graph the numpy net and the jax
+    trainer run), so it honors the net's residual block instead of silently dropping it."""
 
     def __init__(self, net):
         if net.n_actions is None:
@@ -71,10 +82,10 @@ class MlpJaxForward:
     def refresh(self):
         net = self.net
         d = _JDTYPE
-        self.W1 = jnp.asarray(net.W1, dtype=d); self.b1 = jnp.asarray(net.b1, dtype=d)
-        self.W2 = jnp.asarray(net.W2, dtype=d); self.b2 = jnp.asarray(net.b2, dtype=d)
-        self.Wv = jnp.asarray(net.Wv, dtype=d); self.bv = jnp.asarray(net.bv, dtype=d)
-        self.Wp = jnp.asarray(net.Wp, dtype=d); self.bp = jnp.asarray(net.bp, dtype=d)
+        # the full params dict keyed like `_params()` — INCLUDING the residual block when the net
+        # has it, so `forward_core` applies it (the residual-drop fix). Single source of which
+        # params exist: the net's own `_params()`.
+        self.params = {k: jnp.asarray(v, dtype=d) for k, v in net._params().items()}
         self.ym = jnp.asarray(net.y_mean, dtype=d)
         self.ys = jnp.asarray(net.y_std, dtype=d)
 
@@ -87,8 +98,7 @@ class MlpJaxForward:
         if single:
             x = x[None, :]
             lm = lm[None, :]
-        v, p = _forward_both(x, lm, self.W1, self.b1, self.W2, self.b2,
-                             self.Wv, self.bv, self.Wp, self.bp, self.ym, self.ys)
+        v, p = _forward_both(self.params, x, lm, self.ym, self.ys)
         v = np.asarray(v)
         p = np.asarray(p)
         if single:
