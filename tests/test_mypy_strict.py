@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 tests/test_mypy_strict.py — the ENFORCED mypy --strict gate (ADR-0011 mechanism; typing rollout
-Stage 0/1).
+Stage 0/1/2).
 
 Runs `mypy` (which reads the `[tool.mypy]` config in pyproject.toml — global `strict` + the four
 documented stub-gap overrides) on the SET OF MODULES that are fully `--strict`-clean, and asserts
@@ -19,17 +19,23 @@ first (assessment §5, Stage 0: "enforcing the Stage-1 set first," not gating th
 
 What is in / out
 ----------------
-IN (100% --strict-clean now): config.py, az/dtypes.py, model/instance.py, hp/schema.py, and every
-`__init__.py`. These have NO unresolved cross-module dependency on the still-untyped env↔Policy seam.
+IN (100% --strict-clean now):
+  * Stage 1 core: config.py, az/dtypes.py, model/instance.py, hp/schema.py, every `__init__.py`.
+  * Stage 2 — the env↔Policy SEAM (the keystone): model/env.py + solvers/base.py, with the seam
+    aliases (Loc / MoveAction / Action / WorldSet / Collected) introduced in env.py and imported by
+    every downstream solver/feature/bound. model/facemodel.py joins too — env delegates its detector
+    dynamics to facemodel.SenseAction (filter/observe/informative), so the seam is only strict-clean
+    once that single face-carrier is typed. With env.py typed, references.py and hp/registry.py lose
+    their `no-untyped-call` into the seam and are now strict-clean too (the assessment's "vanishes as
+    callees are annotated", §2). registry.py also needed two non-seam residuals fixed under ADR-0004
+    minimal-touch (the redis-8 py.typed kwargs, the reflective facet-walk's group-union) — signatures
+    only, no body rewrite.
 
-OUT, deliberately, though annotated this stage:
-  * references.py / hp/registry.py — their OWN signatures are fully annotated (honest + complete),
-    but they call into the still-untyped env.py seam (`env.d`/`env.exit_cost`/`Environment()` →
-    `no-untyped-call`). That is the Stage-2 downstream backlog the assessment predicts "vanishes as
-    callees are annotated" (§2). Including them now would require suppressing `no-untyped-call`, a
-    HIDDEN relaxation — refused (ADR-0002). They join `STRICT_CLEAN` when Stage 2 types env.py.
+OUT, deliberately:
   * az/optimizer.py / az/mlp_jax_train.py — HARD modules (jax/optax seam, Stage 4). Only their
-    standalone `AdamHParams` contract was made honest this stage; the module bodies are not clean.
+    standalone `AdamHParams` contract was made honest in Stage 1; the module bodies are not clean.
+  * the Stage-3 medium bulk (the solver/bounds/eval/az leaves) — they import the seam aliases now in
+    place, so each lands as its callees do; they are appended here as Stage 3 types them.
 
 Skips gracefully (does not fail) if mypy is not importable, mirroring how `tests/test_cpp_runner.py`
 skips without its binary.
@@ -44,8 +50,9 @@ import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The enforced strict-clean SET (Stage 1 core). Extend this list as later stages type more modules.
+# The enforced strict-clean SET. Extend this list as later stages type more modules.
 STRICT_CLEAN = [
+    # --- Stage 1 core (easy_strict) ---
     "chocofarm/config.py",
     "chocofarm/az/dtypes.py",
     "chocofarm/model/instance.py",
@@ -58,6 +65,12 @@ STRICT_CLEAN = [
     "chocofarm/hp/__init__.py",
     "chocofarm/model/__init__.py",
     "chocofarm/solvers/__init__.py",
+    # --- Stage 2 — the env↔Policy seam (the keystone) + the downstream that depended on it ---
+    "chocofarm/model/env.py",        # the seam: Environment + the Loc/Action/WorldSet aliases
+    "chocofarm/model/facemodel.py",  # the SenseAction the env's detector dynamics delegate to
+    "chocofarm/solvers/base.py",     # the Policy ABC + Policy.decide contract (every solver's seam)
+    "chocofarm/references.py",       # was blocked only by no-untyped-call into the seam
+    "chocofarm/hp/registry.py",      # likewise (+ two ADR-0004 minimal-touch non-seam residuals)
 ]
 
 

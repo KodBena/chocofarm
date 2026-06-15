@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from chocofarm.model.env import Environment
+    from chocofarm.model.env import Environment, Loc
 
 # The documented exact-decomposition rate (decomp exact, h=1) — the empirical decomp anchor
 # reference line. Source: docs/agents/decomp-solver-report.md ("decomp (exact, h=1) 0.0941")
@@ -35,7 +35,11 @@ DECOMP_ANCHOR = 0.0941
 
 
 def realizable_static(env: Environment) -> float:
-    loc, unv, route, t, best = ("w", env.entry), set(range(env.N)), [], 0.0, (-1.0, 0)
+    loc: Loc = ("w", env.entry)
+    unv = set(range(env.N))
+    route: list[int] = []
+    t = 0.0
+    best: tuple[float, int] = (-1.0, 0)
     while unv:
         i = max(unv, key=lambda j: env.value[j] / (env.d(loc, ("t", j)) + 1e-9))
         t += env.d(loc, ("t", i)); loc = ("t", i); route.append(i); unv.discard(i)

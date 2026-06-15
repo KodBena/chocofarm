@@ -9,19 +9,81 @@ point). It knows nothing about HOW a decision is made — that is a `Policy` (se
 chocofarm/solvers/base.py), passed in. New solution methods (NMCS, ISMCTS, …) are new
 Policy subclasses; this file does not change.
 """
+from __future__ import annotations
+
 import copy
 import math
+from collections.abc import Iterable, Sequence, Set as AbstractSet
+from typing import TYPE_CHECKING, Literal, cast
+
 import numpy as np
+import numpy.typing as npt
+from typing_extensions import TypeIs
 
 from chocofarm.model import arrangement as A
 from chocofarm.model import facemodel
-from chocofarm.model.instance import load_instance, world_array
+from chocofarm.model.instance import Scenario, load_instance, world_array
 
-TERMINATE = ("term", None)
+if TYPE_CHECKING:
+    # `Policy` lives in chocofarm/solvers/base.py, which imports TERMINATE from THIS module — a
+    # runtime import here would be circular. The seam is type-only in this direction (the env
+    # CALLS policy.decide but does not construct a Policy), so the TYPE_CHECKING guard is honest.
+    from chocofarm.solvers.base import Policy
+
+# ---------------------------------------------------------------------------
+# The env↔Policy SEAM types (the keystone aliases; assessment Stage 2). Every
+# solver/feature/bound consumer imports these from here — env.py is their home
+# because it already owns TERMINATE and is the foundation everything depends on.
+#
+# These spell the ACTUAL runtime representations (not approximations):
+#
+#   Loc      a coord key, a tagged tuple whose tag picks the second element's
+#            TYPE: a teleport key ('w', name:str) — the entry/exit nodes are
+#            keyed by teleport NAME, a str — vs a treasure/detector node
+#            ('t'|'d', id:int). So Loc is genuinely a UNION, not a single
+#            tuple[str, int]: the 'w' variant carries a str. `coord`/`d` are
+#            keyed by exactly these three shapes (env.__init__ builds them).
+#   MoveAction  a realisable step: collect ('t', i) or sense ('d', i) — what
+#            `apply` consumes. Never TERMINATE (the episode loop filters that
+#            BEFORE apply), so apply's param is MoveAction, honestly.
+#   Action   what a Policy returns: a MoveAction OR the TERMINATE sentinel
+#            ('term', None). `legal_actions` returns the MoveAction subset; a
+#            Policy.decide may additionally return TERMINATE.
+#   WorldSet the belief world-set: a bitmask array (bit t set = τ_t present),
+#            ALWAYS int64 (the integer bit-mechanics dtype, dtypes.py). Every
+#            filter_* returns a fresh one (ADR-0001 immutability).
+#   Collected  the already-collected treasure ids — read-only at the seam
+#            (AbstractSet[int]); the simulator owns the mutable set internally.
+# ---------------------------------------------------------------------------
+Loc = (
+    tuple[Literal["w"], str]
+    | tuple[Literal["t"], int]
+    | tuple[Literal["d"], int]
+)
+MoveAction = tuple[Literal["t"], int] | tuple[Literal["d"], int]
+Action = MoveAction | tuple[Literal["term"], None]
+WorldSet = npt.NDArray[np.int64]
+Collected = AbstractSet[int]
+
+# The episode-terminating sentinel action. Spelled as the precise Action member
+# (not the inferred tuple[str, None]) so it is itself a valid Action wherever a
+# Policy returns it.
+TERMINATE: tuple[Literal["term"], None] = ("term", None)
+
+
+def is_terminate(a: Action) -> TypeIs[tuple[Literal["term"], None]]:
+    """Whether `a` is the TERMINATE sentinel — a TypeIs guard so the episode loops narrow `a` to
+    the MoveAction subset after `if is_terminate(a): break`. The runtime test is exactly
+    `a == TERMINATE` (the codebase's idiom); the guard only teaches mypy the narrowing that an
+    equality-to-a-value comparison does not give on its own. ('term', None) is the unique Action
+    with tag 'term', so the value equality and the type narrowing coincide."""
+    return a == TERMINATE
 
 
 class Environment:
-    def __init__(self, instance_path=None, value=None, teleport_overhead=12.0, entry="CSNE"):
+    def __init__(self, instance_path: str | None = None,
+                 value: Sequence[float] | None = None,
+                 teleport_overhead: float = 12.0, entry: str = "CSNE") -> None:
         inst = load_instance(instance_path)
         self.treasures = inst.treasures
         self.teleports = inst.teleports
@@ -87,21 +149,21 @@ class Environment:
         self.det_pt = {k: self.senses[k].rep_point for k in self.detectors}
         self.cover_mask = {k: self.senses[k].bitmask for k in self.detectors}
 
-        self.coord = {}
+        self.coord: dict[Loc, tuple[float, float]] = {}
         for i, xy in self.treasures.items():
             self.coord[("t", i)] = xy
-        for i, xy in self.det_pt.items():
-            self.coord[("d", i)] = xy
+        for i, dxy in self.det_pt.items():
+            self.coord[("d", i)] = dxy
         for k, xy in self.teleports.items():
             self.coord[("w", k)] = xy
 
-        self.worlds = world_array(self.N, self.K)
+        self.worlds: WorldSet = world_array(self.N, self.K)
 
         # The treasure ids `legal_actions` iterates as candidate ('t', i) pickups. For the
         # FULL env this is `range(self.N)` (every treasure); `restrict` overrides it with the
         # kept-subset for a sub-instance (a perf specialization — restricted worlds never set
         # non-keep bits, so marg[i]=0 there and range(N)+(marg>0) already excludes them).
-        self._treasure_ids = range(self.N)
+        self._treasure_ids: Iterable[int] = range(self.N)
 
         # Precomputed inter-node distance table (perf). The coordinate set is STATIC for an
         # instance, so `d(a, b)` is a static function of the two coord keys; recomputing
@@ -109,7 +171,7 @@ class Environment:
         # profile). The table is built from the SAME `math.hypot(x1-x2, y1-y2)` inputs, so it is
         # bit-identical to the on-the-fly computation — a structural memoization, not an
         # approximation. 67 coord keys -> ~4.5k entries, a few ms to build, negligible memory.
-        self._dist = {}
+        self._dist: dict[tuple[Loc, Loc], float] = {}
         coord_items = list(self.coord.items())
         for ka, (x1, y1) in coord_items:
             for kb, (x2, y2) in coord_items:
@@ -117,7 +179,7 @@ class Environment:
 
     # ---- public read of the legal-action treasure-id hook ----
     @property
-    def keep(self):
+    def keep(self) -> tuple[int, ...]:
         """The treasure ids this env proposes as ('t', i) collects: the kept subset for a
         restricted sub-instance (Environment.restrict), or all N for a full env. Public read
         of the legal-action treasure-id hook (_treasure_ids).
@@ -130,7 +192,7 @@ class Environment:
         return tuple(self._treasure_ids)
 
     # ---- scenario (copy-on-write) ----
-    def with_scenario(self, scenario):
+    def with_scenario(self, scenario: Scenario) -> "Environment":
         """Return a NEW Environment that SHARES this env's immutable Tier-1 geometry
         by reference (copy-on-write) and overrides only the Tier-2 scenario knobs
         `value`/`entry`/`tp` from `scenario`.
@@ -161,7 +223,7 @@ class Environment:
         return new
 
     # ---- restriction (copy-on-write) ----
-    def restrict(self, keep, k_local):
+    def restrict(self, keep: Iterable[int], k_local: int) -> "Environment":
         """Return a restriction VIEW of this env: a genuinely small sub-instance over a
         SUBSET of treasures `keep` with a reduced present-count `k_local`, sharing this
         env's geometry AND belief mechanics by reference (copy-on-write) and overriding
@@ -226,7 +288,7 @@ class Environment:
         return new
 
     # ---- geometry ----
-    def d(self, a, b):
+    def d(self, a: Loc, b: Loc) -> float:
         """Distance between two coord keys. Served from the precomputed static table built at
         construction (same `math.hypot` inputs -> bit-identical); falls back to a live compute
         for any key pair not in the table (none arise in normal use, but keeps the contract
@@ -237,13 +299,13 @@ class Environment:
         (x1, y1), (x2, y2) = self.coord[a], self.coord[b]
         return math.hypot(x1 - x2, y1 - y2)
 
-    def exit_cost(self, loc):
+    def exit_cost(self, loc: Loc) -> float:
         return min(self.d(loc, ("w", k)) for k in self.teleports) + self.tp
 
-    def nearest_exit(self, loc):
+    def nearest_exit(self, loc: Loc) -> str:
         return min(self.teleports, key=lambda k: self.d(loc, ("w", k)))
 
-    def route_time(self, start, seq):
+    def route_time(self, start: Loc, seq: Sequence[int]) -> float:
         if not seq:
             return self.exit_cost(start)
         t = self.d(start, ("t", seq[0]))
@@ -252,61 +314,75 @@ class Environment:
         return t + self.exit_cost(("t", seq[-1]))
 
     # ---- belief ----
-    def marginals(self, bw):
+    def marginals(self, bw: WorldSet) -> npt.NDArray[np.float64]:
         if len(bw) == 0:
             return np.zeros(self.N)
-        return ((bw[:, None] >> np.arange(self.N)) & 1).mean(0)
+        # numpy's reduction stubs return Any for `.mean`; the cast states the float64 contract the
+        # bit-shift+mean already produces (no runtime change — same array).
+        return cast("npt.NDArray[np.float64]", ((bw[:, None] >> np.arange(self.N)) & 1).mean(0))
 
-    def filter_treasure(self, bw, i, present):
+    def filter_treasure(self, bw: WorldSet, i: int, present: bool) -> WorldSet:
         bit = (bw >> i) & 1
-        return bw[bit == (1 if present else 0)]
+        # boolean-mask indexing returns Any in numpy's stubs; the cast states the int64 contract the
+        # mask selection preserves (a subset of `bw`'s elements — same dtype, no runtime change).
+        return cast(WorldSet, bw[bit == (1 if present else 0)])
 
-    def filter_detector(self, bw, i, pos):
+    def filter_detector(self, bw: WorldSet, i: int, pos: bool) -> WorldSet:
         # Delegates to the face's single carrier (audit item E): SenseAction.filter is the same
         # `bw[(bw & bitmask)!=0]` disjunction, now owned in one place rather than re-inlined here.
         return self.senses[i].filter(bw, pos)
 
-    def sample_world(self, bw, rng):
+    def sample_world(self, bw: WorldSet, rng: np.random.Generator) -> int:
         return int(rng.choice(bw))
 
     # ---- dynamics ----
-    def legal_actions(self, loc, bw, collected):
+    def legal_actions(self, loc: Loc, bw: WorldSet, collected: Collected) -> list[MoveAction]:
         marg = self.marginals(bw)
-        acts = [("t", i) for i in self._treasure_ids if i not in collected and marg[i] > 0]
+        acts: list[MoveAction] = [
+            ("t", i) for i in self._treasure_ids if i not in collected and marg[i] > 0]
         for i in self.detectors:
             if self.senses[i].informative(bw):     # outcome still uncertain (both polarities live)
                 acts.append(("d", i))              # delegated to the face's single carrier (item E)
         return acts
 
-    def apply(self, loc, bw, collected, action, world):
+    def apply(self, loc: Loc, bw: WorldSet, collected: Collected, action: MoveAction,
+              world: int) -> tuple[float, Loc, WorldSet, Collected, float]:
         """Realise `action` against the true `world`. Returns (reward, loc', bw', collected', dt)."""
         kind, i = action
-        dt = self.d(loc, (kind, i))
+        # `action` (a MoveAction: ('t'|'d', int)) IS a Loc — both its members are Loc members — so it
+        # is the new location key directly, no tuple rebuild. (Rebuilding `(kind, i)` would widen the
+        # tag to Literal['t','d'], which mypy will not re-distribute over the Loc union.)
+        dt = self.d(loc, action)
         if kind == "t":
             pres = bool((world >> i) & 1)
             r = self.value[i] if (pres and i not in collected) else 0.0
             nc = collected | {i} if pres else collected
-            return r, (kind, i), self.filter_treasure(bw, i, pres), nc, dt
+            return r, action, self.filter_treasure(bw, i, pres), nc, dt
         pos = self.senses[i].observe(world)        # the face's reading at this world (item E carrier)
-        return 0.0, (kind, i), self.filter_detector(bw, i, pos), collected, dt
+        return 0.0, action, self.filter_detector(bw, i, pos), collected, dt
 
     # ---- simulation / evaluation (solver-agnostic) ----
-    def simulate(self, policy, world, lam, rng, max_steps=None):
+    def simulate(self, policy: "Policy", world: int, lam: float, rng: np.random.Generator,
+                 max_steps: int | None = None) -> tuple[float, float, str]:
         if max_steps is None:
             max_steps = self.max_steps         # the single episode-horizon home (see __init__)
-        loc, bw, collected, R, T = ("w", self.entry), self.worlds, set(), 0.0, 0.0
+        loc: Loc = ("w", self.entry)
+        bw: WorldSet = self.worlds
+        collected: Collected = set()
+        R, T = 0.0, 0.0
         for _ in range(max_steps):
             a = policy.decide(self, loc, bw, collected, lam, rng)
-            if a == TERMINATE:
+            if is_terminate(a):
                 break
             r, loc, bw, collected, dt = self.apply(loc, bw, collected, a, world)
             R += r; T += dt
         return R, T + self.exit_cost(loc), self.nearest_exit(loc)
 
-    def rate(self, policy, lam, runs, seed):
+    def rate(self, policy: "Policy", lam: float, runs: int,
+             seed: int) -> tuple[float, float, float, dict[str, int]]:
         rng = np.random.default_rng(seed)
         totR = totT = 0.0
-        exits = {}
+        exits: dict[str, int] = {}
         for _ in range(runs):
             w = int(rng.choice(self.worlds))
             R, T, e = self.simulate(policy, w, lam, rng)
@@ -314,7 +390,9 @@ class Environment:
             exits[e] = exits.get(e, 0) + 1
         return totR / totT, totR / runs, totT / runs, exits
 
-    def dinkelbach_rate(self, policy, iters=4, warm_runs=600, final_runs=3000, seed=7, lam0=0.0):
+    def dinkelbach_rate(self, policy: "Policy", iters: int = 4, warm_runs: int = 600,
+                        final_runs: int = 3000, seed: int = 7,
+                        lam0: float = 0.0) -> dict[str, float | dict[str, int]]:
         """A policy's own long-run rate = its Dinkelbach fixed point (lambda <- achieved rate)."""
         lam = lam0
         for _ in range(iters):

@@ -82,6 +82,15 @@ from chocofarm.hp.schema import (
 # Key namespace (design §5.1) and connection facts (the registry's own env-driven params —
 # `config.registry_redis_params()`, the disk-persisted noeviction instance; NOT the transport's)
 # ---------------------------------------------------------------------------
+# The ten config-group dataclasses ExperimentConfig nests. The reflective facet-walk
+# (`_iter_facet_diffs`) and the field-path resolution iterate them via `dataclasses.fields`, so the
+# union spells "a config-group dataclass instance" — the honest common type they share (no class
+# base does).
+_GroupConfig = (
+    EnvConfig | SearchConfig | ValueTargetConfig | FeatureConfig | ArchConfig
+    | TrainConfig | ExItLoopConfig | EvalConfig | ParallelConfig | BoundsConfig
+)
+
 KEY_PREFIX = "choco:hp:"
 
 # bounded write-retry count for the WATCH/MULTI/EXEC optimistic guard (design §5.4)
@@ -148,10 +157,16 @@ def _connect() -> Any:
             "redis-py is not importable; the hp registry needs it (it is the transport's dep too)"
         ) from e
     from chocofarm import config
+    # redis-py (8.x) ships py.typed, so Redis(**dict[str, str | int]) fails the precise kwarg types
+    # (host:str / port:int / db:int). Pass the three connection facts explicitly-typed (the params
+    # dict's runtime keys are exactly these — config.registry_redis_params()), no behavior change.
+    params = _redis_params()
     r = redis.Redis(
+        host=str(params["host"]),
+        port=int(params["port"]),
+        db=int(params["db"]),
         socket_timeout=config.redis_socket_timeout(),
         socket_connect_timeout=config.redis_connect_timeout(),
-        **_redis_params(),
     )
     try:
         r.ping()
@@ -708,7 +723,11 @@ def _iter_facet_diffs(
     """Yield (group_name, mut, field_name, a_value, b_value) over every leaf field of two configs,
     carrying each field's `Mut` facet (read from the schema metadata). The single place the read
     path walks the facet-tagged leaves."""
-    groups = {
+    # The 10 config groups are distinct dataclasses with no shared base, so a dict literal joins
+    # their value type to `object` (on which `fields()` is rejected). The explicit union annotation
+    # states the honest "each value is one of the config dataclasses" so the reflective walk type-
+    # checks; the runtime structure is unchanged.
+    groups: dict[str, tuple[_GroupConfig, _GroupConfig]] = {
         "env": (a.env, b.env), "search": (a.search, b.search), "value": (a.value, b.value),
         "feat": (a.feat, b.feat), "arch": (a.arch, b.arch), "train": (a.train, b.train),
         "loop": (a.loop, b.loop), "eval": (a.eval, b.eval), "par": (a.par, b.par),
