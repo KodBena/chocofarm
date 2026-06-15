@@ -31,7 +31,9 @@ from chocofarm.solvers.base import Policy, RandomPolicy
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CPP_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-cpp-runner")
+NET_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-net-dump")
 PARITY = os.path.join(REPO, "cpp", "parity", "parity.py")
+NET_PARITY = os.path.join(REPO, "cpp", "parity", "net_parity.py")
 
 
 # ---------------------------------------------------------------------------
@@ -117,4 +119,21 @@ def test_cpp_parity_harness():
                          capture_output=True, text=True, timeout=600)
     # the harness prints a verdict and returns 0 on PASS
     assert out.returncode == 0, f"parity harness FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not os.path.exists(NET_BIN),
+                    reason="C++ net-dump not built (cmake -S cpp -B cpp/build && cmake --build cpp/build)")
+def test_cpp_net_forward_parity():
+    """The C++ NetForward forward-parity harness (cpp/parity/net_parity.py): the C++ leaf evaluator
+    reimplements the ONE Python `forward_core` to the test_jax_equivalence bar (max|Δvalue| AND
+    max|Δlogit| < 1e-4) over N≥1000 random float32 feature vectors, residual ON and OFF — the same
+    ADR-0012 P6 behavioral-equivalence bar (NOT byte-identity). Skips (does not fail) when redis is
+    down, so the default suite stays green without the worker-transport instance up."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    out = subprocess.run([sys.executable, NET_PARITY], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"net-forward parity harness FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout

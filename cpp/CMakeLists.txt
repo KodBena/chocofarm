@@ -70,6 +70,7 @@ add_library(chocofarm_core
   src/env.cpp
   src/features.cpp
   src/transport.cpp
+  src/net.cpp
   src/runner.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -86,3 +87,12 @@ target_compile_options(chocofarm-cpp-runner PRIVATE -Wall -Wextra)
 add_executable(chocofarm-mask-dump src/mask_dump.cpp)
 target_link_libraries(chocofarm-mask-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-mask-dump PRIVATE -Wall -Wextra)
+
+# A second tiny parity fixture (NOT the runner): reads a published net off redis via the manifest
+# (the SAME weight-read seam, no hardcoded offsets — P1), builds the C++ NetForward, and dumps the
+# value + policy logits for feature vectors on stdin, so the harness can hold the C++ forward to the
+# Python forward_core under the ADR-0012 P6 behavioral bar (max|Δ| < 1e-4). Separate from the runner
+# (P3, one-owner): the runner owns the wire + episode loop, this tool owns the forward parity fixture.
+add_executable(chocofarm-net-dump src/net_dump.cpp)
+target_link_libraries(chocofarm-net-dump PRIVATE chocofarm_core)
+target_compile_options(chocofarm-net-dump PRIVATE -Wall -Wextra)
