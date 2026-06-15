@@ -216,6 +216,68 @@ def test_vmix_prior_weighted():
     assert abs(got - v_mix_visit) > 0.1   # and clearly NOT the visit-weighted variant
 
 
+def test_policy_target_rule_is_pure_in_value_target():
+    """Audit item C: the Danihelka policy-target rule (improved_policy / v_mix) is a PURE function
+    in value_target.py — callable with FABRICATED inputs, no live tree. Pins (a) v_mix's prior-
+    weighting with hand inputs (the bug-2 invariant, now testable without _Node surgery), (b) the
+    improved policy is a valid masked distribution, (c) the search adapter delegates to the SAME
+    rule byte-for-byte (search._improved_policy == value_target.improved_policy on the same node)."""
+    from chocofarm.az.value_target import v_mix, improved_policy, sigma_scale
+    from chocofarm.az.gumbel_search import _Node
+    import math
+
+    env = Environment()
+    n_slots = n_action_slots(env)
+
+    # (a) v_mix with fabricated per-slot inputs — the prior-weighted §3 completion, no tree.
+    legal_slots = [0, 1, 2]
+    prior = np.zeros(n_slots, dtype=np.float32)
+    prior[0], prior[1], prior[2] = np.float32(0.8), np.float32(0.2), np.float32(0.5)
+    visited_q = [0.0] * n_slots
+    visited_n = [0] * n_slots
+    visited_q[0], visited_n[0] = 1.0, 10      # Q=+1, visited 10x
+    visited_q[1], visited_n[1] = -1.0, 1      # Q=-1, visited 1x   (slot 2 unvisited)
+    sum_n = 11
+    v_bar_prior = (0.8 * 1.0 + 0.2 * (-1.0)) / (0.8 + 0.2)        # = 0.6 (prior-weighted)
+    expect = (0.0 + sum_n * v_bar_prior) / (1 + sum_n)            # ≈ 0.55
+    got = v_mix(0.0, visited_q, visited_n, prior, legal_slots)
+    assert abs(float(got) - expect) < 1e-6, (got, expect)
+    v_bar_visit = (10 * 1.0 + 1 * (-1.0)) / 11                    # the WRONG visit-weighted variant
+    assert abs(float(got) - (sum_n * v_bar_visit) / (1 + sum_n)) > 0.1
+    # sigma_scale: (c_visit + max_a N(a)) * c_scale
+    assert sigma_scale(visited_n, legal_slots, 50.0, 1.0) == (50.0 + 10) * 1.0
+
+    # (b) improved_policy is a valid masked distribution over the legal slots.
+    logits = np.full(n_slots, -1e30)
+    for s in legal_slots:
+        logits[s] = math.log(prior[s])
+    pi = improved_policy(logits, visited_q, visited_n, 0.0, prior, legal_slots, 50.0, 1.0)
+    assert pi.shape == (n_slots,)
+    assert np.isfinite(pi).all()
+    assert abs(float(pi.sum()) - 1.0) < 1e-9
+    illegal = np.ones(n_slots, dtype=bool)
+    illegal[legal_slots] = False
+    assert float(pi[illegal].sum()) == 0.0
+
+    # (c) the search adapter delegates to the same rule, byte-for-byte, on a live node.
+    net = ValueMLP(feature_dim(env), hidden=16, n_actions=n_slots, seed=0)
+    search = GumbelAZSearch(net, env, m=4, n_sims=8)
+    root = _Node()
+    loc, bw, coll = ("w", env.entry), env.worlds, set()
+    search._evaluate(root, loc, bw, coll)
+    ls = [action_to_slot(env, a) for a in root.legal]
+    a0 = root.legal[0]
+    root.N[a0], root.W[a0] = 3, 1.5          # one visited action so v_mix engages
+    lg = np.full(n_slots, -1e30)
+    for s in ls:
+        lg[s] = math.log(max(root.prior[s], 1e-12))
+    vq, vn = search._node_visited_lists(root, ls)
+    direct = improved_policy(lg, vq, vn, root.value, root.prior, ls, search.c_visit, search.c_scale)
+    via_search = search._improved_policy(root, lg, ls)
+    assert np.array_equal(direct, via_search)
+    assert direct.dtype == via_search.dtype
+
+
 # ---- Part C: belief-resolution features (uncertainty encoding) ----
 
 def test_feature_dim_includes_unc_block():
