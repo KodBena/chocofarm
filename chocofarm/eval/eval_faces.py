@@ -4,7 +4,8 @@ eval_faces.py — re-measure the Monte-Carlo solvers on the HONEST detector mode
 
 The environment now keys its sense actions to the planar arrangement FACES
 (arrangement.py + chocobo_faces.json), not the old `cover_mask[i] = {i} ∪
-overlap-neighbours` over-approximation (consult-002 §4). Standing in face F
+overlap-neighbours` over-approximation (docs/consults/consult-002-detector-misspec-report.md
+§(4)). Standing in face F
 reveals the disjunction over exactly F.cover — cover and position consistent by
 construction. The old model handed out information no real sensor could (70% of
 sensing area is singleton-cover; the lone k=4 face is a 0.05-area sliver), so the

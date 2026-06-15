@@ -11,7 +11,7 @@ This map is constant on each atomic face of the planar arrangement of the {Δ_j}
 boundaries, so the faces — not the regions — are the natural carriers of a sense
 action.  This module computes that arrangement and its cover function, the
 "deferred reification" consult-002 specifies as the fix for the `cover_mask`
-over-approximation.
+over-approximation (docs/consults/consult-002-detector-misspec-report.md §(4)).
 
 A Face is a value:  (cover, rep_point, area, polygon_wkt).  Nothing here knows
 about solvers, beliefs, or travel; see facemodel.py for the sense-action that
