@@ -19,8 +19,12 @@ was reading cover_mask[i] (the union over *all* faces in Δ_i) at det_pt[i] (one
 particular face's rep point) — a k=2 position given k=5 semantics.
 
 This module is deliberately small and effect-free.  It depends only on
-arrangement.Face and a metric `d`; it touches no solver.  See ENV_ADOPTION
-(bottom) for how Environment would consume it.
+arrangement.Face and a metric `d`; it touches no solver.  It is the env's SINGLE
+carrier of a face (audit item E — adopted): Environment builds
+`self.senses = sense_actions(faces)` and its detector dynamics delegate to the
+SenseAction's filter/observe/informative — see ENV_ADOPTION (bottom).
+
+Public Domain (The Unlicense).
 """
 from __future__ import annotations
 import numpy as np
@@ -61,35 +65,51 @@ def sense_actions(faces=None):
     """The face sense-action set.  Singleton faces are exact single-treasure
     probes (τ_j? — 70% of area); the genuine disjunctive VoI lives in the k≥2
     faces.  Callers may prune dominated/singleton faces; the model does not
-    decide policy."""
+    decide policy.
+
+    GEOMETRIC DERIVABILITY (maintainer's binding constraint).  Each face is a
+    DERIVED object, never a frozen opaque table: it is the intersection-refinement
+    of the atomic detectors, computed from the geometric data and reproducible
+    end-to-end via
+        scripts/chocobo_geometry.py  (parse chocobo.ggb -> the atomic detector
+                                      regions Δ_j; data/instance.json regions_wkt)
+        arrangement.arrangement(...) (polygonize(unary_union({∂Δ_j})) -> the atomic
+                                      faces; each face's cover = {j : Δ_j ⊇ face},
+                                      read at an interior rep-point — a REFINEMENT
+                                      of the Δ_j, not a change: per region,
+                                      ⋃(covers of its faces) == the old cover_mask)
+            -> arrangement.persist() -> data/faces.json -> arrangement.load()
+        scripts/{build_faces_ggb,verify_faces}.py  (visual round-trip + the
+                                      self-check of that per-region union equality;
+                                      docs/design/face-model-verification.md).
+    A SenseAction MERELY CARRIES that derived face (position + cover + the
+    observe/filter/informative reads); it freezes nothing the geometry does not
+    already determine.  Re-running the pipeline regenerates faces.json and the
+    senses follow — the face stays derived, not baked."""
     return [SenseAction(f) for f in (faces if faces is not None else A.load())]
 
 
 # ---------------------------------------------------------------------------
-# ENV_ADOPTION — how Environment would consume this (no rewiring done here).
+# ENV_ADOPTION — how Environment DOES consume this (audit item E: adopted).
 #
-# Environment.__init__ replaces the cover_mask block with:
-#     self.faces   = arrangement.load()                 # 44 faces
-#     self.senses  = facemodel.sense_actions(self.faces)
-#     # action coords: a sense action 's' is reached at s.rep_point
-#     for k, s in enumerate(self.senses):
-#         self.coord[("f", k)] = s.rep_point
+# `Environment.__init__` builds `self.senses = facemodel.sense_actions(faces)` (faces
+# from `arrangement.load()`) and the SenseAction is the env's SINGLE carrier of a
+# face — the env no longer reimplements filter/observe/informative inline beside a
+# dead copy.  The detector dynamics DELEGATE to the SenseAction:
+#     filter_detector(bw, i, pos)  ->  self.senses[i].filter(bw, pos)
+#     legal_actions informative    ->  self.senses[i].informative(bw)
+#     apply observe                ->  self.senses[i].observe(world)
+# `det_pt` / `cover_mask` are served FROM the senses (`senses[i].rep_point` /
+# `.bitmask`), so position and cover semantics are the *same* object (the face) and
+# the consult-001 / cover_mask inconsistency cannot recur.
 #
-# legal_actions: collects (unchanged) + informative faces + TERMINATE
-#     acts = [("t", i) for i ... ]                       # collects, as today
-#     acts += [("f", k) for k, s in enumerate(self.senses) if s.informative(bw)]
-#
-# apply, for a sense action ("f", k):
-#     s   = self.senses[k]
-#     dt  = self.d(loc, ("f", k))
-#     pos = s.observe(world)
-#     return 0.0, ("f", k), s.filter(bw, pos), collected, dt
-#
-# The action set becomes ~20 collects + |informative faces| sense actions +
-# TERMINATE — replacing the fixed 16 detector actions.  det_pt and the cover
-# semantics are now the *same* object (the face), so the consult-001 /
-# cover_mask inconsistency cannot recur.  Singleton-face pruning is a policy
-# choice left to the solver, not baked into the model.
+# ACTION SHAPE is the legacy ('d', id) — id is the face id (0..43), one detector
+# action per arrangement face — NOT the ('f', k) this comment once speculatively
+# prescribed (that shape never went live; the audit flagged the drift, and this
+# note is corrected to the live shape).  The deliberate ('d', id) preservation is
+# the honest reuse: re-keying regions->faces happened, but the action key still fit,
+# so it was kept (ADR-0008).  Singleton-face pruning (70% of area, exact
+# single-treasure probes) is a policy choice left to the solver, not baked here.
 # ---------------------------------------------------------------------------
 
 
