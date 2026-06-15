@@ -16,6 +16,8 @@ SGD on the value MSE via `mlp_jax_train.JaxTrainer` (writing into `mlp.ValueMLP`
 CLI: python -m chocofarm.az.train_value --data d.npz --out w.npz [--epochs E] [--batch B]
      [--lr LR] [--l2 L2] [--val-frac F] [--seed S] [--hidden H]
 Pin to core 3 under timeout (see docs/results/az-edecide.md).
+
+Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
@@ -48,9 +50,17 @@ def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
                    y_mean=y_mean, y_std=y_std)
     # JAX/optax trainer (value-only loss); autodiff over the jit'd forward replaces the manual
     # numpy backprop. Built once so Adam's moments persist across epochs; writes trained weights
-    # back into the net so predict_value (numpy) reads them.
+    # back into the net so predict_value (numpy) reads them. The Stage-1 gate is the SECOND
+    # construction-and-step call site (the loop's exit_loop.run is the first); audit item M routes it
+    # through the same `Optimizer`/`AdamHParams` contract as the loop, so the structural single-writer
+    # (the effective lr/betas/eps come from the REQUIRED `hp` argument of the step, not a captured
+    # construction default) holds on BOTH call sites — design §5.2 I1 scope note / §7 Step-4. The
+    # gate's hparams are fixed for the run (no live registry here), so it builds one explicit
+    # `AdamHParams` from its CLI `--lr` + the canonical betas/eps and passes it every step.
     from chocofarm.az.mlp_jax_train import JaxTrainer
+    from chocofarm.az.optimizer import AdamHParams
     trainer = JaxTrainer(net, lr=lr, l2=l2)
+    gate_hp = AdamHParams(lr=lr, b1=0.9, b2=0.999, eps=1e-8)
 
     n_tr = Xtr.shape[0]
     steps_per_epoch = max(1, n_tr // batch)
@@ -62,7 +72,7 @@ def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
             b = idx[s * batch:(s + 1) * batch]
             if len(b) == 0:
                 continue
-            ep_loss += trainer.train_step_value(Xtr[b], ytr[b])
+            ep_loss += trainer.train_step_value(Xtr[b], ytr[b], hp=gate_hp, l2=l2)
         do_print = (ep + 1) % max(1, epochs // 5) == 0 or ep == 0
         if writer is not None or do_print:
             pv = net.predict_value(Xva.astype(np.float64))

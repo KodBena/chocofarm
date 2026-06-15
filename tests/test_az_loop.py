@@ -380,16 +380,25 @@ def test_jax_train_step_reduces_loss():
     assert ce < ce0, f"policy CE did not reduce: {ce0:.4f} -> {ce:.4f}"
 
 
-def test_jax_train_live_lr_l2():
-    """Audit R13 (the frozen-config headline): lr/l2 are LIVE per step — `optax.inject_hyperparams`
-    puts lr in opt_state.hyperparams (set per step, moments persist) and l2 is a traced loss arg.
-    Pin the new capability: (a) lr=0 leaves params unchanged (proves the injected lr is consumed,
-    not the inject_hyperparams placeholder); (b) 10x lr ⇒ ~10x the first-step update on a fixed
-    gradient (Adam's fresh-moment first step has magnitude ~lr); (c) a changed l2 changes the
-    gradient by exactly l2*W on weight tensors (proves l2 is live, not baked)."""
+def test_jax_train_live_lr_l2_betas_eps():
+    """Audit item M (the Optimizer⊥Trainer split + the betas/eps follow-up to R13's frozen-config
+    headline): lr/l2/betas/eps are ALL LIVE per step. The Trainer DELEGATES the update to an
+    `Optimizer` that owns the `optax.inject_hyperparams` transform; lr/b1/b2/eps are set per step from
+    the REQUIRED `AdamHParams` (the construction-enforced single-writer), l2 is a traced loss arg.
+    Pin the new capability:
+      (a) lr=0 leaves params unchanged (proves the injected lr is consumed, NOT the inject_hyperparams
+          placeholder — the single-writer fires);
+      (b) 10x lr ⇒ ~10x the first-step update on a fixed gradient (Adam's fresh-moment first step has
+          magnitude ~lr);
+      (c) a changed l2 changes the gradient by exactly l2*W on weight tensors (l2 live, not baked);
+      (d) a changed b1 (the momentum decay) CHANGES the multi-step update — the new betas/eps-live
+          capability. b1 governs the first-moment EMA, so two runs identical but for b1 diverge after
+          a few steps (the same gradient stream produces a different Adam trajectory). This proves
+          the injected b1 is read live, not the placeholder 0.9."""
     import jax
     import jax.numpy as jnp
     from chocofarm.az.mlp_jax_train import JaxTrainer, _az_loss, _JDTYPE
+    from chocofarm.az.optimizer import AdamHParams
     from chocofarm.az.mlp import is_weight
     env = Environment()
     fb = FeatureBuilder(env)
@@ -413,7 +422,8 @@ def test_jax_train_live_lr_l2():
         n = fresh_net()
         p0 = {k: np.asarray(v, np.float64) for k, v in n._params().items()}
         tr = JaxTrainer(n, lr=1e-3, l2=l2)
-        tr.train_step(X, PI, M, Y, alpha=1.0, beta=1.0, lr=lr, l2=l2)
+        tr.train_step(X, PI, M, Y, alpha=1.0, beta=1.0,
+                      hp=AdamHParams(lr=lr, b1=0.9, b2=0.999, eps=1e-8), l2=l2)
         p1 = {k: np.asarray(v, np.float64) for k, v in n._params().items()}
         return max(float(np.max(np.abs(p1[k] - p0[k]))) for k in p0)
 
@@ -441,6 +451,24 @@ def test_jax_train_live_lr_l2():
             got = np.asarray(g1[k], np.float64) - np.asarray(g0[k], np.float64)
             worst = max(worst, float(np.max(np.abs(got - expected))))
     assert worst < 1e-4, f"l2 not applied as a live coupled penalty (weights-only): max|Δ|={worst:.3e}"
+
+    # (d) betas are LIVE: a changed b1 changes the multi-step update. Run K steps on the same fixed
+    # batch with b1=0.9 vs b1=0.5 (everything else identical); the first-moment EMA differs, so the
+    # Adam trajectory diverges — measurably (NOT roundoff). This is the new capability item M adds.
+    def run_k(b1_val, K=8):
+        n = fresh_net()
+        tr = JaxTrainer(n, lr=1e-3, l2=1e-4)
+        hp = AdamHParams(lr=1e-3, b1=b1_val, b2=0.999, eps=1e-8)
+        for _ in range(K):
+            tr.train_step(X, PI, M, Y, alpha=1.0, beta=1.0, hp=hp, l2=1e-4)
+        return {k: np.asarray(v, np.float64) for k, v in n._params().items()}
+
+    p_default = run_k(0.9)
+    p_changed = run_k(0.5)
+    b1_delta = max(float(np.max(np.abs(p_default[k] - p_changed[k]))) for k in p_default)
+    assert b1_delta > 1e-4, (
+        f"changing b1 (0.9 -> 0.5) did not change the multi-step update (betas not live?): "
+        f"max|Δ|={b1_delta:.3e}")
 
 
 def test_jax_train_writes_back_numpy_inference():

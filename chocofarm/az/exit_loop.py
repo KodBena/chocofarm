@@ -28,6 +28,8 @@ init weights are given, both heads start random.
 CLI: python -m chocofarm.az.exit_loop -I 40 -E 300 -W 5 --epochs 2 --m 12 --n-sims 48
        --lam 0.0855 --seed 7 [--init-weights w.npz] --tb-logdir tb/az_exit_loop --ckpt-dir ckpt
 Pin to a free core under timeout; numpy only (no new deps). See docs/results/az-exit-loop.md.
+
+Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
@@ -134,7 +136,19 @@ class ReplayBuffer:
         return X, PI, M, Y
 
 
-def train_epochs(trainer, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
+def adam_hparams_from(cfg):
+    """ACL (audit item M, training-optimization-refactor.md §2.4): translate the registry's
+    `TrainConfig` (the SSOT) into the optimizer's runtime `AdamHParams` (the optimizer's own
+    vocabulary). The ONE place `TrainConfig.{lr,beta1,beta2,eps}` crosses into the optimizer — read
+    LIVE off the per-iteration snapshot, never captured. `l2`/`alpha`/`beta` go to the Trainer's loss
+    separately (they are loss inputs, not optimizer state). betas/eps are now HOT (the R13 follow-up:
+    they were already physically in `opt_state.hyperparams` via `inject_hyperparams`; this wires them
+    to a live writer)."""
+    from chocofarm.az.optimizer import AdamHParams
+    return AdamHParams(lr=cfg.train.lr, b1=cfg.train.beta1, b2=cfg.train.beta2, eps=cfg.train.eps)
+
+
+def train_epochs(trainer, X, PI, M, Y, epochs, batch, hp, l2, alpha, beta, rng):
     """Adam epochs over the buffer via the JAX/optax trainer (`mlp_jax_train.JaxTrainer`);
     autodiff over the jit'd forward replaces the manual numpy backprop. Re-pins the value
     standardization to the buffer's Y stats (design §3) before training so the MSE stays O(1) as
@@ -142,11 +156,11 @@ def train_epochs(trainer, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
     re-pin propagates. After training, numpy inference (`predict_value`) reads the trained weights
     the trainer wrote back into the net. Returns (mean_ce, mean_value_std_mse, heldout_R2_on_buffer).
 
-    `lr`/`l2` are LIVE (audit R13 — the frozen-config headline). The caller passes the per-iteration
-    snapshot values; they flow into each `train_step` so an LR anneal / L2 retune lands on the
-    running experiment WITHOUT a trainer rebuild (the trainer is built once so Adam's moments
-    persist; the injected `lr` changes in `opt_state.hyperparams`, `l2` is a traced loss arg). This
-    was the vestigial accepted-then-ignored channel before R13; it is now wired through."""
+    `hp`/`l2` are LIVE (audit item M / R13 — the frozen-config headline). The caller passes the
+    per-iteration snapshot's `AdamHParams` (lr/betas/eps) + `l2`; they flow into each `train_step` so
+    an LR anneal / beta retune / L2 retune lands on the running experiment WITHOUT a trainer rebuild
+    (the trainer is built once so Adam's moments persist; the injected lr/betas/eps are set per step
+    from `hp` in the Optimizer's jit'd update, `l2` is a traced loss arg)."""
     net = trainer.net
     net.set_value_scale(float(Y.mean()), float(Y.std()))
     n = X.shape[0]
@@ -159,7 +173,7 @@ def train_epochs(trainer, X, PI, M, Y, epochs, batch, lr, l2, alpha, beta, rng):
             if len(b) == 0:
                 continue
             ce, vl = trainer.train_step(X[b], PI[b], M[b], Y[b],
-                                        alpha=alpha, beta=beta, lr=lr, l2=l2)
+                                        alpha=alpha, beta=beta, hp=hp, l2=l2)
             ce_tot += ce; v_tot += vl; cnt += 1
     pv = net.predict_value(X.astype(np.float64))
     return ce_tot / max(1, cnt), v_tot / max(1, cnt), r2_score(Y, pv)
@@ -245,15 +259,21 @@ def run(args):
     #     fully-initialised, possibly warm-started) net's weights and writes the trained weights
     #     back into the net after each step — numpy inference (generation/eval) reads them. ---
     from chocofarm.az.mlp_jax_train import JaxTrainer
-    # lr/l2 are HOT (audit R13 — the frozen-config headline). The trainer is still built ONCE (so
-    # Adam's moments persist), but lr is now injected via optax.inject_hyperparams (lives in
-    # opt_state.hyperparams, changeable per step) and l2 is a traced loss arg — both read LIVE off
-    # the per-iteration snapshot in the TRAIN block below, so an LR anneal / L2 retune via the
-    # registry lands without a --resume / trainer rebuild. The cfg0 values here are just the launch
-    # seed (the first iteration's snapshot supplies the live values, equal to cfg0 at launch).
-    trainer = JaxTrainer(net, lr=cfg0.train.lr, l2=cfg0.train.l2)
-    print(f"training: JAX/optax Adam (lr={cfg0.train.lr} l2={cfg0.train.l2}, both HOT — live per "
-          f"iteration via inject_hyperparams/traced-l2); inference: numpy float32", flush=True)
+    # lr/betas/eps/l2 are HOT (audit item M — the Optimizer⊥Trainer split + the betas/eps follow-up
+    # to R13's frozen-config headline). The trainer is still built ONCE (so Adam's moments persist),
+    # but it now DELEGATES the update to an Optimizer that owns the optax transform: lr/betas/eps are
+    # injected via optax.inject_hyperparams (live in opt_state.hyperparams, set per step from the
+    # required AdamHParams argument — the construction-enforced single-writer) and l2 is a traced loss
+    # arg. All read LIVE off the per-iteration snapshot in the TRAIN block below, so an LR anneal /
+    # beta retune / L2 retune via the registry lands without a --resume / trainer rebuild. The cfg0
+    # values here are just the launch-seed defaults (the first iteration's snapshot supplies the live
+    # AdamHParams, equal to cfg0 at launch).
+    trainer = JaxTrainer(net, lr=cfg0.train.lr, l2=cfg0.train.l2,
+                         betas=(cfg0.train.beta1, cfg0.train.beta2), eps=cfg0.train.eps)
+    print(f"training: JAX/optax Adam (lr={cfg0.train.lr} l2={cfg0.train.l2} "
+          f"betas=({cfg0.train.beta1},{cfg0.train.beta2}) eps={cfg0.train.eps}, all HOT — live per "
+          f"iteration via Optimizer/inject_hyperparams/traced-l2); inference: numpy float32",
+          flush=True)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     writer = None
@@ -332,7 +352,12 @@ def run(args):
         batch = snap.cfg.train.batch
         alpha = snap.cfg.train.alpha
         beta = snap.cfg.train.beta
-        lr = snap.cfg.train.lr           # HOT (audit R13): live lr, injected per step (no rebuild)
+        # HOT (audit item M / R13): the live optimizer hparams (lr/betas/eps) — translated off the
+        # snapshot into the optimizer's AdamHParams vocabulary by the §2.4 ACL, supplied per step as
+        # the required argument of the Optimizer's update (the construction-enforced single-writer).
+        # betas/eps are now HOT too (the R13 follow-up: they were already in opt_state.hyperparams
+        # via inject_hyperparams; here they get a live writer). `l2` is a traced loss coefficient.
+        hp = adam_hparams_from(snap.cfg)
         l2 = snap.cfg.train.l2           # HOT (audit R13): live loss coefficient, traced per step
         max_steps = snap.cfg.env.max_steps   # HOT rollout cap (per-call, not instance)
         # HOT search knobs (read off the live snapshot; the search object is rebuilt every iteration
@@ -378,14 +403,17 @@ def run(args):
         t_gen = time.time() - t0
 
         # ---- 2. TRAIN ----
-        # epochs/batch/alpha/beta AND lr/l2 are HOT (read off the live snapshot — audit R13). lr is
-        # injected into the trainer's optax state per step (inject_hyperparams) and l2 is a traced
-        # loss arg, so an LR anneal / L2 retune via the registry lands LIVE on the running experiment
-        # (no --resume, no trainer rebuild — Adam's moments persist across the change). This was the
-        # vestigial accepted-then-ignored lr/l2 channel; R13 makes it the live read.
+        # epochs/batch/alpha/beta AND lr/betas/eps/l2 are HOT (read off the live snapshot — audit
+        # item M). The trainer DELEGATES the update to an Optimizer: lr/betas/eps are injected into
+        # the optax state per step from the required AdamHParams `hp` (inject_hyperparams; the
+        # construction-enforced single-writer) and l2 is a traced loss arg, so an LR anneal / beta
+        # retune / L2 retune via the registry lands LIVE on the running experiment (no --resume, no
+        # trainer rebuild — Adam's moments persist across the change). betas/eps joined lr/l2 as HOT
+        # here (the R13 follow-up: they were already in opt_state.hyperparams; now they have a live
+        # writer via `adam_hparams_from`).
         bX, bPI, bM, bY = buf.arrays()
         ce, vmse, r2 = train_epochs(trainer, bX, bPI, bM, bY, epochs, batch,
-                                    lr, l2, alpha, beta, train_rng)
+                                    hp, l2, alpha, beta, train_rng)
         t_train = time.time() - t0 - t_gen
 
         # ---- 3. EVALUATE (greedy argmax-π′ policy on a held-out seed, fixed λ₀) ----

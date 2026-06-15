@@ -394,8 +394,9 @@ _ARGPARSE_MAP = (
     # search
     ("m", "search", "m"),
     ("n_sims", "search", "n_sims"),
-    # train (the jit-boundary knobs; lr/l2 are HOT as of audit R13 — live via inject_hyperparams /
-    # traced-l2; betas/eps remain RESTART)
+    # train (the jit-boundary knobs; lr/l2/betas/eps are ALL HOT as of audit item M — the Optimizer
+    # owns the inject_hyperparams transform and reads lr/betas/eps off the per-step AdamHParams, l2 is
+    # a traced loss arg. betas/eps have no argparse flag, so they default + are HOT off the registry)
     ("lr", "train", "lr"),
     ("l2", "train", "l2"),
     ("alpha", "train", "alpha"),
