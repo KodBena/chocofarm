@@ -418,9 +418,13 @@ def run(args):
 
         # ---- 3. EVALUATE (greedy argmax-π′ policy on a held-out seed, fixed λ₀) ----
         if executor is not None:
-            # re-publishes the now-trained weights at a distinct version, fans eval episodes; the
-            # HOT search knobs ride the call as in generate.
-            totR, totT, ets = executor.evaluate(net, it + 1_000_000, eval_worlds, lam,
+            # re-publishes the now-trained weights for the EVAL phase of this SAME iteration `it`, fans
+            # eval episodes; the HOT search knobs ride the call as in generate. The eval phase
+            # namespaces its weight key by phase ("eval") internally (R14), so passing the REAL `it`
+            # publishes to az:w:<run>:eval:<it> — distinct from gen's az:w:<run>:gen:<it> — and the
+            # worker's (phase, version) gate reloads the post-train weights. The pre-R14 fake-version
+            # offset hack (a synthetic large version to dodge the gen key) is gone.
+            totR, totT, ets = executor.evaluate(net, it, eval_worlds, lam,
                                                 hot_search=hot_search, max_steps=max_steps)
         else:
             eval_pol = GumbelPolicy(net, env, m=cfg0.search.m, n_sims=cfg0.search.n_sims,
