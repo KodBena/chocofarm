@@ -317,7 +317,18 @@ or sentinel. So the absence/error path is declared in the return type and
 strongest surface, and a P8 honest-contract obligation — the type carries the
 nullability the body relies on), while the functional core stays *total*
 (throw-free, neither throwing nor returning `expected`) and a genuine invariant
-violation (a bug) remains an `assert`/abort, not an `expected`.
+violation (a bug) remains an `assert`/abort, not an `expected`. These five rules
+are the **catalog of one general posture, not the whole of it**: P9 is the
+**modern-C++ discipline** — for any legacy / C-with-classes / pre-modern
+(*reliquary*) construct there is usually a standard C++ (11–23) feature designed
+precisely to make it safer or clearer **at zero runtime cost**, that feature is
+preferred, and the reliquary form is forbidden **absent a measured reason** (a
+profile, or a real named constraint like a fixed C ABI — never a habit one like
+"that's how it's always been done"). Representative (non-exhaustive) catalog
+rows beyond the five: raw `new`/`delete` → RAII / smart pointers; C-style casts →
+named casts; `#define` constants → `constexpr`; `strcmp`/`strcpy` →
+`std::string_view`; `NULL` → `nullptr`; `typedef` → `using`; unscoped `enum` →
+`enum class`; hand-rolled index loops → range-based-`for` / `<algorithm>`.
 The C++ `NetForward` MLP (`predict(const float* X)`, the `void matvec_bias(…,
 std::vector<float>& out)` internals, the throwing constructor) is the cautionary
 instance — every `cpp/src` throw is at a boundary (redis I/O, instance load, the
@@ -327,9 +338,13 @@ the untyped-optional cautionary instance (compliant: `[[nodiscard]]
 std::optional<std::string_view> opt(std::span<const std::string_view>, …)`, with
 `main` building the typed `argv` view once as the boundary ACL). P9 is now
 a mix: the error/`[[nodiscard]]` axis is **compile-enforced** (an unhandled
-`std::expected` fails the build), the input/output/mutation rules review-policed
-with the compiler `-Wall -Wextra` and a future `clang-tidy` config as the
-mechanization surface. It composes with rather than
+`std::expected` fails the build), the input/output/mutation rules and the general
+posture review-policed with the compiler `-Wall -Wextra` as the floor and a
+future `clang-tidy` config as the mechanization surface — its **`modernize-*`
+family** (`modernize-use-nullptr`, `modernize-use-using`,
+`modernize-avoid-c-arrays`, …) and `cppcoreguidelines-*` checks the purpose-built
+net for the reliquary→modern substitutions, enabled per ADR-0011 Rule 2 when a
+reliquary form recurs. It composes with rather than
 restates its siblings (0002/0004/0005/0007/0009/0011 cited, not re-derived), and
 carries a dedicated concrete C++ wire contract (the `transport.py` keys/dtypes,
 parity under the P6 bar).
