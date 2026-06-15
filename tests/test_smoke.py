@@ -26,7 +26,7 @@ import numpy as np
 
 from chocofarm.model.env import Environment, TERMINATE
 from chocofarm.model import arrangement, facemodel
-from chocofarm.analysis.analyzer import analyze, real_instance
+from tools.analysis.analyzer import analyze, real_instance  # relocated 2026-06-15 (offline tooling)
 from chocofarm.solvers.base import (
     Policy, GreedyPolicy, CertaintyEquivalentPolicy,
     RolloutPolicy, SparseSamplingPolicy, RolloutConfig, SparseSamplingConfig,

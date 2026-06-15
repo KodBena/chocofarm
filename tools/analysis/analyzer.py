@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-analyzer.py — the structural decomposition of a chocofarm instance, as a
-*program* over the abstract instance, not a one-off hand-analysis.
+tools/analysis/analyzer.py — the structural decomposition of a chocofarm
+instance, as a *program* over the abstract instance, not a one-off
+hand-analysis.
+
+OFFLINE EXPLORATION TOOLING — relocated from chocofarm/analysis/ on 2026-06-15
+(see tools/analysis/README.md). NOT part of the live chocofarm import pipeline;
+the live cluster partition is owned by solvers/decomp.py (recomputed from the
+env). Importable under the repo-root run convention as tools.analysis.analyzer
+(PYTHONPATH=.).
 
 WHY THIS FILE EXISTS
 --------------------

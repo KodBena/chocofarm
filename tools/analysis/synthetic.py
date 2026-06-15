@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-synthetic.py — a controlled-geometry instance generator for the analyzer.
+tools/analysis/synthetic.py — a controlled-geometry instance generator for the
+analyzer.
+
+OFFLINE EXPLORATION TOOLING — relocated from chocofarm/analysis/ on 2026-06-15
+(see tools/analysis/README.md). NOT part of the live chocofarm import pipeline.
+Importable under the repo-root run convention as tools.analysis.synthetic
+(PYTHONPATH=.).
 
 PURPOSE
 -------
@@ -43,7 +49,7 @@ from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
 from chocofarm.model import arrangement as A
-from chocofarm.analysis.analyzer import Instance
+from tools.analysis.analyzer import Instance
 
 
 def _convex_blob(cx, cy, r, rng, n_vert=7):
@@ -131,7 +137,7 @@ def generate(n_treasures=14, K=4, n_regions=8, overlap_density=0.5,
 
 if __name__ == "__main__":
     import sys
-    from chocofarm.analysis.analyzer import analyze, _print_report
+    from tools.analysis.analyzer import analyze, _print_report
 
     seed = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     inst = generate(seed=seed)
