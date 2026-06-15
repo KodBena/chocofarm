@@ -22,19 +22,21 @@ Usage (always pinned + bounded):
 import argparse
 import itertools
 import time
+from typing import Sequence, cast
 
 import numpy as np
 
-from chocofarm.model.env import Environment
+from chocofarm.model.env import Environment, Loc, WorldSet
 from chocofarm.bounds.info_relaxation import (
     PenalizedClairvoyant, dual_bound_rate, empirical_penalty_mean,
 )
-from chocofarm.bounds.vhats import vhat_analytic
+from chocofarm.bounds.vhats import Vhat, vhat_analytic
 from chocofarm.bounds.vhats_decomp import DecompVhat
 from chocofarm.bounds.vhats_exact import ExactBeliefVhat
 
 
-def exact_optimal_rate(mini, lo=0.0, hi=0.4, it=40):
+def exact_optimal_rate(mini: Environment, lo: float = 0.0, hi: float = 0.4,
+                       it: int = 40) -> float:
     """The exact optimal belief-MDP rate on a (small) sub-instance: the λ where
     V*(initial belief) = 0 (the optimal policy's own Dinkelbach fixed point). This is
     the ACHIEVABLE optimum on the sub-instance — the dual bound must sit ≥ it, and with
@@ -50,11 +52,12 @@ def exact_optimal_rate(mini, lo=0.0, hi=0.4, it=40):
     return 0.5 * (lo + hi)
 
 
-def clairvoyant_on_worlds(env, keep, worlds, dink_iters=6, lo=0.0, hi=0.4):
+def clairvoyant_on_worlds(env: Environment, keep: Sequence[int], worlds: WorldSet,
+                          dink_iters: int = 6, lo: float = 0.0, hi: float = 0.4) -> float:
     """The EXISTING clairvoyant inner solve (harness.clairvoyant_rate) restricted to
     `worlds` over treasures `keep` — the z≡0 ground truth (a Dinkelbach fixed point of
     ΣR/ΣT over the per-world subset×permutation optima)."""
-    def ev(lam):
+    def ev(lam: float) -> float:
         totR = totT = 0.0
         for w in worlds:
             w = int(w)
@@ -78,16 +81,17 @@ def clairvoyant_on_worlds(env, keep, worlds, dink_iters=6, lo=0.0, hi=0.4):
     return lam
 
 
-def achievable_on_mini(mini, vl=0.10):
+def achievable_on_mini(mini: Environment, vl: float = 0.10) -> float:
     """A simple achievable rate on the sub-instance: the realizable-static-style route
     over the mini cluster (a fixed value-aware NN route, best expected-rate prefix) —
     a genuine ACHIEVABLE policy rate the bound must not fall below (deliverable iii).
     Uses the mini's reduced prior (K/|keep| present-fraction)."""
     env = mini
-    loc = ("w", env.entry)
+    loc: Loc = ("w", env.entry)
     keep = mini.keep                 # the restricted env's kept treasure ids (sorted tuple)
     unv = set(keep)
-    route, t, best = [], 0.0, -1.0
+    route: list[int] = []
+    t, best = 0.0, -1.0
     while unv:
         i = max(unv, key=lambda j: env.value[j] / (env.d(loc, ("t", j)) + 1e-9))
         t += env.d(loc, ("t", i)); loc = ("t", i); route.append(i); unv.discard(i)
@@ -99,7 +103,7 @@ def achievable_on_mini(mini, vl=0.10):
     return best
 
 
-def validate():
+def validate() -> None:
     env = Environment()
     print("=" * 74)
     print("INFORMATION-RELAXATION DUAL BOUND — validation on a small sub-instance")
@@ -125,7 +129,9 @@ def validate():
     t0 = time.time()
     pc0 = PenalizedClairvoyant(mini, vhat=None)
     out0 = dual_bound_rate(pc0, mini.worlds, lo=0.0, hi=0.4)
-    dual0 = out0["lambda"]
+    # dual_bound_rate returns a heterogeneous dict[str, object]; "lambda" is the float
+    # root λ̄ — cast states that contract (no runtime change; the value IS a float).
+    dual0 = cast(float, out0["lambda"])
     ok_i = abs(clair_ref - dual0) < 2e-3
     print(f"(i)   REGRESSION   z≡0 dual = {dual0:.4f}   clairvoyant = {clair_ref:.4f}   "
           f"{'PASS' if ok_i else 'FAIL'}   ({time.time()-t0:.1f}s)", flush=True)
@@ -152,13 +158,14 @@ def validate():
     # V̂=V* is the DEFINITIVE tightening test: BSS strong duality ⇒ λ̄ = opt, well below
     # the clairvoyant — proving the machinery tightens when handed a good V̂. analytic
     # and decomp are weaker approximations (may or may not tighten; both still VALID).
-    vhats = [("exact-V*", ExactBeliefVhat(), opt),
-             ("analytic", vhat_analytic, 0.10)]
+    vhats: list[tuple[str, Vhat, float]] = [
+        ("exact-V*", ExactBeliefVhat(), opt),
+        ("analytic", vhat_analytic, 0.10)]
     for name, vh, vl in vhats:
         t0 = time.time()
         pc = PenalizedClairvoyant(mini, vhat=vh, vhat_lam=vl)
         out = dual_bound_rate(pc, mini.worlds, lo=0.0, hi=0.4)
-        lam_bar = out["lambda"]
+        lam_bar = cast(float, out["lambda"])   # heterogeneous dict; "lambda" is the float root
         certified = min(lam_bar, clair_ref)   # both valid; report the tighter
         below = certified <= clair_ref + 2e-3
         above = lam_bar >= opt - 2e-3         # validity floor: bound ≥ achievable
@@ -192,7 +199,7 @@ def validate():
           "needs the decomposition-aligned separable solve.", flush=True)
 
 
-def full():
+def full() -> None:
     """The full 15,504-world headline. DEFERRED — run only with cores freed.
 
     MEASURED TRACTABILITY FINDING (see the report / dual-bound.md §4.3): the FLAT

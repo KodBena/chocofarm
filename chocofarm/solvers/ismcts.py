@@ -40,7 +40,14 @@ import math
 from dataclasses import dataclass
 import numpy as np
 from chocofarm.solvers.base import Policy, _base_value, UCB_C, GreedyStopBase
-from chocofarm.model.env import TERMINATE
+from chocofarm.model.env import (
+    Action, Collected, Environment, Loc, TERMINATE, WorldSet, is_terminate,
+)
+
+# The information-set node identity (_belief_key): a (count, first, last) fingerprint, and
+# a child edge key pairs the action taken with the successor belief's fingerprint.
+BeliefKey = tuple[int, int, int]
+ChildKey = tuple[Action, BeliefKey]
 
 
 @dataclass(frozen=True)
@@ -54,13 +61,13 @@ class ISMCTSConfig:
     c: float = UCB_C
     max_depth: int = 24
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "iterations", int(self.iterations))
         object.__setattr__(self, "c", float(self.c))
         object.__setattr__(self, "max_depth", int(self.max_depth))
 
 
-def _belief_key(bw):
+def _belief_key(bw: WorldSet) -> BeliefKey:
     """A cheap, order-insensitive identity for an information set (a belief world-set).
 
     Beliefs reached by the same observations are the same set of worlds regardless of the path;
@@ -83,11 +90,11 @@ class _Node:
     action's bandit statistics."""
     __slots__ = ("reward", "visits", "avail", "children")
 
-    def __init__(self):
-        self.reward = {}     # action -> summed playout return over selections of this action
-        self.visits = {}     # action -> times this action was selected from here   (n_j)
-        self.avail = {}      # action -> times this action was legal/available here  (n'_j)
-        self.children = {}   # (action, belief_key) -> child _Node
+    def __init__(self) -> None:
+        self.reward: dict[Action, float] = {}   # action -> summed playout return over selections
+        self.visits: dict[Action, int] = {}     # action -> times this action was selected   (n_j)
+        self.avail: dict[Action, int] = {}      # action -> times this action was available  (n'_j)
+        self.children: dict[ChildKey, _Node] = {}   # (action, belief_key) -> child _Node
 
 
 class ISMCTSPolicy(Policy):
@@ -97,7 +104,8 @@ class ISMCTSPolicy(Policy):
     default (pass a `policies.GreedyPolicy()` to use the plainer greedy) — cheap, and the search
     supplies the contingent depth the base lacks."""
 
-    def __init__(self, iterations=300, c=UCB_C, base=None, max_depth=24, *, cfg=None):
+    def __init__(self, iterations: int = 300, c: float = UCB_C, base: Policy | None = None,
+                 max_depth: int = 24, *, cfg: "ISMCTSConfig | None" = None) -> None:
         # cfg=ISMCTSConfig(...) supplies (iterations, c, max_depth) in one frozen object; the
         # individual kwargs remain the back-compat path and build the config when no cfg is passed
         # (ADR-0004). `base` (a Policy, not a scalar) is always a separate __init__ param. The config
@@ -110,7 +118,11 @@ class ISMCTSPolicy(Policy):
         self.max_depth = self.cfg.max_depth
 
     # ---- public API ----
-    def decide(self, env, loc, bw, collected, lam, rng):
+    def decide(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+               lam: float, rng: np.random.Generator | None = None) -> Action:
+        # ADR-0002 fail-loud: ISMCTS is stochastic (it determinizes a world per iteration), so
+        # it requires a real Generator — matches the seam's Optional-rng contract (base.py).
+        assert rng is not None, "ISMCTSPolicy.decide requires a Generator (it determinizes worlds)"
         if len(bw) == 0:
             return TERMINATE
         root = _Node()
@@ -123,7 +135,9 @@ class ISMCTSPolicy(Policy):
         return max(root.visits, key=lambda a: root.visits[a])
 
     # ---- one determinized iteration: selection + expansion + simulation + backprop ----
-    def _iterate(self, env, node, loc, bw, collected, world, lam, rng, depth):
+    def _iterate(self, env: Environment, node: _Node, loc: Loc, bw: WorldSet,
+                 collected: Collected, world: int, lam: float,
+                 rng: np.random.Generator, depth: int) -> float:
         """Recursive descent for one iteration in fixed determinization `world`. Returns the
         λ-penalized return from `node` onward, which the caller backpropagates into the edge it
         took. `bw`/`collected` are the information-set + collected-set AT this node."""
@@ -149,7 +163,7 @@ class ISMCTSPolicy(Policy):
 
         # (2) Selection: UCB1 with availability count in the exploration term.
         a = self._ucb_select(node)
-        if a == TERMINATE:
+        if is_terminate(a):
             ret = -lam * env.exit_cost(loc)            # stop now: only the exit toll remains
             self._update(node, a, ret)
             return ret
@@ -168,10 +182,12 @@ class ISMCTSPolicy(Policy):
         self._update(node, a, ret)
         return ret
 
-    def _expand_and_simulate(self, env, node, loc, bw, collected, a, world, lam, rng, depth):
+    def _expand_and_simulate(self, env: Environment, node: _Node, loc: Loc, bw: WorldSet,
+                             collected: Collected, a: Action, world: int, lam: float,
+                             rng: np.random.Generator, depth: int) -> float:
         """Realise a freshly expanded action under `world`, register its successor child, then
         (4) play the base policy to the end of the episode for the leaf estimate."""
-        if a == TERMINATE:
+        if is_terminate(a):
             return -lam * env.exit_cost(loc)
         r, nloc, nbw, ncoll, dt = env.apply(loc, bw, collected, a, world)
         step = r - lam * dt
@@ -183,10 +199,11 @@ class ISMCTSPolicy(Policy):
         return step + cont
 
     # ---- bandit + bookkeeping ----
-    def _ucb_select(self, node):
+    def _ucb_select(self, node: _Node) -> Action:
         """UCB1 (eq. 7) with the subset-armed-bandit denominator: the log term uses the action's
         own availability count n'_j (times the action was legal here), per §IV-B."""
-        best_a, best_v = None, -math.inf
+        best_a: Action | None = None
+        best_v = -math.inf
         c = self.c
         for a, n_j in node.visits.items():
             if n_j == 0:
@@ -197,9 +214,12 @@ class ISMCTSPolicy(Policy):
             v = exploit + explore
             if v > best_v:
                 best_v, best_a = v, a
+        # `_ucb_select` is only called on a fully-expanded node (visits non-empty), so a
+        # best is always found; ADR-0002 fail-loud rather than a None the caller can't use.
+        assert best_a is not None
         return best_a
 
     @staticmethod
-    def _update(node, a, ret):
+    def _update(node: _Node, a: Action, ret: float) -> None:
         node.visits[a] = node.visits.get(a, 0) + 1
         node.reward[a] = node.reward.get(a, 0.0) + ret

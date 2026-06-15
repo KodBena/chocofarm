@@ -51,10 +51,17 @@ Pin any run to CPU core 3 under `timeout` (a live AZ job holds cores 0–3). The
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
-from chocofarm.model.env import Environment, TERMINATE
+from chocofarm.model.env import (
+    Action, Collected, Environment, Loc, MoveAction, TERMINATE, WorldSet, is_terminate,
+)
+from chocofarm.solvers.base import Policy
+
+if TYPE_CHECKING:
+    from chocofarm.bounds.vhats import Vhat
 
 
 # ===========================================================================
@@ -107,8 +114,9 @@ class PenalizedClairvoyant:
     is exact. `max_inner_states` ABORTS LOUDLY (never truncates) — a truncated search
     could miss the argmax and return a LOWER bound, silently breaking (★)."""
 
-    def __init__(self, env: Environment, vhat=None, vhat_lam=None,
-                 max_inner_states=2_000_000, restrict_faces=True):
+    def __init__(self, env: Environment, vhat: "Vhat | None" = None,
+                 vhat_lam: float | None = None,
+                 max_inner_states: int = 2_000_000, restrict_faces: bool = True) -> None:
         self.env = env
         self.vhat = vhat
         self.vhat_lam = vhat_lam          # fix V̂ at this λ (Route A); None → rebuild
@@ -116,7 +124,7 @@ class PenalizedClairvoyant:
         self.restrict_faces = restrict_faces
 
     # ---- penalized per-step reward (telescoped BSS form) ----
-    def _vh(self, loc, bw, collected, lam):
+    def _vh(self, loc: Loc, bw: WorldSet, collected: Collected, lam: float) -> float:
         """V̂ at the reference λ (Route A) — or 0 in the NO-PENALTY mode (vhat=None),
         which makes the inner objective the pure realized r − λ·dt (the z≡0 clairvoyant
         regression baseline)."""
@@ -125,7 +133,9 @@ class PenalizedClairvoyant:
         vl = self.vhat_lam if self.vhat_lam is not None else lam
         return self.vhat(self.env, loc, bw, collected, vl)
 
-    def _penalized_step(self, loc, bw, collected, action, world, lam):
+    def _penalized_step(self, loc: Loc, bw: WorldSet, collected: Collected,
+                        action: MoveAction, world: int, lam: float
+                        ) -> tuple[float, float, Loc, WorldSet, Collected, float]:
         """The realized step contribution `r_t − z_t` of the inner objective, plus the
         realized (r, x') so the caller can recurse. Returns (contribution, r, loc',
         bw', collected', dt).
@@ -142,8 +152,11 @@ class PenalizedClairvoyant:
         r_t − z_t."""
         env = self.env
         kind, i = action
-        dt = env.d(loc, (kind, i))
+        # `action` (a MoveAction) IS a Loc — pass it directly rather than rebuilding
+        # (kind, i), which would widen the tag off the Loc union (env.apply's idiom).
+        dt = env.d(loc, action)
         no_penalty = (self.vhat is None)
+        nloc: Loc      # the realised successor key, a Loc in both branches below
         if kind == "t":
             # conditional expectation over presence under the belief
             q = float(env.marginals(bw)[i]) if len(bw) else 0.0
@@ -185,7 +198,7 @@ class PenalizedClairvoyant:
             return (exp_rv - vh_real), 0.0, nloc, nbw, collected, dt
 
     # ---- exact inner DP for one world ----
-    def inner_value(self, world, lam):
+    def inner_value(self, world: int, lam: float) -> tuple[float, float, float]:
         """sup_a Σ_t ρ̃(x_t, a_t, w) over finite action sequences ending in TERMINATE,
         in the fully-revealed `world`. EXACT memoized DP. Returns (value, R, T): the
         penalized inner objective AND the realized (reward, time) along the OPTIMIZING
@@ -199,7 +212,8 @@ class PenalizedClairvoyant:
         state_count = [0]
 
         @lru_cache(maxsize=None)
-        def solve(loc, bw_key, collected):
+        def solve(loc: Loc, bw_key: tuple[int, ...],
+                  collected: frozenset[int]) -> tuple[float, float, float]:
             state_count[0] += 1
             if state_count[0] > self.max_inner_states:
                 raise RuntimeError(
@@ -239,12 +253,13 @@ class PenalizedClairvoyant:
                      bw_key=tuple(int(x) for x in self._world_belief()),
                      collected=frozenset())
 
-    def _world_belief(self):
+    def _world_belief(self) -> WorldSet:
         """The initial belief = the full world-set (the sub-instance's worlds)."""
         return self.env.worlds
 
     # ---- B(λ) = E_w[ inner_value(λ) ] ----
-    def B_value(self, lam, worlds, weights=None):
+    def B_value(self, lam: float, worlds: WorldSet,
+                weights: Sequence[float] | None = None) -> tuple[float, float, float]:
         """B(λ) = mean over `worlds` of the per-world inner sup value. This is the BSS
         penalized-clairvoyant value (★). Also returns the realized (ΣR, ΣT) along the
         inner-optimal paths (for diagnostics / the no-penalty ratio shortcut).
@@ -266,8 +281,10 @@ class PenalizedClairvoyant:
 # ===========================================================================
 
 
-def dual_bound_rate(pc: PenalizedClairvoyant, worlds, weights=None,
-                    lo=0.0, hi=0.30, tol=1e-4, max_iter=40):
+def dual_bound_rate(pc: PenalizedClairvoyant, worlds: WorldSet,
+                    weights: Sequence[float] | None = None,
+                    lo: float = 0.0, hi: float = 0.30, tol: float = 1e-4,
+                    max_iter: int = 40) -> dict[str, object]:
     """The dual upper bound λ̄ = root of B(·, z) (dual-bound.md §3), by BISECTION.
 
     B(λ) is strictly decreasing in λ when V̂ is fixed at vhat_lam (Route A): the inner
@@ -285,9 +302,9 @@ def dual_bound_rate(pc: PenalizedClairvoyant, worlds, weights=None,
     `worlds`: the world-set to average over (sub-instance for validation, full for
     headline). Returns {'lambda': λ̄, 'B_at_root': B(λ̄), 'bracket': (lo,hi), 'log': [...]}.
     """
-    log = []
+    log: list[dict[str, float]] = []
 
-    def B(lam):
+    def B(lam: float) -> float:
         b, totR, totT = pc.B_value(lam, worlds, weights=weights)
         log.append({"lam": lam, "B": b, "totR": totR, "totT": totT})
         return b
@@ -321,8 +338,9 @@ def dual_bound_rate(pc: PenalizedClairvoyant, worlds, weights=None,
 # ===========================================================================
 
 
-def empirical_penalty_mean(env: Environment, pc: PenalizedClairvoyant, policy, lam,
-                           runs=200, seed=11):
+def empirical_penalty_mean(env: Environment, pc: PenalizedClairvoyant, policy: Policy,
+                           lam: float, runs: int = 200, seed: int = 11
+                           ) -> tuple[float, float]:
     """Direct dual-feasibility check (dual-bound.md §2.3 / §5 deliverable (iv)): run an
     F-adapted `policy`, accumulate the realized per-step penalty increments
         z_t = (r_t + V̂_{t+1}(x_{t+1})) − E[r_t + V̂_{t+1} | F_t, a_t]
@@ -334,31 +352,40 @@ def empirical_penalty_mean(env: Environment, pc: PenalizedClairvoyant, policy, l
     We recompute it directly here (not via _penalized_step) to keep the check
     independent of the inner-solve code path."""
     rng = np.random.default_rng(seed)
-    totals = []
+    totals: list[float] = []
+    # This check measures the V̂-penalty martingale, so it needs a real V̂ (a no-penalty
+    # pc has no per-step penalty to feasibility-check). ADR-0002 fail-loud — surfaced
+    # here rather than as a None-not-callable on the first step.
+    assert pc.vhat is not None, "empirical_penalty_mean needs a pc with a V̂ (vhat is None)"
+    vhat = pc.vhat
     vl = pc.vhat_lam if pc.vhat_lam is not None else lam
     for _ in range(runs):
         world = int(rng.choice(env.worlds))
-        loc, bw, collected = ("w", env.entry), env.worlds, set()
+        loc: Loc = ("w", env.entry)
+        bw: WorldSet = env.worlds
+        collected: set[int] = set()
         zsum = 0.0
         for _step in range(env.max_steps):           # the single episode-horizon home (env.py)
             a = policy.decide(env, loc, bw, collected, lam, rng)
-            if a == TERMINATE:
+            if is_terminate(a):
                 break
             kind, i = a
-            dt = env.d(loc, (kind, i))
+            # `a` is a MoveAction here (is_terminate narrowed off TERMINATE) and IS a Loc,
+            # so pass it directly rather than rebuilding (kind, i) (env.apply's idiom).
+            dt = env.d(loc, a)
             if kind == "t":
                 q = float(env.marginals(bw)[i]) if len(bw) else 0.0
                 pres_b = env.filter_treasure(bw, i, True)
                 abs_b = env.filter_treasure(bw, i, False)
                 r_pres = env.value[i] if i not in collected else 0.0
-                vh_pres = pc.vhat(env, ("t", i), pres_b, collected | {i}, vl) if len(pres_b) else 0.0
-                vh_abs = pc.vhat(env, ("t", i), abs_b, collected, vl) if len(abs_b) else 0.0
+                vh_pres = vhat(env, ("t", i), pres_b, collected | {i}, vl) if len(pres_b) else 0.0
+                vh_abs = vhat(env, ("t", i), abs_b, collected, vl) if len(abs_b) else 0.0
                 exp_rv = q * (r_pres + vh_pres) + (1.0 - q) * vh_abs   # −λ·dt cancels
                 pres = bool((world >> i) & 1)
                 nbw = pres_b if pres else abs_b
                 nc = (collected | {i}) if pres else collected
                 r_real = env.value[i] if (pres and i not in collected) else 0.0
-                vh_real = pc.vhat(env, ("t", i), nbw, nc, vl) if len(nbw) else 0.0
+                vh_real = vhat(env, ("t", i), nbw, nc, vl) if len(nbw) else 0.0
                 z_t = (r_real + vh_real) - exp_rv
                 loc, bw, collected = ("t", i), nbw, nc
             else:
@@ -366,12 +393,12 @@ def empirical_penalty_mean(env: Environment, pc: PenalizedClairvoyant, policy, l
                 hit = (bw & cm) != 0
                 pos_b, neg_b = bw[hit], bw[~hit]
                 p_pos = float(hit.mean()) if len(bw) else 0.0
-                vh_pos = pc.vhat(env, ("d", i), pos_b, collected, vl) if len(pos_b) else 0.0
-                vh_neg = pc.vhat(env, ("d", i), neg_b, collected, vl) if len(neg_b) else 0.0
+                vh_pos = vhat(env, ("d", i), pos_b, collected, vl) if len(pos_b) else 0.0
+                vh_neg = vhat(env, ("d", i), neg_b, collected, vl) if len(neg_b) else 0.0
                 exp_rv = p_pos * vh_pos + (1.0 - p_pos) * vh_neg
                 pos = bool(world & cm)
                 nbw = pos_b if pos else neg_b
-                vh_real = pc.vhat(env, ("d", i), nbw, collected, vl) if len(nbw) else 0.0
+                vh_real = vhat(env, ("d", i), nbw, collected, vl) if len(nbw) else 0.0
                 z_t = vh_real - exp_rv
                 loc, bw = ("d", i), nbw
             zsum += z_t

@@ -14,7 +14,17 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from chocofarm.solvers import decomp as D
+
+if TYPE_CHECKING:
+    from chocofarm.model.env import Collected, Environment, Loc, WorldSet
+    from chocofarm.solvers.decomp import Cluster, MacroPlanner, MicroSolution
+
+    # The per-λ cache payload `_build` returns: the macro planner, the sense clusters,
+    # and the δ-singleton treasure ids.
+    _Built = tuple[MacroPlanner, list[Cluster], list[int]]
 
 
 class DecompVhat:
@@ -32,11 +42,11 @@ class DecompVhat:
     state-value estimate. It is accurate but sub-optimal, so the resulting bound is
     tight-ish, not exact (dual-bound.md §6)."""
 
-    def __init__(self, horizon=1):
+    def __init__(self, horizon: int = 1) -> None:
         self.horizon = horizon
-        self._built = {}   # round(lam,6) -> (macro, sense, delta_ids)
+        self._built: dict[float, "_Built"] = {}   # round(lam,6) -> (macro, sense, delta_ids)
 
-    def _build(self, env, lam):
+    def _build(self, env: "Environment", lam: float) -> "_Built":
         key = round(lam, 6)
         if key in self._built:
             return self._built[key]
@@ -44,9 +54,9 @@ class DecompVhat:
         sense = [c for c in clusters if c.size > 1]
         anchors = {c.name: min(c.tres, key=lambda t: env.d(("w", env.entry), ("t", t)))
                    for c in sense}
-        micro = {}
+        micro: dict[tuple[str, int], "MicroSolution"] = {}
         for c in sense:
-            entry = ("t", anchors[c.name])
+            entry: "Loc" = ("t", anchors[c.name])
             for k in range(1, c.size + 1):
                 micro[(c.name, k)] = D.build_cluster_micro(env, c, k, lam, entry)
         macro = D.MacroPlanner(env, clusters, micro, lam, horizon=self.horizon)
@@ -55,7 +65,8 @@ class DecompVhat:
         self._built[key] = built
         return built
 
-    def __call__(self, env, loc, bw, collected, lam):
+    def __call__(self, env: "Environment", loc: "Loc", bw: "WorldSet",
+                 collected: "Collected", lam: float) -> float:
         if len(bw) == 0:
             return -lam * env.exit_cost(loc)
         macro, sense, delta_ids = self._build(env, lam)
@@ -63,7 +74,7 @@ class DecompVhat:
         # visited: clusters already fully collected (all members collected) count as
         # visited so the macro does not re-enter them; conservative — an unvisited but
         # partly-collected cluster is left enterable (the macro re-values it).
-        visited = set()
+        visited: set[int] = set()
         for ci, c in enumerate(sense):
             if all(t in collected for t in c.tres):
                 visited.add(ci)

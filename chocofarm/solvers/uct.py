@@ -66,7 +66,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value, UCB_C, GreedyStopBase
-from chocofarm.model.env import TERMINATE
+from chocofarm.model.env import (
+    Action, Collected, Environment, Loc, MoveAction, TERMINATE, WorldSet, is_terminate,
+)
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,7 @@ class UCTConfig:
     c: float = UCB_C
     horizon: int = 24
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "iterations", int(self.iterations))
         object.__setattr__(self, "c", float(self.c))
         object.__setattr__(self, "horizon", int(self.horizon))
@@ -91,11 +93,11 @@ class _Decision:
     statistics over the actions legal here, and a chance-node child per action taken."""
     __slots__ = ("reward", "visits", "n", "chance")
 
-    def __init__(self):
-        self.reward = {}     # action -> summed differential return backed up through it
-        self.visits = {}     # action -> times this action was selected here          (N(a))
+    def __init__(self) -> None:
+        self.reward: dict[Action, float] = {}   # action -> summed differential return backed up through it
+        self.visits: dict[Action, int] = {}     # action -> times this action was selected here  (N(a))
         self.n = 0           # total selections from this node                         (N(node))
-        self.chance = {}     # action -> _Chance node reached by taking that action
+        self.chance: dict[Action, _Chance] = {}  # action -> _Chance node reached by taking that action
 
 
 class _Chance:
@@ -104,10 +106,10 @@ class _Chance:
     belief filtered to that outcome). Keeps its own visit/return mean for backup."""
     __slots__ = ("reward", "visits", "outcomes")
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.reward = 0.0    # summed (step + continuation) return through this chance node
         self.visits = 0      # times this chance node was traversed
-        self.outcomes = {}   # outcome-key (bool) -> _Decision child for that observation
+        self.outcomes: dict[bool, _Decision] = {}   # outcome-key (bool) -> _Decision child
 
 
 class UCTPolicy(Policy):
@@ -128,7 +130,9 @@ class UCTPolicy(Policy):
         Hard cap on tree depth per simulation; the rollout base also self-caps inside `_base_value`.
     """
 
-    def __init__(self, iterations=300, c=UCB_C, rollout="greedy_stop", horizon=24, *, cfg=None):
+    def __init__(self, iterations: int = 300, c: float = UCB_C,
+                 rollout: "str | Policy" = "greedy_stop", horizon: int = 24,
+                 *, cfg: "UCTConfig | None" = None) -> None:
         # cfg=UCTConfig(...) supplies (iterations, c, horizon) in one frozen object; the individual
         # kwargs remain the back-compat path and build the config when no cfg is passed (ADR-0004).
         # `rollout` (a str/Policy, not a scalar) is always a separate __init__ param. The config is
@@ -148,7 +152,12 @@ class UCTPolicy(Policy):
             raise ValueError(f"unknown rollout base {rollout!r}")
 
     # ---- public Policy API -------------------------------------------------------------
-    def decide(self, env, loc, bw, collected, lam, rng):
+    def decide(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+               lam: float, rng: np.random.Generator | None = None) -> Action:
+        # ADR-0002 fail-loud: UCT is stochastic (it samples worlds / expands at random), so
+        # it requires a real Generator — matches the env↔Policy seam's Optional-rng contract
+        # (base.py: the stochastic policies assert it) rather than a deep None-deref.
+        assert rng is not None, "UCTPolicy.decide requires a Generator (it samples worlds)"
         if len(bw) == 0:
             return TERMINATE
         root = _Decision()
@@ -159,7 +168,9 @@ class UCTPolicy(Policy):
         return max(root.visits, key=lambda a: root.visits[a])      # robust child (most-visited)
 
     # ---- one simulation: select -> expand -> rollout -> backup -------------------------
-    def _simulate(self, env, node, loc, bw, collected, lam, rng, depth):
+    def _simulate(self, env: Environment, node: _Decision, loc: Loc, bw: WorldSet,
+                  collected: Collected, lam: float, rng: np.random.Generator,
+                  depth: int) -> float:
         """Recursive descent for one simulation. Returns the λ-penalised differential return from
         `node` onward, which the caller backs up into the chance node it descended through."""
         if depth >= self.horizon:
@@ -181,11 +192,13 @@ class UCTPolicy(Policy):
         self._backup_decision(node, a, ret)
         return ret
 
-    def _expand(self, env, node, loc, bw, collected, a, lam, rng):
+    def _expand(self, env: Environment, node: _Decision, loc: Loc, bw: WorldSet,
+                collected: Collected, a: Action, lam: float,
+                rng: np.random.Generator) -> float:
         """First visit to action `a` from this node: create its chance node, sample one outcome,
         register the resulting child belief, and rollout the base policy from it for the leaf
         estimate. Returns the differential return (step + rollout-to-go)."""
-        if a == TERMINATE:
+        if is_terminate(a):
             return -lam * env.exit_cost(loc)                       # stop now: only the exit toll
         chance = _Chance()
         node.chance[a] = chance
@@ -200,11 +213,13 @@ class UCTPolicy(Policy):
         self._backup_chance(chance, ret)
         return ret
 
-    def _descend(self, env, node, loc, bw, collected, a, lam, rng, depth):
+    def _descend(self, env: Environment, node: _Decision, loc: Loc, bw: WorldSet,
+                 collected: Collected, a: Action, lam: float, rng: np.random.Generator,
+                 depth: int) -> float:
         """A previously-tried action selected by UCB1: realise it through its chance node, sample
         one observation outcome weighted by the current belief, and recurse into (or expand) the
         decision child for that outcome."""
-        if a == TERMINATE:
+        if is_terminate(a):
             return -lam * env.exit_cost(loc)
         chance = node.chance[a]
         world = env.sample_world(bw, rng)                          # belief-weighted outcome draw
@@ -223,11 +238,12 @@ class UCTPolicy(Policy):
         return ret
 
     # ---- bandit + outcome keying -------------------------------------------------------
-    def _ucb_select(self, node, actions):
+    def _ucb_select(self, node: _Decision, actions: list[Action]) -> Action:
         """UCB1: argmax_a Q̄(a) + c·sqrt(ln N(node) / N(a)). All `actions` are tried here (the
         expansion phase guarantees it), so every one has N(a) ≥ 1."""
         logN = math.log(node.n) if node.n > 0 else 0.0
-        best_a, best_v = None, -math.inf
+        best_a: Action | None = None
+        best_v = -math.inf
         c = self.c
         for a in actions:
             n_a = node.visits[a]
@@ -236,10 +252,13 @@ class UCTPolicy(Policy):
             v = exploit + explore
             if v > best_v:
                 best_v, best_a = v, a
+        # `actions` is always non-empty here (it includes TERMINATE), so a best is found;
+        # ADR-0002 fail-loud rather than returning an Optional the caller cannot use.
+        assert best_a is not None
         return best_a
 
     @staticmethod
-    def _outcome_key(a, world, env):
+    def _outcome_key(a: MoveAction, world: int, env: Environment) -> bool:
         """The binary observation outcome of action `a` in `world`: treasure present/absent, or
         detector positive/negative. This is the chance-node branch the traversal descends into."""
         kind, i = a
@@ -249,12 +268,12 @@ class UCTPolicy(Policy):
 
     # ---- backup ------------------------------------------------------------------------
     @staticmethod
-    def _backup_decision(node, a, ret):
+    def _backup_decision(node: _Decision, a: Action, ret: float) -> None:
         node.visits[a] = node.visits.get(a, 0) + 1
         node.reward[a] = node.reward.get(a, 0.0) + ret
         node.n += 1
 
     @staticmethod
-    def _backup_chance(chance, ret):
+    def _backup_chance(chance: _Chance, ret: float) -> None:
         chance.visits += 1
         chance.reward += ret

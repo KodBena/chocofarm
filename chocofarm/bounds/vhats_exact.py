@@ -13,7 +13,12 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+if TYPE_CHECKING:
+    from chocofarm.model.env import Collected, Environment, Loc, WorldSet
 
 
 class ExactBeliefVhat:
@@ -31,14 +36,17 @@ class ExactBeliefVhat:
     decomp / analytic V̂ are merely weaker approximations, not a failure of the
     construction)."""
 
-    def __init__(self):
-        self._memo = {}     # (lam, loc, belief, collected) -> V*
+    def __init__(self) -> None:
+        # (lam, loc, belief, collected) -> V*
+        self._memo: dict[tuple[float, "Loc", tuple[int, ...], frozenset[int]], float] = {}
 
-    def __call__(self, env, loc, bw, collected, lam):
+    def __call__(self, env: "Environment", loc: "Loc", bw: "WorldSet",
+                 collected: "Collected", lam: float) -> float:
         return self._solve(env, lam, loc,
                            tuple(int(x) for x in bw), frozenset(collected))
 
-    def _solve(self, env, lam, loc, bw_key, collected):
+    def _solve(self, env: "Environment", lam: float, loc: "Loc",
+               bw_key: tuple[int, ...], collected: frozenset[int]) -> float:
         key = (round(lam, 9), loc, bw_key, collected)
         if key in self._memo:
             return self._memo[key]
