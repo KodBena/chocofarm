@@ -62,10 +62,28 @@ root action (the robust-child rule, matching ISMCTS's final selection, so the tw
 same statistic). TERMINATE is an ordinary decision-node action valued at the bare `−λ·exit_cost`.
 """
 import math
+from dataclasses import dataclass
 import numpy as np
 
 from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value, UCB_C, GreedyStopBase
 from chocofarm.model.env import TERMINATE
+
+
+@dataclass(frozen=True)
+class UCTConfig:
+    """Frozen scalar hyperparameters for `UCTPolicy` (audit item I). The `rollout` base
+    selector (a str/Policy, not a scalar) stays a separate __init__ param. Defaults match
+    `UCTPolicy.__init__` so a config built from the defaults is behaviour-identical. The config
+    is the single coercion home: `__post_init__` applies the same `int()`/`float()` the old
+    `__init__` did, so a config-built and a kwargs-built policy hold identical typed fields."""
+    iterations: int = 300
+    c: float = UCB_C
+    horizon: int = 24
+
+    def __post_init__(self):
+        object.__setattr__(self, "iterations", int(self.iterations))
+        object.__setattr__(self, "c", float(self.c))
+        object.__setattr__(self, "horizon", int(self.horizon))
 
 
 class _Decision:
@@ -110,10 +128,16 @@ class UCTPolicy(Policy):
         Hard cap on tree depth per simulation; the rollout base also self-caps inside `_base_value`.
     """
 
-    def __init__(self, iterations=300, c=UCB_C, rollout="greedy_stop", horizon=24):
-        self.iterations = int(iterations)
-        self.c = float(c)
-        self.horizon = int(horizon)
+    def __init__(self, iterations=300, c=UCB_C, rollout="greedy_stop", horizon=24, *, cfg=None):
+        # cfg=UCTConfig(...) supplies (iterations, c, horizon) in one frozen object; the individual
+        # kwargs remain the back-compat path and build the config when no cfg is passed (ADR-0004).
+        # `rollout` (a str/Policy, not a scalar) is always a separate __init__ param. The config is
+        # the single typed home (its __post_init__ does the int()/float()); the scalars decide()
+        # reads are projected straight off it, so config-built and kwargs-built policies are equal.
+        self.cfg = cfg if cfg is not None else UCTConfig(iterations, c, horizon)
+        self.iterations = self.cfg.iterations
+        self.c = self.cfg.c
+        self.horizon = self.cfg.horizon
         if isinstance(rollout, Policy):
             self.base = rollout
         elif rollout == "greedy":

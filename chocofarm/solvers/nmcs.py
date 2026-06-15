@@ -40,10 +40,25 @@ belief is exactly where the value-of-information is captured. Memory stays flat 
 search only ever holds one path and a handful of sampled worlds; it never enumerates or
 caches the belief space (per the project's bounded-safety rule).
 """
+from dataclasses import dataclass
+
 import numpy as np
 
 from chocofarm.model.env import TERMINATE
 from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value, candidate_actions
+
+
+@dataclass(frozen=True)
+class NMCSConfig:
+    """Frozen scalar hyperparameters for `NMCSPolicy` (audit item I). The level-0 `base`
+    (a Policy, not a scalar) stays a separate __init__ param. Defaults match
+    `NMCSPolicy.__init__` so a config built from the defaults is behaviour-identical."""
+    level: int = 1
+    playout_samples: int = 3
+    step_samples: int = 2
+    cand_det: int = 4
+    cand_tre: int = 4
+    max_steps: int = 24
 
 
 class NMCSPolicy(Policy):
@@ -76,14 +91,22 @@ class NMCSPolicy(Policy):
     """
 
     def __init__(self, level=1, base=None, playout_samples=3, step_samples=2,
-                 cand_det=4, cand_tre=4, max_steps=24):
-        self.level = level
+                 cand_det=4, cand_tre=4, max_steps=24, *, cfg=None):
+        # cfg=NMCSConfig(...) supplies the scalar knobs in one frozen object; the individual
+        # kwargs remain the back-compat path and build the config when no cfg is passed (ADR-0004).
+        # `base` (the level-0 Policy, not a scalar) is always a separate __init__ param. The config
+        # is the single home; the scalars decide() reads are projected straight off it. NB: the old
+        # __init__ stored these knobs AS-PASSED (no int() coercion), so the config does NOT coerce —
+        # behaviour-preserving means matching that, not adding a cast.
+        self.cfg = cfg if cfg is not None else NMCSConfig(
+            level, playout_samples, step_samples, cand_det, cand_tre, max_steps)
         self.base = base if base is not None else GreedyPolicy()
-        self.ps = playout_samples
-        self.ss = step_samples
-        self.cand_det = cand_det
-        self.cand_tre = cand_tre
-        self.max_steps = max_steps
+        self.level = self.cfg.level
+        self.ps = self.cfg.playout_samples
+        self.ss = self.cfg.step_samples
+        self.cand_det = self.cfg.cand_det
+        self.cand_tre = self.cfg.cand_tre
+        self.max_steps = self.cfg.max_steps
 
     # ---- candidate generation (bounded branching) -------------------------------------
     def _candidates(self, env, loc, bw, collected):

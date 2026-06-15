@@ -9,11 +9,48 @@ env.py changes. The env is passed in, so a policy may freely query dynamics/beli
 (legal_actions, marginals, apply, filter_*, sample_world, d, exit_cost, route_time).
 """
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import numpy as np
 from chocofarm.model.env import TERMINATE
 
 # The UCB1 exploration constant, held fixed across UCT/ISMCTS/NetValueISMCTS for a fair comparison — one home.
 UCB_C = 0.7
+
+
+# ---------------------------------------------------------------------------
+# Per-solver SearchConfig dataclasses (audit item I / R10's deferred slice).
+#
+# Each classical solver freezes its hyperparameters as scalar `self.X` in
+# `__init__`, so a sweep reconstructs one policy per budget. The audit
+# (§3.5, appendix C) prescribes "a SearchConfig dataclass PER SOLVER FAMILY":
+# the knobs genuinely differ between families (UCT has c/horizon, NMCS has
+# level/sample-budgets/candidate-widths, Rollout has n_samples/near_*), so a
+# single shared dataclass would be a union of disjoint fields, not a real SSOT.
+# We therefore give each family its own frozen dataclass grouping exactly that
+# family's current scalar __init__ knobs. The NON-scalar knobs (the rollout /
+# base Policy *object*) stay as ordinary __init__ params — a frozen scalar
+# config is the wrong home for a live Policy instance, and the audit's scope is
+# the scalar hyperparameter set.
+#
+# Each solver's __init__ accepts EITHER `cfg=<Config>` OR the current individual
+# kwargs (back-compat: `UCTPolicy(iterations=200)` still works — the kwargs build
+# the config). Defaults are unchanged, so behaviour is preserved.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RolloutConfig:
+    """Frozen scalar hyperparameters for `RolloutPolicy` (the base Policy is passed separately)."""
+    n_samples: int = 10
+    near_det: int = 3
+    near_tre: int = 3
+
+
+@dataclass(frozen=True)
+class SparseSamplingConfig:
+    """Frozen scalar hyperparameters for `SparseSamplingPolicy` (the leaf Policy is passed separately)."""
+    depth: int = 2
+    width: int = 3
 
 
 class Policy(ABC):
@@ -92,8 +129,12 @@ class RolloutPolicy(Policy):
     """One-step policy improvement over a base policy: for each candidate action, sample
     worlds from the current belief, apply the action, play the base to the end, average the
     λ-value, take the argmax. Candidates pruned to the nearest few detectors/treasures + exit."""
-    def __init__(self, base, n_samples=10, near_det=3, near_tre=3):
-        self.base, self.S, self.nd, self.nt = base, n_samples, near_det, near_tre
+    def __init__(self, base, n_samples=10, near_det=3, near_tre=3, *, cfg=None):
+        # cfg=RolloutConfig(...) supplies the scalar knobs in one frozen object; the individual
+        # kwargs remain the back-compat path and build the config when no cfg is passed (ADR-0004).
+        self.cfg = cfg if cfg is not None else RolloutConfig(n_samples, near_det, near_tre)
+        self.base = base
+        self.S, self.nd, self.nt = self.cfg.n_samples, self.cfg.near_det, self.cfg.near_tre
 
     def decide(self, env, loc, bw, collected, lam, rng):
         # nearest-few detectors/treasures via the shared pruner; Rollout handles exit through its
@@ -117,8 +158,18 @@ class SparseSamplingPolicy(Policy):
     """Sparse-sampling expectimax (Kearns–Mansour–Ng): the dumb convergent anchor. Full legal
     action set, sample `width` worlds per node, recurse to `depth`, base-policy rollout at the
     leaf. More width/depth → provably nearer optimal."""
-    def __init__(self, depth, width, leaf):
-        self.depth, self.width, self.leaf = depth, width, leaf
+    def __init__(self, depth=None, width=None, leaf=None, *, cfg=None):
+        # cfg=SparseSamplingConfig(...) supplies (depth, width); the positional/kwarg form
+        # SparseSamplingPolicy(depth, width, leaf) remains the back-compat path (ADR-0004). The
+        # leaf base Policy is always passed separately (not a frozen-config scalar).
+        if cfg is not None:
+            self.cfg = cfg
+        else:
+            if depth is None or width is None:
+                raise ValueError("SparseSamplingPolicy needs (depth, width) or cfg=SparseSamplingConfig(...)")
+            self.cfg = SparseSamplingConfig(depth, width)
+        self.depth, self.width = self.cfg.depth, self.cfg.width
+        self.leaf = leaf
 
     def decide(self, env, loc, bw, collected, lam, rng):
         best_q, best_a = -lam * env.exit_cost(loc), TERMINATE

@@ -37,9 +37,27 @@ ordinary edge whose value is the bare −λ·exit_cost continuation, so the sear
 early-exit option that the clairvoyant ceiling shows is where most of the +70% lives.
 """
 import math
+from dataclasses import dataclass
 import numpy as np
 from chocofarm.solvers.base import Policy, _base_value, UCB_C, GreedyStopBase
 from chocofarm.model.env import TERMINATE
+
+
+@dataclass(frozen=True)
+class ISMCTSConfig:
+    """Frozen scalar hyperparameters for `ISMCTSPolicy` (audit item I). The simulation `base`
+    (a Policy, not a scalar) stays a separate __init__ param. Defaults match
+    `ISMCTSPolicy.__init__` so a config built from the defaults is behaviour-identical. The config
+    is the single coercion home: `__post_init__` applies the same `int()`/`float()` the old
+    `__init__` did, so a config-built and a kwargs-built policy hold identical typed fields."""
+    iterations: int = 300
+    c: float = UCB_C
+    max_depth: int = 24
+
+    def __post_init__(self):
+        object.__setattr__(self, "iterations", int(self.iterations))
+        object.__setattr__(self, "c", float(self.c))
+        object.__setattr__(self, "max_depth", int(self.max_depth))
 
 
 def _belief_key(bw):
@@ -79,11 +97,17 @@ class ISMCTSPolicy(Policy):
     default (pass a `policies.GreedyPolicy()` to use the plainer greedy) — cheap, and the search
     supplies the contingent depth the base lacks."""
 
-    def __init__(self, iterations=300, c=UCB_C, base=None, max_depth=24):
-        self.iterations = int(iterations)
-        self.c = float(c)
+    def __init__(self, iterations=300, c=UCB_C, base=None, max_depth=24, *, cfg=None):
+        # cfg=ISMCTSConfig(...) supplies (iterations, c, max_depth) in one frozen object; the
+        # individual kwargs remain the back-compat path and build the config when no cfg is passed
+        # (ADR-0004). `base` (a Policy, not a scalar) is always a separate __init__ param. The config
+        # is the single typed home (its __post_init__ does the int()/float()); the scalars decide()
+        # reads are projected straight off it, so config-built and kwargs-built policies are equal.
+        self.cfg = cfg if cfg is not None else ISMCTSConfig(iterations, c, max_depth)
+        self.iterations = self.cfg.iterations
+        self.c = self.cfg.c
         self.base = base if base is not None else GreedyStopBase()
-        self.max_depth = int(max_depth)
+        self.max_depth = self.cfg.max_depth
 
     # ---- public API ----
     def decide(self, env, loc, bw, collected, lam, rng):
