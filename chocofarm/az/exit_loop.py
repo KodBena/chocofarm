@@ -53,7 +53,7 @@ def r2_score(y_true, y_pred):
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
-def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_steps=40,
+def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_steps=None,
                      lam_blend=1.0, n_step=None):
     """One self-play episode driven by the Gumbel search. Records, per decision,
     (features, improved-pi, legal-mask, value-target). The value target is the Part B blended
@@ -66,6 +66,8 @@ def generate_episode(env, search, fb, world, lam, rng, n_explore_plies, max_step
 
     `lam_blend` / `n_step`: the Part B value-target knobs (mutually exclusive; n_step takes
     precedence if set). λ_blend=1 / n=∞ → pure MC (prior behavior). See value_target.py."""
+    if max_steps is None:
+        max_steps = env.max_steps              # the single episode-horizon home (env.py)
     loc, bw, collected = ("w", env.entry), env.worlds, set()
     feats, pis, masks, step_rt, boots = [], [], [], [], []
     for ply in range(max_steps):

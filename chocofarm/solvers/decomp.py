@@ -79,6 +79,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 
 from chocofarm.model.env import Environment, TERMINATE
+from chocofarm.solvers.base import Policy
 
 
 # ===========================================================================
@@ -502,7 +503,7 @@ class MacroPlanner:
 # POLICY — wrap micro + macro behind the env's Policy interface
 # ===========================================================================
 
-class DecompPolicy:
+class DecompPolicy(Policy):
     """Exact hierarchical-decomposition policy, behind the env's Policy interface
     (policies.Policy.decide(env, loc, bw, collected, lam, rng)).
 

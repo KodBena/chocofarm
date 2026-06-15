@@ -27,6 +27,12 @@ class Environment:
         self.value = list(value) if value is not None else [1.0] * self.N
         self.entry, self.tp = entry, float(teleport_overhead)
 
+        # The single episode-horizon home: a named safety-net cap on episode/rollout length
+        # (episodes normally terminate on TERMINATE well before it). Every episode loop that
+        # ran a bare `40` (simulate, _base_value, info-relaxation, generate_episode) references
+        # this one attribute so the horizon has exactly one source of truth.
+        self.max_steps = 40
+
         # detectors: arrangement faces (consult-002 §4 / facemodel.ENV_ADOPTION). A sense action
         # is "stand at face F's representative point and read the disjunction over F's cover" —
         # cover and position are consistent BY CONSTRUCTION (the face is the single carrier of
@@ -128,7 +134,9 @@ class Environment:
         return 0.0, (kind, i), self.filter_detector(bw, i, pos), collected, dt
 
     # ---- simulation / evaluation (solver-agnostic) ----
-    def simulate(self, policy, world, lam, rng, max_steps=40):
+    def simulate(self, policy, world, lam, rng, max_steps=None):
+        if max_steps is None:
+            max_steps = self.max_steps         # the single episode-horizon home (see __init__)
         loc, bw, collected, R, T = ("w", self.entry), self.worlds, set(), 0.0, 0.0
         for _ in range(max_steps):
             a = policy.decide(self, loc, bw, collected, lam, rng)

@@ -45,7 +45,7 @@ continuation value — the chance-node analogue of UCB1's mean backup.
 Rollout. From a freshly expanded leaf we play a cheap default base policy to the end of the
 episode in a single sampled world and score the λ-penalised differential return
 `Σ (reward − λ·dt)` to the exit (`_base_value`, shared with the other solvers). Default base is
-`GreedyStopBase` (imported from `ismcts.py`) — the SAME base ISMCTS uses by default, chosen so
+`GreedyStopBase` (the shared rollout base in `base.py`) — the SAME base ISMCTS uses by default, chosen so
 the rollout estimator is held FIXED across the two solvers and any rate difference is attributable
 to the tree, not the leaf heuristic. (`GreedyPolicy` is available as a weaker alternative; pass it
 to study sensitivity.)
@@ -64,8 +64,7 @@ same statistic). TERMINATE is an ordinary decision-node action valued at the bar
 import math
 import numpy as np
 
-from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value
-from chocofarm.solvers.ismcts import GreedyStopBase
+from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value, UCB_C, GreedyStopBase
 from chocofarm.model.env import TERMINATE
 
 
@@ -111,7 +110,7 @@ class UCTPolicy(Policy):
         Hard cap on tree depth per simulation; the rollout base also self-caps inside `_base_value`.
     """
 
-    def __init__(self, iterations=300, c=0.7, rollout="greedy_stop", horizon=24):
+    def __init__(self, iterations=300, c=UCB_C, rollout="greedy_stop", horizon=24):
         self.iterations = int(iterations)
         self.c = float(c)
         self.horizon = int(horizon)

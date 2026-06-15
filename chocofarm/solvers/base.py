@@ -12,6 +12,9 @@ from abc import ABC, abstractmethod
 import numpy as np
 from chocofarm.model.env import TERMINATE
 
+# The UCB1 exploration constant, held fixed across UCT/ISMCTS/NetValueISMCTS for a fair comparison — one home.
+UCB_C = 0.7
+
 
 class Policy(ABC):
     @abstractmethod
@@ -31,6 +34,34 @@ class GreedyPolicy(Policy):
             s = marg[i] * env.value[i] - lam * env.d(loc, ("t", i))
             if s > best:
                 best, act = s, ("t", i)
+        return act
+
+
+class GreedyStopBase(Policy):
+    """Default ISMCTS/UCT playout policy: a λ-rational greedy that stops cleanly.
+
+    Plain `GreedyPolicy` (the obvious base) over-collects under a renewal-reward penalty — it
+    keeps a treasure as long as `marg·value − λ·travel > 0`, ignoring that reaching it also
+    *relocates the exit*, so it sweeps low-marginal treasures across the map and the playout
+    return understates the rate (the over-collection signature in docs/results). This base nets
+    the exit relocation into the step value: move to the best treasure only when
+
+        marg·value − λ·(go_there + exit(there) − exit(here)) > 0,
+
+    else TERMINATE. That single correction turns the playout into a tighter renewal cycle, so
+    leaf estimates reward banking a reachable basket and exiting — the behaviour the clairvoyant
+    ceiling rewards — rather than an exhaustive sweep."""
+    def decide(self, env, loc, bw, collected, lam, rng=None):
+        marg = env.marginals(bw)
+        cur_exit = env.exit_cost(loc)
+        best, act = 0.0, TERMINATE
+        for i in range(env.N):
+            if i in collected or marg[i] <= 0:
+                continue
+            go = env.d(loc, ("t", i))
+            net = marg[i] * env.value[i] - lam * (go + env.exit_cost(("t", i)) - cur_exit)
+            if net > best:
+                best, act = net, ("t", i)
         return act
 
 
@@ -65,13 +96,9 @@ class RolloutPolicy(Policy):
         self.base, self.S, self.nd, self.nt = base, n_samples, near_det, near_tre
 
     def decide(self, env, loc, bw, collected, lam, rng):
-        marg = env.marginals(bw)
-        dets = sorted([i for i in env.detectors
-                       if np.any((bw & env.cover_mask[i]) != 0) and np.any((bw & env.cover_mask[i]) == 0)],
-                      key=lambda i: env.d(loc, ("d", i)))[:self.nd]
-        tres = sorted([i for i in range(env.N) if i not in collected and marg[i] > 0],
-                      key=lambda i: env.d(loc, ("t", i)))[:self.nt]
-        cands = [("d", i) for i in dets] + [("t", i) for i in tres]
+        # nearest-few detectors/treasures via the shared pruner; Rollout handles exit through its
+        # `best_q = -lam*exit_cost(loc)` init, so it does NOT include TERMINATE in the candidate set.
+        cands = candidate_actions(env, loc, bw, collected, self.nd, self.nt)
         sample = rng.choice(bw, size=min(self.S, len(bw)), replace=len(bw) < self.S)
         best_q, best_a = -lam * env.exit_cost(loc), TERMINATE
         for a in cands:
@@ -118,11 +145,26 @@ class SparseSamplingPolicy(Policy):
         return tot / len(sample)
 
 
+def candidate_actions(env, loc, bw, collected, n_det, n_tre, include_terminate=False):
+    """Nearest-n_det informative detectors + nearest-n_tre uncollected-possible treasures
+    (by env.d from loc), optionally + TERMINATE. The shared bounded-branching pruner."""
+    marg = env.marginals(bw)
+    dets = sorted((i for i in env.detectors
+                   if np.any((bw & env.cover_mask[i]) != 0) and np.any((bw & env.cover_mask[i]) == 0)),
+                  key=lambda i: env.d(loc, ("d", i)))[:n_det]
+    tres = sorted((i for i in range(env.N) if i not in collected and marg[i] > 0),
+                  key=lambda i: env.d(loc, ("t", i)))[:n_tre]
+    cands = [("d", i) for i in dets] + [("t", i) for i in tres]
+    if include_terminate:
+        cands.append(TERMINATE)
+    return cands
+
+
 def _base_value(env, base, loc, bw, collected, world, lam):
     """Play a (deterministic) base policy to the end in a fixed world; return its λ-value."""
     R = T = 0.0
     collected = set(collected)
-    for _ in range(40):
+    for _ in range(env.max_steps):              # the single episode-horizon home (env.py)
         a = base.decide(env, loc, bw, collected, lam, None)
         if a == TERMINATE:
             break

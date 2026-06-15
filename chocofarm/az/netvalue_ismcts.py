@@ -25,6 +25,7 @@ Loads weights from an npz (the trained value net). Pin any eval to core 3 under 
 from __future__ import annotations
 
 from chocofarm.solvers.ismcts import ISMCTSPolicy, _Node, _belief_key
+from chocofarm.solvers.base import UCB_C
 from chocofarm.model.env import TERMINATE
 from chocofarm.az.features import FeatureBuilder
 from chocofarm.az.mlp import ValueMLP
@@ -38,7 +39,7 @@ class NetValueISMCTS(ISMCTSPolicy):
     `env` is needed at construction to build the FeatureBuilder (feature dims are env-derived).
     """
 
-    def __init__(self, env, weights_path, iterations=200, c=0.7, max_depth=24):
+    def __init__(self, env, weights_path, iterations=200, c=UCB_C, max_depth=24):
         # base= is irrelevant (the playout leaf is never used), but ISMCTSPolicy builds a
         # default GreedyStopBase; harmless and keeps the parent contract intact.
         super().__init__(iterations=iterations, c=c, base=None, max_depth=max_depth)
@@ -47,12 +48,12 @@ class NetValueISMCTS(ISMCTSPolicy):
 
     def _leaf_value(self, env, loc, bw, collected, lam):
         """The F4 cure: learned λ-penalized return-to-go from this (post-action) belief,
-        replacing the determinized base playout. One cached marginals call per leaf (F7)."""
+        replacing the determinized base playout. The fused kernel inside `fb.build` derives the
+        marginals in one pass, so no separate marginals call is made here (F7)."""
         if len(bw) == 0:
             # empty belief: no continuation value beyond the exit toll (mirrors the base case).
             return -lam * env.exit_cost(loc)
-        marg = env.marginals(bw)
-        feat = self.fb.build(loc, bw, collected, marg=marg)
+        feat = self.fb.build(loc, bw, collected)
         return self.net.predict_value(feat)
 
     def _expand_and_simulate(self, env, node, loc, bw, collected, a, world, lam, rng, depth):

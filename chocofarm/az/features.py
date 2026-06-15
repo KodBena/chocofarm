@@ -75,9 +75,9 @@ class FeatureBuilder:
     instance has only a fixed set of coordinate keys — so they are precomputed once per loc and
     served by lookup; the normalizer, teleport keys, and detector cover masks are fixed too).
 
-    `build(loc, bw, collected, marg=None)` — pass a pre-computed `marg = env.marginals(bw)` to
-    reuse the single per-node marginals call (the F7 amortization); otherwise it is computed
-    here. Returns a float64 vector of length `feature_dim(env)`.
+    `build(loc, bw, collected)` — the marginals are derived internally by the fused numba kernel
+    (a single pass over `bw` that also yields the detector counts), so no caller-supplied `marg`
+    is needed. Returns a float64 vector of length `feature_dim(env)`.
 
     Two perf caches, both behavior-preserving (structural — same values, computed fewer times):
 
@@ -141,7 +141,7 @@ class FeatureBuilder:
         return block
 
     # ---- belief-derived intermediates (cached by belief, verified on collision) ----
-    def _belief_feats(self, bw, marg):
+    def _belief_feats(self, bw):
         """Returns (marg, p_pos, informative, marg_sum, sharpness, nb) — all functions of `bw`
         alone. Cached by `_belief_key`; a hit is verified with `np.array_equal` so a key
         collision never returns another belief's features."""
@@ -164,7 +164,7 @@ class FeatureBuilder:
             informative = ((cnt > 0) & (cnt < nb)).astype(np.float64)
             sharpness = math.log(nb) / self.log_nworlds
         else:
-            # empty belief: marginals are zero regardless of any passed-in value
+            # empty belief: marginals are zero
             marg = np.zeros(self.N)
             p_pos = np.zeros(self.nD)
             informative = np.zeros(self.nD)
@@ -180,15 +180,14 @@ class FeatureBuilder:
         self._belief_cache_n += 1
         return feats
 
-    def build(self, loc, bw, collected, marg=None) -> np.ndarray:
-        """Build the §2.2 feature vector at `(loc, bw, collected)`. `marg` is accepted for
-        backward compatibility but is now ADVISORY: the fused numba kernel computes the marginals
-        AND the detector counts in one pass (kernels.belief_marg_cover), so a supplied `marg` is
-        not consumed — the kernel's marg is bit-identical to `env.marginals(bw)` (verified). The
-        kernel is faster than the old separate marginals call, so recomputing is a net win even
-        when a caller already has `marg` (netvalue_ismcts / dataset). Returns a `DTYPE` vector."""
+    def build(self, loc, bw, collected) -> np.ndarray:
+        """Build the §2.2 feature vector at `(loc, bw, collected)`. The fused numba kernel computes
+        the marginals AND the detector counts in one pass (kernels.belief_marg_cover), so the
+        builder always derives its own marginals here — the kernel's marg is bit-identical to
+        `env.marginals(bw)` (verified) and faster than a separate marginals call, so there is no
+        caller-supplied `marg` to consume. Returns a `DTYPE` vector."""
         N, nD = self.N, self.nD
-        marg_in, p_pos, informative, marg_sum, sharpness, nb = self._belief_feats(bw, marg)
+        marg_in, p_pos, informative, marg_sum, sharpness, nb = self._belief_feats(bw)
         marg = marg_in
         dist_t, dist_d, dist_w, exit_norm = self._loc_block(loc)
 
