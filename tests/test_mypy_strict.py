@@ -115,6 +115,21 @@ STRICT_CLEAN = [
     "chocofarm/az/features.py",         # imports az/kernels (numba, config-ignored), not a held-out
     "chocofarm/az/transport.py",        # ValueMLP only under TYPE_CHECKING / lazy
     "chocofarm/az/worker_pool.py",      # az/worker imported only lazily inside __init__
+    # --- Shape B batched ZeroMQ inference service (#27 / docs/design/zmq-inference-service.md) ---
+    # The four new modules. They run the SSOT forward (forward_core) but do NOT drag the held-out
+    # jax/numba boundary into the gate: the server's only held-out-adjacent import is the JAX-FREE
+    # `forward` module (forward_core), and it calls the forward THROUGH the typed `ForwardFn` Callable
+    # (so there is no `no-untyped-call` into the kernel seam the way mlp.py has) — the JAX/zmq backends
+    # are imported lazily inside function bodies. net_port imports ValueMLP only under TYPE_CHECKING. So
+    # each is genuinely strict-clean WITHOUT pulling a deferred module into the enforced set.
+    "chocofarm/az/inference_wire.py",   # pure codec (struct + numpy); no jax/zmq at all
+    "chocofarm/az/net_port.py",         # the Net Protocol + local adapter; ValueMLP under TYPE_CHECKING
+    "chocofarm/az/inference_server.py", # forward_core via typed ForwardFn; jax/zmq lazy in bodies
+    "chocofarm/az/zmq_net_client.py",   # the remote Net impl; zmq lazy in bodies
+    # NOTE on zmq typing: pyzmq (27.1) SHIPS py.typed + .pyi stubs, so it is NOT a stub-gap — there is
+    # NO `zmq.*` ignore_missing_imports override (one would be a dishonest convenience-relaxation P8
+    # forbids, and warn_unused_ignores would flag it). The modules annotate against the real stubs
+    # (`zmq.Context[zmq.Socket[bytes]]`, `zmq.Socket[bytes]`) and pass --strict cleanly.
     # eval/ — the classical (non-AZ) eval wave; eval_az.py is OUT (hard-loads mlp via NetValueISMCTS)
     "chocofarm/eval/harness.py",        # owns dink_float, the dinkelbach_rate field-narrowing SSOT
     "chocofarm/eval/report.py",

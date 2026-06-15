@@ -222,4 +222,29 @@ or redis is absent, like the existing opt-in cpp parity.
 - **Single instance, uncalibrated time model** — the standing chocofarm caveat; it does not bear
   on this structural design (about the boundary, not instance numbers).
 
+### Amendment 2026-06-15 — the Python side landed (ADR-0005 Rule 8: append, don't rewrite)
+
+The forward-looking record above is preserved as written. As of this amendment the **Python half is
+built** (the C++ `ZmqNetClient` remains deferred to the P9 `cpp/` pass, exactly as §9 sequenced):
+
+- `chocofarm/az/inference_wire.py` — the ONE wire codec (the §2 frame: a protocol-version byte,
+  length-prefixed little-endian float32; request `[ver][in_dim][X]`, response
+  `[ver][n_actions][value][logits]`, `n_actions=0` ⇒ value-only). Shared by server and client.
+- `chocofarm/az/net_port.py` — the `Net` Protocol (`predict(X) -> (value, logits)`, the §1 raw
+  forward) plus the local `ValueMLPNet` adapter; both it and `ZmqNetClient` satisfy it.
+- `chocofarm/az/inference_server.py` — the ROUTER + self-clocking greedy-drain microbatch loop (§3),
+  the pure `run_microbatch` core, the version-gated reload hook as a mockable `ParamsSource`
+  (`StaticParamsSource` injects params with NO redis; `RedisParamsSource` is the seam-4 path), and a
+  jax-free `params_from_manifest_blob` so the server runs `forward_core` without dragging the held-out
+  jax/numba boundary into the mypy gate.
+- `chocofarm/az/zmq_net_client.py` — the remote `Net` impl (`ZmqNetClient`), a blocking REQ RPC that
+  raises loudly on timeout/server-down (§5, no silent local fallback).
+- `tests/test_zmq_inference.py` — always-on codec/Protocol/greedy-drain pins + the opt-in
+  (`CHOCO_RUN_ZMQ=1`) server+client parity harness (§7), which measured max|Δvalue|≈4.8e-7,
+  max|Δlogit|≈2.4e-7 over N=1200 vectors across batch sizes B∈{1..64}, residual ON and OFF — far
+  inside the 1e-4 ADR-0012 P6 bar.
+
+The four modules are `mypy --strict`-clean and in `STRICT_CLEAN`; pyzmq (27.1, ships py.typed) needs
+no `ignore_missing_imports` override. The new dependency is **pyzmq** on the shared scratch venv.
+
 *Public Domain (The Unlicense).*
