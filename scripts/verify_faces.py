@@ -8,16 +8,35 @@ frozen instance, and validates the chocobo_faces.ggb round-trip. Bounded, read
 only against the WKT; no solver runs. Run under `timeout`.
 """
 import collections
+import itertools
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-import json
 from shapely import wkt
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 from chocofarm.model import arrangement as A
 
+
 GGB = "chocobo_faces.ggb"
+
+
+def old_cover_mask(regions):
+    """Reconstruct the OLD (superseded) `cover_mask[i] = {i} ∪ overlap-neighbours`
+    DIRECTLY from the geometry, not from any stored array.
+
+    The old model defined two regions as overlap-neighbours iff their detection
+    polygons share positive area (`chocobo_geometry.py` computed this as the
+    pairwise area-intersection — the same `area > 0` test it persisted as the now
+    retired `overlaps` fossil).  Re-deriving it here from `regions_wkt` keeps [4]
+    a genuine cross-check: an INDEPENDENT pairwise-area-overlap construction versus
+    the arrangement-face per-region union — the two encodings consult-002 says must
+    coincide on the real map — both sourced from the live geometry, neither frozen."""
+    nbr = {i: {i} for i in regions}
+    for i, j in itertools.combinations(sorted(regions), 2):
+        if regions[i].intersection(regions[j]).area > 0:   # the old area-overlap test
+            nbr[i].add(j); nbr[j].add(i)
+    return nbr
 
 
 def model_checks(regions, faces):
@@ -25,11 +44,9 @@ def model_checks(regions, faces):
     print("FACE MODEL — self-check vs consult-002")
     print("=" * 68)
 
-    # old (buggy) cover_mask: {i} ∪ overlap-neighbours
-    data = json.load(open(A.INSTANCE))
-    nbr = {i: {i} for i in regions}
-    for a, b in data["overlaps"]:
-        nbr[int(a)].add(int(b)); nbr[int(b)].add(int(a))
+    # old (buggy) cover_mask {i} ∪ overlap-neighbours — re-derived from the geometry
+    # (regions_wkt), NOT read from the retired `overlaps` fossil.
+    nbr = old_cover_mask(regions)
 
     print(f"\n[1] total faces = {len(faces)}   (consult-002 ~44)")
 
