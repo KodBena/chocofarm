@@ -17,9 +17,9 @@ reachable beliefs are in the hundreds), so the inner solve is provably complete.
 """
 from __future__ import annotations
 
-import itertools
-
 import numpy as np
+
+from chocofarm.model.instance import world_array
 
 
 class MiniEnv:
@@ -48,10 +48,7 @@ class MiniEnv:
         self.teleports = env.teleports
         self.coord = env.coord
         # worlds: K_local-of-keep present-sets, as bitmasks over ORIGINAL bit positions
-        self.worlds = np.array(
-            [sum(1 << t for t in combo)
-             for combo in itertools.combinations(self.keep, self.K)],
-            dtype=np.int64)
+        self.worlds = world_array(self.N, self.K, support=self.keep)
         # detectors: faces whose cover is non-empty and ⊆ keep
         keepset = set(self.keep)
         self.detectors = []

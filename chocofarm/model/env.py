@@ -9,26 +9,21 @@ point). It knows nothing about HOW a decision is made — that is a `Policy` (se
 chocofarm/solvers/base.py), passed in. New solution methods (NMCS, ISMCTS, …) are new
 Policy subclasses; this file does not change.
 """
-import json
-import os
 import math
-import itertools
 import numpy as np
 
 from chocofarm.model import arrangement as A
+from chocofarm.model.instance import load_instance, world_array
 
 TERMINATE = ("term", None)
 
 
 class Environment:
     def __init__(self, instance_path=None, value=None, teleport_overhead=12.0, entry="CSNE"):
-        if instance_path is None:
-            instance_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "..", "data", "instance.json")
-        data = json.load(open(instance_path))
-        self.treasures = {int(i): tuple(xy) for i, xy in data["treasures"].items()}
-        self.teleports = {k: tuple(v) for k, v in data["teleports"].items()}
-        self.N, self.K = len(self.treasures), 5
+        inst = load_instance(instance_path)
+        self.treasures = inst.treasures
+        self.teleports = inst.teleports
+        self.N, self.K = inst.N, inst.K
         self.value = list(value) if value is not None else [1.0] * self.N
         self.entry, self.tp = entry, float(teleport_overhead)
 
@@ -53,9 +48,7 @@ class Environment:
         for k, xy in self.teleports.items():
             self.coord[("w", k)] = xy
 
-        self.worlds = np.array(
-            [sum(1 << t for t in c) for c in itertools.combinations(range(self.N), self.K)],
-            dtype=np.int64)
+        self.worlds = world_array(self.N, self.K)
 
         # Precomputed inter-node distance table (perf). The coordinate set is STATIC for an
         # instance, so `d(a, b)` is a static function of the two coord keys; recomputing

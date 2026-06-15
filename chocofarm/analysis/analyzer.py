@@ -50,6 +50,8 @@ from math import comb
 import numpy as np
 
 from chocofarm.model import arrangement as A
+from chocofarm.model.instance import load_instance
+from chocofarm.model.instance import world_array as _world_array
 
 
 # ===========================================================================
@@ -84,15 +86,13 @@ class Instance:
         return set(self.ids) - self.covered
 
 
-def real_instance(faces_path: str = A.FACES, instance_path: str = A.INSTANCE,
-                  N: int = 20, K: int = 5) -> Instance:
-    """The frozen real chocofarm map, as an abstract Instance."""
-    import json
-    data = json.load(open(instance_path))
-    treasures = {int(i): tuple(xy) for i, xy in data["treasures"].items()}
-    teleports = {k: tuple(v) for k, v in data["teleports"].items()}
+def real_instance(faces_path: str = A.FACES, instance_path: str = A.INSTANCE) -> Instance:
+    """The frozen real chocofarm map, as an abstract Instance.  Treasures,
+    teleports, and K come from the single `load_instance` parse; N is derived as
+    `len(treasures)` — no hardcoded `N=20`/`K=5` defaults (R1 SSOT)."""
+    inst = load_instance(instance_path)
     faces = A.load(faces_path)
-    return Instance(treasures, faces, teleports, N, K)
+    return Instance(inst.treasures, faces, inst.teleports, inst.N, inst.K)
 
 
 # ===========================================================================
@@ -101,10 +101,9 @@ def real_instance(faces_path: str = A.FACES, instance_path: str = A.INSTANCE,
 
 def world_array(inst: Instance) -> np.ndarray:
     """[DET-IND] The C(N,K) equiprobable worlds as a bitmask array (bit t = τ_t
-    present).  Detector-independent: it is the prior, ports verbatim."""
-    return np.array(
-        [sum(1 << t for t in c) for c in itertools.combinations(range(inst.N), inst.K)],
-        dtype=np.int64)
+    present).  Detector-independent: it is the prior.  Delegates to the single
+    model-package `world_array(N, K)` (R2 SSOT)."""
+    return _world_array(inst.N, inst.K)
 
 
 def bitmask(cover) -> int:
