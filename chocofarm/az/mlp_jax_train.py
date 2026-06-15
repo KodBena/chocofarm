@@ -28,6 +28,8 @@ br2] Wv bv Wp bp) so weights are interchangeable with the numpy net — jax trai
 them. The forward mirrors `ValueMLP._forward` EXACTLY: trunk in→H→ReLU→H→ReLU, the no-outer-ReLU
 pre-activation residual block `head_in = a2 + (ReLU(a2@Wr1+br1)@Wr2+br2)`, a linear scalar value
 head over the STANDARDIZED target, and a policy head of n_actions logits.
+
+Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
@@ -42,11 +44,11 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 import numpy as np
 import jax
 import jax.numpy as jnp
-import optax
 
 from chocofarm.az.dtypes import DTYPE
 from chocofarm.az.forward import forward_core
 from chocofarm.az.mlp import is_weight
+from chocofarm.az.optimizer import AdamHParams, Optimizer
 
 # The equivalence safeguard is a FLOAT32 contract (the inference precision the search runs at and
 # the precision the equivalence test pins). Train in float32 so the weights numpy inference reads
@@ -140,70 +142,64 @@ def _value_loss(params, X, y_std_target, l2):
     return loss, vmse
 
 
-def _make_az_update(opt):
-    """Build the jit'd AZ optax step closing over the optax transformation `opt` (a
-    GradientTransformation, tuple-of-functions — not a jax type, so it MUST be a closure). The L2
-    coefficient is NO LONGER closed over (audit R13): `l2` is a traced call-arg of `value_and_grad`,
-    alongside the already-traced `alpha`/`beta`, so a live `l2` change lands without a re-trace.
-    jit'ing the whole value_and_grad + optax step is the point: XLA fuses the forward, the backward,
-    and the Adam update into one compiled kernel. The weights are trained under THIS jit'd forward —
-    which is why the equivalence test pins numpy against the jit'd (not eager) forward.
-
-    `opt` is `optax.inject_hyperparams(optax.adam)(...)` (audit R13), so the learning rate lives in
-    `opt_state.hyperparams['learning_rate']` as a traced value rather than baked into the transform;
-    a live `lr` change is applied by setting that entry before `opt.update` (see `JaxTrainer`)."""
-    @jax.jit
-    def _az_update(params, opt_state, X, target_pi, legal_mask, y_std_target, alpha, beta, l2):
-        (loss, (ce, vmse)), grads = jax.value_and_grad(_az_loss, has_aux=True)(
-            params, X, target_pi, legal_mask, y_std_target, alpha, beta, l2)
-        updates, opt_state = opt.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, ce, vmse
-    return _az_update
-
-
-def _make_value_update(opt):
-    """The value-only counterpart to `_make_az_update` (no policy head). `l2` is a traced call-arg
-    here too (audit R13), not a closure constant — the value gate's `l2` is live for free."""
-    @jax.jit
-    def _value_update(params, opt_state, X, y_std_target, l2):
-        (loss, vmse), grads = jax.value_and_grad(_value_loss, has_aux=True)(
-            params, X, y_std_target, l2)
-        updates, opt_state = opt.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, vmse
-    return _value_update
+# The two loss GRAD functions the Trainer hands to `Optimizer.make_update` (audit item M). Each is
+# the loss's `value_and_grad` in the `(value, grads)`-with-`has_aux` shape the Optimizer's jit'd
+# step expects (`value == (loss, aux)`). The Optimizer fuses the grad fn + the injected-hparam write
+# + the optax update into ONE jit kernel (XLA fuses forward, backward, Adam step — the equivalence-
+# test contract: the weights are trained under THIS jit'd forward, which is why the test pins numpy
+# against the jit'd, not eager, forward). `l2` is a traced loss arg here (joining `alpha`/`beta`),
+# NOT a closure constant — so a live `l2` change lands without a re-trace (audit R13). The optimizer
+# coefficients (lr/b1/b2/eps) are the Optimizer's injected state, supplied per step as the required
+# `AdamHParams` argument — nothing optimizer-side is closed over here (the Trainer⊥Optimizer split).
+_az_grad = jax.value_and_grad(_az_loss, has_aux=True)
+_value_grad = jax.value_and_grad(_value_loss, has_aux=True)
 
 
 # ---------------------------------------------------------------------------
-# Trainer — wraps a ValueMLP; optax-Adam over the jit'd forward; syncs jax→numpy
+# Trainer — wraps a ValueMLP; owns the loss + data marshalling + write-back; DELEGATES the optax
+# update to an Optimizer (audit item M — the Optimizer⊥Trainer split, design §2.2)
 # ---------------------------------------------------------------------------
 class JaxTrainer:
-    """JAX/optax trainer bound to a `ValueMLP`. The net's params are the single source of truth:
-    this trainer reads them into a jax pytree at construction, runs optax-Adam steps over the jit'd
-    forward, and writes the updated weights BACK into the net after every step (so numpy inference
-    reads the trained weights).
+    """JAX/optax trainer bound to a `ValueMLP` — the slimmed Trainer half of the Optimizer⊥Trainer
+    split (audit item M, training-optimization-refactor.md §2.2). The net's params are the single
+    source of truth: this trainer reads them into a jax pytree at construction, marshals the batch /
+    re-pins the y-standardization / computes the AZ loss gradient, DELEGATES the parameter update to
+    an `Optimizer` (which owns the optax transform + the moment state + the injected lr/betas/eps),
+    and writes the updated weights BACK into the net after every step (so numpy inference reads the
+    trained weights).
 
-    Adam configuration matches the manual optimizer it replaces: betas (0.9, 0.999), eps 1e-8,
-    COUPLED L2 on weight matrices only (the `0.5·l2·‖W‖²` penalty folded into the loss, so its
-    gradient flows through Adam's preconditioner — exactly the numpy path's `g + l2·W`, NOT optax's
-    decoupled `add_decayed_weights` which would also decay biases).
+    What the Trainer owns: the loss (incl. `l2`, correctly a LOSS coefficient — a traced
+    `value_and_grad` arg, design D3); the jax marshalling; the y-standardization read (live off the
+    net per step, design L4); the epoch/batch iteration (in the loop); the write-back. What it does
+    NOT own: the optax transform, the moment state, or lr/betas/eps — those are the `Optimizer`'s
+    (`self.optimizer`), supplied per step as a REQUIRED `AdamHParams` argument of its jit'd update.
+    The single-writer of the effective optimizer coefficients is therefore that update call's
+    argument, construction-enforced at the Optimizer seam (design §2.1): omitting it is an arity
+    error, and no step path reads the injected `opt_state.hyperparams` dict without first setting it
+    from the argument. There is no captured `self.lr` field that drifts (R13's `self.lr`/`self.opt`
+    capture is gone).
 
-    `lr` and `l2` are LIVE (HOT) per-step inputs (audit R13 — the frozen-config headline). `lr` is
-    injected via `optax.inject_hyperparams`, so it lives in `opt_state.hyperparams['learning_rate']`
-    as a traced value rather than baked into the transform; a `lr` supplied to `train_step` is set
-    into that entry before the update, so the learning rate can change PER STEP without rebuilding
-    the trainer — Adam's running moments persist (the loop still builds the trainer ONCE). `l2` is a
-    traced loss coefficient (joins `alpha`/`beta` as a `value_and_grad` arg). `train_step(..., lr=
-    None, l2=None)` with `None` uses the construction-time `self.lr`/`self.l2` (back-compat); a value
-    makes it live. The optimizer state lives across steps — Adam's running moments need to persist,
-    exactly as the numpy `self.m/self.v/self.t` did, and a live `lr` anneal accumulates moments under
-    the changing rate (the intended schedule behavior, NOT a moment reset — see §8 of the design).
+    Both PRODUCTION step call sites pass an explicit `AdamHParams`: the loop's `train_epochs` builds
+    it LIVE off the per-iteration registry snapshot (`adam_hparams_from`), and the Stage-1 value gate
+    (`train_value.py`) builds one off its CLI `--lr` (fixed for the run) — so the live-value guarantee
+    quantifies over both call sites (design §5.2 I1 scope note / §7 Step-4), not just the loop.
 
-    Scope (audit R13): this is the minimal "lr/l2 become HOT" slice. The full Optimizer⊥Trainer
-    object split (a separate `Optimizer` owning the optax transform + moments, the `Trainer` owning
-    loss/data/write-back — design note §2.1/§2.2) is the larger deferred follow-up; here `JaxTrainer`
-    keeps both hats but reads lr/l2 live.
+    Ergonomic construction default: `lr`/`betas`/`eps` passed to `__init__` build the Trainer's
+    `self._default_hp`, used ONLY by `train_step(..., hp=None)` (the back-compat path the unit tests
+    take). This is NOT an Optimizer-side baked copy — the Optimizer has no default, and the production
+    callers always pass an explicit `hp`. Naming it honestly: a `hp=None` call steps on this
+    construction-time default, so the "required argument" property is structural at the Optimizer seam
+    and on every explicit-`hp` call (the two production sites + the live-capability tests); the
+    `hp=None` ergonomic path is the one place a construction-time value is read, and it is read only
+    where the caller deliberately declined to vary it. `l2` is the loss's traced default the same way
+    (`self._l2`).
+
+    `lr`/`betas`/`eps`/`l2` are LIVE (HOT): `lr`/`betas`/`eps` ride the injected optax state (set per
+    step from `hp` inside the Optimizer's jit'd update — Adam's moments persist across a live change,
+    the loop builds the trainer ONCE); `l2` is a traced loss coefficient. `train_step(..., hp=None,
+    l2=None)` uses the construction-time defaults (back-compat); an explicit `hp`/`l2` makes the step
+    use those. So an LR anneal / beta retune / L2 retune is a per-step argument with NO trainer
+    rebuild (design §4.1 — the artifact-RESTART set becomes HOT).
 
     Cache-coherence invariant (preserved): writing weights back REBINDS the net's arrays
     (`net.W1 = np.asarray(...)`), so the float32 inference cache's identity check (`c["_W1"] is
@@ -212,37 +208,19 @@ class JaxTrainer:
 
     def __init__(self, net, lr, l2=0.0, betas=(0.9, 0.999), eps=1e-8):
         self.net = net
-        self.lr = float(lr)
-        self.l2 = float(l2)
         self.has_policy = net.n_actions is not None
         b1, b2 = betas
-        # optax Adam with decoupled L2 in the loss (NOT optax weight_decay, which decays ALL params
-        # incl. biases — the numpy path decays weight matrices only, so we keep L2 in the loss and
-        # leave optax as plain Adam). This makes the gradient exactly the numpy path's `g + l2*W`.
-        #
-        # `inject_hyperparams` (audit R13) wraps the transform so `learning_rate` lives in
-        # `opt_state.hyperparams` as a traced value instead of being closed over once. The lr is then
-        # changeable PER STEP (set into the state before the update) without rebuilding the trainer,
-        # so Adam's moments persist across a live lr anneal. With a CONSTANT lr each step this is
-        # numerically the same Adam update as the old `optax.adam(learning_rate=lr)` (injected-state
-        # Adam with constant hparams == closed-over Adam, to float32 roundoff).
-        self.opt = optax.inject_hyperparams(optax.adam)(
-            learning_rate=self.lr, b1=b1, b2=b2, eps=eps)
+        # the Trainer's construction-time DEFAULT optimizer hparams + loss l2 (convenience for the
+        # direct-construct callers; NOT an Optimizer-side baked copy — the Optimizer has no default).
+        self._default_hp = AdamHParams(lr=float(lr), b1=float(b1), b2=float(b2), eps=float(eps))
+        self._l2 = float(l2)
         self.params = self._read_params()
-        self.opt_state = self.opt.init(self.params)
-        # jit'd update steps closing over this instance's optax transformation. L2 is NO LONGER
-        # closed over (it is a traced loss arg per step — audit R13); lr lives in opt_state.
-        self._az_update = _make_az_update(self.opt)
-        self._value_update = _make_value_update(self.opt)
-
-    def _set_lr(self, lr):
-        """Set the injected learning rate in `opt_state.hyperparams` (audit R13). The ONE place a
-        live lr enters the optax state — Adam's moment state (also in `opt_state`) is untouched, so
-        the rate changes while the moments persist. `inject_hyperparams` keeps `learning_rate` as a
-        jax array in the hyperparams dict; assigning a python/np float keeps it traceable."""
-        hps = dict(self.opt_state.hyperparams)
-        hps["learning_rate"] = jnp.asarray(lr, dtype=hps["learning_rate"].dtype)
-        self.opt_state = self.opt_state._replace(hyperparams=hps)
+        # DELEGATE the update: the Optimizer owns the optax transform + moments, typed to these params
+        # (design §2.1 I4). The Trainer hands it the loss grad fns; the Optimizer fuses each into one
+        # jit kernel whose required AdamHParams arg is the single writer of lr/b1/b2/eps.
+        self.optimizer = Optimizer(self.params)
+        self._az_update = self.optimizer.make_update(_az_grad)
+        self._value_update = self.optimizer.make_update(_value_grad)
 
     def _read_params(self):
         """Read the net's numpy weights into a jax pytree (float32 = the training/inference
@@ -264,52 +242,63 @@ class JaxTrainer:
 
     def sync_from_net(self):
         """Re-read the net's weights into the jax params (e.g. after a load/warm-start replaced
-        them outside the trainer). Resets the optimizer state — the moments no longer correspond to
-        the new weights, exactly as `_init_adam()` reset them in the numpy path on load."""
+        them outside the trainer) and RESET the optimizer — the moments no longer correspond to the
+        new weights, exactly as `_init_adam()` reset them in the numpy path on load. `reset` is now
+        a method ON the Optimizer (the Trainer re-reads, then asks the Optimizer to reset its own
+        state — unconfused ownership, design S4)."""
         self.params = self._read_params()
-        self.opt_state = self.opt.init(self.params)
+        self.optimizer.reset(self.params)
+
+    def _hp_arrays(self, hp: AdamHParams) -> AdamHParams:
+        """Cast an `AdamHParams` of python floats to traced jax scalars (the dtype the optax state
+        carries). Returned as an `AdamHParams` so the Optimizer's `_with_hparams` sees the same
+        named fields — the construction-enforced single-writer reads them by name."""
+        return AdamHParams(lr=jnp.asarray(hp.lr, _JDTYPE), b1=jnp.asarray(hp.b1, _JDTYPE),
+                           b2=jnp.asarray(hp.b2, _JDTYPE), eps=jnp.asarray(hp.eps, _JDTYPE))
 
     def train_step(self, X, target_pi, legal_mask, target_v, *, alpha=1.0, beta=1.0,
-                   lr=None, l2=None):
-        """One Adam step on the AZ loss. X: (B, in_dim); target_pi: (B, n_actions) prob rows;
-        legal_mask: (B, n_actions) {0,1}; target_v: (B,) RAW value targets (standardized here with
-        the net's y_mean/y_std, matching the numpy path). Returns (ce, vmse) floats for logging,
-        and writes the updated weights back into the net.
+                   hp: AdamHParams = None, l2=None):
+        """One Adam step on the AZ loss, DELEGATED to the Optimizer. X: (B, in_dim); target_pi:
+        (B, n_actions) prob rows; legal_mask: (B, n_actions) {0,1}; target_v: (B,) RAW value targets
+        (standardized here with the net's y_mean/y_std, matching the numpy path). Returns (ce, vmse)
+        floats for logging, and writes the updated weights back into the net.
 
-        `lr`/`l2` are LIVE (audit R13): `None` uses the construction-time `self.lr`/`self.l2`
-        (back-compat); a value makes this step use that lr/l2 — `lr` is set into the injected
-        `opt_state.hyperparams` before the update (Adam's moments persist), `l2` is passed as a
-        traced loss coefficient. So an LR anneal is `train_step(..., lr=new)` with NO trainer
-        rebuild."""
+        `hp`/`l2` are LIVE (audit item M): `None` uses the construction-time `self._default_hp`/
+        `self._l2` (back-compat for the direct-construct callers); an explicit `AdamHParams hp` makes
+        this step use those lr/betas/eps, and an explicit `l2` that L2 — `hp` is the REQUIRED argument
+        of the Optimizer's jit'd update (written into the injected optax state inside that call, the
+        single-writer), `l2` is a traced loss coefficient. So an LR anneal / beta retune is
+        `train_step(..., hp=AdamHParams(...))` with NO trainer rebuild; Adam's moments persist."""
         if not self.has_policy:
             raise ValueError("net has no policy head (n_actions=None) — use train_step_value")
-        if lr is not None:
-            self._set_lr(lr)
-        l2_eff = self.l2 if l2 is None else float(l2)
+        hp = self._default_hp if hp is None else hp
+        l2_eff = self._l2 if l2 is None else float(l2)
         ys = np.float32(self.net.y_std) if _JDTYPE == jnp.float32 else np.float64(self.net.y_std)
         ym = np.float32(self.net.y_mean) if _JDTYPE == jnp.float32 else np.float64(self.net.y_mean)
         X = jnp.asarray(X, dtype=_JDTYPE)
         target_pi = jnp.asarray(target_pi, dtype=_JDTYPE)
         legal_mask = jnp.asarray(legal_mask, dtype=_JDTYPE)
         y_std_target = (jnp.asarray(target_v, dtype=_JDTYPE) - ym) / ys
-        self.params, self.opt_state, ce, vmse = self._az_update(
-            self.params, self.opt_state, X, target_pi, legal_mask, y_std_target,
+        self.params, self.optimizer.opt_state, (ce, vmse) = self._az_update(
+            self.params, self.optimizer.opt_state, self._hp_arrays(hp),
+            X, target_pi, legal_mask, y_std_target,
             jnp.asarray(alpha, _JDTYPE), jnp.asarray(beta, _JDTYPE),
             jnp.asarray(l2_eff, _JDTYPE))
         self._write_params()
         return float(ce), float(vmse)
 
-    def train_step_value(self, X, target_v, *, lr=None, l2=None):
-        """One Adam step on the value-only loss (for the no-policy Stage-1 net). Returns vmse.
-        `lr`/`l2` are LIVE (audit R13): `None` uses `self.lr`/`self.l2` (back-compat)."""
-        if lr is not None:
-            self._set_lr(lr)
-        l2_eff = self.l2 if l2 is None else float(l2)
+    def train_step_value(self, X, target_v, *, hp: AdamHParams = None, l2=None):
+        """One Adam step on the value-only loss (for the no-policy Stage-1 net), DELEGATED to the
+        Optimizer. Returns vmse. `hp`/`l2` are LIVE (audit item M): `None` uses the construction-time
+        `self._default_hp`/`self._l2` (back-compat)."""
+        hp = self._default_hp if hp is None else hp
+        l2_eff = self._l2 if l2 is None else float(l2)
         ys = np.float32(self.net.y_std) if _JDTYPE == jnp.float32 else np.float64(self.net.y_std)
         ym = np.float32(self.net.y_mean) if _JDTYPE == jnp.float32 else np.float64(self.net.y_mean)
         X = jnp.asarray(X, dtype=_JDTYPE)
         y_std_target = (jnp.asarray(target_v, dtype=_JDTYPE) - ym) / ys
-        self.params, self.opt_state, vmse = self._value_update(
-            self.params, self.opt_state, X, y_std_target, jnp.asarray(l2_eff, _JDTYPE))
+        self.params, self.optimizer.opt_state, vmse = self._value_update(
+            self.params, self.optimizer.opt_state, self._hp_arrays(hp),
+            X, y_std_target, jnp.asarray(l2_eff, _JDTYPE))
         self._write_params()
         return float(vmse)

@@ -205,17 +205,19 @@ def test_every_leaf_has_a_facet():
 
 
 def test_known_facet_split():
-    """Spot-check the design §4 facet reading: lr/l2 are HOT (audit R13 — live via
-    optax.inject_hyperparams / traced loss arg), alpha is HOT (traced call-arg), betas/eps stay
-    RESTART (R13 defers them), the env constants are INSTANCE."""
+    """Spot-check the design §4 facet reading: lr/l2/betas/eps are ALL HOT (audit item M — the
+    Optimizer owns the inject_hyperparams transform; lr/betas/eps are set per step from the live
+    AdamHParams, l2 is a traced loss arg), alpha is HOT (traced call-arg), the net shape / search
+    bracket / master seed stay RESTART, the env constants are INSTANCE."""
     facets = {}
     a = ExperimentConfig(experiment_id="f")
     for g, mut, fld, _av, _bv in reg._iter_facet_diffs(a, a):
         facets[f"{g}.{fld}"] = mut
-    assert facets["train.lr"] is Mut.HOT       # audit R13: injected via inject_hyperparams, live
+    assert facets["train.lr"] is Mut.HOT       # audit M: injected via inject_hyperparams, live
     assert facets["train.l2"] is Mut.HOT       # audit R13: traced loss coefficient, live per step
-    assert facets["train.beta1"] is Mut.RESTART  # betas/eps stay baked (R13 is the lr/l2 slice)
-    assert facets["train.eps"] is Mut.RESTART
+    assert facets["train.beta1"] is Mut.HOT    # audit M: live injected hparam, set per step
+    assert facets["train.beta2"] is Mut.HOT    # audit M: live injected hparam, set per step
+    assert facets["train.eps"] is Mut.HOT      # audit M: live injected hparam, set per step
     assert facets["train.alpha"] is Mut.HOT
     assert facets["train.beta"] is Mut.HOT
     assert facets["search.m"] is Mut.RESTART
@@ -396,19 +398,44 @@ def test_seed_registry_idempotent(isolated_id):
 # RESTART-refusal (design §3.4) — the heart of the mutability facet
 # ---------------------------------------------------------------------------
 def test_restart_refusal_fires_on_baked_field(isolated_id):
-    """A RESTART field (train.beta1 — Adam b1, baked into optax.adam at construction; R13 made lr/l2
-    HOT but defers betas/eps) changed mid-run vs the launched_with shadow fires the loud refusal."""
+    """A RESTART field (arch.hidden — the trunk width, baked into every weight-matrix shape at net
+    construction and the optimizer's moment pytree; audit item M made ALL optimizer coefficients
+    lr/l2/betas/eps HOT, so the baked-field example is now a genuine net-shape RESTART) changed
+    mid-run vs the launched_with shadow fires the loud refusal."""
     r = _redis_or_skip()
     try:
         launched = ExperimentConfig(experiment_id=isolated_id)
         reg.write_config(isolated_id, launched, r=r)
         snap = reg.ConfigSnapshot.launch(isolated_id, launched_with=launched, r=r)
-        # operator changes a baked Adam beta in the registry (a RESTART field)
-        reg.set_fields(isolated_id, {"train.beta1": "0.95"}, r=r)
+        # operator changes the net width in the registry (a RESTART field — sizes the weight matrices
+        # and the optimizer's moment pytree, so it cannot move on a running process)
+        reg.set_fields(isolated_id, {"arch.hidden": "512"}, r=r)
         with pytest.raises(reg.RestartRequired) as ei:
             snap.refresh(iteration=1, r=r)
-        assert "train.beta1" in str(ei.value)
+        assert "arch.hidden" in str(ei.value)
         assert "--resume" in str(ei.value)
+    finally:
+        r.close()
+
+
+def test_betas_eps_hot_change_applied_not_refused(isolated_id):
+    """Audit item M (the betas/eps follow-up): beta1/beta2/eps are now HOT — a mid-run change via the
+    registry snapshot is APPLIED at the next refresh, NOT refused (the counterpart to the old
+    test_restart_refusal that used train.beta1 when it was still RESTART). This is the registry-
+    integration half of GATE-3; the trainer-side live-beta scaling is verified in test_az_loop's
+    test_jax_train_live_lr_l2_betas_eps (d)."""
+    r = _redis_or_skip()
+    try:
+        launched = ExperimentConfig(experiment_id=isolated_id)
+        reg.write_config(isolated_id, launched, r=r)
+        snap = reg.ConfigSnapshot.launch(isolated_id, launched_with=launched, r=r)
+        # operator retunes the Adam betas + eps on the running experiment (all HOT post-item-M)
+        reg.set_fields(isolated_id, {"train.beta1": "0.95", "train.beta2": "0.9999",
+                                     "train.eps": "1e-7"}, r=r)
+        snap.refresh(iteration=1, r=r)   # must NOT raise — betas/eps are HOT
+        assert snap.cfg.train.beta1 == 0.95
+        assert snap.cfg.train.beta2 == 0.9999
+        assert snap.cfg.train.eps == 1e-7
     finally:
         r.close()
 

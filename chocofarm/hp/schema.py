@@ -152,22 +152,31 @@ class ArchConfig:
 
 @dataclass
 class TrainConfig:
-    """chocofarm/az/mlp_jax_train.py — the jit boundary (design C4). `lr`/`l2` are LIVE (HOT) as of
-    audit R13 (training-optimization-refactor.md §4.1, the frozen-config headline): `lr` is injected
-    via `optax.inject_hyperparams`, so it lives in `opt_state.hyperparams` as a traced value and is
-    set per step from the live snapshot (no rebuild — Adam's moments persist across a live anneal);
-    `l2` is a traced loss coefficient (joins `alpha`/`beta` as a `value_and_grad` arg). So a registry
-    lr-drop / L2-retune now lands LIVE on the running experiment, not as a `--resume` adoption.
-    `betas`/`eps` are STILL baked into `optax.adam` at construction (RESTART — R13 is the minimal
-    lr/l2 slice; the betas/eps live-injection + the full Optimizer⊥Trainer object split are the
-    deferred follow-up, design note §2.1). `alpha`/`beta` are traced call-args (HOT). `epochs`/
-    `batch` are loop bounds read at iter start (HOT)."""
+    """chocofarm/az/mlp_jax_train.py + az/optimizer.py — the jit boundary (design C4). ALL four
+    optimizer coefficients `lr`/`l2`/`betas`/`eps` are now LIVE (HOT) as of audit item M (training-
+    optimization-refactor.md §4.1, the frozen-config headline + its follow-up). The Trainer
+    DELEGATES the update to an `Optimizer` (the Optimizer⊥Trainer split, §2.1): `lr`/`beta1`/`beta2`/
+    `eps` are injected via `optax.inject_hyperparams`, so they live in `opt_state.hyperparams` as
+    traced values and are set per step from the snapshot's `AdamHParams` — the REQUIRED argument of
+    the Optimizer's jit'd update, written into the injected state inside that call, so the single-
+    writer is construction-enforced (omitting it is an arity error; no path reads the injected dict
+    un-set). Both step call sites supply it explicitly off their config — the loop's `train_epochs`
+    builds it live off the per-iteration snapshot, the Stage-1 value gate (`train_value.py`) builds
+    one off its CLI `--lr` — so the guarantee quantifies over both (§5.2 I1 / §7 Step-4). `l2` is a
+    traced loss coefficient (joins `alpha`/`beta` as a `value_and_grad`
+    arg — it is a LOSS input, owned by the Trainer, not optimizer state, design D3). So a registry
+    lr-drop / beta-retune / L2-retune now lands LIVE on the running experiment, not as a `--resume`
+    adoption — Adam's moments persist across the change (the loop builds the trainer ONCE; a live lr
+    anneal accumulates moments under the changing rate, the intended schedule behavior, design §8).
+    `alpha`/`beta` are traced call-args (HOT). `epochs`/`batch` are loop bounds read at iter start
+    (HOT). (R13 was the minimal lr/l2 slice; item M completes it — betas/eps were already physically
+    in `opt_state.hyperparams` via `inject_hyperparams` but lacked a live writer; they now have one.)"""
 
-    lr: float = hp(1e-3, Mut.HOT, "Adam lr — LIVE via optax.inject_hyperparams, set per step (audit R13)")
+    lr: float = hp(1e-3, Mut.HOT, "Adam lr — LIVE via Optimizer/optax.inject_hyperparams, set per step (audit M)")
     l2: float = hp(1e-4, Mut.HOT, "L2 — LIVE traced loss coefficient, read per step (audit R13)")
-    beta1: float = hp(0.9, Mut.RESTART, "Adam b1 — baked into optax.adam (R13 defers betas/eps)")
-    beta2: float = hp(0.999, Mut.RESTART, "Adam b2 — baked into optax.adam (R13 defers betas/eps)")
-    eps: float = hp(1e-8, Mut.RESTART, "Adam eps — baked into optax.adam (R13 defers betas/eps)")
+    beta1: float = hp(0.9, Mut.HOT, "Adam b1 — LIVE injected hparam, set per step from AdamHParams (audit M)")
+    beta2: float = hp(0.999, Mut.HOT, "Adam b2 — LIVE injected hparam, set per step from AdamHParams (audit M)")
+    eps: float = hp(1e-8, Mut.HOT, "Adam eps — LIVE injected hparam, set per step from AdamHParams (audit M)")
     alpha: float = hp(1.0, Mut.HOT, "policy CE weight — traced call-arg, read each step")
     beta: float = hp(1.0, Mut.HOT, "value MSE weight — traced call-arg, read each step")
     epochs: int = hp(2, Mut.HOT, "train epochs over the buffer per iter (loop bound)")
