@@ -34,7 +34,7 @@ from chocofarm.solvers.base import (
 from chocofarm.solvers.nmcs import NMCSPolicy
 from chocofarm.solvers.ismcts import ISMCTSPolicy
 from chocofarm.solvers.decomp import DecompPolicy
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.eval.harness import realizable_static, clairvoyant_rate, BeliefRefs
 
 
 def test_environment_shape():
@@ -89,10 +89,13 @@ def test_search_solvers_construct():
 
 
 def test_reference_lines_unmoved():
-    """The detector-independent floor / ceiling are unchanged by the restructure."""
+    """The detector-independent floor / ceiling are unchanged by the restructure, exercised
+    through the BeliefRefs SSOT (a recompute-sanity check, not a frozen-literal pin)."""
     env = Environment()
-    assert abs(realizable_static(env) - 0.0855) < 1e-3
-    assert abs(clairvoyant_rate(env) - 0.1454) < 1e-3
+    refs = BeliefRefs(env)
+    assert abs(refs.static_floor - 0.0855) < 1e-3
+    assert abs(refs.clairvoyant_ceiling - 0.1454) < 1e-3
+    assert abs(refs.decomp_anchor - 0.0941) < 1e-9
 
 
 if __name__ == "__main__":
