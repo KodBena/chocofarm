@@ -37,6 +37,33 @@ class Instance:
         return len(self.treasures)
 
 
+@dataclass(frozen=True)
+class Scenario:
+    """The Tier-2 mutable "what-if" knobs — the per-experiment levers that do NOT
+    enter the distance table, so they are cheap to vary by copy-on-write
+    (distinct from the Tier-1 geometry invariant: treasures/teleports/faces/`_dist`,
+    which are fixed for an instance).
+
+    A value/entry/teleport sweep over these is a `[env.with_scenario(s) for s in
+    scenarios]` comprehension that SHARES the expensive ~4.5k-entry distance table
+    by reference, not N full `Environment` rebuilds. This makes the
+    heterogeneous-value experiment first-class — the precedent it replaces is the
+    dead `attic/het_values_eval.py`, which monkeypatched `M.value` globally.
+
+    Fields (defaults match `Environment.__init__`'s):
+      value             per-treasure reward vector; None -> unit values ([1.0]*N).
+      entry             entry teleport name.
+      teleport_overhead the fixed exit/teleport surcharge (feeds only `exit_cost`).
+
+    `K` is NOT a Scenario field in this step: it comes from the instance data
+    (Tier-1), and a K-restriction is the separate R8 `Environment.restrict`. A
+    future step may fold a K knob in here.
+    """
+    value: list | None = None
+    entry: str = "CSNE"
+    teleport_overhead: float = 12.0
+
+
 def load_instance(path: str | None = None) -> Instance:
     """Resolve + parse the instance file into an `Instance`.
 
