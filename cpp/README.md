@@ -50,8 +50,9 @@ This builds `cpp/build/chocofarm-cpp-runner` (the runner) and
 
 ## Run
 
-Connection is the **same `CHOCO_REDIS_*` env contract** `chocofarm/config.py`
-owns (default `127.0.0.1:6379` db 0) — no hardcoded port. The runner reads
+Connection is the **same `CHOCO_TRANSPORT_REDIS_*` env contract**
+`chocofarm/config.transport_redis_params()` owns (default `127.0.0.1:6380` db 0,
+the ephemeral transport instance) — no hardcoded port. The runner reads
 weights for a `(run, phase, version)` (a published manifest+blob must exist),
 then runs `E` random episodes and writes the four result blocks.
 
@@ -134,8 +135,9 @@ redis is absent, so `pytest tests/ -q` stays green without the C++ build).
   encoder**: the four float32 blocks are exactly what `np.frombuffer().reshape()`
   decodes. Every dimension (`feat_dim`, `n_action_slots`, the world count) is
   **derived from the env**, never typed as a literal. "Which redis" defers to
-  `config.py`'s `CHOCO_REDIS_*` contract — this client only reads the same env
-  vars, it does not re-own the connection facts.
+  `config.py`'s `CHOCO_TRANSPORT_REDIS_*` contract (the transport role, default
+  6380 db0) — this client only reads the same env vars, it does not re-own the
+  connection facts.
 - **P2 — composable Policy seam.** `policy.hpp` defines the abstract `Policy`
   with the single `decide(env, loc, bw, collected, lam, rng)` method (mirroring
   Python's). The env owns all dynamics; the runner takes `const Policy&` and

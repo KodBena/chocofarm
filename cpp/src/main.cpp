@@ -1,7 +1,7 @@
 // cpp/src/main.cpp
 // Purpose: the chocofarm-cpp-runner entrypoint. Loads the instance geometry (instance.json +
 //   the DERIVED faces.json), builds the env + feature builder, connects to redis via the
-//   CHOCO_REDIS_* env contract, reads weights for (run, phase, version) — exercising the weight-
+//   CHOCO_TRANSPORT_REDIS_* env contract, reads weights for (run, phase, version) — exercising the weight-
 //   read seam (P7) — and runs E episodes of the INJECTED RandomPolicy (the env<->Policy seam, P2),
 //   writing the (X, PI, M, Y) result blocks. lam / m-as-episodes / max_steps arrive as LIVE CLI
 //   scalars (P4), never baked in. The Gumbel search and MLP forward are deferred (this is the
@@ -38,7 +38,7 @@ void usage(const char* prog) {
         "  --seed <uint>       per-episode RNG seed base (default 0)\n"
         "  --res-token <id>    result-key namespace token (required)\n"
         "  --parity-stats <p>  ALSO write per-episode aggregate stats (JSON lines) to <p>\n"
-        "Connection: CHOCO_REDIS_HOST/PORT/DB env (default 127.0.0.1:6379 db0).\n";
+        "Connection: CHOCO_TRANSPORT_REDIS_HOST/PORT/DB env (default 127.0.0.1:6380 db0).\n";
 }
 
 const char* opt(int argc, char** argv, const char* name) {
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
         chocofarm::Environment env(inst);
         chocofarm::FeatureBuilder fb(env);
         chocofarm::RandomPolicy policy;          // the trivial composable Policy (P2 drop-in)
-        chocofarm::RedisClient redis;            // CHOCO_REDIS_* contract (no hardcoded port)
+        chocofarm::RedisClient redis;            // CHOCO_TRANSPORT_REDIS_* contract (no hardcoded port)
         const char* stats_path = opt(argc, argv, "--parity-stats");
         std::ofstream stats_file;
         std::ostream* stats_out = nullptr;

@@ -111,7 +111,7 @@ def test_cpp_parity_harness():
     """Run the full ADR-0012 P6/P7 parity harness end-to-end. Skips (does not fail) when redis is
     down, so the default suite stays green without the worker-transport instance up."""
     if not _redis_up():
-        pytest.skip("redis not reachable on the CHOCO_REDIS_* contract")
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
     out = subprocess.run([sys.executable, PARITY], cwd=REPO,
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=600)

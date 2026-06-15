@@ -2,8 +2,8 @@
 // Purpose: the C++ redis wire client (hiredis) — the wire as the ONLY contract (ADR-0012 P7). See
 //   transport.hpp. It mirrors chocofarm/az/transport.py + config.py byte-for-byte: the key
 //   namespace, the manifest-driven float64 weight read (no hardcoded offsets — P1), the four
-//   float32 result blocks (no second encoder — P7), and the CHOCO_REDIS_* connection contract
-//   (default 127.0.0.1:6379 db0 — no hardcoded port; mirrors config.redis_params).
+//   float32 result blocks (no second encoder — P7), and the CHOCO_TRANSPORT_REDIS_* connection
+//   contract (default 127.0.0.1:6380 db0 — no hardcoded port; mirrors config.transport_redis_params).
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/transport.hpp"
@@ -19,7 +19,7 @@ namespace chocofarm {
 
 using nlohmann::json;
 
-// ---- env contract (mirrors config.redis_params / config._result_ttl) ----
+// ---- env contract (mirrors config.transport_redis_params / config._result_ttl) ----
 static std::string env_str(const char* name, const std::string& dflt) {
     const char* v = std::getenv(name);
     return v ? std::string(v) : dflt;
@@ -43,12 +43,13 @@ ResultKeys result_keys(const std::string& res_token, int idx) {
 
 // ---- connection ----
 RedisClient::RedisClient() {
-    // CHOCO_REDIS_HOST / CHOCO_REDIS_PORT / CHOCO_REDIS_DB — the SAME env contract as config.py
-    // (defaults 127.0.0.1 / 6379 / 0). No hardcoded port (ADR-0012 P7 / P1: config.py is the one
-    // owner of "which redis"; this just reads the same env vars so it lands on the same instance).
-    std::string host = env_str("CHOCO_REDIS_HOST", "127.0.0.1");
-    int port = env_int("CHOCO_REDIS_PORT", 6379);
-    int db = env_int("CHOCO_REDIS_DB", 0);
+    // CHOCO_TRANSPORT_REDIS_HOST / _PORT / _DB — the SAME env contract as config.transport_redis_params
+    // (defaults 127.0.0.1 / 6380 / 0). No hardcoded port (ADR-0012 P7 / P1: config.py is the one
+    // owner of "which redis"; this just reads the same transport-role env vars so it lands on the
+    // same ephemeral instance). The C++ runner is a transport component, so it uses the transport role.
+    std::string host = env_str("CHOCO_TRANSPORT_REDIS_HOST", "127.0.0.1");
+    int port = env_int("CHOCO_TRANSPORT_REDIS_PORT", 6380);
+    int db = env_int("CHOCO_TRANSPORT_REDIS_DB", 0);
 
     ctx_ = redisConnect(host.c_str(), port);
     if (ctx_ == nullptr || ctx_->err) {

@@ -3,9 +3,9 @@
 //   mirrors chocofarm/az/transport.py byte-for-byte: the SAME `az:w:<run>:<phase>:<version>:m|:b`
 //   weight keys and `az:res:<token>:<idx>:X|PI|M|Y` result keys, the SAME manifest-driven weight
 //   read (float64 blob, no hardcoded offsets — P1), and the SAME four float32 result blocks (no
-//   second encoder — P7). Connection facts come from the SAME `CHOCO_REDIS_*` env contract as
-//   chocofarm/config.py (default 127.0.0.1:6379 db0), so the C++ client lands wherever the operator
-//   points the Python transport. No hardcoded port.
+//   second encoder — P7). Connection facts come from the SAME `CHOCO_TRANSPORT_REDIS_*` env contract
+//   as chocofarm/config.transport_redis_params (default 127.0.0.1:6380 db0), so the C++ client lands
+//   wherever the operator points the Python transport. No hardcoded port.
 //
 // Public Domain (The Unlicense).
 #pragma once
@@ -50,10 +50,10 @@ std::pair<std::string, std::string> weight_keys(const std::string& run, const st
 struct ResultKeys { std::string X, PI, M, Y; };
 ResultKeys result_keys(const std::string& res_token, int idx);
 
-// ---- connection (the CHOCO_REDIS_* env contract; mirrors config.redis_params) ----
+// ---- connection (the CHOCO_TRANSPORT_REDIS_* env contract; mirrors config.transport_redis_params) ----
 class RedisClient {
   public:
-    RedisClient();   // reads CHOCO_REDIS_HOST/PORT/DB (defaults 127.0.0.1/6379/0), connects + PINGs
+    RedisClient();   // reads CHOCO_TRANSPORT_REDIS_HOST/PORT/DB (defaults 127.0.0.1/6380/0), connects + PINGs
     ~RedisClient();
     RedisClient(const RedisClient&) = delete;
     RedisClient& operator=(const RedisClient&) = delete;
