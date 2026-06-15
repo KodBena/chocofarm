@@ -59,6 +59,29 @@ class Policy(ABC):
         """Return an action ('t', i) / ('d', i) / TERMINATE."""
 
 
+class RandomPolicy(Policy):
+    """Uniform-random over the legal action set (collects + informative senses + TERMINATE).
+
+    The trivial composable Policy — the env↔Policy seam's simplest non-trivial instance, and the
+    parity baseline for the C++ runner's `RandomPolicy` (ADR-0012 P2/P7: a new capability is a new
+    `Policy` subclass with zero env edits; the C++ runner mirrors THIS behavioral contract behind
+    the wire, not its bytes). It uses ONLY the env's own dynamics primitives — `legal_actions`
+    (which already excludes uninformative senses and collected/absent treasures) plus the
+    always-legal TERMINATE slot — and draws one uniformly with the injected `rng`. λ does not enter
+    the choice (a dumb-random runner ignores the rate target); it is still threaded through the
+    seam unchanged (P4), so a value-aware policy is a drop-in replacement with no signature change.
+
+    Determinism note: the choice index is drawn with `rng.integers(len(acts) + 1)` over the legal
+    actions in `env.legal_actions` order with TERMINATE appended last — a single integer draw per
+    decision, so a reproducing harness can match the action-TYPE distribution exactly under matched
+    seeds, while the cross-language float-sensitive aggregates (E[T], λ-return) are held to the
+    ADR-0012 P6 behavioral-equivalence bar, not byte-identity."""
+    def decide(self, env, loc, bw, collected, lam, rng):
+        acts = env.legal_actions(loc, bw, collected)
+        acts = acts + [TERMINATE]          # TERMINATE is always legal (matches actions.term_slot)
+        return acts[int(rng.integers(len(acts)))]
+
+
 class GreedyPolicy(Policy):
     """Myopic: go to the treasure with best expected λ-adjusted value; else terminate.
     Belief-responsive only through collect-reveals; detector-blind (a deliberately weak base)."""

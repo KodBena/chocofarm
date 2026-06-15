@@ -9,3 +9,4 @@ tb_runlogs/
 tb-archive/
 runs/
 .scratch/
+cpp/build/
