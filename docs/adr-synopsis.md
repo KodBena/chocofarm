@@ -267,7 +267,7 @@ Rule 2 (recurrence → mechanism).
 
 **Decision.** A structural-design tenet for all *new* code — the incoming C++
 runner first, the future async actor-learner second — stated as the positive
-inverse of the 2026-06-15 audit's eight "architectural cancers." Eight checkable
+inverse of the 2026-06-15 audit's eight "architectural cancers." Nine checkable
 principles: **P1** single-source-of-truth / derive-don't-duplicate; **P2**
 seam/port discipline (the env↔Policy inversion of control as template; derived
 state owned on the object whose lifetime it shares, never a module global keyed
@@ -289,7 +289,20 @@ coordination); **P8** typed signatures are the SSOT of a function's contract
 annotation the body does not honor is a *lying signature*; the bar is
 strict-where-achievable, each relaxation a named stub-gap not a convenience,
 enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing
-baseline). It composes with rather than
+baseline); **P9** functional core, imperative shell — the compiled-component
+(C++) contract framed around *honest function signatures*: a computation is a
+pure function of typed, bounds-carrying, const-correct inputs (`std::span<const
+T>` over a raw `T*`) *returning its result by value* (free under guaranteed copy
+elision / NRVO — the discipline costs no performance), with effects confined to a
+thin imperative shell, the signature naming every mutation, and the *only*
+sanctioned hidden mutation a *measured* hot-path buffer-reuse routed through an
+explicitly-typed `Workspace`/`Context&` parameter; it outlaws the
+*untyped-effectful void* (a raw-pointer-taking, `void`-returning,
+out-parameter-writing black box — the compiled form of B / P2 / P8), with the
+C++ `NetForward` MLP (`predict(const float* X)`, the `void matvec_bias(…,
+std::vector<float>& out)` internals) as the cautionary instance, review-policed
+with the compiler `-Wall -Wextra` and a future `clang-tidy` config as the
+mechanization surface. It composes with rather than
 restates its siblings (0002/0004/0005/0007/0009/0011 cited, not re-derived), and
 carries a dedicated concrete C++ wire contract (the `transport.py` keys/dtypes,
 parity under the P6 bar).

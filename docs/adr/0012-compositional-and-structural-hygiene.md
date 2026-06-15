@@ -77,7 +77,7 @@ adjacent concerns:
 We adopt **Compositional and Structural Hygiene** as a codebase-wide tenet for
 new structure. It is stated in two registers: first **the anti-pattern
 checklist** (each audit cancer → the rule that prevents it — the index a
-contributor scans before authoring), then **the eight principles** (each a
+contributor scans before authoring), then **the nine principles** (each a
 checkable rule, with a worked example from this codebase and the cancer it
 prevents), then a **dedicated concrete section for a new-language (C++)
 component**.
@@ -100,8 +100,9 @@ this shape, the named principle forbids it."
 | **H** — Defensive band-aids stacked against a hostile substrate | a new mitigation layered on an un-diagnosed cause; a reliability strategy that *is* a stack of patches | **P5** (fail loud; remove the root cause) — distinguish a justified guard from a band-aid masking an undiagnosed cause |
 | **(new, cross-language)** — two writers of one cross-boundary truth | a hand-mirrored type, offset, key, or codec on the far side of the language boundary that re-authors a fact the near side already defines (a hardcoded weight offset; a second result-blob codec) | **P7** (cross-language wire discipline) — a cross-boundary fact has exactly one authoritative definition and every side *derives* its view (reads it at runtime or generates it at build time), never re-authors it by hand; mechanically enforced at the strongest feasible level (generate/compile-from-one-source > build-time lint > runtime parity backstop). Schema-driven codegen (one schema → N derived readers) is SSOT and is encouraged, not banned |
 | **(new, call-boundary)** — a contract carried only by an unenforced or dishonest signature | an untyped function/method/dataclass signature (the contract lives nowhere checkable), or a *lying* one whose body does not honor its annotation (`hp: AdamHParams = None` whose body accepts `None`; `lr/b1/b2/eps: float` populated with jax `Array`s) | **P8** (typed signatures are the contract's SSOT) — the signature is the single source of truth of the input/output contract, honored by the body, at the **strict-where-achievable** bar, with each relaxation a named stub-gap (not a convenience); mechanically enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing baseline (ADR-0011 Rule 1) |
+| **(new, compiled-component)** — an untyped-effectful-void / black-box mutation in a compiled (C++/new-language) component | a function taking raw pointers (`const float*`, a `T*, size_t` pair) and returning `void` while writing its result through an output parameter or mutating hidden/global state (`void matvec_bias(const float* in, …, std::vector<float>& out)`; `void require_matrix(…, int& rows, int& cols, std::vector<float>& out)`) — a black box you cannot unit-test (it mutates rather than returns), cannot compose (it is not a value-function to chain), and whose contract is invisible (the `void` + raw-pointer signature names neither the bounds, the const-ness, nor what it mutates) | **P9** (functional core, imperative shell) — a computation is a pure function of typed, bounds-carrying, const-correct inputs (`std::span<const T>` over a raw `T*`) **returning its result by value**; every effect is named in the signature, and the only sanctioned hidden mutation is a measured hot-path buffer-reuse routed through an explicitly-typed `Workspace`/`Context&` parameter — the compiled-component form of B (a second/hidden writer), of P2 (hidden state / a lying signature), and of P8 (an untyped contract), enforced by the compiler (`-Wall -Wextra`) and a future `clang-tidy` config (ADR-0011 Rule 1) |
 
-### The eight principles
+### The nine principles
 
 #### P1 — Single source of truth / derive-don't-duplicate
 
@@ -436,6 +437,102 @@ the call-boundary form of B's two-writers (the signature says one thing, the
 body another) and of ADR-0002's silently-accepted lie. P8 makes the signature
 the one honored authority, checked by the gate below.
 
+#### P9 — Functional core, imperative shell (the compiled-component contract)
+
+**Rule (checkable).** In a **compiled (C++/new-language) component**, a
+computation is a **pure function of typed inputs that returns its result by
+value**; effects (I/O, the redis transport, the episode/inference loop, buffer
+lifetimes) live in a thin **imperative shell** that calls the pure core. This
+is **P8's typed-contract rule carried into the compiled component** and **P2's
+no-hidden-state rule sharpened by C++**, where a raw `T*` erases the bounds and
+the const that the contract depends on. The discipline costs **no performance**:
+it is built on **zero-cost abstractions** (a `std::span<const T>` compiles to the
+same pointer+length a hand-rolled pair would; **guaranteed copy elision /
+(N)RVO** makes return-by-value free), so the honest signature is not a tax paid
+for cleanliness — it is the same machine code with the contract restored. Four
+**checkable rules a reviewer enforces yes/no from the signature alone**:
+
+1. **Inputs are typed, bounds-carrying, const-correct.** Favor
+   `std::span<const T>` (or a typed view) over a raw `T*` or a `T*, size_t`
+   pair — the span carries the extent and prevents the out-of-bounds the raw
+   pointer silently invites; a non-trivial read-only input is `const&`. *Check:
+   does any signature take a raw pointer where a `std::span<const T>` would
+   carry the extent? Is every read-only input `const`?*
+2. **Outputs are returned by value.** A function that computes a value
+   **returns** it — exploiting guaranteed copy elision / (N)RVO so the return is
+   free — not a `void f(…, Out& out)` that writes through an output parameter.
+   *Check: does the function return what it computes, or mutate an
+   out-parameter? A primary result delivered through an out-parameter is
+   forbidden.*
+3. **The signature declares every effect.** A function mutates only what its
+   signature names — an explicit non-`const` `&` parameter that **is** the
+   declared purpose, or `this`; never a global/static, never a parameter whose
+   mutation is not the function's stated job. *Check: can a reviewer name, from
+   the signature alone, every piece of state the function mutates? An invisible
+   mutation is forbidden.*
+4. **The ML hot-path exception is explicit and typed.** When **measured**
+   allocation overhead on a hot path (an inference / episode loop) genuinely
+   requires reusing buffers, the mutable scratch is isolated into an
+   explicitly-typed **`Workspace`/`Context`** struct passed as an explicit
+   `Workspace&` parameter — so the reuse is a **declared, typed requirement of
+   the computation**, not a hidden side-effect. The core stays otherwise pure:
+   it reads its typed inputs, uses the `Workspace` as named scratch, and
+   **still returns its result by value**. *Check: is every hot-path
+   buffer-reuse mutation routed through an explicitly-typed `Workspace`/
+   `Context` parameter, with the result still returned by value, and is that the
+   only mutation?* **Reusing the P7/P8 no-excuse posture verbatim:** a hidden
+   mutation is justified **only** by a measured, named hot-path requirement
+   expressed as a typed `Workspace` — *never* by a scale / minimality / "it's
+   faster" / "for now" / "unnecessary here" / YAGNI argument. That argument
+   shape is the tell P7 and P8 already named and reject; "faster" with no
+   measured allocation profile and no typed `Workspace` is a hand-wave, and the
+   hand-wave is exactly how the cancers grew.
+
+**Worked example (the anchor).** The C++ `NetForward` MLP
+(`cpp/include/chocofarm/net.hpp`, `cpp/src/net.cpp`) is the cautionary
+instance. Its leaf-evaluator entry point `NetPrediction predict(const float* X)
+const` does return by value (rule 2 met) — but it takes a **raw `const float*`
+with no length** (rule 1 violated: the caller must already know `in_dim_`, and
+the body trusts the pointer addresses that many floats — exactly the
+bounds-erasure `std::span<const float>` exists to close; the sibling
+`predict(const std::vector<float>&)` overload only re-derives the length to
+guard *one* caller, not the raw-pointer path the search will actually use). The
+internals are the **untyped-effectful void** in full: `void matvec_bias(const
+float* in, const std::vector<float>& W, int rows, int cols, const float* bias,
+std::vector<float>& out)` takes two raw pointers and an `int rows, int cols`
+pair (no bounds, no const-carrying view) and returns its result by **writing
+through `std::vector<float>& out`**; `void require_matrix(…, int& rows, int&
+cols, std::vector<float>& out)` returns `void` while writing **three**
+out-parameters and `void require_vector(…, int& len, std::vector<float>& out)`
+**two**, in place of returning a small typed result; `void
+relu_inplace(std::vector<float>& v)` is a void in-place mutation.
+None of these can be unit-tested as value-functions or chained, and none
+declares its contract in its signature. The **compliant form**: the matmul is a
+pure value-function — `std::vector<float> matvec_bias(std::span<const float> in,
+std::span<const float> W, int rows, int cols, std::span<const float> bias)`
+returning its result by value (free under NRVO), `relu` returning a new vector
+(or taking and returning by value), and `require_matrix`/`require_vector`
+returning a small typed result struct rather than writing those out-params; the
+public entry becomes `predict(std::span<const float> x, const WeightPayload& w)
+-> NetPrediction` (value-returned), with the per-layer matmul scratch — **if and
+only if** a measured allocation profile on the search's leaf loop shows the
+per-`predict` `std::vector` churn matters — moved into a typed
+`ForwardWorkspace&` parameter, leaving the core otherwise pure and still
+returning `NetPrediction` by value. The as-merged interim `NetForward` predates
+P9 (it is the live instance that **motivated** the rule) and is to be brought
+into compliance; per the no-retroactive-sweep scoping it is retrofitted on
+touch, not by a P9 sweep.
+
+**Cancer prevented: untestable, uncomposable black-box mutations.** A
+`void`-returning, raw-pointer-taking, out-parameter-writing function in a
+compiled component is the compiled form of three cancers at once — **B** (a
+second/hidden writer of state the signature does not name), **P2's hidden state
+/ lying signature** (a contract the signature does not carry), and **P8's
+untyped contract** (no bounds, no const, no return declared) — sharpened by C++,
+where the raw `T*` erases the very bounds and const-ness the contract needs. The
+functional core makes each computation a value you can test in isolation and
+compose, and confines every effect to the named, typed imperative shell.
+
 ---
 
 ## Concrete guidance for a new-language (C++) component
@@ -698,6 +795,18 @@ write-time data constraint / run-time invariant / review-only):
   recurrence that converts review-only prose to a mechanism), here a scheduled
   monotonic rollout rather than a defect. `warn_unused_ignores` keeps each
   named relaxation honest at the same gate.
+- **P9 (functional core, imperative shell):** **review-only**, policed against
+  its four checkable rules at C++ review, with the **compiler (`-Wall
+  -Wextra`)** and a **future `clang-tidy` config** as the mechanization surface.
+  The compiler already raises some of the relevant signals (an unused parameter,
+  a const-violation); the `clang-tidy` config is the ADR-0011 Rule-2 conversion
+  trigger — **when a P9 violation recurs after this record, mint the
+  `clang-tidy` check** that catches it (e.g. a check against out-parameters or
+  raw-pointer arithmetic where a `std::span` belongs) rather than re-stating the
+  rule in prose. Until that recurrence, P9 is review-only — and settling for
+  review-only is *not* justified by a scale / "one compiled component" / "for
+  now" argument (that argument shape is the tell P7/P8 reject); it is the honest
+  ADR-0011 Rule-1 level for a discipline whose recurrence has not yet fired.
 
 This tenet's own Rule-1 declaration: **review-and-audit-policed**, with the
 architectural audit as the absence-detector — exactly as ADR-0011 declares for
@@ -724,6 +833,13 @@ prose.
   coordination mechanism (a bytes-store holds state, a messaging fabric carries
   coordination) — so "swap the worker for C++" stays a drop-in and a second
   hand-author of one truth cannot form across the language boundary.
+- **The compiled component is value-functional, not a black box.** P9 makes each
+  C++ computation a pure function of typed, bounds-carrying inputs returning its
+  result by value, so the compiled core is unit-testable and composable rather
+  than an untyped-effectful void — at zero performance cost (zero-cost
+  abstractions: a `std::span` is a pointer+length, return-by-value is free under
+  (N)RVO), with the one hot-path buffer-reuse exception declared as a typed
+  `Workspace` parameter rather than hidden.
 
 ### Negative
 
