@@ -13,6 +13,27 @@ Why processes, not threads: the search is pure-Python tree control flow (the GIL
 floor, az-jax-perf.md) — threads would serialise on the GIL. Processes give true 4-core parallelism.
 The pool is stdlib `multiprocessing`; the DATA TRANSPORT is **redis**, not pickle.
 
+Three orthogonal collaborators (audit item K — Transport ⊥ Pool ⊥ Task)
+----------------------------------------------------------------------
+`ParallelExecutor` is the THIN orchestrator that composes three single-responsibility collaborators,
+each the sole owner of one concern that used to be fused into this god-object:
+  * `transport.RedisTransport` (`chocofarm/az/transport.py`) — the SOLE owner of the redis raw-bytes
+    protocol: the bounded-timeout connection + fail-loud ping, the ONE place the `az:w:...` weight
+    keys and the `az:res:...` result keys are spelled (`weight_keys`/`result_keys`), the weight
+    publish, the worker-side weight read, the result-blob write/read+delete, and the TTLs. Weight
+    (un)packing stays delegated to `WeightContainer` (audit J).
+  * `worker_pool.WorkerPool` (`chocofarm/az/worker_pool.py`) — the SOLE owner of the multiprocessing
+    lifecycle: the spawn pool built with `worker._worker_init`, the per-result bounded drain, the
+    `imap_unordered` fan-out under that drain (`map`), and the bounded `close()` teardown.
+  * `worker` + `worker.TaskSpec` (`chocofarm/az/worker.py`) — the unit of work: `_gen_task`/`_eval_task`
+    as the two work-kinds (DATA in `TASK_SPECS`), the version-gated `_ensure_net`, the seed fold
+    `_task_rng`, and the per-worker `_W` global (item L will promote `_W` to a `Worker` object).
+
+For back-compat (and because the test suite + the weights/registry docstrings reference these names
+on `parallel`), the collaborators' public callables are re-exported here: `pack_net` / `unpack_net` /
+`_connect` / `_drain_imap` / `_worker_init` / `_ensure_net` / `_task_rng` / `_gen_task` / `_eval_task`
+/ `_W`.
+
 Why redis transport, not the pool pipe (pickle)
 -----------------------------------------------
 multiprocessing's default result return pickles the worker's Python objects (the per-episode
@@ -45,300 +66,55 @@ regardless of worker count or scheduling — the aggregate transition multiset i
 count (verified: workers=1 and workers=4 produce bit-identical gathered data). `workers=1` runs the
 pool with one pinned worker (the parallel code path, for the A/B); the loop's in-process path is the
 true serial baseline.
+
+Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
 import uuid
 
-import numpy as np
+from chocofarm.az import transport
+from chocofarm.az import worker as _worker
+from chocofarm.az import worker_pool
+from chocofarm.az.transport import connect as _connect, pack_net, unpack_net
+from chocofarm.az.worker import (
+    _W, _ensure_net, _eval_task, _gen_task, _task_rng, _worker_init,
+)
+from chocofarm.az.worker_pool import _RESULT_TIMEOUT_S, _drain_imap
 
-
-# ---- redis connection (raw-bytes transport; no pickle) ----
-def _redis_params():
-    """Shared connection facts from chocofarm/config.py (the registry uses the same), so transport
-    and registry address one redis instance by default."""
-    from chocofarm import config
-    return config.redis_params()
-
-
-def _connect():
-    import redis  # local import so a serial (workers=0) run needs no redis at all
-    # Bound EVERY socket op (ADR-0002 / deadlock fix H2). The default `socket_timeout=None`
-    # makes every r.get / pipe.execute block FOREVER if the TCP socket stalls — a stalled
-    # worker read is then indistinguishable, from the parent's imap fan-out, from a wedged
-    # worker, and the loop sits at futex_do_wait at ~1% CPU with no way out. A bounded timeout
-    # turns a stall into a loud redis.TimeoutError (retryable / restart-recoverable; checkpoints
-    # are per-iteration) instead of a silent permanent hang. Loopback redis under no memory
-    # pressure never trips 60s, so this is a safety net, not a happy-path behavior change.
-    from chocofarm import config
-    r = redis.Redis(
-        socket_timeout=config.redis_socket_timeout(),
-        socket_connect_timeout=config.redis_connect_timeout(),
-        **_redis_params(),
-    )
-    r.ping()   # fail loud now if redis is unreachable (ADR-0002), not mid-iteration
-    return r
-
-
-# ---- net (de)serialization as raw bytes (the broadcast payload) ----
-# The raw-bytes (de)serialization is the WeightContainer's (audit item J): the net's weight LAYOUT —
-# the param-key order, the manifest's name/shape/dtype/offset/len entries, the scalar meta, and the
-# `tobytes()`/`np.frombuffer` round-trip — has ONE owner there, the same owner the npz save/load and
-# the L2-mask route through. The transport NO LONGER re-enumerates `net._params()` into its own
-# manifest (that was the split-brained second encoder R11 deferred); it constructs the net from the
-# manifest's meta and delegates the (un)packing. The blob/manifest bytes are byte-identical to the
-# pre-J encoder (the param order is the container's canonical order, which is the historical order).
-
-
-def pack_net(net):
-    """Pack a ValueMLP into (manifest_json: str, blob: bytes) — DELEGATED to
-    `WeightContainer.pack` (the one owner of the weight layout, audit item J). Raw `tobytes()` of each
-    weight concatenated, a JSON manifest of (name, shape, dtype, offset, byte-length) + the scalar
-    meta. No pickle: the blob is contiguous float64 weight bytes; optional params (residual block) ride
-    along automatically because the container reports them iff the net built the block."""
-    from chocofarm.az.weights import WeightContainer
-    return WeightContainer.pack(net)
-
-
-def unpack_net(manifest_json, blob):
-    """Reconstruct a ValueMLP from `pack_net`'s (manifest, blob). The container reads the manifest's
-    construction meta (so older manifests without `residual` → block OFF); this builds the net via the
-    `ValueMLP` constructor (so the Wr*/br* layout entries have a slot to bind to), then the container
-    binds the arrays (`np.frombuffer` views, copied so the net owns writable arrays). No pickle."""
-    from chocofarm.az.mlp import ValueMLP
-    from chocofarm.az.weights import WeightContainer
-    m = WeightContainer.unpack_meta(manifest_json)
-    net = ValueMLP(m["in_dim"], hidden=m["H"],
-                   n_actions=m["n_actions"], y_mean=m["y_mean"], y_std=m["y_std"],
-                   residual=bool(m.get("residual", False)))
-    return WeightContainer.unpack_into(net, manifest_json, blob)
-
-
-# ---- per-worker module-global state (one set per process, built lazily) ----
-_W = {
-    "env": None, "fb": None, "net": None, "search": None,
-    "version": -1, "m": None, "n_sims": None, "base_seed": None, "redis": None,
-}
-
-
-def _worker_init(core_list, base_seed, m, n_sims):
-    """Process-pool initializer: pin THIS worker to its core, build env/feature-builder, open the
-    redis connection, warm the numba kernel. The net is loaded lazily on the first task (when the
-    first weight version arrives over redis)."""
-    # Pin native thread counts to 1 DETERMINISTICALLY, before numba/numpy/BLAS import inside this
-    # child (deadlock fix H1a / Fix C). The worker is core-pinned and wants exactly one native
-    # thread per math runtime; relying on the parent's JAX import to have `setdefault`'d these
-    # into the inherited environment makes the worker's threading config depend on parent import
-    # order and on JAX being present. Setting them here makes the child's native-threading
-    # configuration independent of the parent — the same single-thread pin the (clean) numpy
-    # runs had, severing the JAX→spawn-child residue the RCA fingers as the most likely
-    # worker-wedge trigger. setdefault so an operator override still wins.
-    for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-                 "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS"):
-        os.environ.setdefault(_var, "1")
-    os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
-
-    # WORKER-SIDE FAULTHANDLER (the discriminating instrument). The deadlock is intermittent and
-    # the prime-suspect cause (a worker wedged in a native-runtime lock vs a redis socket recv)
-    # cannot be PROVEN without a dump of the WORKER process — ptrace_scope blocked py-spy, and the
-    # parent's faulthandler only dumps the parent. Registering faulthandler here, with a SIGUSR1
-    # handler, makes the next recurrence debuggable on the worker side: a watcher sends SIGUSR1 to
-    # the wedged worker PID and gets an all-thread Python traceback on stderr (→ the run log),
-    # which discriminates H1a (numba/native threading-init lock) from H2 (timeout-less socket
-    # recv). This is the cheap, low-risk confirming step the bounding fixes (A/B) cannot supply on
-    # their own — without it, Fix C ships un-falsifiable. faulthandler writes a C-level traceback
-    # from a signal handler, so it is safe to call even when the GIL is contended (the exact hang
-    # state). Fail soft if signals aren't available (e.g. a non-POSIX host).
-    try:
-        import faulthandler, signal
-        faulthandler.enable()
-        if hasattr(signal, "SIGUSR1"):
-            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
-    except (ImportError, OSError, ValueError):
-        pass   # diagnostic only — never block worker startup on it
-
-    import multiprocessing as mp
-    name = mp.current_process().name
-    try:
-        widx = int(name.rsplit("-", 1)[-1]) - 1     # PoolWorker-1 -> 0
-    except (ValueError, IndexError):
-        widx = 0
-    core = core_list[widx % len(core_list)]
-    try:
-        os.sched_setaffinity(0, {core})
-    except (AttributeError, OSError):
-        pass   # affinity not available — fail soft (a perf knob, not correctness)
-
-    from chocofarm.model.env import Environment
-    from chocofarm.az.features import FeatureBuilder
-    from chocofarm.az.kernels import warmup as _kwarm
-
-    env = Environment()
-    _W.update(env=env, fb=FeatureBuilder(env), m=m, n_sims=n_sims,
-              base_seed=base_seed, core=core, widx=widx, redis=_connect())
-    _kwarm(env.N, len(env.detectors))   # compile the belief kernel once per process
-
-
-def _ensure_net(run, version, hot_search=None):
-    """Load the net into the worker iff the weight version changed — reading the raw-bytes payload
-    from redis `az:w:<run>:<version>` (no pickle). Rebuilds the GumbelAZSearch on the fresh net.
-
-    `hot_search` (hp-registry §3.4): the live HOT search knobs (c_puct/c_visit/c_scale/c_outcome/
-    max_depth) for THIS iteration, sized by the parent's per-iteration snapshot. The version bumps
-    every iteration (the parent re-publishes weights each iter), so the worker rebuilds its search
-    on the version change and the live HOT knobs are picked up at that natural refresh point — the
-    seam §3.2 names ('the worker's natural refresh coincides with the parent's poll'). `m`/`n_sims`
-    are RESTART (set once in `_worker_init`)."""
-    if _W["version"] == version and _W["net"] is not None:
-        return
-    from chocofarm.az.gumbel_search import GumbelAZSearch
-    r = _W["redis"]
-    manifest = r.get(f"az:w:{run}:{version}:m")
-    blob = r.get(f"az:w:{run}:{version}:b")
-    if manifest is None or blob is None:
-        raise RuntimeError(f"weight payload az:w:{run}:{version} missing from redis")
-    net = unpack_net(manifest.decode("utf-8"), blob)
-    _W["net"] = net
-    hs = dict(hot_search) if hot_search else {}
-    _W["search"] = GumbelAZSearch(net, _W["env"], m=_W["m"], n_sims=_W["n_sims"], **hs)
-    _W["version"] = version
-
-
-def _task_rng(version, kind, idx):
-    """Independent, reproducible per-(iteration, kind, episode) RNG (folds base seed + version +
-    kind tag + idx). Same logical episode → same stream under any worker count (parallel≈serial)."""
-    kind_tag = {"gen": 1_000_003, "eval": 7_000_037}[kind]
-    seed = (np.uint64(_W["base_seed"])
-            ^ (np.uint64(version + 1) * np.uint64(2_654_435_761))
-            ^ (np.uint64(kind_tag) * np.uint64(40_503))
-            ^ (np.uint64(idx) * np.uint64(2_246_822_519)))
-    return np.random.default_rng(int(seed))
-
-
-def _gen_task(args):
-    """Worker task: generate ONE training episode, write its records to redis as raw bytes, return
-    only (idx, n_rows, feat_dim, n_slots). `args` = (run, version, world, lam, explore_plies,
-    lam_blend, n_step, idx, res_token, hot_search, max_steps). `hot_search`/`max_steps` are the live
-    HOT knobs for this iteration (hp-registry §3.4)."""
-    (run, version, world, lam, explore_plies, lam_blend, n_step, idx, res_token,
-     hot_search, max_steps) = args
-    _ensure_net(run, version, hot_search=hot_search)
-    from chocofarm.az.exit_loop import generate_episode
-    rng = _task_rng(version, "gen", idx)
-    recs = generate_episode(_W["env"], _W["search"], _W["fb"], world, lam, rng,
-                            explore_plies, max_steps=max_steps,
-                            lam_blend=lam_blend, n_step=n_step)
-    n = len(recs)
-    if n == 0:
-        return (idx, 0, 0, 0)
-    feat_dim = recs[0][0].shape[0]
-    n_slots = recs[0][1].shape[0]
-    # stack into contiguous float32 blocks, write raw bytes (no pickle)
-    X = np.empty((n, feat_dim), dtype=np.float32)
-    PI = np.empty((n, n_slots), dtype=np.float32)
-    M = np.empty((n, n_slots), dtype=np.float32)
-    Y = np.empty(n, dtype=np.float32)
-    for i, (f, pi, mask, g) in enumerate(recs):
-        X[i] = f; PI[i] = pi; M[i] = mask; Y[i] = g
-    r = _W["redis"]
-    base = f"az:res:{res_token}:{idx}"
-    pipe = r.pipeline(transaction=False)
-    # Result blobs carry a TTL so an ABORTED iteration self-cleans. The happy path deletes them in
-    # `_collect_results` the same iteration; but if the fan-out is aborted (Fix A's loud timeout)
-    # the parent never reaches the delete, and a bare SET leaves the blob with no expiry forever
-    # (the post-mortem found ~980 such leaked az:res:* keys, TTL=-1). A 1h TTL bounds that leak
-    # without affecting the happy path (read+deleted within seconds). `ex=` sets the expiry in the
-    # same SET round-trip (no extra command).
-    _res_ttl = int(os.environ.get("CHOCO_RESULT_TTL", "3600"))
-    pipe.set(base + ":X", X.tobytes(), ex=_res_ttl)
-    pipe.set(base + ":PI", PI.tobytes(), ex=_res_ttl)
-    pipe.set(base + ":M", M.tobytes(), ex=_res_ttl)
-    pipe.set(base + ":Y", Y.tobytes(), ex=_res_ttl)
-    pipe.execute()
-    return (idx, n, feat_dim, n_slots)
-
-
-def _eval_task(args):
-    """Worker task: run ONE greedy-eval episode against a held-out world; return (R, T) (scalars —
-    no array payload, so they ride the pipe cheaply). `args` = (run, version, world, lam, idx,
-    hot_search, max_steps)."""
-    run, version, world, lam, idx, hot_search, max_steps = args
-    _ensure_net(run, version, hot_search=hot_search)
-    from chocofarm.az.gumbel_search import GumbelPolicy
-    hs = dict(hot_search) if hot_search else {}
-    pol = GumbelPolicy(_W["net"], _W["env"], m=_W["m"], n_sims=_W["n_sims"], **hs)
-    rng = _task_rng(version, "eval", idx)
-    R, T, _ = _W["env"].simulate(pol, world, lam, rng, max_steps=max_steps)
-    return float(R), float(T)
-
-
-# Per-result timeout for the fan-out drain (deadlock fix H1 / Fix A). An episode is ~0.2–0.4s of
-# search × ~30 plies; 600s is ~1000× headroom and only trips on a TRUE wedge (a worker stuck in a
-# native-runtime lock or a timeout-less socket read). Env-overridable.
-_RESULT_TIMEOUT_S = float(os.environ.get("CHOCO_RESULT_TIMEOUT", "600"))
-
-
-def _drain_imap(it, n_expected, phase, run):
-    """Drive a Pool `imap_unordered` iterator to exhaustion with a PER-RESULT timeout, instead of
-    the unbounded `list(imap_unordered(...))` that blocks forever on a wedged worker.
-
-    `list(...)` parks the parent's main thread on the result-queue condition until EVERY task
-    reports back; a worker that is alive-but-hung (stuck in a native-threading-init lock, or in a
-    timeout-less redis recv) produces no Pool event, so the parent waits at futex_do_wait at ~1%
-    CPU forever — the observed deadlock. Pulling each result with a timeout converts that silent
-    permanent hang into a LOUD, diagnosable RuntimeError (ADR-0002) naming the phase, the run, and
-    how many of the expected results were collected before the stall. A per-iteration checkpoint
-    means a restart loses nothing."""
-    import multiprocessing
-    out = []
-    while True:
-        try:
-            out.append(it.next(_RESULT_TIMEOUT_S))
-        except StopIteration:
-            break
-        except multiprocessing.TimeoutError as e:
-            raise RuntimeError(
-                f"parallel {phase} fan-out (run={run}) stalled: collected {len(out)}/{n_expected} "
-                f"results, then NO further result arrived within {_RESULT_TIMEOUT_S:.0f}s of the "
-                f"previous one (per-result wait, not a whole-fan-out bound) — likely a wedged "
-                f"worker (native-runtime lock or redis socket stall). To get a worker-side "
-                f"traceback, send SIGUSR1 to the stuck worker PID (faulthandler is registered in "
-                f"_worker_init). Aborting loud rather than deadlocking at futex_do_wait "
-                f"(ADR-0002). Restart from the last checkpoint."
-            ) from e
-    return out
+__all__ = [
+    "ParallelExecutor", "pack_net", "unpack_net", "_connect", "_drain_imap",
+    "_worker_init", "_ensure_net", "_task_rng", "_gen_task", "_eval_task", "_W",
+]
 
 
 class ParallelExecutor:
     """Persistent process pool of `workers` core-pinned workers with a redis raw-bytes transport for
     the ExIt loop's two fan-outs. Construct once before the iteration loop; call `generate(...)` /
-    `evaluate(...)` each iteration. Close at the end (or use as a context manager)."""
+    `evaluate(...)` each iteration. Close at the end (or use as a context manager).
+
+    A THIN orchestrator (audit item K): it composes a `RedisTransport` (the wire protocol), a
+    `WorkerPool` (the multiprocessing lifecycle), and the `worker.TASK_SPECS` work-kinds. It owns no
+    redis key strings and no pool internals — only the per-iteration choreography (publish → fan-out →
+    gather) and the public surface the loop depends on."""
 
     def __init__(self, n_workers, cores, base_seed, m, n_sims):
-        import multiprocessing as mp
         self.n_workers = int(n_workers)
         self.cores = list(cores)[:self.n_workers] if cores else list(range(self.n_workers))
         self.run = uuid.uuid4().hex[:12]            # namespace this run's redis keys
-        self.r = _connect()                         # parent connection (weight publish + result read)
-        ctx = mp.get_context("spawn")               # spawn: clean process, no inherited numba/jax state
-        self.pool = ctx.Pool(
-            processes=self.n_workers,
-            initializer=_worker_init,
-            initargs=(self.cores, base_seed, m, n_sims),
-        )
+        self.transport = transport.RedisTransport(_connect())   # parent connection (publish + read)
+        self.pool = worker_pool.WorkerPool(self.n_workers, self.cores, base_seed, m, n_sims)
+
+    @property
+    def r(self):
+        """The parent's redis connection — preserved as a public attribute (it was `self.r` before
+        the split). It lives on the transport collaborator now; this property keeps the name."""
+        return self.transport.r
 
     def publish_weights(self, net, version):
         """Pack the net to raw bytes and publish to redis `az:w:<run>:<version>` (no pickle, no
         disk). Workers `_ensure_net` read it when the version changes."""
-        manifest, blob = pack_net(net)
-        pipe = self.r.pipeline(transaction=False)
-        pipe.set(f"az:w:{self.run}:{version}:m", manifest)
-        pipe.set(f"az:w:{self.run}:{version}:b", blob)
-        # weights expire after an hour so a long run doesn't leak old versions
-        pipe.expire(f"az:w:{self.run}:{version}:m", 3600)
-        pipe.expire(f"az:w:{self.run}:{version}:b", 3600)
-        pipe.execute()
+        self.transport.publish_weights(net, version, self.run)
 
     def generate(self, net, version, worlds, lam, explore_plies, lam_blend, n_step,
                  hot_search=None, max_steps=40):
@@ -356,37 +132,8 @@ class ParallelExecutor:
                   hs, max_steps)
                  for i, w in enumerate(worlds)]
         # bounded drain (Fix A): per-result timeout so a wedged worker aborts loud, not deadlocks
-        metas = _drain_imap(self.pool.imap_unordered(_gen_task, tasks, chunksize=1),
-                            len(tasks), "generate", self.run)
-        return self._collect_results(res_token, metas)
-
-    def _collect_results(self, res_token, metas):
-        out = []
-        pipe = self.r.pipeline(transaction=False)
-        order = []
-        for (idx, n, fd, ns) in metas:
-            if n == 0:
-                continue
-            base = f"az:res:{res_token}:{idx}"
-            pipe.get(base + ":X"); pipe.get(base + ":PI")
-            pipe.get(base + ":M"); pipe.get(base + ":Y")
-            order.append((idx, n, fd, ns, base))
-        if not order:
-            return out
-        blobs = pipe.execute()
-        # delete the result keys (raw bytes can be large; don't leak across iterations)
-        dpipe = self.r.pipeline(transaction=False)
-        for k, (idx, n, fd, ns, base) in enumerate(order):
-            xb, pib, mb, yb = blobs[4 * k:4 * k + 4]
-            X = np.frombuffer(xb, dtype=np.float32).reshape(n, fd)
-            PI = np.frombuffer(pib, dtype=np.float32).reshape(n, ns)
-            M = np.frombuffer(mb, dtype=np.float32).reshape(n, ns)
-            Y = np.frombuffer(yb, dtype=np.float32)
-            for i in range(n):
-                out.append((X[i], PI[i], M[i], float(Y[i])))
-            dpipe.delete(base + ":X", base + ":PI", base + ":M", base + ":Y")
-        dpipe.execute()
-        return out
+        metas = self.pool.map(_worker.TASK_SPECS["gen"].callable, tasks, "generate", self.run)
+        return self.transport.read_and_delete_results(res_token, metas)
 
     def evaluate(self, net, version, worlds, lam, hot_search=None, max_steps=40):
         """Publish `net` at `version`, fan N eval episodes across the pool; return (totR, totT,
@@ -401,32 +148,16 @@ class ParallelExecutor:
         totR = totT = 0.0
         ets = []
         # bounded drain (Fix A): per-result timeout so a wedged worker aborts loud, not deadlocks
-        for R, T in _drain_imap(self.pool.imap_unordered(_eval_task, tasks, chunksize=1),
-                                len(tasks), "evaluate", self.run):
+        for R, T in self.pool.map(_worker.TASK_SPECS["eval"].callable, tasks, "evaluate", self.run):
             totR += R; totT += T; ets.append(T)
         return totR, totT, ets
 
     def close(self):
-        # Bounded teardown (completes the "parent never waits unbounded" invariant — see Fix A).
-        # `Pool.join()` takes NO timeout, so a worker wedged at end-of-run would hang close()
-        # forever exactly as the hot loop could. Instead: close (no new tasks), then join each
-        # worker process with a timeout; any worker still alive after the grace period is
-        # terminate()'d (SIGTERM) so teardown is bounded. Low-severity vs the hot loop (runs once
-        # at end-of-run) but it makes the no-unbounded-wait property hold everywhere.
+        # Bounded teardown (the "parent never waits unbounded" invariant — Fix A) lives on the
+        # WorkerPool; the parent's redis connection is closed here after the pool is reaped.
         self.pool.close()
-        grace = float(os.environ.get("CHOCO_POOL_JOIN_TIMEOUT", "30"))
-        procs = list(getattr(self.pool, "_pool", []))
-        for p in procs:
-            p.join(grace)
-        for p in procs:
-            if p.is_alive():
-                p.terminate()      # bounded: don't let a wedged worker hang teardown
         try:
-            self.pool.join()       # reap; all workers are now exited or terminated
-        except Exception:
-            pass
-        try:
-            self.r.close()
+            self.transport.r.close()
         except Exception:
             pass
 
