@@ -72,7 +72,9 @@ add_library(chocofarm_core
   src/features.cpp
   src/transport.cpp
   src/net.cpp
+  src/policy.cpp
   src/nmcs.cpp
+  src/ismcts.cpp
   src/runner.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -107,3 +109,13 @@ target_compile_options(chocofarm-net-dump PRIVATE -Wall -Wextra)
 add_executable(chocofarm-nmcs-dump src/nmcs_dump.cpp)
 target_link_libraries(chocofarm-nmcs-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-nmcs-dump PRIVATE -Wall -Wextra)
+
+# A fourth tiny parity fixture (NOT the runner): runs ISMCTSPolicy::run_search with a SCRIPTED,
+# RNG-free ISMCTSSource (sample_world -> bw[0]; expand_index -> a stdin FIFO mod n; leaf_value -> a
+# stdin FIFO) and prints the selected action, so the harness can feed the C++ ISMCTS and the Python
+# ISMCTS the SAME world/expansion/leaf draws on a fixed (loc, belief) and assert the SAME action —
+# the DETERMINISTIC selection+nesting logic check (ADR-0012 P6), independent of RNG. Separate from
+# the runner (P3, one-owner).
+add_executable(chocofarm-ismcts-dump src/ismcts_dump.cpp)
+target_link_libraries(chocofarm-ismcts-dump PRIVATE chocofarm_core)
+target_compile_options(chocofarm-ismcts-dump PRIVATE -Wall -Wextra)

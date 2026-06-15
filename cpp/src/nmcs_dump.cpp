@@ -60,7 +60,7 @@ namespace {
 // fixed table consumed in CALL ORDER and CYCLED modulo its length (so a level-2 search, which can
 // consume far more leaf values than the table holds, never exhausts it — the Python reference cycles
 // the SAME table the SAME way, so the value delivered at each call index is identical on both sides).
-class ScriptedSource final : public chocofarm::WorldSource {
+class ScriptedSource final : public chocofarm::NMCSWorldSource {
   public:
     explicit ScriptedSource(std::vector<double> vals) : vals_(std::move(vals)) {}
     uint32_t sample_world(const std::vector<uint32_t>& bw) override { return bw[0]; }
