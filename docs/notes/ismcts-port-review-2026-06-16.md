@@ -304,3 +304,81 @@ The workflow's own synthesis was still computing when this record was cut; the h
 derived directly from the verified findings.
 
 *Public Domain (The Unlicense).*
+
+
+---
+
+## Correction (appended 2026-06-16) — the collapsed-determinization is NOT assuaged
+
+A clarification the "UPDATE" section above did not make plainly enough, and which the
+maintainer is right to insist on: the synthesis dynamically **proved only the FIRST**
+coverage hole — the `_ucb_select` insertion-order tie-break (the integer-leaf tie-forcing
+run, 128/128 vs a 14/128 sorted-key mutant). It did **NOT** close the SECOND hole.
+
+The collapsed-determinization — the scripted `sample_world→bw[0]` leaves **0 action-edges
+with >1 `belief_key` child** across the whole grid — means the ISMCTS-**defining** multi-belief
+information-set sub-child split (`ismcts.cpp:172-180` ↔ `ismcts.py:175-179`) is verified by
+**code inspection only — by no executed test.** The synthesis confirmed this as an open
+`major` test gap and *recommended* a cycled-multi-world fixture, but **did not run one**. So
+the `trustworthy-mergeable` verdict rests, *for the multi-belief routing specifically*, on
+inspection — exactly the kind of unproven-by-test claim this review exists to distrust.
+
+**It is NOT assuaged until a cycled-multi-world parity fixture exercises the sub-child split
+as an exact-action C++-vs-Python assertion (the same standard to which hole 1 was held).**
+That fixture is the next action; the `trustworthy-mergeable` verdict is provisional on it.
+
+## Workflow synthesis — verbatim deliverable
+
+The independent review workflow's own `summary_markdown` return value, committed verbatim
+(the maintainer asked for the actual deliverable, not a paraphrase). Read against the
+Correction above — note its own table marks the determinization gap `confirmed`, and its
+recommendation only *proposes* the cycled-multi-world case.
+
+> ## Independent review verdict — C++ ISMCTS port @ 5e320a6
+> 
+> **Verdict: TRUSTWORTHY — MERGEABLE.** A light *fix-then-merge* (two test-only additions) is the cleanest call; the production C++ needs no change.
+> 
+> The agent self-certified because its environment had no Task tool — so its "blind sub-agent PASS" was itself. That provenance is correctly distrusted. But on the **substance**, the committed artifact survives independent adversarial scrutiny on the one question that matters.
+> 
+> ### The KEY HAZARD is CLEAN (verified two ways)
+> `std::map` iterates sorted-key order; Python `dict` iterates insertion order; both ISMCTS tie-breaks depend on insertion order. The C++ averts the divergence with a `visit_order` vector.
+> 
+> - **Byte-level inspection (clean tree, 5e320a6):** `visit_order` has exactly ONE mutation site — `ismcts.cpp:60`, inside the first-`visits`-insertion branch (`if (vit == nd.visits.end())`). It records first visits-insertion order, mirroring Python's `visits` dict (written only by `_update`, `ismcts.py:224`). The avail-bump loop (`ismcts.cpp:125`) touches **only** `avail`, never `visit_order`. Both tie sites iterate `visit_order` with strict `>` first-wins (`ucb_select` :82/:93 ↔ `ismcts.py:208/215`; most-visited final :206/:209 ↔ `ismcts.py:135`).
+> - **Behavioral proof I ran (the test the suite lacks):** an integer-leaf, c∈{0,0.7} grid drove **1,243 genuine exact UCB ties** and the committed C++ matched Python **128/128**. A sorted-key Python mutant diverged **14/128**, proving the test discriminates and the committed code is on the correct side.
+> 
+> ### Three alarming raw findings are FALSE ALARMS — do not act on them
+> A "blocker" + two "majors" claimed the discarded **wrong draft** shipped (`visit_order` keyed to `avail` at "line 125", with an author comment `// WRONG: first-sighting over avail`). **That line and that comment do not exist in the commit.** Real `ismcts.cpp:125` touches only the `avail` map; `grep` for `WRONG`/`first-sighting` returns nothing. The alleged `std::out_of_range` crash is also impossible (no `erase` anywhere, so every `visit_order` slot is always in `visits`). These describe a draft that was **not** committed. **Do NOT re-port and do NOT block on them.**
+> 
+> ### What's actually left: a verification-adequacy gap (not a behavioral bug)
+> | Item | Severity | Status |
+> |---|---|---|
+> | `_ucb_select` insertion-order tie-break has **zero** test coverage (float leaves → 0 ties across 9,118 calls; a sorted-key mutant still passes 240/240) | major *(test gap)* | confirmed by my instrumentation |
+> | Fixed `sample_world→bw[0]` collapses the multi-determinization child split (0 action-edges ever get >1 belief_key child) | major *(test gap)* | confirmed |
+> | Aggregate: uncorrected 6-key 3σ (~1.6% family-wise false-fail) at iterations=80 vs default 300 — flaky **and** insensitive | minor *(methodology)* | confirmed |
+> | Aggregate discards raw per-episode JSONL to `/tmp` + `os.unlink` | observation | confirmed; low-stakes (IPC channel, reproducible-by-construction) |
+> 
+> ### Also verified faithful
+> UCB1 + availability denominator, expansion, TERMINATE edge, step reward, `max_depth=24`, per-iteration determinization, `belief_key` (incl. `(0,0,0)` empty + matched no-equality collision), node-arena index design (no dangling refs), **P1** (ismcts includes `policy.hpp` not `nmcs.hpp` — the grep "hit" was prose comments), GreedyStopBase net formula + strict-`>` tie, the mechanical DRY hoist. Three changed TUs compile syntax-clean (zero warnings, `-std=c++23 -Wall -Wextra`). Deterministic logic check reruns **240/240 PASS**.
+> 
+> ### Recommendation
+> Merge is defensible as-is. Best path: add two **deterministic, test-only** cases to `cpp/parity/ismcts_logic.py` — (1) an integer-leaf tie-forcing case (I validated it: 1,243 ties, 128/128, mutant caught), (2) a cycled-multi-world case to exercise the belief-key child split — and soften the over-claiming docstrings (`:22-23`, `:194-196`). Optionally tune the aggregate's 3σ bar. No production-code change is warranted. The port is faithful; the verification was simply under-built for the exact-tie path, and that is the cheap, contained thing to close.
+
+### Confirmed defects (verbatim, with the workflow's proposed fixes)
+
+**[major (verification-adequacy gap, NOT a code defect)] The _ucb_select insertion-order tie-break — the KEY KNOWN HAZARD — has zero test coverage in the committed suite**  
+- location: `cpp/parity/ismcts_logic.py:162 (leaf_fifo = rng.standard_normal(2048)*1.7, continuous float64); the 240-case grid at :170-175; over-claims at :22-23/:194-196 and tests/test_cpp_runner.py:~225-226`  
+- fix: Add a deterministic tie-forcing case to the logic grid: feed an INTEGER-quantized leaf FIFO (e.g. values in {-1,0,1}) with c in {0.0,0.7}, which makes the UCB value reward[a]/n_j + explore a ratio of small integers and produces frequent EXACT ties. I verified independently that this drives 1,243 real exact UCB ties and the committed C++ matches Python 128/128, while a sorted-key mutant diverges 14/128 (so the case DISCRIMINATES). Also soften the docstring/test claims at ismcts_logic.py:22-23/:194-196 and tests/test_cpp_runner.py: the float-leaf grid exercises the UCB *scoring arithmetic* and availability denominator but NOT the insertion-order tie-break (I measured 0 ties across 9,118 ucb_select calls).
+
+**[major (verification-adequacy gap, NOT a code defect)] Fixed sample_world->bw[0] collapses the ISMCTS multi-determinization sub-child split — 0 action-edges ever get >1 belief_key child, so the BeliefKey routing is untested action-for-action**  
+- location: `cpp/parity/ismcts_logic.py:113 (Environment.sample_world = lambda ...: int(bw[0])); C++ counterpart ismcts_dump.cpp:~76; the multi-belief branch it leaves uncovered is ismcts.cpp:172-180 / ismcts.py:175-179`  
+- fix: Add a deterministic multi-world fixture: script sample_world to CYCLE a small fixed list of distinct worlds (FIFO, identical on both sides) instead of constant bw[0], so a single action edge accumulates >1 (action, belief_key) child and the std::map<tuple<int,BeliefKey>,int> routing + the 'child is None for this determinization' branch are exercised as an exact-action assertion. The defining ISMCTS information-set-aggregation property is currently only loosely touched by the aggregate tier (|z|<3.0).
+
+**[minor (verification methodology, NOT a code defect)] Aggregate parity is an uncorrected 6-statistic 3-sigma test at reduced iterations: ~1.6% family-wise false-fail AND low sensitivity to subtle drift**  
+- location: `cpp/parity/ismcts_parity.py:102 (6 keys), :134-136 (z<3.0 ANDed, no family-wise correction), :97-101 (episodes=120 x 2 seeds = 240/side, iterations=80 vs ISMCTSConfig default 300)`  
+- fix: Apply a family-wise (Bonferroni) threshold OR document the 1.6% expected false-fail rate; note the keys are positively correlated so 1.6% is an upper bound. For sensitivity, either raise N/iterations or (better) rely on the deterministic logic check for exact-tie paths once the two coverage gaps above are closed. This harness is honest in its own docstring (defers exact logic to the deterministic check), so this is a tuning note, not an over-claim.
+
+**[observation (housekeeping)] Aggregate parity writes per-episode JSONL to a /tmp tempfile and os.unlinks it, retaining only 6 summary stats — at odds with the CLAUDE.md 'never discard experiment output' guidance**  
+- location: `cpp/parity/ismcts_parity.py:54 (tempfile.mktemp) and :70 (os.unlink); inherited pattern at parity.py:107/121`  
+- fix: Optional: write the raw per-episode rows under ~/w/vdc (not /tmp) so a skeptic can re-test at a tighter tolerance / inspect an outlier without re-running the expensive search. Mitigated by the harness being reproducible-by-construction (fixed seeds 11/23, fixed cfg); the /tmp file is genuinely an IPC channel (C++ subprocess -> Python parent), so this is low-stakes housekeeping, not a defect of the parity logic.
+
+*Public Domain (The Unlicense).*
