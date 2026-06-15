@@ -39,6 +39,12 @@ z ≡ 0 reproduces the existing clairvoyant ceiling 0.1454 — the regression ch
 visits are strictly dominated, so the inner sup collapses to clairvoyant_rate's
 subset×permutation enumeration.
 
+The V̂ STRATEGIES themselves live elsewhere, split BY DEPENDENCY so this engine carries
+none of their imports: `chocofarm/bounds/vhats.py` (the `Vhat` Protocol + the
+no-heavy-deps vhat_zero / vhat_analytic), `chocofarm/bounds/vhats_decomp.py` (DecompVhat,
+needs solvers.decomp), `chocofarm/bounds/vhats_exact.py` (ExactBeliefVhat, the belief
+enumeration). PenalizedClairvoyant takes whichever V̂ the caller injects.
+
 Pin any run to CPU core 3 under `timeout` (a live AZ job holds cores 0–3). The full
 15,504-world computation is DEFERRED — validate on small sub-instances only.
 """
@@ -57,159 +63,19 @@ from chocofarm.model.env import Environment, TERMINATE
 #
 # A V̂ estimates the fixed-λ value-to-go E[ΣR − λΣT | state] of near-optimal
 # continuation. ANY V̂ yields a VALID bound (dual feasibility is automatic); a good V̂
-# yields a TIGHT one. The penalty / inner solve treat V̂ as an injected callable
-# `vhat(env, loc, bw, collected, lam) -> float`.
-
-
-def vhat_zero(env, loc, bw, collected, lam):
-    """V̂ ≡ 0 — but NOTE this is NOT the z≡0 clairvoyant baseline. With V̂≡0 the
-    value-function penalty is z_t = r_t − E[r_t | F_t, a_t] (the REWARD-DEVIATION
-    martingale), which is dual-feasible and nonzero. It is a (mild) valid penalty, not
-    the pure relaxation. The TRUE z≡0 regression baseline is `vhat=None` (the
-    no-penalty mode in PenalizedClairvoyant), which uses the realized r − λ·dt and
-    reproduces clairvoyant_rate exactly. Kept only as a curiosity / extra valid V̂."""
-    return 0.0
-
-
-def vhat_analytic(env, loc, bw, collected, lam):
-    """Trivial analytic V̂₀ (sanity baseline, dual-bound.md §2.4(1)): expected
-    still-collectable reward if grabbable for free, minus the cost to leave.
-
-        V̂₀ = Σ_i marginals(b)[i]·value[i]·1[i∉c]  −  λ·exit_cost(loc)
-
-    Crude but a genuine value estimate; it makes the penalty CHARGE for resolving
-    marginals, so B(λ, V̂₀) is a valid bound that should sit modestly below 0.1454."""
-    if len(bw) == 0:
-        return -lam * env.exit_cost(loc)
-    marg = env.marginals(bw)
-    er = sum(marg[i] * env.value[i] for i in range(env.N) if i not in collected)
-    return er - lam * env.exit_cost(loc)
-
-
-class DecompVhat:
-    """Decomp belief value function V̂_D (dual-bound.md §2.4(2)): the macro's λ-value
-    of the live state, reusing chocofarm.solvers.decomp's exact per-cluster
-    continuation values + the live occupancy posterior. This is the SAME object the
-    decomp policy acts on (the 0.094-achievable belief value), reused as the penalty's
-    value approximation — the strongest TRUSTED V̂ here.
-
-    V̂_D(loc, bw, collected) = MacroPlanner.value(loc, live_posterior, visited∅,
-    delta_done(from collected), horizon)[0], i.e. the expectimax λ-value of the
-    macro state, which already includes the exit toll. Built lazily per λ and cached.
-
-    Note: this is a DECISION value function (it steers the decomp policy), reused as a
-    state-value estimate. It is accurate but sub-optimal, so the resulting bound is
-    tight-ish, not exact (dual-bound.md §6)."""
-
-    def __init__(self, horizon=1):
-        self.horizon = horizon
-        self._built = {}   # round(lam,6) -> (macro, sense, delta_ids)
-
-    def _build(self, env, lam):
-        key = round(lam, 6)
-        if key in self._built:
-            return self._built[key]
-        # import here to keep the bounds module importable without decomp on hand
-        from chocofarm.solvers import decomp as D
-        clusters = D.discover_clusters(env)
-        sense = [c for c in clusters if c.size > 1]
-        anchors = {c.name: min(c.tres, key=lambda t: env.d(("w", env.entry), ("t", t)))
-                   for c in sense}
-        micro = {}
-        for c in sense:
-            entry = ("t", anchors[c.name])
-            for k in range(1, c.size + 1):
-                micro[(c.name, k)] = D.build_cluster_micro(env, c, k, lam, entry)
-        macro = D.MacroPlanner(env, clusters, micro, lam, horizon=self.horizon)
-        delta_ids = [c.tres[0] for c in clusters if c.size == 1]
-        built = (macro, sense, delta_ids, D)
-        self._built[key] = built
-        return built
-
-    def __call__(self, env, loc, bw, collected, lam):
-        if len(bw) == 0:
-            return -lam * env.exit_cost(loc)
-        macro, sense, delta_ids, D = self._build(env, lam)
-        post = D._live_occupancy_posterior(env, bw, macro)
-        # visited: clusters already fully collected (all members collected) count as
-        # visited so the macro does not re-enter them; conservative — an unvisited but
-        # partly-collected cluster is left enterable (the macro re-values it).
-        visited = set()
-        for ci, c in enumerate(sense):
-            if all(t in collected for t in c.tres):
-                visited.add(ci)
-        delta_done = frozenset(t for t in delta_ids if t in collected)
-        v, _ = macro.value(loc, post, visited, delta_done, self.horizon)
-        # macro.value returns the λ-value of CONTINUING (it includes the exit toll on
-        # its 'exit' leaf). Add the already-collected reward? No: V̂ is value-TO-GO,
-        # the continuation value from this state, which is exactly what macro.value
-        # returns. Reward already banked is not part of value-to-go.
-        return v
-
-
-class ExactBeliefVhat:
-    """The EXACT optimal value-to-go V*(loc, belief, collected) of the (small) belief-
-    MDP at a fixed λ, by backward induction over the belief semilattice. Tractable ONLY
-    on small sub-instances (`env.restrict(keep, k_local)`) — it enumerates reachable
-    beliefs, which is the full 15,504-world intractability on the real env (do NOT use on
-    the full env).
-
-    Its purpose is the DEFINITIVE tightening test (dual-bound.md §2.3 / §6): BSS
-    strong duality (Thm 3.4) says V̂ = V* makes the penalty OPTIMAL and the bound TIGHT
-    — λ̄ = ρ*_subinstance exactly. So on a restricted sub-instance this V̂ should drive the dual bound
-    down to the sub-instance's achievable optimum, well below its clairvoyant value —
-    a direct demonstration that the machinery TIGHTENS when handed a good V̂ (the
-    decomp / analytic V̂ are merely weaker approximations, not a failure of the
-    construction)."""
-
-    def __init__(self):
-        self._memo = {}     # (lam, loc, belief, collected) -> V*
-
-    def __call__(self, env, loc, bw, collected, lam):
-        return self._solve(env, lam, loc,
-                           tuple(int(x) for x in bw), frozenset(collected))
-
-    def _solve(self, env, lam, loc, bw_key, collected):
-        key = (round(lam, 9), loc, bw_key, collected)
-        if key in self._memo:
-            return self._memo[key]
-        bw = np.array(bw_key, dtype=np.int64)
-        if len(bw) == 0:
-            self._memo[key] = -lam * env.exit_cost(loc)
-            return self._memo[key]
-        best = -lam * env.exit_cost(loc)                   # TERMINATE
-        marg = env.marginals(bw)
-        # collect a possibly-present uncollected treasure
-        for i in range(env.N):
-            if i in collected or marg[i] <= 0:
-                continue
-            dt = env.d(loc, ("t", i))
-            q = float(marg[i])
-            pres_b = env.filter_treasure(bw, i, True)
-            abs_b = env.filter_treasure(bw, i, False)
-            vp = env.value[i] + self._solve(env, lam, ("t", i),
-                                            tuple(int(x) for x in pres_b),
-                                            collected | {i}) if len(pres_b) else 0.0
-            va = self._solve(env, lam, ("t", i), tuple(int(x) for x in abs_b),
-                             collected) if len(abs_b) else 0.0
-            q_val = -lam * dt + q * vp + (1.0 - q) * va
-            best = max(best, q_val)
-        # read an informative face
-        for j in env.detectors:
-            cm = env.cover_mask[j]
-            hit = (bw & cm) != 0
-            if not (hit.any() and (~hit).any()):
-                continue
-            dt = env.d(loc, ("d", j))
-            p = float(hit.mean())
-            vpos = self._solve(env, lam, ("d", j),
-                               tuple(int(x) for x in bw[hit]), collected)
-            vneg = self._solve(env, lam, ("d", j),
-                               tuple(int(x) for x in bw[~hit]), collected)
-            q_val = -lam * dt + p * vpos + (1.0 - p) * vneg
-            best = max(best, q_val)
-        self._memo[key] = best
-        return best
+# yields a TIGHT one. The penalty / inner solve treat V̂ as an injected STRATEGY: a
+# (belief, λ) → value callable `vhat(env, loc, bw, collected, lam) -> float` (the `Vhat`
+# Protocol). Callers PASS the V̂ they want; this module imports none of them, so it stays
+# free of their dependencies. The implementations live BY DEPENDENCY in sibling modules:
+#
+#   * chocofarm/bounds/vhats.py        — the `Vhat` Protocol + the no-heavy-deps
+#                                        strategies (vhat_zero, vhat_analytic).
+#   * chocofarm/bounds/vhats_decomp.py — DecompVhat (needs chocofarm.solvers.decomp).
+#   * chocofarm/bounds/vhats_exact.py  — ExactBeliefVhat (the belief enumeration).
+#
+# Keeping DecompVhat in its own module is what lets it import decomp NORMALLY (at module
+# top) — the old lazy in-method `import decomp` (dodging a bounds→decomp cycle) is gone:
+# the bounds engine never imports decomp at all, only the V̂ it is handed does.
 
 
 # ===========================================================================
