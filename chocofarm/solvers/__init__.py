@@ -23,10 +23,11 @@ from chocofarm.solvers.uct import UCTPolicy, UCTConfig
 from chocofarm.solvers.ismcts import ISMCTSPolicy, ISMCTSConfig
 from chocofarm.solvers.nmcs import NMCSPolicy, NMCSConfig
 from chocofarm.solvers.decomp import DecompPolicy
-from chocofarm.solvers.base import RolloutConfig, SparseSamplingConfig
+from chocofarm.solvers.base import RandomPolicy, RolloutConfig, SparseSamplingConfig
 
 # name -> Policy class. The SINGLE source for "which class is this solver".
 SOLVERS = {
+    "random": RandomPolicy,
     "uct": UCTPolicy,
     "ismcts": ISMCTSPolicy,
     "nmcs": NMCSPolicy,
