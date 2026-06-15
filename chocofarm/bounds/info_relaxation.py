@@ -150,12 +150,13 @@ class DecompVhat:
 class ExactBeliefVhat:
     """The EXACT optimal value-to-go V*(loc, belief, collected) of the (small) belief-
     MDP at a fixed λ, by backward induction over the belief semilattice. Tractable ONLY
-    on small sub-instances (MiniEnv) — it enumerates reachable beliefs, which is the
-    full 15,504-world intractability on the real env (do NOT use on the full env).
+    on small sub-instances (`env.restrict(keep, k_local)`) — it enumerates reachable
+    beliefs, which is the full 15,504-world intractability on the real env (do NOT use on
+    the full env).
 
     Its purpose is the DEFINITIVE tightening test (dual-bound.md §2.3 / §6): BSS
     strong duality (Thm 3.4) says V̂ = V* makes the penalty OPTIMAL and the bound TIGHT
-    — λ̄ = ρ*_subinstance exactly. So on a MiniEnv this V̂ should drive the dual bound
+    — λ̄ = ρ*_subinstance exactly. So on a restricted sub-instance this V̂ should drive the dual bound
     down to the sub-instance's achievable optimum, well below its clairvoyant value —
     a direct demonstration that the machinery TIGHTENS when handed a good V̂ (the
     decomp / analytic V̂ are merely weaker approximations, not a failure of the
