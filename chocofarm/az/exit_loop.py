@@ -46,7 +46,7 @@ from chocofarm.az.actions import n_action_slots, legal_mask_from_features
 from chocofarm.az.mlp import ValueMLP
 from chocofarm.az.gumbel_search import GumbelAZSearch, GumbelPolicy
 from chocofarm.az.value_target import blended_returns_to_go
-from chocofarm.eval.harness import BeliefRefs
+from chocofarm.references import BeliefRefs
 
 
 def r2_score(y_true, y_pred):
