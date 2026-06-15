@@ -9,6 +9,7 @@ point). It knows nothing about HOW a decision is made — that is a `Policy` (se
 chocofarm/solvers/base.py), passed in. New solution methods (NMCS, ISMCTS, …) are new
 Policy subclasses; this file does not change.
 """
+import copy
 import math
 import numpy as np
 
@@ -24,6 +25,12 @@ class Environment:
         self.treasures = inst.treasures
         self.teleports = inst.teleports
         self.N, self.K = inst.N, inst.K
+        # COPY-ON-WRITE CONTRACT (with_scenario): the scenario knobs `value`/`entry`/`tp`
+        # are the ONLY construction state that may depend on the scenario. Nothing below may
+        # cache a structure DERIVED from value/entry/tp (e.g. a value-weighted precompute) —
+        # `with_scenario` shallow-copies the env and overrides only these three, so any such
+        # derived cache would be shared stale across scenarios (silent divergence). Keep
+        # value/entry/tp-derived quantities computed at point-of-use (apply/simulate/exit_cost).
         self.value = list(value) if value is not None else [1.0] * self.N
         self.entry, self.tp = entry, float(teleport_overhead)
 
@@ -67,6 +74,37 @@ class Environment:
         for ka, (x1, y1) in coord_items:
             for kb, (x2, y2) in coord_items:
                 self._dist[(ka, kb)] = math.hypot(x1 - x2, y1 - y2)
+
+    # ---- scenario (copy-on-write) ----
+    def with_scenario(self, scenario):
+        """Return a NEW Environment that SHARES this env's immutable Tier-1 geometry
+        by reference (copy-on-write) and overrides only the Tier-2 scenario knobs
+        `value`/`entry`/`tp` from `scenario`.
+
+        The expensive geometry — `_dist` (the ~4.5k-entry distance table), `coord`,
+        `worlds`, `detectors`, `det_pt`, `cover_mask`, `treasures`, `teleports`,
+        `N`, `K` — depends ONLY on the instance, NOT on the scenario knobs (`value`
+        is read only in `apply`, `entry` only in `simulate`, `tp` only in
+        `exit_cost`). So a `copy.copy(self)` (shallow — those attributes are aliased
+        to the original, NOT rebuilt) plus the three overrides is exactly equivalent
+        to a fresh `Environment(value=…, entry=…, teleport_overhead=…)`.
+
+        A value/entry/teleport sweep is therefore
+        `[env.with_scenario(s) for s in scenarios]` — one geometry build, N shallow
+        copies — not N full rebuilds. `self` is NOT mutated.
+        """
+        if scenario.value is not None and len(scenario.value) != self.N:
+            # ADR-0002 fail-loud: a wrong-length value vector is a config error, not
+            # something to silently broadcast or truncate to N.
+            raise ValueError(
+                f"Scenario.value has length {len(scenario.value)}, "
+                f"expected N={self.N} (one reward per treasure)."
+            )
+        new = copy.copy(self)
+        new.value = list(scenario.value) if scenario.value is not None else [1.0] * new.N
+        new.entry = scenario.entry
+        new.tp = float(scenario.teleport_overhead)
+        return new
 
     # ---- geometry ----
     def d(self, a, b):
