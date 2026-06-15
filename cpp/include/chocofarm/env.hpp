@@ -63,6 +63,15 @@ class Environment {
     Point entry_point() const { return inst_.teleports[entry_idx_]; }
     Point treasure_pt(int i) const { return inst_.treasures[i]; }
     Point face_pt(int i) const { return inst_.faces[i].rep_point; }
+    // Per-treasure reward magnitude (mirrors env.value[i]). The live instance carries unit values
+    // (env.py: `self.value = [1.0]*N`), the same constant `apply` already banks as the collect
+    // reward — one home for the magnitude, read explicitly here so a value-using policy (the NMCS
+    // GreedyPolicy base) mirrors Python's `env.value[i]` rather than hiding the 1.0 in a literal.
+    double value(int i) const { (void)i; return 1.0; }
+    // The single episode-horizon home (mirrors env.max_steps): the safety-net cap a base playout
+    // runs to (solvers.base._base_value loops `range(env.max_steps)`). One source of truth so a
+    // playout's horizon cannot silently desync from the Python env's.
+    int max_steps() const { return 40; }
     int n_teleports() const { return static_cast<int>(inst_.teleports.size()); }
     Point teleport_pt(int k) const { return inst_.teleports[k]; }
 

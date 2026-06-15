@@ -22,15 +22,19 @@ cpp/
     instance.hpp            instance geometry: treasures/teleports/K + the DERIVED faces (cover+rep_point)
     env.hpp                 the env port: belief world-set, legal actions, apply, filters, distances
     policy.hpp              the composable Policy interface (P2) + RandomPolicy (the trivial drop-in)
+    nmcs.hpp                the NMCS Policy (nested Monte-Carlo search) — a drop-in alongside RandomPolicy
     features.hpp            §2.2 featurization + the action↔slot legality mask (all dims DERIVED)
     transport.hpp           the redis wire client (the SOLE contract; manifest-driven weight read)
     runner.hpp              the runner: read weights → run E episodes → write (X,PI,M,Y)
   src/
-    instance.cpp env.cpp features.cpp transport.cpp runner.cpp
-    main.cpp                the runner entrypoint (live scalars as CLI args)
+    instance.cpp env.cpp features.cpp transport.cpp nmcs.cpp runner.cpp
+    main.cpp                the runner entrypoint (live scalars as CLI args; --policy random|nmcs)
     mask_dump.cpp           a tiny PARITY fixture (replay → dump mask/features); not the runner (P3)
+    nmcs_dump.cpp           a tiny PARITY fixture (scripted-source NMCS search → selected action); not the runner (P3)
   parity/
-    parity.py              the ADR-0012 P6/P7 behavioral-parity harness
+    parity.py              the ADR-0012 P6/P7 behavioral-parity harness (RandomPolicy)
+    nmcs_logic.py          the NMCS deterministic logic check (same action on scripted leaf returns)
+    nmcs_parity.py         the NMCS aggregate behavioral parity (aggregates within MC CI)
   README.md
 ```
 
@@ -68,6 +72,69 @@ cpp/build/chocofarm-cpp-runner \
 `lam` / `episodes` / `max-steps` are **live CLI scalars** (P4), never baked in.
 A missing weight payload is a **loud abort** (non-zero exit + the same message
 `read_weights` raises), never a silent stale serve.
+
+## The NMCS Policy (nested Monte-Carlo search)
+
+`--policy nmcs` selects the **NMCS** Policy (`nmcs.hpp` / `nmcs.cpp`), a faithful
+port of `chocofarm/solvers/nmcs.py` behind the **same env↔Policy seam** —
+**zero edits to the runner / env core** (the P2 seam test: `main.cpp` is the one
+place a policy is chosen, a clean `--policy random|nmcs` strategy selection; the
+runner takes `const Policy&` and never names a concrete subclass).
+
+It mirrors `nmcs.py`'s three parts exactly:
+
+- **The level-k nested recursion** (`NMCSPolicy::search`): walk the line forward;
+  at each step evaluate every candidate by a level-`(k-1)` search of its result,
+  take the **argmax** (strict `>`, first-wins on ties — matching Python's
+  `if q > best_q`), play it in a determinized world, continue; **memorize-and-
+  replay** the best complete line's first action (Cazenave's rule). 2-level is
+  the milestone.
+- **The level-0 determinized base playout** (`NMCSPolicy::playout`): mean over
+  `playout_samples` sampled worlds of `GreedyBase` (the λ-rational `GreedyPolicy`)
+  played deterministically to the end (`base_value`), scored by the λ-penalized
+  return `Σvalue − λ(travel + exit)`.
+- **The per-move evaluation** (`NMCSPolicy::eval_move`): mean over `step_samples`
+  determinizations of (immediate λ-step + the nested level-`(k-1)` continuation).
+
+Candidate pruning is the shared nearest-few-detectors/treasures + always
+`TERMINATE` (mirrors `solvers.base.candidate_actions(..., include_terminate=True)`).
+NMCS uses **NO net** (no `NetForward`). The knobs are live CLI scalars (P4),
+defaulting to `NMCSConfig`'s:
+
+```sh
+cpp/build/chocofarm-cpp-runner --policy nmcs \
+    --instance chocofarm/data/instance.json --faces chocofarm/data/faces.json \
+    --run R --res-token T --episodes 150 --lam 0.1 --max-steps 24 \
+    --nmcs-level 1 --nmcs-playouts 3 --nmcs-step-samples 2 \
+    --nmcs-cand-det 4 --nmcs-cand-tre 4 --nmcs-max-steps 24
+```
+
+### NMCS parity (ADR-0012 P6 — behavioral, not byte-identity)
+
+The C++ NMCS has its **own** RNG (`std::mt19937_64 ≠ numpy`), so parity is the
+behavioral bar. Two harnesses:
+
+- **Deterministic logic check** (`cpp/parity/nmcs_logic.py`, needs
+  `chocofarm-nmcs-dump`, **no redis**). RNG enters NMCS only through
+  world-sampling, so we make the search **RNG-free on both sides** — `sample_world
+  → bw[0]` (the lowest-bitmask world, same combinations order both sides) and the
+  level-0 playout value → **a fixed table cycled in call order**. The recursion is
+  structurally identical, so the table is consumed identically; feeding **both**
+  the **same** scripted leaf returns on fixed `(loc, belief, collected)` inputs,
+  the two **select the same action** — asserted for **level-1 AND level-2** (the
+  milestone) over a grid of states / λ / candidate widths. This validates the
+  nesting + selection logic (the part that *must* be exact) independent of RNG.
+- **Aggregate behavioral parity** (`cpp/parity/nmcs_parity.py`, needs the runner
+  + redis). The C++ NMCS runner and the Python `NMCSPolicy` over matched-seed
+  episodes agree on every aggregate — mean length, λ-return, action-type
+  distribution, belief-shrinkage — within Monte-Carlo CI (every `|z| = |Δ|/SE <
+  3`), with the MC SE **reported**. NMCS is the slowest solver, so N is moderate
+  (150 episodes × 2 seeds, level 1); level-2 is covered exactly by the logic
+  check above.
+
+Both are gated in `tests/test_cpp_runner.py` (skip when the fixture / redis is
+absent), and `NMCSPolicy is a Policy subclass registered in SOLVERS` is an
+always-on pin.
 
 ## How the env port mirrors `env.py` / `facemodel.py`
 

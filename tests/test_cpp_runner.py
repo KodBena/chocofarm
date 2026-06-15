@@ -13,6 +13,15 @@ Two layers:
     the feature X-port equivalence, the format round-trip. SKIPPED (not failed) when the binary or
     redis is absent, so the default `pytest tests/ -q` stays green on a box without the C++ build.
 
+The NMCS Policy (the nested Monte-Carlo search ported behind the SAME seam) adds:
+  * ALWAYS-ON: NMCSPolicy is a Policy subclass registered in SOLVERS (the seam invariant).
+  * OPT-IN (needs chocofarm-nmcs-dump): the DETERMINISTIC logic check (cpp/parity/nmcs_logic.py) —
+    same selected action on identical scripted leaf returns, level-1 AND level-2. NO redis (pure
+    env + scripted source).
+  * OPT-IN (needs chocofarm-cpp-runner + redis): the AGGREGATE behavioral parity
+    (cpp/parity/nmcs_parity.py) — NMCS aggregates within MC CI. Both SKIPPED when the fixture/redis
+    is absent.
+
 Public Domain (The Unlicense).
 """
 import os
@@ -32,8 +41,11 @@ from chocofarm.solvers.base import Policy, RandomPolicy
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CPP_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-cpp-runner")
 NET_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-net-dump")
+NMCS_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-nmcs-dump")
 PARITY = os.path.join(REPO, "cpp", "parity", "parity.py")
 NET_PARITY = os.path.join(REPO, "cpp", "parity", "net_parity.py")
+NMCS_LOGIC = os.path.join(REPO, "cpp", "parity", "nmcs_logic.py")
+NMCS_PARITY = os.path.join(REPO, "cpp", "parity", "nmcs_parity.py")
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +56,14 @@ def test_random_policy_is_a_policy_subclass():
     it is registered in the SOLVERS name table."""
     assert issubclass(RandomPolicy, Policy)
     assert SOLVERS["random"] is RandomPolicy
+
+
+def test_nmcs_policy_is_a_policy_subclass():
+    """P2: the NMCS search is a `Policy` subclass registered in SOLVERS — the SAME seam invariant the
+    C++ NMCSPolicy mirrors (a drop-in alongside RandomPolicy with zero env/runner core edits)."""
+    from chocofarm.solvers.nmcs import NMCSPolicy
+    assert issubclass(NMCSPolicy, Policy)
+    assert SOLVERS["nmcs"] is NMCSPolicy
 
 
 def test_random_policy_only_picks_legal_actions():
@@ -136,4 +156,36 @@ def test_cpp_net_forward_parity():
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, f"net-forward parity harness FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not os.path.exists(NMCS_BIN),
+                    reason="C++ nmcs-dump not built (cmake -S cpp -B cpp/build && cmake --build cpp/build)")
+def test_cpp_nmcs_logic_parity():
+    """The DETERMINISTIC NMCS logic check (cpp/parity/nmcs_logic.py): with the RNG abstracted behind a
+    scripted, RNG-free WorldSource (sample_world->bw[0]; playout_value->a fixed cycled table), the C++
+    NMCS and the Python NMCS SELECT THE SAME ACTION on fixed (loc, belief) inputs — for level-1 AND
+    level-2 (the milestone). This validates the nesting + selection logic, the part that MUST be exact,
+    independent of RNG (ADR-0012 P6). No redis needed (pure env + scripted source)."""
+    out = subprocess.run([sys.executable, NMCS_LOGIC], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"NMCS logic check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not os.path.exists(CPP_BIN),
+                    reason="C++ runner not built (cmake -S cpp -B cpp/build && cmake --build cpp/build)")
+def test_cpp_nmcs_aggregate_parity():
+    """The AGGREGATE NMCS behavioral parity (cpp/parity/nmcs_parity.py): the C++ NMCS runner
+    (`--policy nmcs`) and the Python NMCSPolicy over matched-seed episodes agree on every aggregate
+    (mean length, λ-return, action-type distribution, belief-shrinkage) within Monte-Carlo CI, with
+    the MC SE reported — the ADR-0012 P6 behavioral bar (NOT byte-identity; the RNGs differ). NMCS is
+    the slowest solver, so N is moderate. Skips (does not fail) when redis is down."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    out = subprocess.run([sys.executable, NMCS_PARITY], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=1200)
+    assert out.returncode == 0, f"NMCS aggregate parity FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
