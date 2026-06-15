@@ -31,6 +31,7 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
     std::vector<std::vector<float>> pis, masks;
     std::vector<std::pair<double, double>> step_rt;  // (r, dt) for each EXECUTED (non-TERMINATE) step
     int n_collect = 0, n_sense = 0, n_terminate = 0;
+    std::vector<int> exec_slots;  // the executed-action slot trace (for wire-content replay parity)
 
     for (int ply = 0; ply < max_steps; ++ply) {
         if (bw.empty()) break;  // mirrors generate_episode's len(bw)==0 break
@@ -60,12 +61,14 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
             pis.push_back(std::move(pi));
             masks.push_back(std::move(mask));
             n_terminate = 1;
+            exec_slots.push_back(term_slot(env));   // record the TERMINATE decision in the trace
             break;
         }
         feats.push_back(std::move(feat));
         pis.push_back(std::move(pi));
         masks.push_back(std::move(mask));
         if (action.kind == ActionKind::Treasure) ++n_collect; else ++n_sense;
+        exec_slots.push_back(action_to_slot(env, action));
         StepResult sr = env.apply(loc, bw, collected, action, world);
         step_rt.emplace_back(sr.reward, sr.dt);
     }
@@ -98,6 +101,8 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
     out.n_terminate = n_terminate;
     out.belief_shrinkage = (bw0 > 0) ? (1.0 - static_cast<double>(bw.size()) /
                                               static_cast<double>(bw0)) : 0.0;
+    out.world = world;
+    out.exec_slots = std::move(exec_slots);
     out.X.resize(static_cast<size_t>(n_rec) * feat_dim);
     out.PI.resize(static_cast<size_t>(n_rec) * n_slots);
     out.M.resize(static_cast<size_t>(n_rec) * n_slots);
@@ -147,13 +152,22 @@ int run(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
         EpisodeBlocks ep = run_episode(env, fb, policy, world, cfg.lam, rng, cfg.max_steps);
         if (stats_out) {
             // one JSON-object line per episode for the P6 behavioral-parity harness (additive to the
-            // wire write below; does not change what crosses the wire).
-            (*stats_out) << "{\"length\":" << ep.ep_length
+            // wire write below; does not change what crosses the wire). It carries the aggregate
+            // stats AND the exact episode trace (idx, world, executed slots) so the harness can
+            // replay the SAME episode in Python and value-compare the wire PI/Y/X/M bytes against an
+            // INDEPENDENT computation (the wire-content parity check).
+            (*stats_out) << "{\"idx\":" << idx
+                         << ",\"world\":" << ep.world
+                         << ",\"length\":" << ep.ep_length
                          << ",\"lam_return\":" << ep.lam_return
                          << ",\"n_collect\":" << ep.n_collect
                          << ",\"n_sense\":" << ep.n_sense
                          << ",\"n_terminate\":" << ep.n_terminate
-                         << ",\"belief_shrinkage\":" << ep.belief_shrinkage << "}\n";
+                         << ",\"belief_shrinkage\":" << ep.belief_shrinkage
+                         << ",\"exec_slots\":[";
+            for (size_t s = 0; s < ep.exec_slots.size(); ++s)
+                (*stats_out) << (s ? "," : "") << ep.exec_slots[s];
+            (*stats_out) << "]}\n";
         }
         if (ep.n == 0) continue;  // no records (empty belief immediately) — nothing to write
         redis.write_results(cfg.res_token, idx, ep.X, ep.n, ep.feat_dim, ep.PI, ep.M, ep.Y,

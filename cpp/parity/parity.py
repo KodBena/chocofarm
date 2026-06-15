@@ -156,31 +156,6 @@ def compare(py_rows, cpp_rows, keys):
 # the C++ M is built by the SAME legal_actions->slot mapping, so we assert the Python-rebuilt mask
 # equals the C++-emitted mask for every recorded decision of a real C++ episode).
 # ---------------------------------------------------------------------------
-def mask_parity(env, res_token, episodes, feat_dim_, n_slots):
-    """Read the C++ M blocks back and, for the SAME (loc, belief) the C++ visited, rebuild the
-    Python mask and assert bit-identity. We reconstruct the visited (loc, belief) by replaying the
-    executed action sequence — but the executed action is not on the wire, so instead we assert the
-    structural mask invariants the logic guarantees AND, separately (test_cpp_runner.py), drive a
-    hand-picked belief through both. Here we assert, per recorded decision, the strongest wire-only
-    logic facts: M is {0,1}, illegal-PI mass == 0.0, TERMINATE slot == 1.0."""
-    conn = transport.connect()
-    checked = 0
-    for idx in range(episodes):
-        xk, pik, mk, yk = transport.result_keys(res_token, idx)
-        yb = conn.get(yk)
-        if yb is None:
-            continue
-        Y = np.frombuffer(yb, dtype=np.float32)
-        n = len(Y)
-        M = np.frombuffer(conn.get(mk), dtype=np.float32).reshape(n, n_slots)
-        PI = np.frombuffer(conn.get(pik), dtype=np.float32).reshape(n, n_slots)
-        assert set(np.unique(M).tolist()) <= {0.0, 1.0}, "M not in {0,1}"
-        assert float(PI[M == 0.0].sum()) == 0.0, "illegal-slot PI mass != 0.0"
-        assert bool((M[:, n_slots - 1] == 1.0).all()), "TERMINATE slot not always legal"
-        checked += n
-    return checked
-
-
 def mask_bit_exact(env, n_seqs, max_steps, seed, n_slots):
     """The STRONG bit-exact mask claim (ADR-0012 P6/P7): for a matched (loc, belief) sequence, the
     C++ legality mask M is BYTE-IDENTICAL to Python's `legal_mask`. Drive a random action sequence in
@@ -293,6 +268,90 @@ def format_roundtrip(res_token, episodes, feat_dim_, n_slots):
     return n_total
 
 
+def wire_content_parity(env, cpp_rows, res_token, lam, max_steps, feat_dim_, n_slots):
+    """The WIRE-CONTENT cross-impl parity check (closes the gap ADR-0012 P7 flags as deferred).
+
+    For each C++ episode we have its exact trace (world, executed slots). Replay the SAME episode in
+    Python — building X (the §2.2 feature vector), PI (uniform-over-legal), M (the legality mask),
+    and Y (pure-MC suffix return-to-go) per recorded decision — and compare to the actual wire bytes
+    the C++ runner wrote, read back via np.frombuffer(...).reshape(...). This compares the PI and Y
+    BYTES (not just illegal-mass + shape) against an INDEPENDENT Python computation:
+      * M, PI  -> bit-exact (logic invariants: the mask and a uniform-over-legal target float32
+                  cannot perturb);
+      * X, Y   -> forward-roundoff bar (ABS_TOL=1e-4): same float64 math, different language.
+    Returns (n_decisions_checked, max|ΔX|, max|ΔY|, pi_bit_exact, mask_bit_exact)."""
+    from chocofarm.az.actions import action_to_slot, legal_mask, term_slot
+    from chocofarm.az.features import FeatureBuilder
+    fb = FeatureBuilder(env)
+    conn = transport.connect()
+    ABS_TOL = 1e-4
+    nslot = n_slots
+    tslot = term_slot(env)
+    checked = 0
+    max_dx = max_dy = 0.0
+    pi_ok = mask_ok = True
+    for row in cpp_rows:
+        idx = row["idx"]
+        world = row["world"]
+        slots = row["exec_slots"]
+        xk, pik, mk, yk = transport.result_keys(res_token, idx)
+        yb = conn.get(yk)
+        if yb is None:
+            continue  # empty episode wrote nothing
+        Yw = np.frombuffer(yb, dtype=np.float32)
+        nrec = len(Yw)
+        Xw = np.frombuffer(conn.get(xk), dtype=np.float32).reshape(nrec, feat_dim_)
+        PIw = np.frombuffer(conn.get(pik), dtype=np.float32).reshape(nrec, nslot)
+        Mw = np.frombuffer(conn.get(mk), dtype=np.float32).reshape(nrec, nslot)
+
+        # --- replay the exact episode in Python, reproducing the C++ runner's per-decision records ---
+        loc, bw, collected = ("w", env.entry), env.worlds, set()
+        ref_X, ref_PI, ref_M = [], [], []
+        step_rt = []
+        for slot in slots:
+            feat = fb.build(loc, bw, collected).astype(np.float64)
+            mask = legal_mask(env, loc, bw, collected).astype(np.float32)
+            legal = env.legal_actions(loc, bw, collected)
+            n_choices = len(legal) + 1
+            u = np.float32(1.0 / n_choices)
+            pi = np.zeros(nslot, dtype=np.float32)
+            for a in legal:
+                pi[action_to_slot(env, a)] = u
+            pi[tslot] = u
+            ref_X.append(feat); ref_PI.append(pi); ref_M.append(mask)
+            if slot == tslot:
+                break  # TERMINATE decision: no step
+            a = (("t", slot) if slot < env.N else ("d", slot - env.N))
+            r, loc, bw, collected, dt = env.apply(loc, bw, collected, a, world)
+            step_rt.append((r, dt))
+        exit_c = env.exit_cost(loc)
+        n_dec = len(step_rt)
+        # pure-MC suffix return-to-go; trailing TERMINATE record -> -λ·exit_c
+        g = [0.0] * len(ref_X)
+        sr = st = 0.0
+        for j in range(n_dec - 1, -1, -1):
+            sr += step_rt[j][0]; st += step_rt[j][1]
+            g[j] = sr - lam * (st + exit_c)
+        for j in range(n_dec, len(ref_X)):
+            g[j] = -lam * exit_c
+        ref_Y = np.array(g, dtype=np.float32)
+
+        assert len(ref_X) == nrec, (len(ref_X), nrec, idx)
+        ref_Xa = np.array(ref_X, dtype=np.float64)
+        ref_PIa = np.array(ref_PI, dtype=np.float32)
+        ref_Ma = np.array(ref_M, dtype=np.float32)
+        # M and PI: bit-exact (byte-identical float32)
+        if ref_Ma.tobytes() != Mw.tobytes():
+            mask_ok = False
+        if ref_PIa.tobytes() != PIw.tobytes():
+            pi_ok = False
+        # X and Y: forward-roundoff bar
+        max_dx = max(max_dx, float(np.max(np.abs(ref_Xa - Xw.astype(np.float64)))))
+        max_dy = max(max_dy, float(np.max(np.abs(ref_Y.astype(np.float64) - Yw.astype(np.float64)))))
+        checked += nrec
+    return checked, max_dx, max_dy, pi_ok, mask_ok, ABS_TOL
+
+
 def publish_weights(run_id, version):
     """Publish a real net to the (run, phase=gen, version) keys so the C++ runner's weight-read seam
     has a manifest+blob to parse (it reads but RandomPolicy ignores the weights — the read is the
@@ -344,22 +403,34 @@ def main():
           f"(bar ABS_TOL={ABS_TOL:.0e}) -> {'OK' if feat_ok else 'DIVERGE'}\n")
 
     py_rows_all, cpp_rows_all = [], []
-    last_token = None
+    wire_ok = True
+    wire_dx = wire_dy = 0.0
+    wire_checked = 0
     for seed in seeds:
         py_rows = py_run(env, policy, lam, episodes, seed, max_steps)
         cpp_rows, res_token = cpp_run(run_id, version, lam, episodes, seed, max_steps)
         py_rows_all += py_rows
         cpp_rows_all += cpp_rows
-        last_token = res_token
-        # per-seed mask + format checks on this seed's blobs
-        checked = mask_parity(env, res_token, episodes, fd, ns)
+        # per-seed format check + the WIRE-CONTENT cross-impl parity (PI/Y/X/M bytes vs Python)
         nfmt = format_roundtrip(res_token, episodes, fd, ns)
-        print(f"[seed {seed}] mask logic-invariants bit-exact over {checked} decisions; "
-              f"format round-trip OK over {nfmt} rows")
+        wc, dx, dy, pi_ok, mask_ok, abs_tol = wire_content_parity(
+            env, cpp_rows, res_token, lam, max_steps, fd, ns)
+        wire_checked += wc
+        wire_dx = max(wire_dx, dx)
+        wire_dy = max(wire_dy, dy)
+        seed_wire_ok = pi_ok and mask_ok and dx <= abs_tol and dy <= abs_tol
+        wire_ok = wire_ok and seed_wire_ok
+        print(f"[seed {seed}] format round-trip OK over {nfmt} rows; "
+              f"wire-content vs Python over {wc} decisions: "
+              f"PI {'bit-exact' if pi_ok else 'DIVERGE'}, M {'bit-exact' if mask_ok else 'DIVERGE'}, "
+              f"max|ΔX|={dx:.2e} max|ΔY|={dy:.2e} (bar {abs_tol:.0e})")
 
-    print()
+    print(f"\n[wire-content] over {wire_checked} decisions across {len(seeds)} seeds: the C++ wire "
+          f"PI & M bytes are BIT-EXACT vs an independent Python replay; max|ΔX|={wire_dx:.2e} "
+          f"max|ΔY|={wire_dy:.2e} (bar 1e-04) -> {'OK' if wire_ok else 'DIVERGE'}\n")
+
     res = compare(py_rows_all, cpp_rows_all, keys)
-    ok = feat_ok
+    agg_ok = True
     print(f"{'stat':<18}{'py mean±SE':<26}{'cpp mean±SE':<26}{'Δ':<14}{'SE_comb':<12}{'|z|':<8}verdict")
     for k in keys:
         r = res[k]
@@ -367,16 +438,28 @@ def main():
         cp = f"{r['cpp_mean']:.5f}±{r['cpp_se']:.5f}"
         verdict = "OK" if r["z"] < 3.0 else "DIVERGE"
         if r["z"] >= 3.0:
-            ok = False
+            agg_ok = False
         print(f"{k:<18}{py:<26}{cp:<26}{r['diff']:<+14.5f}{r['se_combined']:<12.5f}"
               f"{r['z']:<8.2f}{verdict}")
 
+    ok = feat_ok and wire_ok and agg_ok
     print()
     print("Bar: |z| = |Δ| / SE_combined < 3.0 (≈99.7% two-sided MC band) for every float-sensitive")
-    print("     aggregate; the legality mask M is a logic invariant asserted BIT-EXACT (above).")
+    print("     aggregate; the legality mask M AND the wire PI/M bytes are logic invariants asserted")
+    print("     BIT-EXACT; X/Y feature & value-target bytes held to ABS_TOL=1e-4 (forward roundoff).")
     print()
-    print("RESULT:", "PASS — aggregates indistinguishable within MC CI; mask bit-exact; format "
-          "round-trips" if ok else "FAIL — an aggregate diverged beyond 3·SE")
+    if ok:
+        print("RESULT: PASS — mask & wire PI/M bit-exact; X/Y within ABS_TOL; aggregates "
+              "indistinguishable within MC CI; format round-trips")
+    else:
+        why = []
+        if not feat_ok:
+            why.append("feature X-port > ABS_TOL")
+        if not wire_ok:
+            why.append("wire PI/M/X/Y diverged")
+        if not agg_ok:
+            why.append("an aggregate beyond 3·SE")
+        print("RESULT: FAIL — " + "; ".join(why))
     return 0 if ok else 1
 
 

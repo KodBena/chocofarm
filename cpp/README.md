@@ -99,11 +99,21 @@ A missing weight payload is a **loud abort** (non-zero exit + the same message
 - **Logic invariants → bit-exact.** The legality mask `M` is **byte-identical**
   to Python's `legal_mask` for the same `(loc, belief)` (matched-sequence
   replay through `chocofarm-mask-dump`); illegal-slot `PI` mass is `== 0.0`.
+- **Wire-content cross-impl parity.** Each C++ episode emits its exact trace
+  `(world, executed slots)`; the harness **replays the same episode in Python**
+  and value-compares the **actual wire bytes** read back from redis against an
+  **independent** Python computation — `PI` and `M` **bit-exact**, `X` and `Y`
+  to `ABS_TOL=1e-4` — over **12,150 decisions × 2 seeds**. This compares the
+  `PI`/`Y` *content* (not just illegal-mass + shape), mechanizing the
+  manifest-round-trip / wire-content parity ADR-0012 P7's self-application flags
+  as otherwise deferred.
 - **Float-sensitive / RNG-driven → aggregate behavioral equivalence.** Mean
   episode length, mean λ-return (at a fixed λ₀), action-type distribution, and
   mean belief-shrinkage over **N=400 episodes × 2 seeds (800/side)** are
   statistically indistinguishable within Monte-Carlo CI (every `|z| = |Δ|/SE <
-  3`), with the MC standard error reported.
+  3`), with the MC standard error reported. (Independent RNG draws per side —
+  the comparison is a genuine Monte-Carlo distribution comparison, not a matched
+  world.)
 - **Feature X-port → forward-roundoff bar.** The §2.2 feature vector matches
   Python's to `max|Δ| < 1e-4` (the `test_jax_equivalence` `ABS_TOL`; observed
   `~1e-7`, pure float64 roundoff).
@@ -154,14 +164,19 @@ redis is absent, so `pytest tests/ -q` stays green without the C++ build).
   path; the *consume* path (the MLP forward `forward_core`) is **deferred** to
   the search slice.
 - **The PI target is the policy's own action distribution**, not a Gumbel
-  search-improved π′ (there is no search yet). It is a valid normalized target
-  **on the legality mask** (illegal-slot mass `== 0.0`), and the format/round-
-  trip it exercises is the real wire contract; the search-improved π′ arrives
-  with the search.
+  search-improved π′ (there is no search yet — `RandomPolicy` has no
+  `decide_with_value`, so it structurally cannot traverse `generate_episode`).
+  It is a valid normalized target **on the legality mask** (illegal-slot mass
+  `== 0.0`), and the wire-content parity above confirms the emitted `PI` bytes
+  are **bit-exact** to an independent Python computation of that same rule — so
+  what *is* shipped is an honest mirror; only the search-improved π′ *semantics*
+  is deferred (it arrives with the search).
 - **The value target is the pure-MC λ-penalized return-to-go** (the
-  `lam_blend=1 / n_step=None` limit `generate_episode` produces by default); the
+  `lam_blend=1 / n_step=None` limit `generate_episode` produces by default; the
+  C++ formula is bit-equivalent to `value_target.suffix_returns_to_go`, and the
+  wire `Y` bytes are confirmed against an independent Python replay above). The
   TD(λ)/n-step blend that needs the search's root-value bootstrap is **deferred**
-  (it has no meaning without the search bootstrap).
+  (it has no meaning without the search bootstrap that does not yet exist).
 - **P3 (no god-objects)** is honored structurally (env / policy / features /
   transport / runner are one-owner collaborators; the mask-replay fixture is a
   separate executable from the runner), but it is the principle this slice

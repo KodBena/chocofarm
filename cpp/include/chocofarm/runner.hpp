@@ -46,6 +46,16 @@ struct EpisodeBlocks {
     int n_sense = 0;          // # executed ("d", j) sense actions
     int n_terminate = 0;      // 1 if the episode ended on a TERMINATE decision, else 0
     double belief_shrinkage = 0.0;  // 1 − |bw_final| / |bw_initial| (how much belief was resolved)
+
+    // ---- the exact episode trace (for the WIRE-CONTENT cross-impl parity check) ----
+    // The true world + the executed-slot sequence (TERMINATE recorded as the last slot when the
+    // episode terminated on it). Given (world, slots) the env is deterministic, so the harness can
+    // replay the SAME episode in Python and value-compare the wire PI / Y / X / M bytes against an
+    // INDEPENDENT Python computation (not just illegal-mass + shape). This closes the wire-content
+    // parity gap ADR-0012 P7 flags as "review-only until a manifest-round-trip parity test
+    // mechanizes it".
+    uint32_t world = 0;
+    std::vector<int> exec_slots;  // executed action slots in order (+ TERMINATE slot if it ended so)
 };
 
 // Run ONE episode against `world` under `policy`, building the per-decision records. `rng` is the
