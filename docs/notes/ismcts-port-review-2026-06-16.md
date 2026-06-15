@@ -36,6 +36,44 @@ certification could not provide. The implementation is at `5e320a6` (worktree cl
   rebuild the verification to actually exercise the multi-determinization sub-child split and a
   forced UCB tie, persist raw data, and re-review — THEN decide on merge.
 
+## UPDATE — workflow synthesis verdict (appended after this record was first cut, 2026-06-16)
+
+The review workflow's synthesis completed after the headline above was written, and it
+**upgrades the disposition** with evidence the static reviewers did not have. **Overall
+verdict: `trustworthy-mergeable`.**
+
+The decisive addition: the synthesis agent **authored the test the committed suite is missing**
+and ran it. An integer-leaf, `c ∈ {0, 0.7}` tie-forcing logic grid drove **1,243 genuine exact
+UCB ties**; the committed C++ matched Python **128/128**, while a `std::map` sorted-key mutant
+control diverged **14/128** — so the test *discriminates* and the committed code is *on the
+correct side*. It separately confirmed the coverage hole is real: a Python sorted-key mutant
+**still passes the committed 240/240 logic check** (the green is blind to the std::map-ordering
+bug). So the implementation is **positively demonstrated faithful at the `visit_order`/tie-break
+crux** — not merely "no defect found." All secondary faithfulness (UCB1 + availability
+denominator, expansion, TERMINATE edge, max_depth, determinization + fresh-collected copy,
+belief_key incl. the empty `(0,0,0)` case, the node-arena index design with no dangling refs,
+the P1 DRY hoist, GreedyStopBase) was confirmed; the three TUs compile warning-clean at
+`-std=c++23 -Wall -Wextra`.
+
+**Reconciliation with the interim headline above:** "do NOT trust the green" remains literally
+true of the *committed tests* — they exercise 0 exact UCB ties (0 across 9,118 calls) and 0
+multi-belief splits. What changed is that the synthesis supplied the affirmative evidence the
+green lacked, by building the missing test. So the disposition moves from *"quarantine / rebuild
+/ re-review"* to:
+
+> **The code is sound. The remediation is test-only (no production-code change): add the two
+> deterministic cases the synthesis already authored+verified — (a) an integer-leaf tie-forcing
+> grid that produces real exact UCB ties, (b) a cycled-multi-world fixture that exercises the
+> `belief_key` multi-belief sub-child split — soften the over-claiming coverage docstrings, and
+> Bonferroni-correct + persist the aggregate. Then merge. `MERGE AS-IS is defensible`;
+> `FIX-THEN-MERGE` is the cleaner call.**
+
+The three alarming raw findings below (the "blocker" + two "majors") are confirmed **false
+alarms** — they quote a `line 125` and an author comment `// WRONG: first-sighting over avail`
+that **do not exist** in the commit (the real line 125 touches only the `avail` map; the sole
+`visit_order.push_back` is at line 60 in the first-visits-insertion branch — the correct
+variant). Do **not** re-port and do **not** block on them.
+
 ## The 8 adversarially-verified findings
 
 ### CONFIRMED REAL (5)
