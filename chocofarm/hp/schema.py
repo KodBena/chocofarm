@@ -42,6 +42,8 @@ import typing
 from dataclasses import dataclass, field, fields
 from enum import Enum
 
+from chocofarm import config
+
 
 # The schema-shape version. Bumped when the dataclass shape changes (a field added / removed /
 # renamed / re-typed). The stored blob carries it; the reader checks it against the code's
@@ -187,9 +189,9 @@ class ParallelConfig:
 
     workers: int = hp(4, Mut.RESTART, "process-pool size; pool built once before the loop")
     cores: str = hp("0,1,2,3", Mut.RESTART, "core-pin list; set in the pool initializer")
-    redis_host: str = hp("127.0.0.1", Mut.RESTART, "CHOCO_REDIS_HOST")
-    redis_port: int = hp(6380, Mut.RESTART, "CHOCO_REDIS_PORT")
-    redis_db: int = hp(0, Mut.RESTART, "CHOCO_REDIS_DB")
+    redis_host: str = hp(config.DEFAULT_REDIS_HOST, Mut.RESTART, "CHOCO_REDIS_HOST")
+    redis_port: int = hp(config.DEFAULT_REDIS_PORT, Mut.RESTART, "CHOCO_REDIS_PORT")
+    redis_db: int = hp(config.DEFAULT_REDIS_DB, Mut.RESTART, "CHOCO_REDIS_DB")
 
 
 @dataclass

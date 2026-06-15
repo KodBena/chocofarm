@@ -31,13 +31,13 @@ So neither weights nor results travel as pickle:
     back with `np.frombuffer` and reshapes — zero pickle of array data. Keys are namespaced by a
     per-call run-token and deleted after read so redis doesn't accumulate.
 
-Connection facts come from env (`CHOCO_REDIS_HOST`/`CHOCO_REDIS_PORT`/`CHOCO_REDIS_DB`, defaulting
-to 127.0.0.1:6380 db 0 — the memory-cache instance, a 1GB allkeys-lru store). Redis being
-unreachable is a loud failure (ADR-0002) — the loop must not silently fall back to a slow path the
-operator didn't ask for. The instance's `allkeys-lru` eviction can in principle drop a key under
-memory pressure; weights carry a 1h TTL and are read-validated (a missing payload is a loud
-RuntimeError, never a silent stale-net serve), and result blobs are read + deleted in the same
-iteration they're written, so the eviction window is small (≤ a few MB live at once vs 1GB).
+Connection facts come from `chocofarm/config.py` (`redis_params()`, env-overridable via
+`CHOCO_REDIS_HOST`/`CHOCO_REDIS_PORT`/`CHOCO_REDIS_DB`), defaulting to 127.0.0.1:6379 db 0 — the
+disk-persisted instance (`noeviction`, no `maxmemory` cap). Redis being unreachable is a loud
+failure (ADR-0002) — the loop must not silently fall back to a slow path the operator didn't ask
+for. Weights carry a 1h TTL and are read-validated (a missing payload is a loud RuntimeError, never
+a silent stale-net serve), and result blobs are read + deleted in the same iteration they're
+written, so transport keys never accumulate.
 
 Determinism / parallel≈serial: a task's seed is folded from `base_seed`, the weight version, a kind
 tag, and the episode index, so the SAME logical (iteration, kind, episode) draws the SAME stream
@@ -57,11 +57,10 @@ import numpy as np
 
 # ---- redis connection (raw-bytes transport; no pickle) ----
 def _redis_params():
-    return dict(
-        host=os.environ.get("CHOCO_REDIS_HOST", "127.0.0.1"),
-        port=int(os.environ.get("CHOCO_REDIS_PORT", "6380")),   # the memory-cache instance
-        db=int(os.environ.get("CHOCO_REDIS_DB", "0")),
-    )
+    """Shared connection facts from chocofarm/config.py (the registry uses the same), so transport
+    and registry address one redis instance by default."""
+    from chocofarm import config
+    return config.redis_params()
 
 
 def _connect():
@@ -73,9 +72,10 @@ def _connect():
     # turns a stall into a loud redis.TimeoutError (retryable / restart-recoverable; checkpoints
     # are per-iteration) instead of a silent permanent hang. Loopback redis under no memory
     # pressure never trips 60s, so this is a safety net, not a happy-path behavior change.
+    from chocofarm import config
     r = redis.Redis(
-        socket_timeout=float(os.environ.get("CHOCO_REDIS_SOCKET_TIMEOUT", "60")),
-        socket_connect_timeout=float(os.environ.get("CHOCO_REDIS_CONNECT_TIMEOUT", "10")),
+        socket_timeout=config.redis_socket_timeout(),
+        socket_connect_timeout=config.redis_connect_timeout(),
         **_redis_params(),
     )
     r.ping()   # fail loud now if redis is unreachable (ADR-0002), not mid-iteration

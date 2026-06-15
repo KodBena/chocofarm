@@ -16,9 +16,10 @@ One JSON blob per experiment, addressed by an operator-meaningful `experiment_id
 The single-blob-per-experiment choice (over key-per-field) is design §5.2: a read is one GET + one
 strict decode (atomic + whole-config-validated by construction); a write is a read-modify-write of
 the one small (<4 KB) blob under a WATCH/MULTI/EXEC optimistic guard (§5.4). Registry keys carry
-NO TTL (a bare SET — design §2.1), so they never sit on a clock; the eviction-policy half of the
-fix (`volatile-lru`) is an operator step nudged idempotently at bootstrap (§2.2/§2.3) and is a
-no-op if already set.
+NO TTL (a bare SET — design §2.1), so they never sit on a clock; on the disk-persisted redis
+(127.0.0.1:6379, `noeviction` — see `chocofarm/config.py`) they survive a restart and are never
+evicted, so the §2.2/§2.3 `volatile-lru` eviction workaround the 6380 memory-cache instance needed
+is moot here.
 
 Namespacing (design §5.1): distinct ids → disjoint key prefixes → concurrent experiments never
 clobber, mirroring the transport's per-run token (parallel.py) under a human name.
@@ -89,13 +90,10 @@ def _meta_key(experiment_id: str) -> str:
 
 
 def _redis_params() -> dict:
-    """Same env-driven connection facts as the transport (parallel.py), so the registry and the
-    transport share one redis instance by default."""
-    return dict(
-        host=os.environ.get("CHOCO_REDIS_HOST", "127.0.0.1"),
-        port=int(os.environ.get("CHOCO_REDIS_PORT", "6380")),
-        db=int(os.environ.get("CHOCO_REDIS_DB", "0")),
-    )
+    """Shared connection facts from chocofarm/config.py (the transport in parallel.py uses the same),
+    so the registry and the transport address one redis instance by default."""
+    from chocofarm import config
+    return config.redis_params()
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +138,10 @@ def _connect():
         raise RegistryUnavailable(
             "redis-py is not importable; the hp registry needs it (it is the transport's dep too)"
         ) from e
+    from chocofarm import config
     r = redis.Redis(
-        socket_timeout=float(os.environ.get("CHOCO_REDIS_SOCKET_TIMEOUT", "60")),
-        socket_connect_timeout=float(os.environ.get("CHOCO_REDIS_CONNECT_TIMEOUT", "10")),
+        socket_timeout=config.redis_socket_timeout(),
+        socket_connect_timeout=config.redis_connect_timeout(),
         **_redis_params(),
     )
     try:
@@ -151,37 +150,6 @@ def _connect():
         raise RegistryUnavailable(
             f"hp registry redis unreachable at {_redis_params()}: {e}") from e
     return r
-
-
-# ---------------------------------------------------------------------------
-# Eviction-policy bootstrap nudge (design §2.2 / §2.3)
-# ---------------------------------------------------------------------------
-def ensure_volatile_lru(r=None) -> str:
-    """Idempotently move the eviction policy to `volatile-lru` (design §2.2) via a live
-    `CONFIG SET` — no root needed, takes effect immediately, a no-op if already set. This protects
-    no-TTL registry keys from LRU eviction at the 1 GB ceiling while letting the TTL'd transport
-    blobs (az:res:*, az:w:*) still self-clean.
-
-    This is the LIVE half only. Persisting across a redis restart requires a root edit of the conf
-    (design §2.3: `CONFIG REWRITE` FAILS here — the conf is root-owned and redis runs as `bork`),
-    which is an OPERATOR step recorded in the design doc, not done here. Returns the resulting
-    policy string. Failure to read/set the policy is surfaced (not swallowed) but is non-fatal to a
-    seed — the no-TTL write is already the first eviction vector closed."""
-    own = r is None
-    if own:
-        r = _connect()
-    try:
-        cur = r.config_get("maxmemory-policy").get("maxmemory-policy")
-        if cur != "volatile-lru":
-            r.config_set("maxmemory-policy", "volatile-lru")
-            cur = r.config_get("maxmemory-policy").get("maxmemory-policy")
-        return cur
-    finally:
-        if own:
-            try:
-                r.close()
-            except Exception:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -477,12 +445,13 @@ def from_argparse(args: argparse.Namespace, experiment_id: str) -> ExperimentCon
 
 
 def seed_registry(experiment_id: str, cfg: ExperimentConfig, env=None,
-                  overwrite: bool = False, nudge_policy: bool = True, r=None) -> ExperimentConfig:
+                  overwrite: bool = False, r=None) -> ExperimentConfig:
     """Seed the experiment's blob from `cfg` IF IT DOES NOT ALREADY EXIST (idempotent — design §6).
     A --resume of an existing experiment re-binds to the existing blob (does NOT clobber operator
     overrides) unless `overwrite=True`. If `env` is given, the derived dims + INSTANCE facts are
     recorded for the drift check (design §7): arch.in_dim/n_actions and the env constants the net
-    was fit to. Nudges the eviction policy to volatile-lru (design §2.2) by default.
+    was fit to. On the disk-persisted 6379 redis (`noeviction`) registry keys never expire or evict,
+    so no eviction-policy nudge is needed (the 6380 memory-cache instance once required one).
 
     Returns the config now in the registry (the freshly-seeded one, or the existing one on a
     re-bind). This is also the post-restart recovery path (design §2.3)."""
@@ -490,15 +459,6 @@ def seed_registry(experiment_id: str, cfg: ExperimentConfig, env=None,
     if own:
         r = _connect()
     try:
-        if nudge_policy:
-            try:
-                ensure_volatile_lru(r)
-            except Exception as e:
-                # surface, don't swallow: the no-TTL write already closed the first vector, and the
-                # policy nudge needs the operator's redis to honor CONFIG SET. Print loud, continue.
-                print(f"[hp-registry] WARNING: could not nudge maxmemory-policy to volatile-lru: "
-                      f"{e} (design §2.2 — registry keys are still no-TTL; set the policy by hand)",
-                      flush=True)
         if env is not None:
             _record_derived(cfg, env)
         if not overwrite and exists(experiment_id, r=r):

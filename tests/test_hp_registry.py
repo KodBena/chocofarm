@@ -8,12 +8,10 @@ redis round-trip (no-TTL write + decode), namespacing isolation (two ids never c
 RESTART-refusal (a baked field changed mid-run fires the loud refusal; a HOT field does not), and
 the seed-from-argparse bootstrap (argparse defaults = dataclass defaults; idempotent re-bind).
 
-REDIS SAFETY (the scratch redis at 127.0.0.1:6380 is SHARED with a live training run):
+REDIS SAFETY (the disk-persisted redis at 127.0.0.1:6379 is SHARED with a live training run):
   * every test key is under an ISOLATED namespace `choco:hp:__test__<uuid>` — never an az:* key.
   * each test cleans up its own keys (try/finally delete).
   * NO FLUSHALL / FLUSHDB, NO CONFIG SET on the server, NO touching az:* keys.
-  * the eviction-policy nudge is suppressed in tests (nudge_policy=False) so the test never mutates
-    the shared server's config — the policy change is an operational step, not a test concern.
 
 The redis-touching tests skip cleanly if redis is unreachable (so the schema/codec tests still run
 in a redis-less environment). Run pinned + bounded, e.g.:
@@ -380,12 +378,12 @@ def test_seed_registry_idempotent(isolated_id):
     r = _redis_or_skip()
     try:
         cfg = ExperimentConfig(experiment_id=isolated_id)
-        reg.seed_registry(isolated_id, cfg, nudge_policy=False, r=r)
+        reg.seed_registry(isolated_id, cfg, r=r)
         # operator override after the seed
         reg.set_fields(isolated_id, {"train.lr": "1e-4"}, r=r)
         # a second seed (a --resume) with the DEFAULT cfg must NOT overwrite the override
         cfg2 = ExperimentConfig(experiment_id=isolated_id)   # lr back at default
-        seeded = reg.seed_registry(isolated_id, cfg2, nudge_policy=False, r=r)
+        seeded = reg.seed_registry(isolated_id, cfg2, r=r)
         assert seeded.train.lr == 1e-4   # the override survived the idempotent re-bind
     finally:
         r.close()
@@ -485,13 +483,13 @@ def test_resume_rebind_adopts_lr_no_false_refusal(isolated_id):
     try:
         # first launch: seed with default lr (1e-3)
         cfg0 = reg.seed_registry(isolated_id, ExperimentConfig(experiment_id=isolated_id),
-                                 nudge_policy=False, r=r)
+                                 r=r)
         assert cfg0.train.lr == 1e-3
         # operator drops lr in the registry
         reg.set_fields(isolated_id, {"train.lr": "1e-4"}, r=r)
         # second launch (--resume): re-seed with the DEFAULT config; re-bind returns the dropped blob
         cfg0b = reg.seed_registry(isolated_id, ExperimentConfig(experiment_id=isolated_id),
-                                  nudge_policy=False, r=r)
+                                  r=r)
         assert cfg0b.train.lr == 1e-4   # ADOPTED the registry drop (the construction value)
         # the re-bound config is the shadow -> iter-0 refresh must NOT refuse
         snap = reg.ConfigSnapshot.launch(isolated_id, launched_with=cfg0b, r=r)
