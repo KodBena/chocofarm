@@ -61,6 +61,10 @@ import json
 import os
 import time
 from dataclasses import fields
+from typing import TYPE_CHECKING, Any, Iterator
+
+if TYPE_CHECKING:
+    from chocofarm.model.env import Environment
 
 from chocofarm.hp.schema import (
     Mut,
@@ -92,7 +96,7 @@ def _meta_key(experiment_id: str) -> str:
     return f"{KEY_PREFIX}{experiment_id}:meta"
 
 
-def _redis_params() -> dict:
+def _redis_params() -> dict[str, str | int]:
     """REGISTRY connection facts from chocofarm/config.py — the disk-persisted noeviction instance
     (127.0.0.1:6379 db 0 by default), DELIBERATELY DISTINCT from the transport's ephemeral
     allkeys-lru 6380 instance so TTL-less registry blobs are never evicted. Env-overridable via the
@@ -133,7 +137,7 @@ class RestartRequired(RuntimeError):
     experiment (the running net is invalid against the changed env)."""
 
 
-def _connect():
+def _connect() -> Any:
     """Open a bounded redis connection (mirrors parallel.py's bounded-socket discipline / ADR-0002:
     a stall becomes a loud error, not a silent hang). Pings now so an unreachable redis fails loud
     here rather than mid-read."""
@@ -160,7 +164,8 @@ def _connect():
 # ---------------------------------------------------------------------------
 # Store primitives (design §5.2 / §5.4)
 # ---------------------------------------------------------------------------
-def write_config(experiment_id: str, cfg: ExperimentConfig, writer: str | None = None, r=None) -> None:
+def write_config(experiment_id: str, cfg: ExperimentConfig, writer: str | None = None,
+                 r: Any = None) -> None:
     """Write the whole config blob (+ meta) for `experiment_id` with NO TTL (design §2.1: a bare
     SET leaves TTL=-1). Validates before writing (ADR-0002: refuse a malformed write at the source).
     Used by the bootstrap seed and the CLI `set`/`init` (which add the optimistic guard around it)."""
@@ -196,7 +201,7 @@ def write_config(experiment_id: str, cfg: ExperimentConfig, writer: str | None =
                 pass
 
 
-def read_config(experiment_id: str, r=None) -> ExperimentConfig:
+def read_config(experiment_id: str, r: Any = None) -> ExperimentConfig:
     """GET + strict-decode the experiment's blob (design §3.6). Raises `RegistryKeyMissing` if
     unseeded (never coerce to defaults — design §7), `RegistryDecodeError` if malformed/drifted,
     `RegistryUnavailable` if redis stalls."""
@@ -228,7 +233,7 @@ def read_config(experiment_id: str, r=None) -> ExperimentConfig:
                 pass
 
 
-def exists(experiment_id: str, r=None) -> bool:
+def exists(experiment_id: str, r: Any = None) -> bool:
     own = r is None
     if own:
         r = _connect()
@@ -242,7 +247,7 @@ def exists(experiment_id: str, r=None) -> bool:
                 pass
 
 
-def delete_experiment(experiment_id: str, r=None) -> int:
+def delete_experiment(experiment_id: str, r: Any = None) -> int:
     """Delete an experiment's blob + meta (test cleanup / operator teardown). Returns the number
     of keys removed."""
     own = r is None
@@ -281,7 +286,7 @@ _GROUP_TYPES = {
 }
 
 
-def _split_path(path: str):
+def _split_path(path: str) -> tuple[str, str]:
     """`'train.lr'` -> ('train', 'lr'). Loud on a malformed path or an unknown group/field."""
     if "." not in path:
         raise RegistryDecodeError(
@@ -312,7 +317,7 @@ def apply_field(cfg: ExperimentConfig, path: str, raw_value: str) -> ExperimentC
     return decode_config(data)
 
 
-def _parse_literal(raw: str):
+def _parse_literal(raw: str) -> Any:
     """Parse a CLI string token into a JSON value (the codec then type-checks it against the field).
     Accepts JSON literals (numbers, true/false/null, quoted strings, lists) and falls back to a bare
     string. `1e-4` parses as a float, `true` as bool, `null` as None, `[1,2]` as a list."""
@@ -326,7 +331,8 @@ def _parse_literal(raw: str):
 # ---------------------------------------------------------------------------
 # Atomic write under the optimistic WATCH/MULTI/EXEC guard (design §5.4)
 # ---------------------------------------------------------------------------
-def set_fields(experiment_id: str, updates: dict, writer: str | None = None, r=None):
+def set_fields(experiment_id: str, updates: dict[str, str], writer: str | None = None,
+               r: Any = None) -> tuple[ExperimentConfig, ExperimentConfig]:
     """Atomically apply a related SET of `group.field -> raw_value` updates (the motivating
     drop-lr-and-raise-l2 case — design §5.4). Read-modify-write of the one blob under WATCH; on a
     lost EXEC (another writer raced between WATCH and EXEC) retry a bounded number of times, then
@@ -451,8 +457,8 @@ def from_argparse(args: argparse.Namespace, experiment_id: str) -> ExperimentCon
     return cfg
 
 
-def seed_registry(experiment_id: str, cfg: ExperimentConfig, env=None,
-                  overwrite: bool = False, r=None) -> ExperimentConfig:
+def seed_registry(experiment_id: str, cfg: ExperimentConfig, env: "Environment | None" = None,
+                  overwrite: bool = False, r: Any = None) -> ExperimentConfig:
     """Seed the experiment's blob from `cfg` IF IT DOES NOT ALREADY EXIST (idempotent — design §6).
     A --resume of an existing experiment re-binds to the existing blob (does NOT clobber operator
     overrides) unless `overwrite=True`. If `env` is given, the derived dims + INSTANCE facts are
@@ -492,7 +498,7 @@ def seed_registry(experiment_id: str, cfg: ExperimentConfig, env=None,
                 pass
 
 
-def _record_derived(cfg: ExperimentConfig, env) -> None:
+def _record_derived(cfg: ExperimentConfig, env: "Environment") -> None:
     """Fill the DERIVED, recorded-for-provenance fields from the env + the running precision (design
     §4.4 / §7): the feature dim and action-slot count that size the net, the env INSTANCE constants
     the net is fit to, and the live CHOCO_AZ_DTYPE (read once at import). These are recorded (the
@@ -521,7 +527,7 @@ def _record_derived(cfg: ExperimentConfig, env) -> None:
             "not. Update FeatureConfig to match FeatureLayout (the single source of truth).")
 
 
-def _feature_group_channels(env) -> dict:
+def _feature_group_channels(env: "Environment") -> dict[str, int]:
     """Derive the per-group channel counts the live FeatureLayout (features.py — the SSOT for the
     feature-vector layout after audit R6) actually produces, WITHOUT re-hardcoding 5/3/6. Each
     FeatureLayout block belongs to a `group` ("treasure"/"detector"/"global"/"teleport"); a treasure
@@ -563,7 +569,7 @@ def _feature_group_channels(env) -> dict:
     }
 
 
-def _assert_feature_config_pins(cfg: ExperimentConfig, env) -> list:
+def _assert_feature_config_pins(cfg: ExperimentConfig, env: "Environment") -> list[str]:
     """Audit item G: check the FeatureConfig per-group provenance counts (cfg.feat.*) against the
     per-group channel widths the live FeatureLayout (features.py — the SSOT) actually produces for
     `env`. Returns a list of human-readable drift strings (empty == in sync). The in_dim check pins
@@ -586,7 +592,7 @@ def _assert_feature_config_pins(cfg: ExperimentConfig, env) -> list:
 
 
 def _assert_no_derived_drift(experiment_id: str, recorded: ExperimentConfig,
-                             live: ExperimentConfig, env=None) -> None:
+                             live: ExperimentConfig, env: "Environment | None" = None) -> None:
     """Fail loud (design §7) if a re-bound blob's recorded env-derived facts disagree with the
     running process's. These define the net shape / precision the blob was fit to; re-binding under
     a different env or dtype would run a mismatched net silently.
@@ -642,14 +648,15 @@ class ConfigSnapshot:
         self._iter = -1
 
     @classmethod
-    def launch(cls, experiment_id: str, launched_with: ExperimentConfig, r=None) -> "ConfigSnapshot":
+    def launch(cls, experiment_id: str, launched_with: ExperimentConfig,
+               r: Any = None) -> "ConfigSnapshot":
         """Bind a snapshot at launch: read the current registry blob (must be seeded) and capture
         the construction-time config as the `launched_with` shadow. Both are validated by the read
         path. Use this once after `seed_registry`, then `refresh()` per iteration."""
         cfg = read_config(experiment_id, r=r)
         return cls(experiment_id, cfg, launched_with)
 
-    def refresh(self, iteration: int, r=None) -> "ConfigSnapshot":
+    def refresh(self, iteration: int, r: Any = None) -> "ConfigSnapshot":
         """Re-read the registry blob at an iteration boundary (design §3.1). Logs any applied HOT
         change loudly (§5.5 reader side), and fires the loud RESTART/INSTANCE refusal (§3.4) before
         returning if a baked field moved. Returns self (the snapshot now holds the fresh cfg)."""
@@ -695,7 +702,9 @@ class ConfigSnapshot:
                       f"at iter {iteration} (experiment {self.experiment_id!r})", flush=True)
 
 
-def _iter_facet_diffs(a: ExperimentConfig, b: ExperimentConfig):
+def _iter_facet_diffs(
+        a: ExperimentConfig, b: ExperimentConfig
+) -> Iterator[tuple[str, "Mut | None", str, Any, Any]]:
     """Yield (group_name, mut, field_name, a_value, b_value) over every leaf field of two configs,
     carrying each field's `Mut` facet (read from the schema metadata). The single place the read
     path walks the facet-tagged leaves."""
@@ -714,19 +723,19 @@ def _iter_facet_diffs(a: ExperimentConfig, b: ExperimentConfig):
 # ---------------------------------------------------------------------------
 # Operator CLI (design §5.3): get / set / init
 # ---------------------------------------------------------------------------
-def _cli_get(args) -> int:
+def _cli_get(args: argparse.Namespace) -> int:
     cfg = read_config(args.experiment_id)
     print(json.dumps(encode_config(cfg), indent=2, sort_keys=True))
     return 0
 
 
-def _cli_set(args) -> int:
+def _cli_set(args: argparse.Namespace) -> int:
     # args.assignments is a flat [path, value, path, value, ...] list (the atomic multi-field case)
     toks = args.assignments
     if not toks or len(toks) % 2 != 0:
         raise SystemExit("set takes pairs: PATH VALUE [PATH VALUE ...] (e.g. train.lr 1e-4)")
-    updates = {}
-    order = []
+    updates: dict[str, str] = {}
+    order: list[tuple[str, str]] = []
     for i in range(0, len(toks), 2):
         path, value = toks[i], toks[i + 1]
         updates[path] = value
@@ -757,7 +766,7 @@ def _cli_set(args) -> int:
     return 0
 
 
-def _cli_init(args) -> int:
+def _cli_init(args: argparse.Namespace) -> int:
     # seed from the dataclass defaults (design §6 bootstrap). The launch path normally seeds with an
     # env in hand (for the derived dims); the CLI `init` seeds from pure defaults and nudges policy.
     cfg = ExperimentConfig(experiment_id=args.experiment_id)
@@ -774,7 +783,7 @@ def _cli_init(args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m chocofarm.hp.registry",
         description="chocofarm hyperparameter registry — operator CLI (design §5.3). "
@@ -801,7 +810,9 @@ def main(argv=None) -> int:
     i.set_defaults(func=_cli_init)
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    # args.func is an argparse-stashed `_cli_*` (all -> int); the attribute is untyped on the
+    # Namespace, so state the int contract the dispatch table already guarantees.
+    return int(args.func(args))
 
 
 if __name__ == "__main__":

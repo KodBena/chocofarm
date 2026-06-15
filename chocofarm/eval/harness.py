@@ -17,6 +17,11 @@ from chocofarm.solvers.base import GreedyPolicy, CertaintyEquivalentPolicy, Roll
 # for back-compat: existing `from chocofarm.eval.harness import ...` sites keep working unchanged.
 from chocofarm.references import BeliefRefs, realizable_static, clairvoyant_rate, DECOMP_ANCHOR
 
+# Explicit public surface (no_implicit_reexport): the four reference names re-exported above for
+# back-compat ARE part of this module's API (`from chocofarm.eval.harness import BeliefRefs/...`),
+# so name them so the re-export is explicit rather than an implicit-reexport mypy flags.
+__all__ = ["BeliefRefs", "realizable_static", "clairvoyant_rate", "DECOMP_ANCHOR", "main"]
+
 
 def main():
     env = Environment()                      # unit values

@@ -15,9 +15,12 @@ from __future__ import annotations
 import itertools
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
+import numpy.typing as npt
 
 DEFAULT_INSTANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "data", "instance.json")
@@ -28,8 +31,8 @@ class Instance:
     """The parsed chocofarm instance: the treasure coordinates, the teleport
     coordinates, and the exactly-K-of-N present-count. `N` is derived from the
     treasure count (never stored), exactly as the model has always computed it."""
-    treasures: dict          # {id(int) -> (x, y)}
-    teleports: dict          # {name(str) -> (x, y)}
+    treasures: dict[int, tuple[float, float]]   # {id(int) -> (x, y)}
+    teleports: dict[str, tuple[float, float]]   # {name(str) -> (x, y)}
     K: int
 
     @property
@@ -59,7 +62,7 @@ class Scenario:
     (Tier-1), and a K-restriction is the separate R8 `Environment.restrict`. A
     future step may fold a K knob in here.
     """
-    value: list | None = None
+    value: list[float] | None = None
     entry: str = "CSNE"
     teleport_overhead: float = 12.0
 
@@ -79,7 +82,7 @@ def load_instance(path: str | None = None) -> Instance:
     return Instance(treasures, teleports, int(data["K"]))
 
 
-def world_array(N: int, K: int, support=None) -> np.ndarray:
+def world_array(N: int, K: int, support: Iterable[int] | None = None) -> npt.NDArray[np.int64]:
     """The C(N,K) equiprobable worlds as a bitmask array (bit t set = τ_t present).
 
     `support=None` enumerates K-subsets of `range(N)`; a `support` iterable
@@ -89,6 +92,10 @@ def world_array(N: int, K: int, support=None) -> np.ndarray:
     itertools.combinations(<support or range(N)>, K)], dtype=np.int64)` — same
     elements, same order, same dtype."""
     items = range(N) if support is None else support
-    return np.array(
-        [sum(1 << t for t in c) for c in itertools.combinations(items, K)],
-        dtype=np.int64)
+    # np.array returns an untyped ndarray; the dtype=np.int64 pins the element type, so the cast to
+    # NDArray[np.int64] states the contract the call already enforces (no runtime change).
+    return cast(
+        "npt.NDArray[np.int64]",
+        np.array(
+            [sum(1 << t for t in c) for c in itertools.combinations(items, K)],
+            dtype=np.int64))

@@ -44,6 +44,11 @@ from chocofarm.az.forward import forward_core
 # the container. `is_weight` is re-exported here unchanged so `mlp_jax_train`'s import still resolves.
 from chocofarm.az.weights import WeightContainer, is_weight  # noqa: F401  (re-export: the L2 SSOT)
 
+# Explicit public surface (no_implicit_reexport): `is_weight` is re-exported from weights.py for
+# back-compat (`mlp_jax_train` imports it here), so name it explicitly alongside the net class so the
+# re-export is honest rather than an implicit-reexport mypy flags.
+__all__ = ["ValueMLP", "is_weight"]
+
 
 def _he_init(rng, fan_in, fan_out):
     return rng.standard_normal((fan_in, fan_out)) * np.sqrt(2.0 / fan_in)
