@@ -49,11 +49,17 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import os
-from collections import namedtuple
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 import numpy as np
 
 from chocofarm.az import transport
+
+if TYPE_CHECKING:
+    from chocofarm.model.env import Environment
+    from chocofarm.az.features import FeatureBuilder
+    from chocofarm.az.gumbel_search import GumbelAZSearch
+    from chocofarm.az.mlp import ValueMLP
 
 
 class Worker:
@@ -68,7 +74,8 @@ class Worker:
     arithmetic) — byte-for-byte the pre-split fold; PHASE namespaces the weight KEY only and never
     enters the rng (so parallel≈serial bit-identity is preserved by construction)."""
 
-    def __init__(self, env, fb, redis, base_seed, m, n_sims, core=None, widx=0):
+    def __init__(self, env: "Environment", fb: "FeatureBuilder", redis: Any, base_seed: int,
+                 m: int, n_sims: int, core: int | None = None, widx: int = 0) -> None:
         self.env = env
         self.fb = fb
         self.redis = redis
@@ -77,18 +84,18 @@ class Worker:
         self.n_sims = n_sims
         self.core = core
         self.widx = widx
-        self.net = None
-        self.search = None
+        self.net: "ValueMLP | None" = None
+        self.search: "GumbelAZSearch | None" = None
         # The reload gate keys on (phase, version) — NOT version alone (R14).  Within one iteration
         # `it`, gen and eval publish to DISTINCT weight keys (phase ∈ {"gen","eval"}); the eval
         # phase must reload the POST-TRAIN weights even though `version == it` is unchanged from
         # gen.  Sentinel (None, -1) forces the first reload.
-        self.phase = None
+        self.phase: str | None = None
         self.version = -1
 
     # ---- numpy-only contract enforcement (the deadlock ROOT-CAUSE lock) ----
     @staticmethod
-    def _assert_jax_free():
+    def _assert_jax_free() -> None:
         """Fail loud (ADR-0002) if `jax`/`jaxlib` is in `sys.modules`.  Called from `_worker_init`
         AFTER the worker's imports — and ONLY there, because `_worker_init` runs solely in the SPAWN
         CHILD (a clean fresh interpreter), where this property must hold.  It is deliberately NOT run
@@ -112,7 +119,7 @@ class Worker:
 
     # ---- the seed fold (worker-count-invariant; byte-for-byte the pre-split arithmetic) ----
     @staticmethod
-    def _fold_seed(base_seed, version, kind, idx):
+    def _fold_seed(base_seed: int, version: int, kind: str, idx: int) -> np.uint64:
         """The np.uint64 seed fold — the parallel≈serial determinism contract.  PURE in
         `base_seed` (no `self`/global reach) so the arithmetic is testable in isolation, but the
         BODY is byte-for-byte the pre-split fold: the kind tag from `TASK_SPECS[kind]`, the
@@ -126,14 +133,15 @@ class Worker:
                 ^ (np.uint64(kind_tag) * np.uint64(40_503))
                 ^ (np.uint64(idx) * np.uint64(2_246_822_519)))
 
-    def task_rng(self, version, kind, idx):
+    def task_rng(self, version: int, kind: str, idx: int) -> np.random.Generator:
         """Independent, reproducible per-(iteration, kind, episode) RNG for THIS worker (folds the
         worker's `base_seed` + version + kind tag + idx via `_fold_seed`).  Same logical episode →
         same stream under any worker count (parallel≈serial)."""
         return np.random.default_rng(int(self._fold_seed(self.base_seed, version, kind, idx)))
 
     # ---- the (phase, version)-gated net reload ----
-    def ensure_net(self, run, phase, version, hot_search=None):
+    def ensure_net(self, run: str, phase: str, version: int,
+                   hot_search: dict[str, Any] | None = None) -> None:
         """Load the net into the worker iff the weight `(phase, version)` changed — reading the
         raw-bytes payload from redis `az:w:<run>:<phase>:<version>` (no pickle) through the transport
         collaborator.  Rebuilds the GumbelAZSearch on the fresh net.
@@ -161,7 +169,8 @@ class Worker:
         self.phase = phase
         self.version = version
 
-    def prepare(self, run, phase, version, kind, idx, hot_search):
+    def prepare(self, run: str, phase: str, version: int, kind: str, idx: int,
+                hot_search: dict[str, Any] | None) -> np.random.Generator:
         """Shared task plumbing both work-kinds run: the `(phase, version)`-gated net reload (through
         the transport) + the worker-count-invariant rng fold.  Returns the per-episode rng.  Keeping
         the gen/eval entrypoints sharing this (rather than each re-reaching into worker state) is the
@@ -170,7 +179,7 @@ class Worker:
         return self.task_rng(version, kind, idx)
 
     # ---- the two work-kinds ----
-    def generate_episode(self, args):
+    def generate_episode(self, args: tuple[Any, ...]) -> tuple[int, int, int, int]:
         """Generate ONE training episode, write its records to redis as raw bytes, return only
         (idx, n_rows, feat_dim, n_slots).  `args` = (run, version, world, lam, explore_plies,
         lam_blend, n_step, idx, res_token, hot_search, max_steps).  Phase is "gen" (this entrypoint's
@@ -178,6 +187,8 @@ class Worker:
         (run, version, world, lam, explore_plies, lam_blend, n_step, idx, res_token,
          hot_search, max_steps) = args
         rng = self.prepare(run, "gen", version, "gen", idx, hot_search)
+        # `prepare` ran `ensure_net`, so the search is built (ADR-0002 fail-loud, not a None pass).
+        assert self.search is not None
         from chocofarm.az.exit_loop import generate_episode
         recs = generate_episode(self.env, self.search, self.fb, world, lam, rng,
                                 explore_plies, max_steps=max_steps,
@@ -197,12 +208,14 @@ class Worker:
         transport.write_results(self.redis, res_token, idx, X, PI, M, Y)
         return (idx, n, feat_dim, n_slots)
 
-    def eval_episode(self, args):
+    def eval_episode(self, args: tuple[Any, ...]) -> tuple[float, float]:
         """Run ONE greedy-eval episode against a held-out world; return (R, T) (scalars — no array
         payload, so they ride the pipe cheaply).  `args` = (run, version, world, lam, idx,
         hot_search, max_steps).  Phase is "eval" (this entrypoint's kind)."""
         run, version, world, lam, idx, hot_search, max_steps = args
         rng = self.prepare(run, "eval", version, "eval", idx, hot_search)
+        # `prepare` ran `ensure_net`, so the net is loaded (ADR-0002 fail-loud, not a None pass).
+        assert self.net is not None
         from chocofarm.az.gumbel_search import GumbelPolicy
         hs = dict(hot_search) if hot_search else {}
         pol = GumbelPolicy(self.net, self.env, m=self.m, n_sims=self.n_sims, **hs)
@@ -211,10 +224,10 @@ class Worker:
 
 
 # ---- per-worker module singleton (one Worker per process, built in `_worker_init`) ----
-_WORKER = None
+_WORKER: "Worker | None" = None
 
 
-def _worker_init(core_list, base_seed, m, n_sims):
+def _worker_init(core_list: list[int], base_seed: int, m: int, n_sims: int) -> None:
     """Process-pool initializer: pin THIS worker to its core, build env/feature-builder, open the
     redis connection, warm the numba kernel, and construct the per-process `Worker` singleton (whose
     constructor LOCKS the numpy-only contract).  The net is loaded lazily on the first task (when the
@@ -284,16 +297,19 @@ def _worker_init(core_list, base_seed, m, n_sims):
                      core=core, widx=widx)
 
 
-def _gen_task(args):
+def _gen_task(args: tuple[Any, ...]) -> tuple[int, int, int, int]:
     """Worker task entrypoint (module-level so the spawn pool resolves it by qualified name):
     delegate to the per-process `Worker` singleton's `generate_episode`.  `hot_search`/`max_steps`
     in `args` are the live HOT knobs for this iteration (hp-registry §3.4)."""
+    # the singleton is built by `_worker_init` before any task runs (ADR-0002 fail-loud).
+    assert _WORKER is not None
     return _WORKER.generate_episode(args)
 
 
-def _eval_task(args):
+def _eval_task(args: tuple[Any, ...]) -> tuple[float, float]:
     """Worker task entrypoint (module-level so the spawn pool resolves it by qualified name):
     delegate to the per-process `Worker` singleton's `eval_episode`."""
+    assert _WORKER is not None     # built by `_worker_init` before any task runs (ADR-0002)
     return _WORKER.eval_episode(args)
 
 
@@ -305,7 +321,12 @@ def _eval_task(args):
 # pool must resolve `callable` by qualified name (a closure / bound method would not survive the
 # re-import; this is also why the work runs through the module-singleton `_WORKER`, not a pickled
 # Worker argument).
-TaskSpec = namedtuple("TaskSpec", ["kind", "kind_tag", "callable"])
+class TaskSpec(NamedTuple):
+    kind: str
+    kind_tag: int
+    # the module-level worker callable (gen -> (idx,n,fd,ns) ints / eval -> (R,T) floats), resolved
+    # by the spawn pool by qualified name; typed Callable[..., Any] over the two distinct returns.
+    callable: Callable[..., Any]
 
 TASK_SPECS = {
     "gen": TaskSpec("gen", 1_000_003, _gen_task),

@@ -82,7 +82,11 @@ delegate. The math, the call order, and the byte-identical outputs are unchanged
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import cast
+
 import numpy as np
+import numpy.typing as npt
 
 # The policy-target rule's final step is the masked softmax over the legal slots. It has ONE home —
 # `ValueMLP._masked_softmax`, a pure numpy staticmethod with no net state (the SAME function the
@@ -94,7 +98,8 @@ from chocofarm.az.mlp import ValueMLP as _ValueMLP
 _masked_softmax = _ValueMLP._masked_softmax
 
 
-def suffix_returns_to_go(step_rt, exit_c, lam):
+def suffix_returns_to_go(step_rt: Sequence[tuple[float, float]], exit_c: float,
+                         lam: float) -> list[float]:
     """Pure-MC λ-penalized return-to-go per decision (the prior behavior; the `lam_blend == 1`
     limit). `step_rt`: list of (r_j, dt_j) for each EXECUTED decision, in order. `exit_c`: the
     single end-of-episode exit toll. Returns a list `g[0..D-1]` aligned to `step_rt`.
@@ -112,7 +117,9 @@ def suffix_returns_to_go(step_rt, exit_c, lam):
     return out
 
 
-def blended_returns_to_go(step_rt, boot, exit_c, lam, lam_blend=1.0, n_step=None):
+def blended_returns_to_go(step_rt: Sequence[tuple[float, float]], boot: Sequence[float],
+                          exit_c: float, lam: float, lam_blend: float = 1.0,
+                          n_step: int | None = None) -> list[float]:
     """The Part B lower-variance value target, with the pure-MC suffix rule as the `lam_blend==1`
     / `n_step is None` limit.
 
@@ -206,7 +213,8 @@ def blended_returns_to_go(step_rt, boot, exit_c, lam, lam_blend=1.0, n_step=None
 # (float32) the prior-weighted product and break byte-identity. `prior`, `logits` stay numpy.
 # ========================================================================================
 
-def sigma_scale(visited_n, legal_slots, c_visit, c_scale):
+def sigma_scale(visited_n: Sequence[int], legal_slots: Sequence[int],
+                c_visit: float, c_scale: float) -> float:
     """The Danihelka §3 monotone Q-transform scale σ-prefactor: (c_visit + max_a N(a)) · c_scale.
 
     `max_a N(a)` is taken over the root's selection counts; matches `GumbelAZSearch._sigma_scale`
@@ -215,7 +223,8 @@ def sigma_scale(visited_n, legal_slots, c_visit, c_scale):
     return (c_visit + max_n) * c_scale
 
 
-def v_mix(root_value, visited_q, visited_n, prior, legal_slots):
+def v_mix(root_value: float, visited_q: Sequence[float], visited_n: Sequence[int],
+          prior: npt.NDArray[np.floating], legal_slots: Sequence[int]) -> float:
     """Danihelka §3 value-completion for unvisited actions:
 
         v_mix = (v_net + ΣN · v̄) / (1 + ΣN),
@@ -240,8 +249,10 @@ def v_mix(root_value, visited_q, visited_n, prior, legal_slots):
     return root_value
 
 
-def improved_policy(logits, visited_q, visited_n, root_value, prior, legal_slots,
-                    c_visit, c_scale):
+def improved_policy(logits: npt.NDArray[np.floating], visited_q: Sequence[float],
+                    visited_n: Sequence[int], root_value: float,
+                    prior: npt.NDArray[np.floating], legal_slots: Sequence[int],
+                    c_visit: float, c_scale: float) -> npt.NDArray[np.float64]:
     """π′ = softmax(logit + σ(completedQ)) over the legal slots (Danihelka et al. 2022 §3).
 
     Unvisited legal actions have their Q "completed" by `v_mix` (the prior-weighted value estimate);
@@ -263,4 +274,7 @@ def improved_policy(logits, visited_q, visited_n, root_value, prior, legal_slots
     # we call it directly: ONE home for the masked-softmax (no copy), byte-identical by construction.
     legal_arr = np.zeros(n_slots)
     legal_arr[legal_slots] = 1.0
-    return _masked_softmax(completed[None, :], legal_arr[None, :])[0]
+    # _masked_softmax returns a (1, n_slots) float64 row-batch; [0] selects the single row. numpy's
+    # __getitem__ is Any-typed, so the cast states the (n_slots,) float64 row contract (no runtime change).
+    return cast("npt.NDArray[np.float64]",
+                _masked_softmax(completed[None, :], legal_arr[None, :])[0])

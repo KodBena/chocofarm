@@ -47,13 +47,18 @@ Honest simplifications (also in docs/results/az-exit-loop.md §caveats):
 from __future__ import annotations
 
 import math
+from typing import Any, Callable
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import TERMINATE
+from chocofarm.model.env import (
+    Action, Collected, Environment, Loc, TERMINATE, WorldSet, is_terminate,
+)
 from chocofarm.az.features import FeatureBuilder
 from chocofarm.az.actions import (n_action_slots, action_to_slot, slot_to_action,
                                   legal_mask_from_features, slot_action_tables)
+from chocofarm.az.mlp import ValueMLP
 from chocofarm.solvers.ismcts import _belief_key
 from chocofarm.solvers.base import Policy
 from chocofarm.az.value_target import (improved_policy as _improved_policy_rule,
@@ -68,17 +73,17 @@ class _Node:
     node's action loop — the F7 amortization)."""
     __slots__ = ("W", "N", "children", "prior", "value", "feat", "mask", "legal")
 
-    def __init__(self):
-        self.W = {}          # action -> summed λ-penalized return over selections
-        self.N = {}          # action -> selection count
-        self.children = {}   # (action, belief_key) -> _Node
-        self.prior = None    # (n_slots,) masked-softmax prior P(s,·)
-        self.value = None    # scalar net value V_λ(belief)
-        self.feat = None     # cached feature vector
-        self.mask = None     # (n_slots,) legal mask
-        self.legal = None    # list of legal actions at this node
+    def __init__(self) -> None:
+        self.W: dict[Action, float] = {}          # action -> summed λ-penalized return over selections
+        self.N: dict[Action, int] = {}            # action -> selection count
+        self.children: dict[tuple[Action, Any], _Node] = {}   # (action, belief_key) -> _Node
+        self.prior: npt.NDArray[Any] | None = None    # (n_slots,) masked-softmax prior P(s,·)
+        self.value: float | None = None    # scalar net value V_λ(belief)
+        self.feat: npt.NDArray[Any] | None = None     # cached feature vector
+        self.mask: npt.NDArray[Any] | None = None     # (n_slots,) legal mask
+        self.legal: list[Action] | None = None    # list of legal actions at this node
 
-    def q(self, a):
+    def q(self, a: Action) -> float:
         n = self.N.get(a, 0)
         return self.W[a] / n if n else 0.0
 
@@ -93,8 +98,9 @@ class GumbelAZSearch:
     (it is always the full distribution — the apprentice learns the improved policy, design §4.4).
     """
 
-    def __init__(self, net, env, m=12, n_sims=48, c_puct=1.25, c_visit=50.0,
-                 c_scale=1.0, c_outcome=2, max_depth=24, use_jax_mlp=False):
+    def __init__(self, net: ValueMLP, env: Environment, m: int = 12, n_sims: int = 48,
+                 c_puct: float = 1.25, c_visit: float = 50.0, c_scale: float = 1.0,
+                 c_outcome: int = 2, max_depth: int = 24, use_jax_mlp: bool = False) -> None:
         self.net = net
         self.env = env
         self.fb = FeatureBuilder(env)
@@ -119,6 +125,13 @@ class GumbelAZSearch:
         # single-eval-dispatch trap; see docs/results/az-jax-perf.md). JAX only wins batched
         # (~4µs/item at batch 48), which the sequential tree descent doesn't expose without a
         # bigger restructure. `use_jax_mlp=True` keeps the jit path selectable for the bench.
+        # the leaf-eval forward: net.predict_both (default numpy fast path) or the jax MlpJaxForward
+        # (held-hard Stage-4 module, Any-typed). Both take (feat, mask) and return (value, policy);
+        # typed as the value/policy callable so callers see the shared contract, not the union.
+        self._predict_both: Callable[
+            [npt.NDArray[Any], npt.NDArray[Any]],
+            tuple[float | npt.NDArray[Any], npt.NDArray[Any]]]
+        self._mlp_fwd: Any
         if use_jax_mlp and net.n_actions is not None:
             from chocofarm.az.mlp_jax import MlpJaxForward
             fwd = MlpJaxForward(net)
@@ -130,7 +143,7 @@ class GumbelAZSearch:
             self._mlp_fwd = None
 
     # ---- net evaluation (one forward, cached on the node) ----
-    def _evaluate(self, node, loc, bw, collected):
+    def _evaluate(self, node: _Node, loc: Loc, bw: WorldSet, collected: Collected) -> float:
         """Populate node.feat/mask/prior/value/legal from a single net forward pass.
 
         The marginals call is left to `FeatureBuilder.build`, which serves the belief-derived
@@ -140,7 +153,10 @@ class GumbelAZSearch:
         env = self.env
         feat = self.fb.build(loc, bw, collected)
         mask = legal_mask_from_features(env, feat)
-        v, p = self._predict_both(feat, mask)
+        # `feat` is a 1-D vector, so predict_both returns the scalar-value arm (float, policy-row);
+        # float() pins the value to the node's `float` slot (no runtime change — already a float).
+        v_raw, p = self._predict_both(feat, mask)
+        v = float(v_raw)
         node.feat = feat
         node.mask = mask
         node.prior = p
@@ -151,7 +167,7 @@ class GumbelAZSearch:
 
     # ---- root-value bootstrap (Part B: the lower-variance value-target seam) ----
     @staticmethod
-    def _root_search_value(root):
+    def _root_search_value(root: _Node) -> float:
         """The search's ~n_sims-averaged estimate of the ROOT belief's value: the visit-weighted
         mean of the root actions' aggregate λ-penalized returns, Σ_a W[a] / Σ_a N[a].
 
@@ -168,7 +184,9 @@ class GumbelAZSearch:
         return sum_w / sum_n
 
     # ---- public API ----
-    def decide_with_value(self, env, loc, bw, collected, lam, rng, temperature=0.0):
+    def decide_with_value(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+                          lam: float, rng: np.random.Generator, temperature: float = 0.0
+                          ) -> tuple[Action, npt.NDArray[Any], float]:
         """Like `decide_with_target` but ALSO returns the search's root-value bootstrap
         `_root_search_value(root)` — the ~n_sims-averaged λ-penalized root value the Part B
         lower-variance value target bootstraps from. Returns `(executed_action, improved_pi,
@@ -182,7 +200,9 @@ class GumbelAZSearch:
         action, pi, root = self._decide_root(env, loc, bw, collected, lam, rng, temperature)
         return action, pi, self._root_search_value(root)
 
-    def decide_with_target(self, env, loc, bw, collected, lam, rng, temperature=0.0):
+    def decide_with_target(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+                           lam: float, rng: np.random.Generator, temperature: float = 0.0
+                           ) -> tuple[Action, npt.NDArray[Any]]:
         n_slots = self.n_slots
         if len(bw) == 0:
             pi = np.zeros(n_slots)
@@ -191,7 +211,9 @@ class GumbelAZSearch:
         action, pi, _root = self._decide_root(env, loc, bw, collected, lam, rng, temperature)
         return action, pi
 
-    def _decide_root(self, env, loc, bw, collected, lam, rng, temperature):
+    def _decide_root(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+                     lam: float, rng: np.random.Generator, temperature: float
+                     ) -> tuple[Action, npt.NDArray[Any], _Node]:
         """Shared core: run the Gumbel search at the root and return (executed_action, improved_pi,
         root_node). The root node carries the per-action W/N stats the root-value bootstrap reads.
         `decide_with_target` and `decide_with_value` are thin wrappers selecting what to expose."""
@@ -211,7 +233,10 @@ class GumbelAZSearch:
 
         root = _Node()
         self._evaluate(root, loc, bw, set(collected))
+        # _evaluate just populated the root, so its legal-action list and prior are cached — assert
+        # to narrow honestly (ADR-0002 fail-loud, not a None-deref on a freshly-evaluated node).
         legal = root.legal
+        assert legal is not None and root.prior is not None
         legal_slots = [action_to_slot(env, a) for a in legal]
 
         # --- root logits = log(prior) over legal slots (Danihelka works in logit space; the
@@ -247,12 +272,17 @@ class GumbelAZSearch:
             chosen = int(rng.choice(self.n_slots, p=probs))
             exec_action = slot_to_action(env, chosen)
         else:
+            # legal_slots is non-empty here (the root has at least TERMINATE), so SH returns a real
+            # survivor slot, never None — assert it loudly (ADR-0002) before the slot lookup.
+            assert survivor is not None
             exec_action = slot_to_action(env, survivor)
         return exec_action, improved, root
 
     # ---- Sequential Halving (Danihelka et al. 2022 §2) ----
-    def _sequential_halving(self, env, root, loc, bw, collected, lam, rng,
-                            considered, g, logits):
+    def _sequential_halving(self, env: Environment, root: _Node, loc: Loc, bw: WorldSet,
+                            collected: Collected, lam: float, rng: np.random.Generator,
+                            considered: list[int], g: npt.NDArray[Any],
+                            logits: npt.NDArray[Any]) -> int | None:
         """Allocate `n_sims` across the `considered` root actions in `⌈log2 m⌉` phases, the
         paper's schedule: in each phase the surviving set each gets an equal share of the phase's
         budget, then the top half by `g + logit + σ(q̂)` survives. Returns the final survivor slot
@@ -296,7 +326,8 @@ class GumbelAZSearch:
             i += 1
         return considered[0]
 
-    def _visit(self, env, root, loc, bw, collected, slot, lam, rng, count):
+    def _visit(self, env: Environment, root: _Node, loc: Loc, bw: WorldSet, collected: Collected,
+               slot: int, lam: float, rng: np.random.Generator, count: int) -> None:
         """Run `count` simulations of root action `slot`, accumulating its aggregate stats."""
         a = slot_to_action(env, slot)
         for _ in range(count):
@@ -305,11 +336,13 @@ class GumbelAZSearch:
             root.W[a] = root.W.get(a, 0.0) + ret
             root.N[a] = root.N.get(a, 0) + 1
 
-    def _simulate_root_action(self, env, root, loc, bw, collected, a, world, lam, rng):
+    def _simulate_root_action(self, env: Environment, root: _Node, loc: Loc, bw: WorldSet,
+                              collected: Collected, a: Action, world: int, lam: float,
+                              rng: np.random.Generator) -> float:
         """One simulation of a chosen root action: realize it (chance outcome from `world`),
         average the leaf over c_outcome immediate determinizations (design §5.2), descend the
         interior with PUCT for the remaining depth. Returns the λ-penalized return."""
-        if a == TERMINATE:
+        if is_terminate(a):     # the seam's TypeIs guard narrows `a` to MoveAction for `apply` below
             return -lam * env.exit_cost(loc)
         # outcome-averaging over c_outcome determinizations of the IMMEDIATE outcome
         total = 0.0
@@ -327,20 +360,23 @@ class GumbelAZSearch:
         return total / self.c_outcome
 
     # ---- interior PUCT descent; net value at the leaf (design §5.2) ----
-    def _descend(self, env, node, loc, bw, collected, world, lam, rng, depth):
+    def _descend(self, env: Environment, node: _Node, loc: Loc, bw: WorldSet, collected: Collected,
+                 world: int, lam: float, rng: np.random.Generator, depth: int) -> float:
         if depth >= self.max_depth or len(bw) == 0:
             if node.value is None:
                 if len(bw) == 0:
                     return -lam * env.exit_cost(loc)
-                self._evaluate(node, loc, bw, collected)
+                return self._evaluate(node, loc, bw, collected)   # the value it just cached
             return node.value
         if node.value is None:
             # first visit to this leaf: net value IS the leaf estimate (no playout — the F4 cure)
-            self._evaluate(node, loc, bw, collected)
-            return node.value
+            return self._evaluate(node, loc, bw, collected)       # the value it just cached
 
         a = self._puct_select(env, node)
-        if a == TERMINATE:
+        # the interior node is evaluated (node.value not None), so it has legal actions and
+        # _puct_select returns one — assert it (ADR-0002 fail-loud, not a None action below).
+        assert a is not None
+        if is_terminate(a):     # the seam's TypeIs guard narrows `a` to MoveAction for `apply` below
             ret = -lam * env.exit_cost(loc)
             node.W[a] = node.W.get(a, 0.0) + ret
             node.N[a] = node.N.get(a, 0) + 1
@@ -358,7 +394,7 @@ class GumbelAZSearch:
         node.N[a] = node.N.get(a, 0) + 1
         return ret
 
-    def _puct_select(self, env, node):
+    def _puct_select(self, env: Environment, node: _Node) -> Action | None:
         """AlphaZero PUCT (Silver et al. 2017): argmax Q + c_puct·P·√(ΣN)/(1+N), over the legal
         actions, with the net prior P and Q the running mean (net value for unvisited via the
         node's own value as the optimistic-free baseline).
@@ -374,8 +410,12 @@ class GumbelAZSearch:
         c_puct = self.c_puct
         prior = node.prior
         a2s = self._a2s
+        # _puct_select is reached only after _evaluate populated this node (in _descend), so the
+        # cached prior/legal are set — assert it to narrow honestly (ADR-0002, not a None-deref).
+        assert prior is not None and node.legal is not None
         base_v = node.value if node.value is not None else 0.0
-        best_a, best_v = None, -np.inf
+        best_a: Action | None = None
+        best_v = -np.inf
         for a in node.legal:
             n = N_map.get(a, 0)
             q = (W_map[a] / n) if n else base_v   # unvisited Q completed by the node value (= node.q(a))
@@ -393,7 +433,8 @@ class GumbelAZSearch:
     # Q over the legal slots) into slot-indexed containers and delegate. The math and call order are
     # unchanged — byte-identical outputs (verified by the audit-item-C byte-identity check).
 
-    def _node_visited_lists(self, root, legal_slots):
+    def _node_visited_lists(self, root: _Node, legal_slots: list[int]
+                            ) -> tuple[list[float], list[int]]:
         """Project the node's per-action W/N stats onto slot-indexed (visited_q, visited_n) lists
         over the legal slots — the explicit per-root-action inputs the value_target rule consumes.
         `visited_n[s]` = N(slot s) (0 if unvisited); `visited_q[s]` = Q(slot s) = root.q(action).
@@ -416,24 +457,30 @@ class GumbelAZSearch:
                 visited_q[s] = root.q(a)
         return visited_q, visited_n
 
-    def _sigma_scale(self, root):
+    def _sigma_scale(self, root: _Node) -> float:
         # max_a N(a) over the visited root actions; the legal slots cover every visited action
         # (root.N keys are always legal), so the max over legal slots equals max(root.N.values()).
+        assert root.legal is not None     # the root is evaluated before this adapter runs (ADR-0002)
         legal_slots = [action_to_slot(self.env, a) for a in root.legal]
         _, visited_n = self._node_visited_lists(root, legal_slots)
         return _sigma_scale_rule(visited_n, legal_slots, self.c_visit, self.c_scale)
 
-    def _v_mix(self, root, legal_slots):
+    def _v_mix(self, root: _Node, legal_slots: list[int]) -> float:
         """Thin adapter: gather the node stats and call `value_target.v_mix` (Danihelka §3 value
         completion — the PRIOR-weighted blend the search uses for unvisited actions)."""
         visited_q, visited_n = self._node_visited_lists(root, legal_slots)
+        # the root is evaluated before this adapter runs, so value/prior are cached (ADR-0002).
+        assert root.value is not None and root.prior is not None
         return _v_mix_rule(root.value, visited_q, visited_n, root.prior, legal_slots)
 
-    def _improved_policy(self, root, logits, legal_slots):
+    def _improved_policy(self, root: _Node, logits: npt.NDArray[Any],
+                         legal_slots: list[int]) -> npt.NDArray[np.float64]:
         """Thin adapter: gather the node stats and call `value_target.improved_policy`
         (π′ = softmax(logit + σ(completedQ)) over the legal slots, Danihelka et al. 2022 §3).
         Returns a (n_slots,) probability row (zero on illegal)."""
         visited_q, visited_n = self._node_visited_lists(root, legal_slots)
+        # the root is evaluated before this adapter runs, so value/prior are cached (ADR-0002).
+        assert root.value is not None and root.prior is not None
         return _improved_policy_rule(logits, visited_q, visited_n, root.value, root.prior,
                                      legal_slots, self.c_visit, self.c_scale)
 
@@ -443,10 +490,15 @@ class GumbelPolicy(Policy):
     0). Used to measure the apprentice's greedy rate via `env.dinkelbach_rate` (design §6 step 3).
     Construct with an already-loaded net; reuses one GumbelAZSearch across decisions."""
 
-    def __init__(self, net, env, m=12, n_sims=48, **kw):
+    def __init__(self, net: ValueMLP, env: Environment, m: int = 12, n_sims: int = 48,
+                 **kw: Any) -> None:
         self.search = GumbelAZSearch(net, env, m=m, n_sims=n_sims, **kw)
 
-    def decide(self, env, loc, bw, collected, lam, rng):
+    def decide(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+               lam: float, rng: np.random.Generator | None = None) -> Action:
+        # GumbelPolicy is a STOCHASTIC search and requires a real Generator (the seam's Optional is
+        # for the deterministic playout bases); assert it loudly rather than silently default-deref.
+        assert rng is not None, "GumbelPolicy.decide requires a numpy Generator (ADR-0002)"
         action, _ = self.search.decide_with_target(env, loc, bw, collected, lam, rng,
                                                     temperature=0.0)
         return action

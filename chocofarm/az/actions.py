@@ -24,19 +24,21 @@ was already built. `legal_mask_from_features` does exactly that, by slicing the 
 from __future__ import annotations
 
 import weakref
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import TERMINATE
+from chocofarm.model.env import Action, Collected, Environment, Loc, TERMINATE, WorldSet
 from chocofarm.az.features import feature_layout
 
 
-def n_action_slots(env) -> int:
+def n_action_slots(env: Environment) -> int:
     """Fixed action-space size for THIS env. Derived, never hardcoded (= 65 on the live env)."""
     return env.N + len(env.detectors) + 1
 
 
-def term_slot(env) -> int:
+def term_slot(env: Environment) -> int:
     """Index of the TERMINATE slot (the last one)."""
     return env.N + len(env.detectors)
 
@@ -64,26 +66,29 @@ def term_slot(env) -> int:
 #
 # Hot loops that convert millions of times should hoist the tables once via `slot_action_tables(env)`
 # and index them directly, rather than calling the wrapper per element.
-_SLOT_TABLES = weakref.WeakKeyDictionary()
+_SlotTables = tuple[tuple[Action, ...], dict[Action, int]]
+_SLOT_TABLES: "weakref.WeakKeyDictionary[Environment, _SlotTables]" = weakref.WeakKeyDictionary()
 
 
-def slot_action_tables(env):
+def slot_action_tables(env: Environment) -> _SlotTables:
     """Return (slot_to_action_tuple, action_to_slot_dict) for `env`, building+caching on first
     use. `slot_to_action_tuple[s]` is the action for slot s; `action_to_slot_dict[a]` the slot
     for action a (TERMINATE included)."""
     tabs = _SLOT_TABLES.get(env)
     if tabs is None:
         N, nD = env.N, len(env.detectors)
-        s2a = (tuple(("t", i) for i in range(N))
-               + tuple(("d", j) for j in range(nD))
-               + (TERMINATE,))
+        # spell the tag as the precise Action members so the bijection's static type IS the seam's
+        # Action union, not the widened tuple[str, int] a bare ("t", i) literal infers.
+        collects: tuple[Action, ...] = tuple(("t", i) for i in range(N))
+        senses: tuple[Action, ...] = tuple(("d", j) for j in range(nD))
+        s2a: tuple[Action, ...] = collects + senses + (TERMINATE,)
         a2s = {a: s for s, a in enumerate(s2a)}
         tabs = (s2a, a2s)
         _SLOT_TABLES[env] = tabs
     return tabs
 
 
-def action_to_slot(env, action) -> int:
+def action_to_slot(env: Environment, action: Action) -> int:
     """('t',i) / ('d',j) / TERMINATE  ->  fixed slot id. O(1) via the cached bijection table."""
     s = slot_action_tables(env)[1].get(action)
     if s is not None:
@@ -91,7 +96,7 @@ def action_to_slot(env, action) -> int:
     raise ValueError(f"unknown action {action!r}")
 
 
-def slot_to_action(env, slot: int):
+def slot_to_action(env: Environment, slot: int) -> Action:
     """fixed slot id  ->  ('t',i) / ('d',j) / TERMINATE. O(1) via the cached bijection table."""
     s2a = slot_action_tables(env)[0]
     if 0 <= slot < len(s2a):
@@ -99,7 +104,8 @@ def slot_to_action(env, slot: int):
     raise ValueError(f"slot {slot} out of range for action space {n_action_slots(env)}")
 
 
-def legal_mask(env, loc, bw, collected) -> np.ndarray:
+def legal_mask(env: Environment, loc: Loc, bw: WorldSet,
+               collected: Collected) -> npt.NDArray[np.float64]:
     """{0,1} mask over the fixed slots from `env.legal_actions` (+ always-legal TERMINATE).
 
     The authoritative legality source is `env.legal_actions` — this maps its output onto slots.
@@ -112,7 +118,8 @@ def legal_mask(env, loc, bw, collected) -> np.ndarray:
     return m
 
 
-def legal_mask_from_features(env, feat: np.ndarray) -> np.ndarray:
+def legal_mask_from_features(env: Environment,
+                             feat: npt.NDArray[Any]) -> npt.NDArray[np.float64]:
     """The hot-path mask: slice the feature blocks that ARE the mask (design §3).
 
     Reads the named blocks straight from the §2.2 layout owner, `FeatureLayout` (features.py),

@@ -23,19 +23,23 @@ from __future__ import annotations
 
 import argparse
 import time
+from typing import Any, cast
 
 import numpy as np
+import numpy.typing as npt
 
 from chocofarm.az.mlp import ValueMLP
 
 
-def r2_score(y_true, y_pred):
+def r2_score(y_true: npt.NDArray[Any], y_pred: npt.NDArray[Any]) -> float:
     ss_res = float(np.sum((y_true - y_pred) ** 2))
     ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
-def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
+def train(X: npt.NDArray[Any], y: npt.NDArray[Any], epochs: int, batch: int, lr: float,
+          l2: float, val_frac: float, seed: int, hidden: int, writer: Any = None
+          ) -> tuple[ValueMLP, float, float, tuple[float, float]]:
     rng = np.random.default_rng(seed)
     n = X.shape[0]
     perm = rng.permutation(n)
@@ -75,7 +79,9 @@ def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
             ep_loss += trainer.train_step_value(Xtr[b], ytr[b], hp=gate_hp, l2=l2)
         do_print = (ep + 1) % max(1, epochs // 5) == 0 or ep == 0
         if writer is not None or do_print:
-            pv = net.predict_value(Xva.astype(np.float64))
+            # Xva is a 2-D batch, so predict_value returns the (B,) array arm of its union; the cast
+            # states that batch contract for r2_score / the MAE below (no runtime change).
+            pv = cast("npt.NDArray[Any]", net.predict_value(Xva.astype(np.float64)))
             r2 = r2_score(yva, pv)
             mae = float(np.mean(np.abs(yva - pv)))
             if writer is not None:
@@ -88,11 +94,11 @@ def train(X, y, epochs, batch, lr, l2, val_frac, seed, hidden, writer=None):
                       f"  held-out R²={r2:.4f}  MAE={mae:.4f}  ({time.time() - t0:.0f}s)",
                       flush=True)
 
-    pv = net.predict_value(Xva.astype(np.float64))
+    pv = cast("npt.NDArray[Any]", net.predict_value(Xva.astype(np.float64)))
     return net, r2_score(yva, pv), float(np.mean(np.abs(yva - pv))), (y_mean, y_std)
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Train the AZ value head; report held-out R²/MAE.")
     ap.add_argument("--data", type=str, required=True)
     ap.add_argument("--out", type=str, required=True)

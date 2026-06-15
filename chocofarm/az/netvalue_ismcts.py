@@ -24,9 +24,11 @@ Loads weights from an npz (the trained value net). Pin any eval to core 3 under 
 """
 from __future__ import annotations
 
+import numpy as np
+
 from chocofarm.solvers.ismcts import ISMCTSPolicy, _Node, _belief_key
 from chocofarm.solvers.base import UCB_C
-from chocofarm.model.env import TERMINATE
+from chocofarm.model.env import Action, Collected, Environment, Loc, WorldSet, is_terminate
 from chocofarm.az.features import FeatureBuilder
 from chocofarm.az.mlp import ValueMLP
 
@@ -39,14 +41,16 @@ class NetValueISMCTS(ISMCTSPolicy):
     `env` is needed at construction to build the FeatureBuilder (feature dims are env-derived).
     """
 
-    def __init__(self, env, weights_path, iterations=200, c=UCB_C, max_depth=24):
+    def __init__(self, env: Environment, weights_path: str, iterations: int = 200,
+                 c: float = UCB_C, max_depth: int = 24) -> None:
         # base= is irrelevant (the playout leaf is never used), but ISMCTSPolicy builds a
         # default GreedyStopBase; harmless and keeps the parent contract intact.
         super().__init__(iterations=iterations, c=c, base=None, max_depth=max_depth)
         self.net = ValueMLP.load(weights_path)
         self.fb = FeatureBuilder(env)
 
-    def _leaf_value(self, env, loc, bw, collected, lam):
+    def _leaf_value(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+                    lam: float) -> float:
         """The F4 cure: learned λ-penalized return-to-go from this (post-action) belief,
         replacing the determinized base playout. The fused kernel inside `fb.build` derives the
         marginals in one pass, so no separate marginals call is made here (F7)."""
@@ -54,12 +58,16 @@ class NetValueISMCTS(ISMCTSPolicy):
             # empty belief: no continuation value beyond the exit toll (mirrors the base case).
             return -lam * env.exit_cost(loc)
         feat = self.fb.build(loc, bw, collected)
-        return self.net.predict_value(feat)
+        # 2-D-vs-1-D: `feat` is the 1-D feature vector, so predict_value returns the scalar `float`
+        # arm of its union; float() pins it (no runtime change — already a Python float there).
+        return float(self.net.predict_value(feat))
 
-    def _expand_and_simulate(self, env, node, loc, bw, collected, a, world, lam, rng, depth):
+    def _expand_and_simulate(self, env: Environment, node: _Node, loc: Loc, bw: WorldSet,
+                             collected: Collected, a: Action, world: int, lam: float,
+                             rng: np.random.Generator, depth: int) -> float:
         """Identical to ISMCTSPolicy._expand_and_simulate EXCEPT the leaf continuation, which
         is the LEARNED value instead of `_base_value`'s determinized playout."""
-        if a == TERMINATE:
+        if is_terminate(a):     # the seam's TypeIs guard narrows `a` to MoveAction below (== TERMINATE)
             return -lam * env.exit_cost(loc)
         r, nloc, nbw, ncoll, dt = env.apply(loc, bw, collected, a, world)
         step = r - lam * dt
