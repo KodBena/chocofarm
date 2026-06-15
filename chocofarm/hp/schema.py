@@ -126,6 +126,11 @@ class FeatureConfig:
     # canonical block-display tokens FeatureLayout.element_names emits (e.g. the belief-sharpness
     # scalar is named "log|bw|", its block KEY is "sharpness"); a future change to the layout's
     # group widths should update FeatureLayout, and these provenance counts alongside it.
+    # SSOT (audit item G): FeatureLayout (chocofarm/az/features.py) is the single source of truth for
+    # the feature layout; these counts are a provenance copy PINNED to it — registry derives the
+    # per-group widths from FeatureLayout.blocks (in _feature_group_channels) and fails loud if these
+    # disagree, on BOTH the fresh-seed path (_record_derived) and the re-bind drift check, so the
+    # layout cannot drift away from this copy silently.
     per_treasure_channels: int = hp(5, Mut.RESTART, "marg,collected,available,dist,unc")
     per_detector_channels: int = hp(3, Mut.RESTART, "informative,p_pos,dist")
     global_channels: int = hp(6, Mut.RESTART, "log|bw|,n_collected,sum_marg,exit_cost,nonempty,sum_unc (+n_tele)")
