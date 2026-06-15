@@ -21,13 +21,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, AbstractSet, Protocol, Tuple
+from typing import TYPE_CHECKING, AbstractSet, Protocol
 
 import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
-    from chocofarm.model.env import Environment
+    from chocofarm.model.env import Environment, Loc
 
 
 class Vhat(Protocol):
@@ -39,15 +39,23 @@ class Vhat(Protocol):
     `loc` is the current location key (("w"|"t"|"d", id)), `bw` the belief world-set
     array, `collected` the set/frozenset of already-collected treasure ids, `lam` the
     fixed reference λ. Both the plain-function strategies (vhat_zero, vhat_analytic) and
-    the class strategies (DecompVhat, ExactBeliefVhat — their `__call__`) satisfy this."""
+    the class strategies (DecompVhat, ExactBeliefVhat — their `__call__`) satisfy this.
 
-    def __call__(self, env: Environment, loc: Tuple[str, int],
+    ADR-0002 honest-signature fix (Stage 3): `loc` is typed as the seam `Loc` alias
+    (env.py), NOT the old `Tuple[str, int]`. The latter was a lying signature — the
+    `("w", entry)` start location carries a STR id (the teleport name), so a real call
+    site passes a tuple `Tuple[str, int]` cannot spell, and every body forwards `loc`
+    straight into `env.exit_cost`/`env.d`, which consume `Loc`. `Loc` is the type the
+    callers (info_relaxation, eval_bound) actually pass and the env actually consumes."""
+
+    def __call__(self, env: Environment, loc: Loc,
                  bw: npt.NDArray[np.int64], collected: AbstractSet[int],
                  lam: float) -> float:
         ...
 
 
-def vhat_zero(env, loc, bw, collected, lam):
+def vhat_zero(env: "Environment", loc: "Loc", bw: npt.NDArray[np.int64],
+              collected: AbstractSet[int], lam: float) -> float:
     """V̂ ≡ 0 — but NOTE this is NOT the z≡0 clairvoyant baseline. With V̂≡0 the
     value-function penalty is z_t = r_t − E[r_t | F_t, a_t] (the REWARD-DEVIATION
     martingale), which is dual-feasible and nonzero. It is a (mild) valid penalty, not
@@ -57,7 +65,8 @@ def vhat_zero(env, loc, bw, collected, lam):
     return 0.0
 
 
-def vhat_analytic(env, loc, bw, collected, lam):
+def vhat_analytic(env: "Environment", loc: "Loc", bw: npt.NDArray[np.int64],
+                  collected: AbstractSet[int], lam: float) -> float:
     """Trivial analytic V̂₀ (sanity baseline, dual-bound.md §2.4(1)): expected
     still-collectable reward if grabbable for free, minus the cost to leave.
 
@@ -68,5 +77,9 @@ def vhat_analytic(env, loc, bw, collected, lam):
     if len(bw) == 0:
         return -lam * env.exit_cost(loc)
     marg = env.marginals(bw)
+    # `marg[i]` is a numpy float64 (marginals returns NDArray[float64]); `sum(...)` over
+    # them yields a numpy scalar, so the difference is np.float64-typed (Any-leakage under
+    # --strict). float(...) states the declared float contract — a lossless scalar unwrap,
+    # not a behavior change (np.float64 == its python-float value).
     er = sum(marg[i] * env.value[i] for i in range(env.N) if i not in collected)
-    return er - lam * env.exit_cost(loc)
+    return float(er - lam * env.exit_cost(loc))

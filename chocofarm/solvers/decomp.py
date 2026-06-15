@@ -77,22 +77,56 @@ import itertools
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import Callable, Literal, TypedDict
 
-from chocofarm.model.env import Environment, TERMINATE
+import numpy as np
+
+from chocofarm.model.env import (
+    Action, Collected, Environment, Loc, MoveAction, TERMINATE, WorldSet,
+)
 from chocofarm.solvers.base import Policy
+
+# ---------------------------------------------------------------------------
+# Decomp-local seam aliases (signatures only; ADR-0004 minimal-touch).
+#
+# MicroAction  what a micro state's π* returns: a realisable in-cluster step
+#              (a MoveAction — ('d', fid) / ('t', tre)) OR the LEAVE boundary
+#              sentinel ('leave', None). The micro layer never returns TERMINATE
+#              (the exit toll is the macro's).
+# MicroState   a micro belief-MDP state: (loc, support, collected_local). `loc`
+#              is an env Loc (the entry point or the realised ('t'|'d', id));
+#              `support` is the frozenset of surviving local present-set bitmasks;
+#              `collected_local` the locally-collected treasure ids.
+# MacroMove    what the macro decides: ('exit', None) / ('enter', cluster_idx) /
+#              ('delta', treasure_id). A tagged tuple whose tag picks the second
+#              element's meaning (None for exit, an int otherwise).
+# ---------------------------------------------------------------------------
+LEAVE_T = tuple[Literal["leave"], None]
+MicroAction = MoveAction | LEAVE_T
+MicroState = tuple[Loc, frozenset[int], frozenset[int]]
+MicroSolve = Callable[[Loc, frozenset[int], frozenset[int]], "tuple[float, MicroAction]"]
+MacroMove = (
+    tuple[Literal["exit"], None]
+    | tuple[Literal["enter"], int]
+    | tuple[Literal["delta"], int]
+)
+# Occupancy bookkeeping: an occupancy vector is (k_0, …, k_{n_cells-1}); the posterior
+# maps each feasible vector to its probability.
+OccVec = tuple[int, ...]
+Posterior = dict[OccVec, float]
 
 
 # ===========================================================================
 # Cluster structure (read off the env's faces; matches analyzer.clusters)
 # ===========================================================================
 
-def _cocoverage_clusters(env: Environment):
+def _cocoverage_clusters(env: Environment) -> list[list[int]]:
     """Connected components of the treasure co-coverage hypergraph — exactly
     analyzer.clusters, recomputed here from the env's own face cover_masks so the
     solver and the env agree on the partition by construction."""
     parent = {t: t for t in range(env.N)}
 
-    def find(x):
+    def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
@@ -102,7 +136,7 @@ def _cocoverage_clusters(env: Environment):
         cover = [t for t in range(env.N) if (env.cover_mask[fid] >> t) & 1]
         for a, b in itertools.combinations(cover, 2):
             parent[find(a)] = find(b)
-    comp = {}
+    comp: dict[int, set[int]] = {}
     for t in range(env.N):
         comp.setdefault(find(t), set()).add(t)
     return sorted((sorted(s) for s in comp.values()), key=lambda s: (-len(s), s))
@@ -114,15 +148,15 @@ class Cluster:
     face ids whose cover lies entirely inside the cluster (the in-cluster sense
     actions); `tres` the member treasure ids (sorted, the local bit order)."""
     name: str
-    tres: tuple
-    faces: tuple          # env face ids with cover ⊆ tres
+    tres: tuple[int, ...]
+    faces: tuple[int, ...]   # env face ids with cover ⊆ tres
 
     @property
-    def size(self):
+    def size(self) -> int:
         return len(self.tres)
 
 
-def discover_clusters(env: Environment):
+def discover_clusters(env: Environment) -> list[Cluster]:
     parts = _cocoverage_clusters(env)
     out = []
     for c in parts:
@@ -159,23 +193,23 @@ class MicroSolution:
     `enter_value`       : enter_ev[0] − λ·enter_ev[1] (the λ-value the macro chains).
     """
     cluster: str
-    k: int
+    k: int | None
     n_states: int
-    value: dict            # (loc, support, collected) -> V*
-    act: dict              # (loc, support, collected) -> optimal action
-    enter_ev: tuple
+    value: dict[MicroState, float]            # (loc, support, collected) -> V*
+    act: dict[MicroState, MicroAction]        # (loc, support, collected) -> optimal action
+    enter_ev: tuple[float, float]
     enter_value: float
-    face_localmask: dict = field(default_factory=dict)   # env face id -> local cover mask
-    wmap: dict = field(default_factory=dict)             # local present-set -> prior weight
-    bit: dict = field(default_factory=dict)              # treasure id -> local bit
-    solve: object = None                                 # the memoised exact solver closure
+    face_localmask: dict[int, int] = field(default_factory=dict)   # env face id -> local cover mask
+    wmap: dict[int, int] = field(default_factory=dict)             # local present-set -> prior weight
+    bit: dict[int, int] = field(default_factory=dict)              # treasure id -> local bit
+    solve: MicroSolve | None = None                                # the memoised exact solver closure
 
 
-LEAVE = ("leave", None)
+LEAVE: LEAVE_T = ("leave", None)
 
 
-def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
-                        entry_loc, max_states: int = 200_000) -> MicroSolution:
+def build_cluster_micro(env: Environment, cluster: Cluster, k: int | None, lam: float,
+                        entry_loc: Loc, max_states: int = 200_000) -> MicroSolution:
     """EXACT backward induction for a per-cluster belief-MDP under λ.
 
     Two construction modes, both EXACT:
@@ -221,7 +255,7 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
     # C(N−size, K−j) global worlds.  Within a fixed k all j are equal so the per-k
     # MDP is uniform (weight 1 each — exact).  The JOINT MDP must carry these
     # completion-count weights to be exact under the true env prior.
-    def _completion(j):
+    def _completion(j: int) -> int:
         r = env.K - j                                  # remaining present outside the cluster
         if r < 0 or r > env.N - size:
             return 0                                    # infeasible occupancy under Σ=K
@@ -231,7 +265,7 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
     latents = frozenset(wmap)
 
     # in-cluster face cover as a LOCAL bitmask
-    face_localmask = {}
+    face_localmask: dict[int, int] = {}
     for fid in cluster.faces:
         lm = 0
         for t in tres:
@@ -239,15 +273,16 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
                 lm |= (1 << bit[t])
         face_localmask[fid] = lm
 
-    def wsum(belief):
+    def wsum(belief: frozenset[int]) -> int:
         return sum(wmap[s] for s in belief)
 
     state_count = [0]
-    act_map = {}                                       # (loc, belief, collected) -> action
-    val_map = {}                                       # (loc, belief, collected) -> V*
+    act_map: dict[MicroState, MicroAction] = {}        # (loc, belief, collected) -> action
+    val_map: dict[MicroState, float] = {}              # (loc, belief, collected) -> V*
 
     @lru_cache(maxsize=None)
-    def solve(loc, belief, collected):
+    def solve(loc: Loc, belief: frozenset[int],
+              collected: frozenset[int]) -> tuple[float, MicroAction]:
         """belief: frozenset of local present-set masks (the support), carrying the
         prior weights `wmap`.  collected: treasure ids already collected here.
         Returns (V, best_action).  Expectimax branches weighted by `wsum`."""
@@ -257,7 +292,8 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
                 f"micro {cluster.name} k={k}: state cap {max_states} exceeded "
                 f"(cluster too large to solve flat — sub-decompose)")
         W = wsum(belief)
-        best_v, best_a = 0.0, LEAVE          # LEAVE now → value 0 (exit is the macro's)
+        best_v: float = 0.0
+        best_a: MicroAction = LEAVE          # LEAVE now → value 0 (exit is the macro's)
 
         # --- collect actions: only members still possibly-present & uncollected ---
         for t in tres:
@@ -297,15 +333,20 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
         return best_v, best_a
 
     # roll up the exact (E[R], E[T]) under π* by replaying it as a weighted expectation.
-    def expectation(loc, belief, collected):
+    def expectation(loc: Loc, belief: frozenset[int],
+                    collected: frozenset[int]) -> tuple[float, float]:
         """Exact (E[R], E[T]) of following π* from this state to LEAVE, over the
         weighted support."""
         W = wsum(belief)
         _, a = solve(loc, belief, collected)
-        if a == LEAVE:
+        # Narrow on the tag (the 'leave' tuple is the unique LEAVE value, so a[0]=='leave'
+        # ⟺ a==LEAVE — behaviour-preserving). The tag test lets mypy narrow `a` to the
+        # MoveAction subset, which IS a Loc, so `a` is the realised location key directly
+        # (matches env.apply's idiom: no tuple rebuild, which would widen the tag).
+        if a[0] == "leave":
             return 0.0, 0.0
         kind, i = a
-        cost = env.d(loc, (kind, i))
+        cost = env.d(loc, a)
         if kind == "t":
             b = bit[i]
             present = frozenset(s for s in belief if (s >> b) & 1)
@@ -333,7 +374,7 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
             er += wm * rm; et += wm * tm
         return er / W, cost + et / W
 
-    init = (entry_loc, latents, frozenset())
+    init: MicroState = (entry_loc, latents, frozenset())
     if k == 0 or not latents:
         # empty cluster: nothing to do
         return MicroSolution(cluster.name, k, 1, {}, {init: LEAVE}, (0.0, 0.0), 0.0,
@@ -353,7 +394,7 @@ def build_cluster_micro(env: Environment, cluster: Cluster, k, lam: float,
 # Occupancy posterior — exact multivariate-hypergeometric bookkeeping
 # ===========================================================================
 
-def _occupancy_posterior(cell_sizes, budget):
+def _occupancy_posterior(cell_sizes: list[int], budget: int) -> Posterior:
     """[exact] Analytic PRIOR over occupancy vectors (k_0,…,k_{n-1}) with Σ k_c =
     budget and 0≤k_c≤cell_sizes[c], each world equiprobable: P(k) ∝ ∏ C(size_c, k_c).
     Returns {tuple(k): probability} — the analyzer's multivariate hypergeometric over
@@ -362,9 +403,9 @@ def _occupancy_posterior(cell_sizes, budget):
     exactly this on the full world set.  Kept as the analytic reference / sanity check
     (the prior the live recompute must match before any reveal)."""
     sizes = list(cell_sizes)
-    vecs = []
+    vecs: list[OccVec] = []
 
-    def rec(i, rem, acc):
+    def rec(i: int, rem: int, acc: list[int]) -> None:
         if i == len(sizes):
             if rem == 0:
                 vecs.append(tuple(acc))
@@ -373,7 +414,7 @@ def _occupancy_posterior(cell_sizes, budget):
             rec(i + 1, rem - kc, acc + [kc])
 
     rec(0, budget, [])
-    weights = {}
+    weights: dict[OccVec, int] = {}
     tot = 0.0
     for v in vecs:
         w = 1
@@ -384,9 +425,9 @@ def _occupancy_posterior(cell_sizes, budget):
     return {v: w / tot for v, w in weights.items()} if tot else {}
 
 
-def _marginal_k(posterior, idx):
+def _marginal_k(posterior: Posterior, idx: int) -> dict[int, float]:
     """Marginal P(k_idx = j) from a joint posterior dict."""
-    out = {}
+    out: dict[int, float] = {}
     for v, p in posterior.items():
         out[v[idx]] = out.get(v[idx], 0.0) + p
     return out
@@ -412,7 +453,9 @@ class MacroPlanner:
     observe==collect).  Visiting the δ-cell collects the single cheapest still-
     plausible δ-treasure (the macro treats δ as a pool drawn down one at a time)."""
 
-    def __init__(self, env, clusters, micro, lam, horizon=1):
+    def __init__(self, env: Environment, clusters: list[Cluster],
+                 micro: dict[tuple[str, int], MicroSolution], lam: float,
+                 horizon: int = 1) -> None:
         self.env = env
         self.lam = lam
         self.horizon = horizon
@@ -425,12 +468,13 @@ class MacroPlanner:
                        for c in self.sense}
 
     # ---- micro lookups ----
-    def _micro_ev(self, cname, k):
+    def _micro_ev(self, cname: str, k: int) -> tuple[float, float]:
         sol = self.micro.get((cname, k))
         return sol.enter_ev if sol else (0.0, 0.0)
 
     # ---- expectimax value of a macro state ----
-    def value(self, loc, posterior, visited, delta_done, depth):
+    def value(self, loc: Loc, posterior: Posterior, visited: set[int],
+              delta_done: frozenset[int], depth: int) -> tuple[float, MacroMove]:
         """V*(macro state) = max over {exit, enter unvisited cluster, dip δ} of the
         expected λ-value (Σ reward − λ·(travel + exit)).  posterior: joint over the
         n_cells occupancy vector.  visited: set of sense-cluster indices done.
@@ -438,7 +482,7 @@ class MacroPlanner:
         (the exit cost is included so 'exit now' is comparable)."""
         # base option: exit now
         best = -self.lam * self.env.exit_cost(loc)
-        best_move = ("exit", None)
+        best_move: MacroMove = ("exit", None)
         if depth <= 0:
             return best, best_move
 
@@ -493,7 +537,8 @@ class MacroPlanner:
 
         return best, best_move
 
-    def decide_macro(self, loc, posterior, visited, delta_done):
+    def decide_macro(self, loc: Loc, posterior: Posterior, visited: set[int],
+                     delta_done: frozenset[int]) -> MacroMove:
         """Top-level macro move from the current boundary state."""
         _, move = self.value(loc, posterior, visited, delta_done, self.horizon)
         return move
@@ -502,6 +547,28 @@ class MacroPlanner:
 # ===========================================================================
 # POLICY — wrap micro + macro behind the env's Policy interface
 # ===========================================================================
+
+class _Built(TypedDict):
+    """The per-λ precomputed tables `DecompPolicy._build` returns (cached per λ). A
+    TypedDict spells the heterogeneous payload honestly so `decide` indexes it typed —
+    no body rewrite, no `Any`-convenience cast (ADR-0004 minimal-touch)."""
+    clusters: list[Cluster]
+    sense: list[Cluster]
+    anchors: dict[str, int]
+    micro: dict[tuple[str, int], MicroSolution]   # per-(cluster,k), for the MACRO
+    joint: dict[str, MicroSolution]               # per-cluster joint, for the RUNTIME
+    macro: MacroPlanner
+    bit: dict[str, dict[int, int]]                # cluster name -> {treasure id -> local bit}
+
+
+class _EpState(TypedDict):
+    """Per-episode mutable bookkeeping (`DecompPolicy._ep`). `active` is the index of the
+    cluster currently being executed, or None outside any cluster."""
+    lam: float
+    visited: set[int]
+    delta_done: frozenset[int]
+    active: int | None
+
 
 class DecompPolicy(Policy):
     """Exact hierarchical-decomposition policy, behind the env's Policy interface
@@ -535,15 +602,15 @@ class DecompPolicy(Policy):
     The env is ground truth: every distance the measured rate sees is exact env.d.
     The micro/macro tables only steer decisions; the rate is unbiased."""
 
-    def __init__(self, horizon=1, verbose=False):
+    def __init__(self, horizon: int = 1, verbose: bool = False) -> None:
         self.horizon = horizon
         self.verbose = verbose
-        self._cache = {}                 # lam(rounded) -> built tables
-        self._ep = None                  # per-episode mutable state
+        self._cache: dict[float, _Built] = {}   # lam(rounded) -> built tables
+        self._ep: _EpState | None = None        # per-episode mutable state
         self.fallbacks = 0               # states solved on-demand (conditioned supports)
 
     # ---- precompute (per λ) ----
-    def _build(self, env, lam):
+    def _build(self, env: Environment, lam: float) -> _Built:
         key = round(lam, 6)
         if key in self._cache:
             return self._cache[key]
@@ -551,22 +618,22 @@ class DecompPolicy(Policy):
         sense = [c for c in clusters if c.size > 1]
         anchors = {c.name: min(c.tres, key=lambda t: env.d(("w", env.entry), ("t", t)))
                    for c in sense}
-        micro = {}        # per-(cluster,k) occupancy-conditioned — for the MACRO
-        joint = {}        # per-cluster joint (all-k) — for the RUNTIME execution
+        micro: dict[tuple[str, int], MicroSolution] = {}   # per-(cluster,k) — for the MACRO
+        joint: dict[str, MicroSolution] = {}               # per-cluster joint — for the RUNTIME
         for c in sense:
-            entry = ("t", anchors[c.name])
+            entry: Loc = ("t", anchors[c.name])
             for k in range(1, c.size + 1):
                 micro[(c.name, k)] = build_cluster_micro(env, c, k, lam, entry)
             joint[c.name] = build_cluster_micro(env, c, None, lam, entry)
         macro = MacroPlanner(env, clusters, micro, lam, horizon=self.horizon)
-        built = {"clusters": clusters, "sense": sense, "anchors": anchors,
-                 "micro": micro, "joint": joint, "macro": macro,
-                 "bit": {c.name: {t: b for b, t in enumerate(c.tres)} for c in sense}}
+        built: _Built = {"clusters": clusters, "sense": sense, "anchors": anchors,
+                         "micro": micro, "joint": joint, "macro": macro,
+                         "bit": {c.name: {t: b for b, t in enumerate(c.tres)} for c in sense}}
         self._cache[key] = built
         return built
 
     # ---- per-episode reset ----
-    def _reset(self, env, lam):
+    def _reset(self, env: Environment, lam: float) -> None:
         self._build(env, lam)
         # NB: the occupancy posterior is NOT stored here — `decide` recomputes it
         # exactly from the live belief bw at every macro decision
@@ -577,7 +644,7 @@ class DecompPolicy(Policy):
 
     # ---- live local belief decode (vectorised projection onto the cluster bits) ----
     @staticmethod
-    def _local_support(bw, cluster, bm):
+    def _local_support(bw: WorldSet, cluster: Cluster, bm: dict[int, int]) -> frozenset[int]:
         cmask = sum(1 << t for t in cluster.tres)
         proj = bw & cmask
         local = proj * 0
@@ -586,12 +653,16 @@ class DecompPolicy(Policy):
         return frozenset(int(x) for x in set(local.tolist()))
 
     # ---- the Policy interface ----
-    def decide(self, env, loc, bw, collected, lam, rng=None):
+    def decide(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+               lam: float, rng: np.random.Generator | None = None) -> Action:
         fresh = (loc == ("w", env.entry) and not collected and len(bw) == len(env.worlds))
         if self._ep is None or self._ep["lam"] != round(lam, 6) or fresh:
             self._reset(env, lam)
         built = self._build(env, lam)
         macro, sense = built["macro"], built["sense"]
+        # _reset (called above whenever _ep was None) always installs a fresh _EpState,
+        # so _ep is non-None here; assert it (ADR-0002 fail-loud) so mypy narrows.
+        assert self._ep is not None
         ep = self._ep
 
         # Outside any cluster → consult the macro.  The occupancy posterior is
@@ -601,10 +672,11 @@ class DecompPolicy(Policy):
         if ep["active"] is None:
             post = _live_occupancy_posterior(env, bw, macro)
             move = macro.decide_macro(loc, post, ep["visited"], ep["delta_done"])
-            kind = move[0]
-            if kind == "exit":
+            # Branch on move[0] directly (not via an intermediate) so mypy narrows the
+            # MacroMove union per tag — exit carries None, enter/delta carry an int.
+            if move[0] == "exit":
                 return TERMINATE
-            if kind == "delta":
+            if move[0] == "delta":
                 ep["delta_done"] = ep["delta_done"] | {move[1]}
                 return ("t", move[1])
             ep["active"] = move[1]                       # 'enter' — fall through
@@ -613,6 +685,10 @@ class DecompPolicy(Policy):
         # (the unconditioned per-cluster belief-MDP; handles the mixed-k live belief
         # exactly, no occupancy mixture).
         ci = ep["active"]
+        # By construction ci is an int here: the macro block above either returned
+        # (exit/delta) or set active to the entered cluster index. ADR-0002 fail-loud —
+        # a None here would be a control-flow bug, surfaced rather than silently indexed.
+        assert ci is not None
         c = sense[ci]
         bm = built["bit"][c.name]
         col_local = frozenset(t for t in c.tres if t in collected)
@@ -622,6 +698,7 @@ class DecompPolicy(Policy):
         # support may be CONDITIONED by other clusters' revealed occupancy via the
         # global Σ=K coupling — a subset of the marginal latents).
         sup = frozenset(s for s in sup if s in sol.wmap)
+        action: MicroAction
         if not sup:
             action = LEAVE
         else:
@@ -632,16 +709,23 @@ class DecompPolicy(Policy):
             # belief count).  Count those as on-demand solves for the eval report.
             if (loc, sup, col_local) not in sol.value:
                 self.fallbacks += 1
+            # `solve` is set on every MicroSolution build (the None default is never
+            # the live value); assert it (ADR-0002 fail-loud) so mypy narrows the call.
+            assert sol.solve is not None
             _, action = sol.solve(loc, sup, col_local)
 
-        if action == LEAVE:
+        # Narrow on the tag (the 'leave' tuple is the unique LEAVE value, so action[0]
+        # == 'leave' ⟺ action == LEAVE — behaviour-preserving) so mypy narrows the final
+        # return to the MoveAction subset (a valid Action).
+        if action[0] == "leave":
             ep["visited"].add(ci)
             ep["active"] = None
             return self.decide(env, loc, bw, collected, lam, rng)
         return action
 
 
-def _live_occupancy_posterior(env, bw, macro):
+def _live_occupancy_posterior(env: Environment, bw: WorldSet,
+                              macro: MacroPlanner) -> Posterior:
     """[exact] The occupancy-vector posterior given the live belief `bw`: project
     each surviving world onto the macro cells (sense clusters + the δ pool), count
     the resulting occupancy vectors, normalise.  Exact — it reflects every reveal
@@ -650,7 +734,6 @@ def _live_occupancy_posterior(env, bw, macro):
 
     Vectorised: per cell, popcount the masked worlds (sum of extracted bits) and
     pack the per-cell occupancies into one signature integer, then group-count."""
-    import numpy as np
     cells = [c.tres for c in macro.sense] + [tuple(macro.delta)]
     n = len(bw)
     occ = np.zeros((len(cells), n), dtype=np.int64)
@@ -664,9 +747,10 @@ def _live_occupancy_posterior(env, bw, macro):
     for ci in range(len(cells)):
         sig = (sig << 3) | occ[ci]
     vals, counts = np.unique(sig, return_counts=True)
-    out, tot = {}, int(counts.sum())
+    out: Posterior = {}
+    tot = int(counts.sum())
     for s, c in zip(vals.tolist(), counts.tolist()):
-        vec = []
+        vec: list[int] = []
         s = int(s)
         for _ in range(len(cells)):
             vec.append(s & 0b111)

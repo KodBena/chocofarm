@@ -44,7 +44,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from chocofarm.model.env import TERMINATE
+from chocofarm.model.env import (
+    Action, Collected, Environment, Loc, MoveAction, TERMINATE, WorldSet, is_terminate,
+)
 from chocofarm.solvers.base import Policy, GreedyPolicy, _base_value, candidate_actions
 
 
@@ -90,8 +92,10 @@ class NMCSPolicy(Policy):
         Hard cap on the length of any search line (matches env.simulate's horizon).
     """
 
-    def __init__(self, level=1, base=None, playout_samples=3, step_samples=2,
-                 cand_det=4, cand_tre=4, max_steps=24, *, cfg=None):
+    def __init__(self, level: int = 1, base: Policy | None = None,
+                 playout_samples: int = 3, step_samples: int = 2,
+                 cand_det: int = 4, cand_tre: int = 4, max_steps: int = 24,
+                 *, cfg: "NMCSConfig | None" = None) -> None:
         # cfg=NMCSConfig(...) supplies the scalar knobs in one frozen object; the individual
         # kwargs remain the back-compat path and build the config when no cfg is passed (ADR-0004).
         # `base` (the level-0 Policy, not a scalar) is always a separate __init__ param. The config
@@ -109,13 +113,15 @@ class NMCSPolicy(Policy):
         self.max_steps = self.cfg.max_steps
 
     # ---- candidate generation (bounded branching) -------------------------------------
-    def _candidates(self, env, loc, bw, collected):
+    def _candidates(self, env: Environment, loc: Loc, bw: WorldSet,
+                    collected: Collected) -> list[Action]:
         # shared bounded-branching pruner; NMCS appends TERMINATE (bank-and-exit is always an option).
         return candidate_actions(env, loc, bw, collected, self.cand_det, self.cand_tre,
                                  include_terminate=True)
 
     # ---- level-0: determinized base playout from a state ------------------------------
-    def _playout(self, env, loc, bw, collected, lam, rng):
+    def _playout(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+                 lam: float, rng: np.random.Generator) -> float:
         """Mean lambda-value of a base-policy playout, averaged over `ps` sampled worlds.
 
         Each sampled world determinizes the whole rollout. `_base_value` (from policies.py)
@@ -132,7 +138,9 @@ class NMCSPolicy(Policy):
         return tot / self.ps
 
     # ---- level-n search from a state: returns (score, first_action) -------------------
-    def _search(self, env, loc, bw, collected, lam, level, rng):
+    def _search(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+                lam: float, level: int, rng: np.random.Generator
+                ) -> tuple[float, Action]:
         """Run an NMCS level-`level` search from (loc, bw, collected).
 
         Returns (score_of_best_line, first_action_of_best_line). For the env's `decide`
@@ -145,12 +153,14 @@ class NMCSPolicy(Policy):
         the score already banked along the memorized line. Level 1's per-move evaluation is
         a base playout (the level-0 case).
         """
-        cur_loc, cur_bw, cur_coll = loc, bw, set(collected)
+        cur_loc: Loc = loc
+        cur_bw: WorldSet = bw
+        cur_coll: Collected = set(collected)
         acc = 0.0                      # lambda-penalized reward accumulated along this line
-        first_action = None
-        best_seq = None                # memorized best full continuation: list of moves
+        first_action: Action | None = None
+        best_seq: list[Action] | None = None   # memorized best full continuation: list of moves
         best_seq_score = -np.inf       # its total score (from the start of this search)
-        best_seq_first = None
+        best_seq_first: Action | None = None
 
         for step in range(self.max_steps):
             cands = self._candidates(env, cur_loc, cur_bw, cur_coll)
@@ -164,22 +174,26 @@ class NMCSPolicy(Policy):
                 return best_seq_score, (best_seq_first if best_seq_first is not None else TERMINATE)
 
             # Evaluate each candidate by a nested (level-1) search / playout of its result.
-            best_q, best_a = -np.inf, None
+            best_q = -np.inf
+            best_a: Action | None = None
             for a in cands:
-                if a == TERMINATE:
+                if is_terminate(a):
                     q = acc - lam * env.exit_cost(cur_loc)
                 else:
                     q = acc + self._eval_move(env, cur_loc, cur_bw, cur_coll, a, lam, level, rng)
                 if q > best_q:
                     best_q, best_a = q, a
 
+            # cands is non-empty (the [TERMINATE]-only case returned above) and every q is a
+            # real float > -inf, so best_a is always assigned; ADR-0002 fail-loud otherwise.
+            assert best_a is not None
             if first_action is None:
                 first_action = best_a
 
             # Memorize-and-replay: if this whole line so far is the best complete line we
             # have seen (i.e. taking best_a and stopping is better than the memorized one),
             # remember its first action. TERMINATE closes the line.
-            if best_a == TERMINATE:
+            if is_terminate(best_a):
                 line_score = acc - lam * env.exit_cost(cur_loc)
                 if line_score > best_seq_score:
                     best_seq_score, best_seq_first = line_score, first_action
@@ -206,7 +220,9 @@ class NMCSPolicy(Policy):
             best_seq_score, best_seq_first = line_score, first_action
         return best_seq_score, (best_seq_first if best_seq_first is not None else TERMINATE)
 
-    def _eval_move(self, env, loc, bw, collected, a, lam, level, rng):
+    def _eval_move(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+                   a: MoveAction, lam: float, level: int,
+                   rng: np.random.Generator) -> float:
         """Mean over `ss` determinizations of: immediate lambda-step of `a` + the value of
         a nested level-(level-1) search from the resulting state. At level 1 the nested
         value is a base playout (level-0)."""
@@ -226,10 +242,14 @@ class NMCSPolicy(Policy):
         return tot / self.ss
 
     # ---- Policy interface --------------------------------------------------------------
-    def decide(self, env, loc, bw, collected, lam, rng):
+    def decide(self, env: Environment, loc: Loc, bw: WorldSet, collected: Collected,
+               lam: float, rng: np.random.Generator | None = None) -> Action:
+        # ADR-0002 fail-loud: NMCS is stochastic (it determinizes sampled worlds per playout),
+        # so it requires a real Generator — matches the seam's Optional-rng contract (base.py).
+        assert rng is not None, "NMCSPolicy.decide requires a Generator (it samples worlds)"
         cands = self._candidates(env, loc, bw, collected)
         if cands == [TERMINATE]:
             return TERMINATE
         _, first_action = self._search(env, loc, bw, collected, lam,
                                        max(1, self.level), rng)
-        return first_action if first_action is not None else TERMINATE
+        return first_action
