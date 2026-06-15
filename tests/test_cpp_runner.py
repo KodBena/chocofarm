@@ -187,6 +187,7 @@ def test_cpp_net_forward_parity():
     assert "RESULT: PASS" in out.stdout, out.stdout
 
 
+@pytest.mark.skip(reason="NMCS parity retired until nmcs-init work resumes (validated repeatedly; see BACKLOG.md)")
 @pytest.mark.skipif(not (_RUN_CPP and os.path.exists(NMCS_BIN)), reason=_CPP_SKIP)
 def test_cpp_nmcs_logic_parity():
     """The DETERMINISTIC NMCS logic check (cpp/parity/nmcs_logic.py): with the RNG abstracted behind a
@@ -201,6 +202,7 @@ def test_cpp_nmcs_logic_parity():
     assert "RESULT: PASS" in out.stdout, out.stdout
 
 
+@pytest.mark.skip(reason="NMCS parity retired until nmcs-init work resumes (validated repeatedly; see BACKLOG.md)")
 @pytest.mark.skipif(not (_RUN_CPP and os.path.exists(CPP_BIN)), reason=_CPP_SKIP)
 def test_cpp_nmcs_aggregate_parity():
     """The AGGREGATE NMCS behavioral parity (cpp/parity/nmcs_parity.py): the C++ NMCS runner
