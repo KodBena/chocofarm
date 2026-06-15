@@ -29,7 +29,7 @@ from chocofarm.model.env import Environment
 from chocofarm.solvers.ismcts import ISMCTSPolicy
 from chocofarm.solvers.decomp import DecompPolicy
 from chocofarm.az.netvalue_ismcts import NetValueISMCTS
-from chocofarm.eval.harness import realizable_static, clairvoyant_rate
+from chocofarm.eval.harness import realizable_static, clairvoyant_rate, DECOMP_ANCHOR
 
 LAM0 = 0.0855  # static-floor rate; the fixed training/operating λ (design §4.1)
 
@@ -76,7 +76,7 @@ def stream_compare(env, net_pol, base_pol, static, ceil, n, chunk, seed, logdir)
             w.add_scalar(f"voi_pct/{tag}", (cumrate - static) / (ceil - static) * 100, a[2])
         w.add_scalar("ref/floor", static, done + c)
         w.add_scalar("ref/ceiling", ceil, done + c)
-        w.add_scalar("ref/decomp", 0.094, done + c)
+        w.add_scalar("ref/decomp", DECOMP_ANCHOR, done + c)
         w.flush()
         s += 1; done += c
         rn = acc["net"]
@@ -119,7 +119,7 @@ def main():
     ceil = clairvoyant_rate(env)
     print(f"static floor        : {static:.4f}")
     print(f"clairvoyant ceiling : {ceil:.4f}   (VoI headroom +{(ceil-static)/static*100:.0f}%)")
-    print(f"decomp anchor       : ~0.094 (the value teacher)\n", flush=True)
+    print(f"decomp anchor       : {DECOMP_ANCHOR} (the value teacher)\n", flush=True)
 
     if args.tb_logdir:
         net_pol = NetValueISMCTS(env, args.weights, iterations=args.it)

@@ -44,11 +44,7 @@ from chocofarm.az.actions import n_action_slots, legal_mask_from_features
 from chocofarm.az.mlp import ValueMLP
 from chocofarm.az.gumbel_search import GumbelAZSearch, GumbelPolicy
 from chocofarm.az.value_target import blended_returns_to_go
-
-# reference lines (docs/results/voi-ceiling-2026-06-13.md, decomp-rate.md)
-STATIC_FLOOR = 0.0855
-CLAIRVOYANT_CEIL = 0.1454
-DECOMP_ANCHOR = 0.0941
+from chocofarm.eval.harness import BeliefRefs
 
 
 def r2_score(y_true, y_pred):
@@ -174,6 +170,8 @@ def policy_entropy(pis):
 
 def run(args):
     env = Environment()
+    # the single source for the %VoI reference lines (derived floor/ceiling + documented anchor)
+    refs = BeliefRefs(env)
     fb = FeatureBuilder(env)
     in_dim = feature_dim(env)
     n_slots = n_action_slots(env)
@@ -396,7 +394,7 @@ def run(args):
                 totR += R; totT += T; ets.append(T)
         rate = totR / totT if totT > 0 else 0.0
         et = float(np.mean(ets)) if ets else 0.0
-        voi = (rate - STATIC_FLOOR) / (CLAIRVOYANT_CEIL - STATIC_FLOOR) * 100
+        voi = refs.voi_pct(rate)
         t_eval = time.time() - t0 - t_gen - t_train
 
         # ---- 4. CHECKPOINT (every iteration) ----
@@ -416,9 +414,9 @@ def run(args):
             writer.add_scalar("eval/rate", rate, it)
             writer.add_scalar("eval/voi_pct", voi, it)
             writer.add_scalar("eval/ET", et, it)
-            writer.add_scalar("ref/static_floor", STATIC_FLOOR, it)
-            writer.add_scalar("ref/clairvoyant_ceiling", CLAIRVOYANT_CEIL, it)
-            writer.add_scalar("ref/decomp_anchor", DECOMP_ANCHOR, it)
+            writer.add_scalar("ref/static_floor", refs.static_floor, it)
+            writer.add_scalar("ref/clairvoyant_ceiling", refs.clairvoyant_ceiling, it)
+            writer.add_scalar("ref/decomp_anchor", refs.decomp_anchor, it)
             writer.add_scalar("train/policy_CE", ce, it)
             writer.add_scalar("train/value_MSE", vmse, it)
             writer.add_scalar("train/value_R2", r2, it)

@@ -170,6 +170,8 @@ def validate():
     # as a diagnostic, not a full bisection (which would widen hi repeatedly + be slow).
     try:
         dv = DecompVhat(horizon=1)
+        # the bound's V̂-evaluation λ, near the decomp rate but kept distinct from the display
+        # DECOMP_ANCHOR (harness.py) so this bound stays numerically fixed — do not reconcile.
         pc = PenalizedClairvoyant(mini, vhat=dv, vhat_lam=0.094)
         t0 = time.time()
         Bc, _, _ = pc.B_value(clair_ref, mini.worlds)
