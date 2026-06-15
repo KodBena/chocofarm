@@ -100,7 +100,7 @@ this shape, the named principle forbids it."
 | **H** — Defensive band-aids stacked against a hostile substrate | a new mitigation layered on an un-diagnosed cause; a reliability strategy that *is* a stack of patches | **P5** (fail loud; remove the root cause) — distinguish a justified guard from a band-aid masking an undiagnosed cause |
 | **(new, cross-language)** — two writers of one cross-boundary truth | a hand-mirrored type, offset, key, or codec on the far side of the language boundary that re-authors a fact the near side already defines (a hardcoded weight offset; a second result-blob codec) | **P7** (cross-language wire discipline) — a cross-boundary fact has exactly one authoritative definition and every side *derives* its view (reads it at runtime or generates it at build time), never re-authors it by hand; mechanically enforced at the strongest feasible level (generate/compile-from-one-source > build-time lint > runtime parity backstop). Schema-driven codegen (one schema → N derived readers) is SSOT and is encouraged, not banned |
 | **(new, call-boundary)** — a contract carried only by an unenforced or dishonest signature | an untyped function/method/dataclass signature (the contract lives nowhere checkable), or a *lying* one whose body does not honor its annotation (`hp: AdamHParams = None` whose body accepts `None`; `lr/b1/b2/eps: float` populated with jax `Array`s) | **P8** (typed signatures are the contract's SSOT) — the signature is the single source of truth of the input/output contract, honored by the body, at the **strict-where-achievable** bar, with each relaxation a named stub-gap (not a convenience); mechanically enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing baseline (ADR-0011 Rule 1) |
-| **(new, compiled-component)** — an untyped-effectful-void / black-box mutation in a compiled (C++/new-language) component | a function taking raw pointers (`const float*`, a `T*, size_t` pair) and returning `void` while writing its result through an output parameter or mutating hidden/global state (`void matvec_bias(const float* in, …, std::vector<float>& out)`; `void require_matrix(…, int& rows, int& cols, std::vector<float>& out)`) — a black box you cannot unit-test (it mutates rather than returns), cannot compose (it is not a value-function to chain), and whose contract is invisible (the `void` + raw-pointer signature names neither the bounds, the const-ness, nor what it mutates) | **P9** (functional core, imperative shell) — a computation is a pure function of typed, bounds-carrying, const-correct inputs (`std::span<const T>` over a raw `T*`) **returning its result by value**; every effect is named in the signature, and the only sanctioned hidden mutation is a measured hot-path buffer-reuse routed through an explicitly-typed `Workspace`/`Context&` parameter — the compiled-component form of B (a second/hidden writer), of P2 (hidden state / a lying signature), and of P8 (an untyped contract), enforced by the compiler (`-Wall -Wextra`) and a future `clang-tidy` config (ADR-0011 Rule 1) |
+| **(new, compiled-component)** — an untyped-effectful-void / black-box mutation in a compiled (C++/new-language) component | a function taking raw pointers (`const float*`, a `T*, size_t` pair) and returning `void` while writing its result through an output parameter or mutating hidden/global state (`void matvec_bias(const float* in, …, std::vector<float>& out)`; `void require_matrix(…, int& rows, int& cols, std::vector<float>& out)`) — a black box you cannot unit-test (it mutates rather than returns), cannot compose (it is not a value-function to chain), and whose contract is invisible (the `void` + raw-pointer signature names neither the bounds, the const-ness, nor what it mutates); or **signaling failure by throwing an exception** (an untyped control-flow escape absent from the signature, which the caller is not forced to handle) | **P9** (functional core, imperative shell) — a computation is a pure function of typed, bounds-carrying, const-correct inputs (`std::span<const T>` over a raw `T*`) **returning its result by value**; every effect is named in the signature, the only sanctioned hidden mutation is a measured hot-path buffer-reuse routed through an explicitly-typed `Workspace`/`Context&` parameter, and **failure is returned as a `[[nodiscard]] std::expected<T, Error>`, never thrown** (a throwing ctor becomes a `create(…) -> std::expected` factory) — the compiled-component form of B (a second/hidden writer), of P2 (hidden state / a lying signature), and of P8 (an untyped contract), enforced by the compiler (`-Wall -Wextra`, the nodiscard warning treated as an error) and a future `clang-tidy` config (ADR-0011 Rule 1) |
 
 ### The nine principles
 
@@ -442,15 +442,16 @@ the one honored authority, checked by the gate below.
 **Rule (checkable).** In a **compiled (C++/new-language) component**, a
 computation is a **pure function of typed inputs that returns its result by
 value**; effects (I/O, the redis transport, the episode/inference loop, buffer
-lifetimes) live in a thin **imperative shell** that calls the pure core. This
-is **P8's typed-contract rule carried into the compiled component** and **P2's
-no-hidden-state rule sharpened by C++**, where a raw `T*` erases the bounds and
-the const that the contract depends on. The discipline costs **no performance**:
-it is built on **zero-cost abstractions** (a `std::span<const T>` compiles to the
-same pointer+length a hand-rolled pair would; **guaranteed copy elision /
-(N)RVO** makes return-by-value free), so the honest signature is not a tax paid
-for cleanliness — it is the same machine code with the contract restored. Four
-**checkable rules a reviewer enforces yes/no from the signature alone**:
+lifetimes, and failure) live in a thin **imperative shell** that calls the pure
+core. This is **P8's typed-contract rule carried into the compiled component**
+and **P2's no-hidden-state rule sharpened by C++**, where a raw `T*` erases the
+bounds and the const that the contract depends on. The discipline costs **no
+performance**: it is built on **zero-cost abstractions** (a `std::span<const T>`
+compiles to the same pointer+length a hand-rolled pair would; **guaranteed copy
+elision / (N)RVO** makes return-by-value free), so the honest signature is not a
+tax paid for cleanliness — it is the same machine code with the contract
+restored. Five **checkable rules a reviewer enforces yes/no from the signature
+alone**:
 
 1. **Inputs are typed, bounds-carrying, const-correct.** Favor
    `std::span<const T>` (or a typed view) over a raw `T*` or a `T*, size_t`
@@ -487,6 +488,35 @@ for cleanliness — it is the same machine code with the contract restored. Four
    shape is the tell P7 and P8 already named and reject; "faster" with no
    measured allocation profile and no typed `Workspace` is a hand-wave, and the
    hand-wave is exactly how the cancers grew.
+5. **Errors are typed return values, not exceptions.** A fallible computation
+   reports failure as a **typed value** — a `[[nodiscard]] std::expected<T,
+   Error>` returned by value — never by throwing. An exception is the purest
+   untyped effect: a control-flow escape that appears **nowhere in the
+   signature**, that the caller is not forced to handle, and that makes the
+   function no longer a total value-function of its inputs (the rule-2/rule-3
+   violation in the one register the other four do not cover). `std::expected`
+   makes the error path a **declared part of the return type**, and
+   `[[nodiscard]]` makes *ignoring* it a **compile error** — lifting ADR-0002's
+   fail-loud to its strongest surface (compile-time > runtime in the loudness
+   hierarchy P5 defers to). The **functional core is total** — pure arithmetic
+   over already-validated inputs, it neither throws nor returns `expected`; the
+   error surface lives entirely in the **imperative shell**, at its boundaries
+   (I/O, parsing, construction). A throwing **constructor** (which cannot return
+   a value) becomes a static factory: `T::create(…) -> std::expected<T, Error>`
+   with a private `noexcept` ctor. *Check: does any function signal failure by
+   throwing rather than returning a `[[nodiscard]] std::expected`? Is the
+   boundary's error path in the return type and forced on the caller? Is the
+   core total (throw-free)?* The one thing `std::expected` does **not** absorb:
+   a genuine **invariant violation** — a state the code's own logic guarantees
+   impossible, i.e. a bug — is an `assert`/contract abort, not an `expected`;
+   `expected` is reserved for the *recoverable, expected* boundary conditions
+   (a missing redis payload, a malformed manifest) an operator or upstream
+   causes and a caller can report. The two are categorically distinct: a
+   `std::expected` value is for what the world legitimately hands you and the
+   program must handle; an abort is for what your own invariants say can never
+   happen and a return value would only paper over. (`std::expected` is C++23;
+   the toolchain — GCC 15.2 — provides it, so the compiled components build at
+   `-std=c++23`.)
 
 **Worked example (the anchor).** The C++ `NetForward` MLP
 (`cpp/include/chocofarm/net.hpp`, `cpp/src/net.cpp`) is the cautionary
@@ -522,6 +552,32 @@ returning `NetPrediction` by value. The as-merged interim `NetForward` predates
 P9 (it is the live instance that **motivated** the rule) and is to be brought
 into compliance; per the no-retroactive-sweep scoping it is retrofitted on
 touch, not by a P9 sweep.
+
+**Worked example (the error axis, rule 5).** Every `throw` in `cpp/src` today is
+a `std::runtime_error`, and every one of them is at a **boundary** — none on the
+hot path: `transport.cpp` (redis connect/GET/SET, and the missing-weight-payload
+abort mirroring `read_weights`), `instance.cpp` (the instance-file/JSON load),
+and the `NetForward` **constructor** with its `require_matrix`/`require_vector`
+helpers, which validate the manifest at construction. The forward compute itself
+(`predict(const float* X)`, `matvec_bias`, `relu`) and the search that will call
+it are **throw-free** — the only `throw` reachable from a `predict` overload is
+the length guard at the *boundary* of the `vector`-taking entry, not on the raw-
+pointer compute path the search uses. So the core is already total; what rule 5
+adds is that the boundary's failures should be **typed return values, not
+thrown.** The compliant form returns `[[nodiscard]] std::expected<…, Error>`
+from those boundary functions (`read_weights`, the instance loader,
+`require_matrix`/`require_vector`), so a caller cannot ignore the error path
+without a compile error; `NetForward`'s construction — a throwing ctor cannot
+return a value — becomes a `NetForward::create(const WeightPayload&) ->
+std::expected<NetForward, Error>` factory over a private `noexcept` ctor.
+The forward/search core stays total and exception-free, exactly as it is today.
+The distinction rule 5 draws against the as-merged code: those manifest-shape
+checks are **recoverable boundary conditions** (a malformed payload an upstream
+produced, a missing redis key an operator can be told about) — they are
+`expected`, not `assert`. A `matvec_bias` indexing past `cols` because the
+caller passed an `in_dim_`/`hidden_` the constructor already reconciled would be
+the other category — an **invariant violation**, a bug, an `assert`/abort — and
+it never becomes an `expected`.
 
 **Cancer prevented: untestable, uncomposable black-box mutations.** A
 `void`-returning, raw-pointer-taking, out-parameter-writing function in a
@@ -795,15 +851,22 @@ write-time data constraint / run-time invariant / review-only):
   recurrence that converts review-only prose to a mechanism), here a scheduled
   monotonic rollout rather than a defect. `warn_unused_ignores` keeps each
   named relaxation honest at the same gate.
-- **P9 (functional core, imperative shell):** **review-only**, policed against
-  its four checkable rules at C++ review, with the **compiler (`-Wall
-  -Wextra`)** and a **future `clang-tidy` config** as the mechanization surface.
-  The compiler already raises some of the relevant signals (an unused parameter,
-  a const-violation); the `clang-tidy` config is the ADR-0011 Rule-2 conversion
-  trigger — **when a P9 violation recurs after this record, mint the
-  `clang-tidy` check** that catches it (e.g. a check against out-parameters or
-  raw-pointer arithmetic where a `std::span` belongs) rather than re-stating the
-  rule in prose. Until that recurrence, P9 is review-only — and settling for
+- **P9 (functional core, imperative shell):** a **mix** — the error axis
+  (rule 5) is **partly compile-enforced**, the other four (input/output/mutation)
+  are **review-only**. `[[nodiscard]]` on every `std::expected`-returning
+  boundary function, **with the nodiscard warning treated as an error**, makes an
+  **unhandled error a build failure** — a strictly stronger surface than the
+  review-only structural rules, and the same compile-time-over-runtime move ADR-
+  0011 Rule 1 ranks highest. Rules 1–4 are policed against their checkable form
+  at C++ review, with the **compiler (`-Wall -Wextra`)** and a **future
+  `clang-tidy` config** as the mechanization surface. The compiler already raises
+  some of the relevant signals (an unused parameter, a const-violation); the
+  `clang-tidy` config is the ADR-0011 Rule-2 conversion trigger — **when a P9
+  violation recurs after this record, mint the `clang-tidy` check** that catches
+  it (e.g. a check against out-parameters or raw-pointer arithmetic where a
+  `std::span` belongs, or `-Werror` on a thrown exception escaping a function the
+  contract says should return `expected`) rather than re-stating the rule in
+  prose. Until that recurrence, rules 1–4 are review-only — and settling for
   review-only is *not* justified by a scale / "one compiled component" / "for
   now" argument (that argument shape is the tell P7/P8 reject); it is the honest
   ADR-0011 Rule-1 level for a discipline whose recurrence has not yet fired.
@@ -839,7 +902,11 @@ prose.
   than an untyped-effectful void — at zero performance cost (zero-cost
   abstractions: a `std::span` is a pointer+length, return-by-value is free under
   (N)RVO), with the one hot-path buffer-reuse exception declared as a typed
-  `Workspace` parameter rather than hidden.
+  `Workspace` parameter rather than hidden. Failure, too, is a **typed return
+  value** (`[[nodiscard]] std::expected<T, Error>`), not an untyped thrown
+  escape — so the error path is declared in the return type, ignoring it is a
+  **compile error** (ADR-0002 fail-loud at its strongest surface), and the core
+  stays total while the error surface lives at the shell's boundaries.
 
 ### Negative
 
