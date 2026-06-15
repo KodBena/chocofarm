@@ -8,8 +8,10 @@
 #include "chocofarm/env.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
-#include <stdexcept>
+#include <cstdlib>
+#include <iostream>
 
 namespace chocofarm {
 
@@ -113,7 +115,15 @@ StepResult Environment::apply(Loc& loc, std::vector<uint32_t>& bw, std::set<int>
     Point target;
     if (action.kind == ActionKind::Treasure) target = inst_.treasures[action.i];
     else if (action.kind == ActionKind::Detector) target = inst_.faces[action.i].rep_point;
-    else throw std::runtime_error("Environment::apply called with TERMINATE");
+    else {
+        // ADR-0012 P9: apply is NEVER legitimately called with TERMINATE — every caller (the
+        // episode loop, the NMCS search/eval, the dump fixtures) breaks before applying it. Reaching
+        // here is an INVARIANT violation (a programmer bug), so it aborts loudly rather than being a
+        // recoverable boundary Error. assert covers debug; the abort makes it loud under NDEBUG too.
+        assert(false && "Environment::apply called with TERMINATE");
+        std::cerr << "chocofarm: FATAL invariant: Environment::apply called with TERMINATE\n";
+        std::abort();
+    }
 
     res.dt = dist(loc.pt, target);  // travel cost (env.apply: d(loc, (kind, i)))
 

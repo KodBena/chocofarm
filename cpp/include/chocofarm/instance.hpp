@@ -14,9 +14,12 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
+#include <expected>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include "chocofarm/error.hpp"
 
 namespace chocofarm {
 
@@ -51,7 +54,10 @@ struct Instance {
 
 // Load the instance geometry. `instance_json` is data/instance.json (treasures / teleports / K);
 // `faces_json` is data/faces.json (the DERIVED face cover + rep_point). A missing/malformed file or
-// a face cover bit >= N is a loud std::runtime_error (ADR-0002 / P5: never silently coerce).
-Instance load_instance(const std::string& instance_json, const std::string& faces_json);
+// a face cover bit >= N is a typed boundary failure (ADR-0002 / P5 + ADR-0012 P9 rule 5: a
+// [[nodiscard]] std::expected<Instance, Error> returned by value — the loud failure is the Error
+// the shell prints, never a silent coerce and never a thrown exception).
+[[nodiscard]] std::expected<Instance, Error> load_instance(std::string_view instance_json,
+                                                           std::string_view faces_json);
 
 }  // namespace chocofarm

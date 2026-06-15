@@ -8,8 +8,10 @@
 #include "chocofarm/features.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
-#include <stdexcept>
+#include <cstdlib>
+#include <iostream>
 
 namespace chocofarm {
 
@@ -26,7 +28,11 @@ int action_to_slot(const Environment& env, const Action& a) {
         case ActionKind::Detector: return env.N() + a.i;       // slot N..N+nD-1
         case ActionKind::Terminate: return term_slot(env);     // slot N+nD
     }
-    throw std::runtime_error("action_to_slot: unknown action");
+    // ADR-0012 P9: the enum class is exhaustive above — reaching here means a corrupted ActionKind,
+    // an INVARIANT violation (a programmer bug), so it aborts loudly rather than being a boundary Error.
+    assert(false && "action_to_slot: unknown action kind");
+    std::cerr << "chocofarm: FATAL invariant: action_to_slot: unknown action kind\n";
+    std::abort();
 }
 
 std::vector<float> legal_mask(const Environment& env, const std::vector<uint32_t>& bw,
@@ -137,7 +143,10 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const std::vector<ui
     out[o++] = sum_unc;                                                    // Σ_uncollected unc
     for (int k = 0; k < n_tel; ++k) out[o++] = dist_w[k];                  // per-teleport distances
 
-    if (o != dim_) throw std::runtime_error("FeatureBuilder::build: layout mismatch");
+    // ADR-0012 P9: dim_ is derived from the SAME N/nD/n_tel this loop walks (5N+3nD+6+n_tel), so a
+    // mismatch is impossible unless the derivation desyncs — an INVARIANT violation (a programmer
+    // bug), an assert/abort, not a recoverable boundary Error.
+    assert(o == dim_ && "FeatureBuilder::build: layout mismatch");
     return out;
 }
 

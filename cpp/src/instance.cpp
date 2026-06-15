@@ -4,11 +4,17 @@
 //   fossil `overlaps` / `delta_treasures` arrays in instance.json are NEVER read — the disjunctive
 //   cover comes only from faces.json (the geometry-derived intersection-refinement). ADR-0012 P1.
 //
+//   ADR-0012 P9 (rule 5): a missing/malformed file is a typed boundary failure returned as
+//   std::expected<Instance, Error> — the shell prints it loudly (ADR-0002), never a throw. The
+//   nlohmann json accessors (at/get) throw on a malformed document; the loader catches them at THIS
+//   boundary and translates them into the typed Error, so the public contract is total (throw-free).
+//
 // Public Domain (The Unlicense).
 #include "chocofarm/instance.hpp"
 
 #include <fstream>
-#include <stdexcept>
+#include <stdexcept>   // std::invalid_argument (from std::stoi on a non-integer treasure key)
+#include <string>
 
 #include <nlohmann/json.hpp>
 
@@ -21,21 +27,25 @@ namespace chocofarm {
 // integer id so their order is order-independent; teleports are NOT.
 using json = nlohmann::ordered_json;
 
-static json load_json(const std::string& path) {
-    std::ifstream f(path);
+namespace {
+
+// Load + parse a JSON file. A missing file or a parse error is a typed Error (P9 rule 5).
+std::expected<json, Error> load_json(std::string_view path) {
+    std::ifstream f{std::string(path)};
     if (!f) {
         // ADR-0002 / P5: a missing instance file is a loud failure, not a silent default.
-        throw std::runtime_error("chocofarm: cannot open instance file: " + path);
+        return std::unexpected(make_error("chocofarm: cannot open instance file: " + std::string(path)));
     }
-    json j;
-    f >> j;
+    json j = json::parse(f, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded())
+        return std::unexpected(make_error("chocofarm: malformed JSON in " + std::string(path)));
     return j;
 }
 
-Instance load_instance(const std::string& instance_json, const std::string& faces_json) {
-    json inst = load_json(instance_json);
-    json faces = load_json(faces_json);
-
+// The actual parse, factored so the boundary try/catch translates nlohmann's accessor exceptions
+// (a missing key, a type mismatch) into a typed Error rather than letting them escape (P9 rule 5:
+// the public contract is throw-free; the JSON library's exceptions are caught HERE at the edge).
+std::expected<Instance, Error> parse_instance(const json& inst, const json& faces) {
     Instance out;
     out.K = inst.at("K").get<int>();
 
@@ -46,9 +56,8 @@ Instance load_instance(const std::string& instance_json, const std::string& face
     out.treasures.resize(out.N);
     for (auto it = tj.begin(); it != tj.end(); ++it) {
         int id = std::stoi(it.key());
-        if (id < 0 || id >= out.N) {
-            throw std::runtime_error("chocofarm: treasure id out of range in instance.json");
-        }
+        if (id < 0 || id >= out.N)
+            return std::unexpected(make_error("chocofarm: treasure id out of range in instance.json"));
         const json& xy = it.value();
         out.treasures[id] = Point{xy.at(0).get<double>(), xy.at(1).get<double>()};
     }
@@ -68,9 +77,8 @@ Instance load_instance(const std::string& instance_json, const std::string& face
         Face face;
         for (const auto& j : f.at("cover")) {
             int t = j.get<int>();
-            if (t < 0 || t >= out.N) {
-                throw std::runtime_error("chocofarm: face cover bit out of range [0,N) in faces.json");
-            }
+            if (t < 0 || t >= out.N)
+                return std::unexpected(make_error("chocofarm: face cover bit out of range [0,N) in faces.json"));
             face.bitmask |= (uint32_t{1} << t);
         }
         const json& rp = f.at("rep_point");
@@ -78,6 +86,27 @@ Instance load_instance(const std::string& instance_json, const std::string& face
         out.faces.push_back(face);
     }
     return out;
+}
+
+}  // namespace
+
+std::expected<Instance, Error> load_instance(std::string_view instance_json,
+                                             std::string_view faces_json) {
+    auto inst = load_json(instance_json);
+    if (!inst) return std::unexpected(inst.error());
+    auto faces = load_json(faces_json);
+    if (!faces) return std::unexpected(faces.error());
+    try {
+        return parse_instance(*inst, *faces);
+    } catch (const json::exception& e) {
+        // Translate a malformed-document accessor failure (missing key / wrong type / bad treasure
+        // id string) into the typed boundary Error — the JSON library's only escape, caught at the
+        // edge so the public load_instance contract stays total (ADR-0012 P9 rule 5).
+        return std::unexpected(make_error(std::string("chocofarm: malformed instance/faces JSON: ") + e.what()));
+    } catch (const std::invalid_argument& e) {
+        // std::stoi on a non-integer treasure key.
+        return std::unexpected(make_error(std::string("chocofarm: bad treasure id key in instance.json: ") + e.what()));
+    }
 }
 
 }  // namespace chocofarm
