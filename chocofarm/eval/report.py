@@ -35,16 +35,25 @@ Fail-loud (ADR-0002): unknown `columns` raises rather than silently printing a w
 Public Domain (The Unlicense).
 """
 import time
+from typing import Any, Sequence
 
-from chocofarm.eval.harness import BeliefRefs
+from chocofarm.eval.harness import BeliefRefs, dink_float
+from chocofarm.model.env import Environment
+from chocofarm.solvers.base import Policy
+
+# `dink_float` (the `dinkelbach_rate` heterogeneous-dict field narrowing) lives in `harness`, below
+# this module in the import order, so the cast has one documented home; re-exported for the eval
+# scripts that read a rate field through `report` (`eval_decomp`).
+__all__ = ["references", "dink_float", "print_reference_header", "run_plan"]
 
 
-def references(env):
+def references(env: Environment) -> BeliefRefs:
     """The single entry the scripts call: the floor/ceiling/%VoI SSOT for this env."""
     return BeliefRefs(env)
 
 
-def print_reference_header(refs, *, extra_lines=(), faces=False):
+def print_reference_header(refs: BeliefRefs, *,
+                           extra_lines: Sequence[str] = (), faces: bool = False) -> None:
     """Print the common floor/ceiling banner, then a blank line.
 
     Reproduces the scripts' CURRENT banner byte-for-byte. The default (uct / ismcts / nmcs)
@@ -83,12 +92,12 @@ def print_reference_header(refs, *, extra_lines=(), faces=False):
 # (name_width, header_string, row_renderer). The row_renderer takes the per-row values and
 # returns the formatted line, so each script's CURRENT column set + alignment widths are
 # reproduced exactly. Add a new spec here rather than re-inlining a loop in a script.
-def _hdr_base(name_w, extra):
+def _hdr_base(name_w: int, extra: str) -> str:
     return (f"{'policy':>{name_w}} {'rate':>8} {'%ceiling':>9} {'VoI clawed':>11}"
             + extra)
 
 
-_COLUMN_SPECS = {
+_COLUMN_SPECS: dict[str, dict[str, Any]] = {
     # eval_ismcts.py: policy(16) / rate / %ceiling / VoI clawed / sec(6)
     "ismcts": dict(
         name_w=16,
@@ -126,7 +135,9 @@ _COLUMN_SPECS = {
 }
 
 
-def run_plan(env, refs, plan, *, seed=7, columns="ismcts"):
+def run_plan(env: Environment, refs: BeliefRefs,
+             plan: Sequence[tuple[str, Policy, dict[str, int]]], *,
+             seed: int = 7, columns: str = "ismcts") -> None:
     """The shared Dinkelbach table runner for the common-format scripts.
 
     `plan` is a list of `(name, policy, budget_dict)`. Prints the header row + one row per
@@ -146,5 +157,5 @@ def run_plan(env, refs, plan, *, seed=7, columns="ismcts"):
         t0 = time.time()
         res = env.dinkelbach_rate(pol, seed=seed, **budget)
         sec = time.time() - t0
-        claw = refs.voi_pct(res["rate"])
+        claw = refs.voi_pct(dink_float(res, "rate"))
         print(spec["row"](name, res, claw, ceil, sec, budget), flush=True)

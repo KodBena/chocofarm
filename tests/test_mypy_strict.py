@@ -31,11 +31,32 @@ IN (100% --strict-clean now):
     minimal-touch (the redis-8 py.typed kwargs, the reflective facet-walk's group-union) — signatures
     only, no body rewrite.
 
+  * Stage 3 — the medium bulk, now gated (the env↔Policy seam aliases are in place, so each
+    landed as its callees did): model/arrangement.py; all of solvers/ (uct/ismcts/nmcs/decomp,
+    base already above); all of bounds/ (vhats/vhats_decomp/vhats_exact/eval_bound/info_relaxation);
+    the strict-clean az leaves (actions/dataset/features/transport/worker_pool); and the
+    strict-clean eval/ scripts (eval_decomp/eval_faces/eval_ismcts/eval_nmcs/eval_uct + the
+    harness/report/tb_runner reporting layer). `solvers/__init__.py`'s `SOLVERS` registry was typed
+    `dict[str, type[Policy]]` (was the bare dict's `type[ABCMeta]`) so `SOLVERS[name](**kw)` is a
+    `Policy`, not `Any` — the registry contract made honest at its one home (P8/P1). The
+    `dinkelbach_rate` heterogeneous-dict field narrowing lives once in `eval/harness.dink_float`.
+
 OUT, deliberately:
   * az/optimizer.py / az/mlp_jax_train.py — HARD modules (jax/optax seam, Stage 4). Only their
     standalone `AdamHParams` contract was made honest in Stage 1; the module bodies are not clean.
-  * the Stage-3 medium bulk (the solver/bounds/eval/az leaves) — they import the seam aliases now in
-    place, so each lands as its callees do; they are appended here as Stage 3 types them.
+  * The 5 jax/numba kernel-boundary az modules, HELD for maintainer review of the boundary crossing
+    (Stage 4): az/mlp.py, az/exit_loop.py, az/train_value.py, az/worker.py, az/gumbel_search.py.
+    Each fails strict on a `no-untyped-call` into the kernel seam (forward_core / kernels.warmup /
+    JaxTrainer / MlpJaxForward). They are fully annotated but NOT gated — the maintainer wants to
+    contemplate the jax/numba boundary before committing the contract.
+  * The az/eval modules that HARD-LOAD one of those 5 boundary modules at import time, even though
+    they currently pass strict (mlp.py/worker.py are annotated, so the call into them is typed, not
+    a no-untyped-call): az/feature_response.py, az/netvalue_ismcts.py, az/value_target.py
+    (top-level `ValueMLP` import + call), az/parallel.py (top-level `import worker`), and
+    eval/eval_az.py (transitively, via NetValueISMCTS). They are kept out so the gate's enforced
+    contract does not reach across the deferred boundary; az/transport.py and az/worker_pool.py, by
+    contrast, touch the held-out modules only under TYPE_CHECKING / lazily and so ARE gated.
+  * the remaining hard az modules (az/kernels.py numba, az/forward.py, az/mlp_jax.py) — Stage 4.
 
 Skips gracefully (does not fail) if mypy is not importable, mirroring how `tests/test_cpp_runner.py`
 skips without its binary.
@@ -71,6 +92,38 @@ STRICT_CLEAN = [
     "chocofarm/solvers/base.py",     # the Policy ABC + Policy.decide contract (every solver's seam)
     "chocofarm/references.py",       # was blocked only by no-untyped-call into the seam
     "chocofarm/hp/registry.py",      # likewise (+ two ADR-0004 minimal-touch non-seam residuals)
+    # --- Stage 3 — medium bulk (solvers / bounds / az leaves / arrangement / eval) ---
+    # Now that 3a (az leaves) and 3b (solvers/bounds) are both on main, their cross-subtree
+    # no-untyped-calls resolve and each medium module that does NOT cross the deferred jax/numba
+    # boundary enters the gate. Membership was determined EMPIRICALLY (mypy --strict, zero errors).
+    "chocofarm/model/arrangement.py",   # the missed medium module decomp.py needs typed (via env)
+    # solvers/ (base.py already above)
+    "chocofarm/solvers/uct.py",
+    "chocofarm/solvers/ismcts.py",
+    "chocofarm/solvers/nmcs.py",
+    "chocofarm/solvers/decomp.py",      # unblocked once arrangement.py was typed
+    # bounds/
+    "chocofarm/bounds/vhats.py",
+    "chocofarm/bounds/vhats_decomp.py",
+    "chocofarm/bounds/vhats_exact.py",
+    "chocofarm/bounds/eval_bound.py",
+    "chocofarm/bounds/info_relaxation.py",
+    # az/ leaves that do NOT hard-load a held-out jax/numba boundary module (the 5 that do are OUT —
+    # see the docstring): the in-set touches mlp/worker only under TYPE_CHECKING or lazily, if at all.
+    "chocofarm/az/actions.py",
+    "chocofarm/az/dataset.py",
+    "chocofarm/az/features.py",         # imports az/kernels (numba, config-ignored), not a held-out
+    "chocofarm/az/transport.py",        # ValueMLP only under TYPE_CHECKING / lazy
+    "chocofarm/az/worker_pool.py",      # az/worker imported only lazily inside __init__
+    # eval/ — the classical (non-AZ) eval wave; eval_az.py is OUT (hard-loads mlp via NetValueISMCTS)
+    "chocofarm/eval/harness.py",        # owns dink_float, the dinkelbach_rate field-narrowing SSOT
+    "chocofarm/eval/report.py",
+    "chocofarm/eval/eval_uct.py",
+    "chocofarm/eval/eval_ismcts.py",
+    "chocofarm/eval/eval_nmcs.py",
+    "chocofarm/eval/eval_faces.py",
+    "chocofarm/eval/eval_decomp.py",
+    "chocofarm/eval/tb_runner.py",
 ]
 
 

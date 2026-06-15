@@ -26,6 +26,8 @@ Monte-Carlo standard error is explicit. Run subsets to bound wall-time:
     python eval_faces.py nmcs                   # NMCS L1, L2
     python eval_faces.py ismcts                 # ISMCTS it=200, it=400
     python eval_faces.py                        # all (longest)
+
+Public Domain (The Unlicense).
 """
 import sys
 
@@ -33,13 +35,13 @@ import numpy as np
 
 from chocofarm.model.env import Environment
 from chocofarm.solvers.base import (GreedyPolicy, CertaintyEquivalentPolicy, RolloutPolicy,
-                      SparseSamplingPolicy)
+                      SparseSamplingPolicy, Policy)
 from chocofarm.solvers.nmcs import NMCSPolicy
 from chocofarm.solvers.ismcts import ISMCTSPolicy
 from chocofarm.eval.report import references, print_reference_header, run_plan
 
 
-def build_plan(env):
+def build_plan(env: Environment) -> list[tuple[str, str, Policy, dict[str, int]]]:
     """(group, label, policy, dinkelbach budget). Budgets shrink with per-episode cost;
     the wider face action set makes every search slower than the 16-detector runs."""
     greedy, ce = GreedyPolicy(), CertaintyEquivalentPolicy()
@@ -70,7 +72,7 @@ def build_plan(env):
     ]
 
 
-def main():
+def main() -> None:
     groups = set(sys.argv[1:])
     want_refs = (not groups) or ("refs" in groups)
     env = Environment()                      # unit values, honest face detectors
