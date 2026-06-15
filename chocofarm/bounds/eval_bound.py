@@ -28,8 +28,10 @@ import numpy as np
 from chocofarm.model.env import Environment
 from chocofarm.bounds.info_relaxation import (
     PenalizedClairvoyant, dual_bound_rate, empirical_penalty_mean,
-    vhat_analytic, DecompVhat, ExactBeliefVhat,
 )
+from chocofarm.bounds.vhats import vhat_analytic
+from chocofarm.bounds.vhats_decomp import DecompVhat
+from chocofarm.bounds.vhats_exact import ExactBeliefVhat
 
 
 def exact_optimal_rate(mini, lo=0.0, hi=0.4, it=40):
