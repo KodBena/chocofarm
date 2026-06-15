@@ -121,9 +121,14 @@ class FeatureConfig:
     """chocofarm/az/features.py — the per-block multipliers ARE the input dimension (they size
     ValueMLP.W1), so RESTART. Exposed for provenance; the feature_dim itself is derived from env."""
 
+    # NOTE (audit R6): these are PROVENANCE counts only — never read to slice/build the vector
+    # (feature_dim is derived from env via FeatureLayout). The display strings below mirror the
+    # canonical block-display tokens FeatureLayout.element_names emits (e.g. the belief-sharpness
+    # scalar is named "log|bw|", its block KEY is "sharpness"); a future change to the layout's
+    # group widths should update FeatureLayout, and these provenance counts alongside it.
     per_treasure_channels: int = hp(5, Mut.RESTART, "marg,collected,available,dist,unc")
     per_detector_channels: int = hp(3, Mut.RESTART, "informative,p_pos,dist")
-    global_channels: int = hp(6, Mut.RESTART, "sharpness,n_coll,Sum_marg,exit,nonempty,Sum_unc (+n_tele)")
+    global_channels: int = hp(6, Mut.RESTART, "log|bw|,n_collected,sum_marg,exit_cost,nonempty,sum_unc (+n_tele)")
 
 
 @dataclass

@@ -59,14 +59,142 @@ def map_diag(env: Environment) -> float:
     return math.hypot(max(xs) - min(xs), max(ys) - min(ys))
 
 
+class FeatureLayout:
+    """THE single owner of the §2.2 feature-vector layout (audit R6).
+
+    The layout used to live, hand-kept in sync, in THREE independent places: the positional
+    `out[o:o+N]=...; o+=N` accumulation in `FeatureBuilder.build`, the literal slice offsets
+    `feat[2N:3N]` / `feat[5N:5N+nD]` in `actions.legal_mask_from_features`, and the per-element
+    name/tag list in `feature_response.feature_names`. Reordering a block in one and not the
+    others silently MISLABELED the vector with no error (and feature_response had zero test
+    coverage). This descriptor is now the one owner: it encodes the ordered named blocks ONCE,
+    derives every slice/name/tag from that single table, and the three consumers read from it.
+    Reorder a block HERE and all consumers follow.
+
+    Built from `env` (widths: N=env.N, nD=len(env.detectors), n_tel=len(env.teleports)). The
+    ordered block table below IS the canonical §2.2 layout; the slices/names/tags are derived from
+    it. Block order (start offsets in parens) gives `available` at 2N..3N and `informative` at
+    5N..5N+nD — the offsets actions.py historically hardcoded — and total dim 5N+3nD+6+n_tel
+    (= 241 on the live env).
+
+    API:
+      * `self.slices: dict[str, slice]` — keyed by block KEY (the first column of the table).
+      * `self.dim: int` — sum of block widths (== `feature_dim(env)`).
+      * `self[key] -> slice` — the slice for a named block (also via `self.slices[key]`).
+      * `element_names() -> list[str]` — the per-element human-readable name for each of `dim`
+        positions, in layout order (reproduces feature_response's historical output exactly).
+      * `block_tags() -> list[str]` — the per-element block tag for each of `dim` positions.
+    """
+
+    def __init__(self, env: Environment):
+        N = env.N
+        nD = len(env.detectors)
+        n_tel = len(env.teleports)
+        # Canonical ordered block table — (key, width, group, display). `group` selects the
+        # element-name / block-tag naming convention; `display` is the per-block display token.
+        #   treasure : element "t{i}.{display}"            tag "treasure/{display}"
+        #   detector : element "d{j}.{display}"            tag "detector/{display}"
+        #   global   : element "global.{display}"          tag "global"
+        #   teleport : element "global.tele_dist{k}"       tag "global"
+        self.blocks: list[tuple[str, int, str, str]] = [
+            # per-treasure (width N)
+            ("marg",        N,     "treasure", "marg"),
+            ("collected",   N,     "treasure", "collected"),
+            ("available",   N,     "treasure", "available"),
+            ("dist_t",      N,     "treasure", "dist"),
+            ("unc",         N,     "treasure", "unc"),
+            # per-detector (width nD)
+            ("informative", nD,    "detector", "informative"),
+            ("p_pos",       nD,    "detector", "p_pos"),
+            ("dist_d",      nD,    "detector", "dist"),
+            # global scalars (width 1 each)
+            ("sharpness",   1,     "global",   "log|bw|"),
+            ("n_collected", 1,     "global",   "n_collected"),
+            ("marg_sum",    1,     "global",   "sum_marg"),
+            ("exit_norm",   1,     "global",   "exit_cost"),
+            ("nonempty",    1,     "global",   "nonempty"),
+            ("sum_unc",     1,     "global",   "sum_unc"),
+            # per-teleport (width n_tel)
+            ("dist_w",      n_tel, "teleport", "tele_dist"),
+        ]
+        self.slices: dict[str, slice] = {}
+        o = 0
+        for key, width, _group, _display in self.blocks:
+            self.slices[key] = slice(o, o + width)
+            o += width
+        self.dim: int = o
+        # Fail-loud (ADR-0002): the blocks must partition [0, dim) contiguously — every position
+        # owned by exactly one block, no gap, no overlap. This is the invariant `build`'s old
+        # positional `assert o == self.dim` checked at write time; checking it ONCE here makes a
+        # write through these slices provably fill the whole `np.empty` vector.
+        covered = sorted((s.start, s.stop) for s in self.slices.values())
+        cursor = 0
+        for start, stop in covered:
+            assert start == cursor and stop >= start, ("non-contiguous layout", start, stop, cursor)
+            cursor = stop
+        assert cursor == self.dim, (cursor, self.dim)
+
+    def __getitem__(self, key: str) -> slice:
+        return self.slices[key]
+
+    def element_names(self) -> list[str]:
+        """Per-element human-readable name for each of `self.dim` positions, in layout order."""
+        names: list[str] = []
+        for key, width, group, display in self.blocks:
+            if group == "treasure":
+                names.extend(f"t{i}.{display}" for i in range(width))
+            elif group == "detector":
+                names.extend(f"d{j}.{display}" for j in range(width))
+            elif group == "global":
+                names.extend(f"global.{display}" for _ in range(width))
+            elif group == "teleport":
+                names.extend(f"global.{display}{k}" for k in range(width))
+            else:  # unreachable; fail-loud on an unknown group
+                raise ValueError(f"unknown feature group {group!r} for block {key!r}")
+        return names
+
+    def block_tags(self) -> list[str]:
+        """Per-element block tag for each of `self.dim` positions, in layout order."""
+        tags: list[str] = []
+        for key, width, group, display in self.blocks:
+            if group == "treasure":
+                tag = f"treasure/{display}"
+            elif group == "detector":
+                tag = f"detector/{display}"
+            elif group in ("global", "teleport"):
+                tag = "global"
+            else:  # unreachable; fail-loud on an unknown group
+                raise ValueError(f"unknown feature group {group!r} for block {key!r}")
+            tags.extend(tag for _ in range(width))
+        return tags
+
+
+# Env-keyed memo for the layout descriptor. The layout is a fixed env-derived table (same idiom as
+# actions._SLOT_TABLES), so build it once per env and serve O(1) — hot-path callers
+# (legal_mask_from_features, run once per search node) get the named slices without re-building the
+# 15-block table every call (the path the docstrings call "only array slicing — no env calls").
+_LAYOUTS = {}
+
+
+def feature_layout(env: Environment) -> "FeatureLayout":
+    """Return the cached `FeatureLayout` for `env`, building+caching on first use (keyed by
+    id(env)). Same env-derived-table memo idiom as actions.slot_action_tables."""
+    key = id(env)
+    lay = _LAYOUTS.get(key)
+    if lay is None:
+        lay = FeatureLayout(env)
+        _LAYOUTS[key] = lay
+    return lay
+
+
 def feature_dim(env: Environment) -> int:
     """Exact feature-vector length for THIS env. Derived, never hardcoded.
 
-    Per-treasure block is N×5 (marg, collected, available, dist, unc — the belief-resolution
-    `unc` is Part C); per-detector is nD×3; global is (6 + n_teleports) (the +1 over the prior 5
-    is the global Σ_uncollected unc scalar). On the live env: 20·5 + 44·3 + (6+3) = 241."""
-    n_tel = len(env.teleports)
-    return env.N * 5 + len(env.detectors) * 3 + (6 + n_tel)
+    Single-sourced through `FeatureLayout` (the one owner of the layout): the per-treasure block
+    is N×5 (marg, collected, available, dist, unc — the belief-resolution `unc` is Part C);
+    per-detector is nD×3; global is (6 + n_teleports) (the +1 over the prior 5 is the global
+    Σ_uncollected unc scalar). On the live env: 20·5 + 44·3 + (6+3) = 241."""
+    return feature_layout(env).dim
 
 
 class FeatureBuilder:
@@ -93,6 +221,15 @@ class FeatureBuilder:
         collisions (distinct beliefs of equal size sharing min/max world ids), so a hit returns
         the features of the SAME belief: bit-identical to recomputing them."""
 
+    # The set of FeatureLayout block KEYs `build` writes — asserted equal to the layout's keys at
+    # the end of every build, so a block added to FeatureLayout but not written here fails loud.
+    _WRITTEN_KEYS = frozenset({
+        "marg", "collected", "available", "dist_t", "unc",
+        "informative", "p_pos", "dist_d",
+        "sharpness", "n_collected", "marg_sum", "exit_norm", "nonempty", "sum_unc",
+        "dist_w",
+    })
+
     def __init__(self, env: Environment):
         self.env = env
         self.N = env.N
@@ -104,7 +241,10 @@ class FeatureBuilder:
         self.log_nworlds = math.log(len(env.worlds))
         # cover masks as a contiguous int64 array, for a single vectorized p_pos over detectors.
         self.cover = np.array([env.cover_mask[i] for i in self.detectors], dtype=np.int64)
-        self.dim = feature_dim(env)
+        # The single owner of the §2.2 layout (audit R6): `build` writes THROUGH it by named
+        # block, so reordering a block in FeatureLayout moves the write here in lockstep.
+        self.layout = FeatureLayout(env)
+        self.dim = self.layout.dim
         self._loc_cache = {}      # loc -> (dist_block (N+nD+n_tel,), exit_cost_norm)
         self._belief_cache = {}   # _belief_key -> list of (bw_ref, BeliefFeat)
         self._belief_cache_n = 0  # entry count, for the safety-net cap below
@@ -186,13 +326,13 @@ class FeatureBuilder:
         builder always derives its own marginals here — the kernel's marg is bit-identical to
         `env.marginals(bw)` (verified) and faster than a separate marginals call, so there is no
         caller-supplied `marg` to consume. Returns a `DTYPE` vector."""
-        N, nD = self.N, self.nD
+        N = self.N
+        lay = self.layout
         marg_in, p_pos, informative, marg_sum, sharpness, nb = self._belief_feats(bw)
         marg = marg_in
         dist_t, dist_d, dist_w, exit_norm = self._loc_block(loc)
 
         out = np.empty(self.dim, dtype=DTYPE)
-        o = 0
 
         # --- per-treasure block (N × 5): marg, collected, available, dist, unc ---
         coll = np.zeros(N)
@@ -204,28 +344,35 @@ class FeatureBuilder:
         # marginal cannot carry (a resolved-absent marg-0 and a split marg-0.5 both look "not here"
         # to a value head reading marg alone).
         unc = marg * (1.0 - marg)
-        out[o:o + N] = marg; o += N
-        out[o:o + N] = coll; o += N
-        out[o:o + N] = avail; o += N
-        out[o:o + N] = dist_t; o += N
-        out[o:o + N] = unc; o += N
+        # Write THROUGH the layout (audit R6): each block goes to its named slice, so the order is
+        # owned by FeatureLayout, not by a positional cursor here. The values keyed below MUST cover
+        # every layout block — `_WRITTEN_KEYS` is asserted equal to the layout's keys (so adding a
+        # block to FeatureLayout without writing it here fails loudly, ADR-0002).
+        out[lay["marg"]] = marg
+        out[lay["collected"]] = coll
+        out[lay["available"]] = avail
+        out[lay["dist_t"]] = dist_t
+        out[lay["unc"]] = unc
 
         # --- per-detector block (nD × 3): informative (open-clause), p_pos, dist ---
-        out[o:o + nD] = informative; o += nD
-        out[o:o + nD] = p_pos; o += nD
-        out[o:o + nD] = dist_d; o += nD
+        out[lay["informative"]] = informative
+        out[lay["p_pos"]] = p_pos
+        out[lay["dist_d"]] = dist_d
 
         # --- global block (6 + n_teleports) ---
         # Σ_uncollected unc[i] — expected number of treasures still in question (Part C). Only
         # uncollected treasures count: a collected one carries no remaining decision-relevant doubt.
         sum_u = float(np.sum(unc * (coll == 0)))
-        out[o] = sharpness; o += 1                          # belief sharpness
-        out[o] = len(collected) / self.K; o += 1            # n_collected
-        out[o] = marg_sum / self.K; o += 1                  # Σmarg (≈ remaining present)
-        out[o] = exit_norm; o += 1                          # early-exit geometry
-        out[o] = 1.0 if nb else 0.0; o += 1                 # non-empty belief flag
-        out[o] = sum_u; o += 1                              # Σ_uncollected unc (belief-resolution)
-        out[o:o + len(dist_w)] = dist_w; o += len(dist_w)   # per-teleport distances
+        out[lay["sharpness"]] = sharpness                  # belief sharpness
+        out[lay["n_collected"]] = len(collected) / self.K  # n_collected
+        out[lay["marg_sum"]] = marg_sum / self.K           # Σmarg (≈ remaining present)
+        out[lay["exit_norm"]] = exit_norm                  # early-exit geometry
+        out[lay["nonempty"]] = 1.0 if nb else 0.0          # non-empty belief flag
+        out[lay["sum_unc"]] = sum_u                        # Σ_uncollected unc (belief-resolution)
+        out[lay["dist_w"]] = dist_w                         # per-teleport distances
 
-        assert o == self.dim, (o, self.dim)
+        # sanity: every layout block was written. The layout's constructor proved its slices
+        # partition [0, dim) contiguously, so covering every block KEY here == the whole vector
+        # is fully written (no `np.empty` garbage leaks through an unwritten slice).
+        assert self._WRITTEN_KEYS == lay.slices.keys(), (self._WRITTEN_KEYS, lay.slices.keys())
         return out

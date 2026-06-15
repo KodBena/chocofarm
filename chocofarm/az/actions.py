@@ -26,6 +26,7 @@ from __future__ import annotations
 import numpy as np
 
 from chocofarm.model.env import TERMINATE
+from chocofarm.az.features import feature_layout
 
 
 def n_action_slots(env) -> int:
@@ -97,23 +98,20 @@ def legal_mask(env, loc, bw, collected) -> np.ndarray:
 def legal_mask_from_features(env, feat: np.ndarray) -> np.ndarray:
     """The hot-path mask: slice the feature blocks that ARE the mask (design §3).
 
-    Feature layout (features.py): per-treasure block is [marg | collected | available | dist | unc],
-    each env.N wide (the `unc` belief-resolution sub-block is Part C — it grew the block 4N→5N); the
-    `available[i]` sub-block is the legal-collect mask. The per-detector block is
-    [informative | p_pos | dist], each nD wide; `informative[j]` is the open-clause / legal-sense
-    mask. TERMINATE is always legal. This costs only array slicing — no env calls.
-
-    The slice offsets are derived from the layout, not magic: available is the 3rd per-treasure
-    sub-block (2N..3N — unchanged by the unc addition, which is the 5th sub-block AFTER dist), and
-    the per-detector block now starts at 5N (was 4N) because the per-treasure block is 5N wide."""
+    Reads the named blocks straight from the §2.2 layout owner, `FeatureLayout` (features.py),
+    rather than re-deriving the slice offsets as literals: the per-treasure `available[i]` block is
+    the legal-collect mask, and the per-detector `informative[j]` block is the open-clause /
+    legal-sense mask. TERMINATE is always legal. Asking the layout for the slice (instead of
+    hardcoding `2N..3N` / `5N..5N+nD`) means a block reorder in FeatureLayout moves this read in
+    lockstep — no silent mislabel. This costs only array slicing — no env calls."""
     N, nD = env.N, len(env.detectors)
+    layout = feature_layout(env)   # O(1) env-keyed memo — no per-call table rebuild on this hot path
     m = np.zeros(n_action_slots(env), dtype=np.float64)
-    # per-treasure block: available[i] is the 3rd sub-block (offset 2N .. 3N)
-    avail = feat[2 * N:3 * N]
+    # per-treasure available[i] is the legal-collect mask (named block, not a magic offset).
+    avail = feat[layout["available"]]
     m[0:N] = (avail > 0).astype(np.float64)
-    # per-detector block starts at 5N (per-treasure is now 5N wide); informative[j] is its 1st
-    # sub-block (offset 5N .. 5N+nD)
-    informative = feat[5 * N:5 * N + nD]
+    # per-detector informative[j] is the open-clause / legal-sense mask (named block).
+    informative = feat[layout["informative"]]
     m[N:N + nD] = (informative > 0).astype(np.float64)
     m[N + nD] = 1.0
     return m
