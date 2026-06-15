@@ -257,7 +257,7 @@ class JaxTrainer:
                            b2=jnp.asarray(hp.b2, _JDTYPE), eps=jnp.asarray(hp.eps, _JDTYPE))
 
     def train_step(self, X, target_pi, legal_mask, target_v, *, alpha=1.0, beta=1.0,
-                   hp: AdamHParams = None, l2=None):
+                   hp: AdamHParams | None = None, l2=None):
         """One Adam step on the AZ loss, DELEGATED to the Optimizer. X: (B, in_dim); target_pi:
         (B, n_actions) prob rows; legal_mask: (B, n_actions) {0,1}; target_v: (B,) RAW value targets
         (standardized here with the net's y_mean/y_std, matching the numpy path). Returns (ce, vmse)
@@ -287,7 +287,7 @@ class JaxTrainer:
         self._write_params()
         return float(ce), float(vmse)
 
-    def train_step_value(self, X, target_v, *, hp: AdamHParams = None, l2=None):
+    def train_step_value(self, X, target_v, *, hp: AdamHParams | None = None, l2=None):
         """One Adam step on the value-only loss (for the no-policy Stage-1 net), DELEGATED to the
         Optimizer. Returns vmse. `hp`/`l2` are LIVE (audit item M): `None` uses the construction-time
         `self._default_hp`/`self._l2` (back-compat)."""

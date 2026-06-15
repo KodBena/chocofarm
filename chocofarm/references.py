@@ -17,8 +17,15 @@ depends on neither `chocofarm.eval.*` nor `chocofarm.az.*` (the cycle it exists 
 
 Public Domain (Unlicense).
 """
+from __future__ import annotations
+
 import itertools
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+if TYPE_CHECKING:
+    from chocofarm.model.env import Environment
 
 # The documented exact-decomposition rate (decomp exact, h=1) — the empirical decomp anchor
 # reference line. Source: docs/agents/decomp-solver-report.md ("decomp (exact, h=1) 0.0941")
@@ -27,7 +34,7 @@ import numpy as np
 DECOMP_ANCHOR = 0.0941
 
 
-def realizable_static(env):
+def realizable_static(env: Environment) -> float:
     loc, unv, route, t, best = ("w", env.entry), set(range(env.N)), [], 0.0, (-1.0, 0)
     while unv:
         i = max(unv, key=lambda j: env.value[j] / (env.d(loc, ("t", j)) + 1e-9))
@@ -38,8 +45,8 @@ def realizable_static(env):
     return best[0]
 
 
-def clairvoyant_rate(env):
-    def ev(lam, runs, seed):
+def clairvoyant_rate(env: Environment) -> float:
+    def ev(lam: float, runs: int, seed: int) -> float:
         rng = np.random.default_rng(seed)
         totR = totT = 0.0
         for _ in range(runs):
@@ -77,24 +84,24 @@ class BeliefRefs:
     display reference-line site and every (rate → %VoI) conversion through here so they cannot drift.
     """
 
-    def __init__(self, env):
+    def __init__(self, env: Environment):
         self.env = env
-        self._static_floor = None
-        self._clairvoyant_ceiling = None
+        self._static_floor: float | None = None
+        self._clairvoyant_ceiling: float | None = None
         self.decomp_anchor = DECOMP_ANCHOR
 
     @property
-    def static_floor(self):
+    def static_floor(self) -> float:
         if self._static_floor is None:
             self._static_floor = realizable_static(self.env)
         return self._static_floor
 
     @property
-    def clairvoyant_ceiling(self):
+    def clairvoyant_ceiling(self) -> float:
         if self._clairvoyant_ceiling is None:
             self._clairvoyant_ceiling = clairvoyant_rate(self.env)
         return self._clairvoyant_ceiling
 
-    def voi_pct(self, rate):
+    def voi_pct(self, rate: float) -> float:
         """% of the clairvoyant value-of-information gap a `rate` claws back over the static floor."""
         return (rate - self.static_floor) / (self.clairvoyant_ceiling - self.static_floor) * 100

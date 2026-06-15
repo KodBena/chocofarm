@@ -66,10 +66,14 @@ class RegistryDecodeError(ValueError):
     proceeds on a config it could not validate, and never coerces to a default (ADR-0002)."""
 
 
-def hp(default, mut: Mut, doc: str, codec: str = "json"):
+def hp(default: typing.Any, mut: Mut, doc: str, codec: str = "json") -> typing.Any:
     """Declare a leaf hyperparameter field (design §1). Wraps `field(default=..., metadata=...)`
     so the per-field facet / doc / codec stay readable at the declaration site. The `default` is
-    the argparse default (one source of defaults — design §6 consolidation)."""
+    the argparse default (one source of defaults — design §6 consolidation).
+
+    `default` is genuinely `Any` (every leaf field's own type), and the return is annotated `Any`
+    so the `field(default=...)` it produces type-checks as the field's declared type at each call
+    site (e.g. `lr: float = hp(1e-3, ...)`) — a typed `Field[...]` return would be rejected there."""
     return field(default=default, metadata={"mut": mut, "doc": doc, "codec": codec})
 
 
@@ -316,7 +320,7 @@ def check_invariants(cfg: ExperimentConfig) -> None:
 # ---------------------------------------------------------------------------
 # Encode — nested dataclass -> JSON-serializable dict (design §5.2 single blob)
 # ---------------------------------------------------------------------------
-def encode_config(cfg: ExperimentConfig) -> dict:
+def encode_config(cfg: ExperimentConfig) -> dict[str, typing.Any]:
     """Flatten the nested `ExperimentConfig` to a plain dict ready for `json.dumps`. `Mut` is not
     stored (it is code, not data — it lives in the schema, not the blob), so this is just the value
     tree. `dataclasses.asdict` recurses the groups; everything is already JSON-native (str / int /
@@ -329,7 +333,7 @@ def encode_config(cfg: ExperimentConfig) -> dict:
 # ---------------------------------------------------------------------------
 # Decode — strict, fail-loud JSON dict -> typed ExperimentConfig (design §3.6)
 # ---------------------------------------------------------------------------
-def _is_optional(ann):
+def _is_optional(ann: typing.Any) -> tuple[bool, typing.Any]:
     """Return (is_optional, inner_type) for `Optional[T]` / `T | None`, else (False, ann)."""
     origin = typing.get_origin(ann)
     if origin in (typing.Union, getattr(types, "UnionType", None)):
@@ -339,7 +343,7 @@ def _is_optional(ann):
     return False, ann
 
 
-def _check_scalar(value, ann, path: str):
+def _check_scalar(value: typing.Any, ann: typing.Any, path: str) -> typing.Any:
     """Strict type-check + coerce a JSON scalar to the annotated type WITHOUT silent lossy
     coercion. JSON has one number type, so a float field legitimately receives an int (5 → 5.0);
     that widening is exact and allowed. Everything else that mismatches is a loud failure — no
@@ -390,7 +394,7 @@ def _check_scalar(value, ann, path: str):
     raise RegistryDecodeError(f"{path}: unsupported field annotation {target!r}")
 
 
-def _resolved_hints(group_cls):
+def _resolved_hints(group_cls: type) -> dict[str, typing.Any]:
     """Resolve a group dataclass's annotations to real type objects. Under
     `from __future__ import annotations` a field's `.type` is the SOURCE STRING (e.g.
     'typing.Optional[str]'), so the codec must resolve it via `get_type_hints` to type-check
@@ -398,7 +402,7 @@ def _resolved_hints(group_cls):
     return typing.get_type_hints(group_cls)
 
 
-def _decode_group(group_cls, data, path: str):
+def _decode_group(group_cls: type, data: typing.Any, path: str) -> typing.Any:
     """Reconstruct one dataclass group from a dict, strict: every key must be a known field
     (unknown key → loud), every present value is type-checked, missing keys take the dataclass
     default (the field's declared default, NOT a silent fallback — a missing key in a
@@ -419,7 +423,7 @@ def _decode_group(group_cls, data, path: str):
     return group_cls(**kwargs)
 
 
-def decode_config(data: dict) -> ExperimentConfig:
+def decode_config(data: dict[str, typing.Any]) -> ExperimentConfig:
     """Strict, fail-loud decode (design §3.6): a plain dict (from `json.loads`) → a validated
     `ExperimentConfig`. Raises `RegistryDecodeError` on any type / domain / unknown-key /
     missing-required / schema-version / cross-field-invariant mismatch. NEVER coerces a malformed

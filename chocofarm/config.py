@@ -47,7 +47,7 @@ DEFAULT_REDIS_SOCKET_TIMEOUT = 60.0
 DEFAULT_REDIS_CONNECT_TIMEOUT = 10.0
 
 
-def transport_redis_params() -> dict:
+def transport_redis_params() -> dict[str, str | int]:
     """Connection facts (host/port/db) for the TRANSPORT redis — the ephemeral allkeys-lru instance
     at 127.0.0.1:6380 db 0 that carries the AZ parallel-loop weight/result blobs. Env-overridable via
     `CHOCO_TRANSPORT_REDIS_HOST`/`CHOCO_TRANSPORT_REDIS_PORT`/`CHOCO_TRANSPORT_REDIS_DB`, independent
@@ -59,7 +59,7 @@ def transport_redis_params() -> dict:
     )
 
 
-def registry_redis_params() -> dict:
+def registry_redis_params() -> dict[str, str | int]:
     """Connection facts (host/port/db) for the REGISTRY redis — the disk-persisted noeviction instance
     at 127.0.0.1:6379 db 0 that holds the hp config blobs (no TTL, must survive a restart).
     Env-overridable via `CHOCO_REGISTRY_REDIS_HOST`/`CHOCO_REGISTRY_REDIS_PORT`/`CHOCO_REGISTRY_REDIS_DB`,

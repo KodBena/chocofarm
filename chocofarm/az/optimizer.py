@@ -55,10 +55,13 @@ class AdamHParams(NamedTuple):
     optax state inside that call. There is no captured copy and no default — a missing hyperparameter
     is an arity error (the construction-enforced single-writer, design §2.1 / Appendix B)."""
 
-    lr: float
-    b1: float
-    b2: float
-    eps: float
+    # Each field holds EITHER a python float (the default-construct / `adam_hparams_from` path) OR a
+    # traced jax scalar (the `_hp_arrays` `jnp.asarray(...)` path that casts to the optax state's
+    # dtype before the jit'd step) — both forms genuinely flow through these slots.
+    lr: float | jax.Array
+    b1: float | jax.Array
+    b2: float | jax.Array
+    eps: float | jax.Array
 
 
 class Optimizer:

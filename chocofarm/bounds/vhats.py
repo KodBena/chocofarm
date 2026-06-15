@@ -21,7 +21,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, AbstractSet, Protocol, Tuple
+
+import numpy as np
+import numpy.typing as npt
+
+if TYPE_CHECKING:
+    from chocofarm.model.env import Environment
 
 
 class Vhat(Protocol):
@@ -35,7 +41,9 @@ class Vhat(Protocol):
     fixed reference λ. Both the plain-function strategies (vhat_zero, vhat_analytic) and
     the class strategies (DecompVhat, ExactBeliefVhat — their `__call__`) satisfy this."""
 
-    def __call__(self, env, loc, bw, collected, lam) -> float:
+    def __call__(self, env: Environment, loc: Tuple[str, int],
+                 bw: npt.NDArray[np.int64], collected: AbstractSet[int],
+                 lam: float) -> float:
         ...
 
 
