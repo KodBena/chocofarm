@@ -25,6 +25,12 @@ class Environment:
         self.treasures = inst.treasures
         self.teleports = inst.teleports
         self.N, self.K = inst.N, inst.K
+        # COPY-ON-WRITE CONTRACT (with_scenario): the scenario knobs `value`/`entry`/`tp`
+        # are the ONLY construction state that may depend on the scenario. Nothing below may
+        # cache a structure DERIVED from value/entry/tp (e.g. a value-weighted precompute) —
+        # `with_scenario` shallow-copies the env and overrides only these three, so any such
+        # derived cache would be shared stale across scenarios (silent divergence). Keep
+        # value/entry/tp-derived quantities computed at point-of-use (apply/simulate/exit_cost).
         self.value = list(value) if value is not None else [1.0] * self.N
         self.entry, self.tp = entry, float(teleport_overhead)
 
