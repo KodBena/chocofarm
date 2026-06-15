@@ -263,6 +263,36 @@ unsubstantiated-claim family (an enforcement level is itself a claim, so it
 must be declared). The audit's R-series roadmap is the chocofarm register of
 Rule 2 (recurrence → mechanism).
 
+## ADR-0012: Compositional and Structural Hygiene
+
+**Decision.** A structural-design tenet for all *new* code — the incoming C++
+runner first, the future async actor-learner second — stated as the positive
+inverse of the 2026-06-15 audit's eight "architectural cancers." Seven checkable
+principles: **P1** single-source-of-truth / derive-don't-duplicate; **P2**
+seam/port discipline (the env↔Policy inversion of control as template; derived
+state owned on the object whose lifetime it shares, never a module global keyed
+by `id()`); **P3** no god-objects (one-owner collaborators — the
+Transport⊥Pool⊥Task split); **P4** live-not-frozen (a value's heat is decided by
+where it lives — a swept tunable is a live cell, not a ctor invariant); **P5**
+fail loud / remove-the-root-cause-not-band-aid (distinguish a re-justified guard
+from a patch on an undiagnosed substrate); **P6** substantiate equivalence/perf
+claims (behavioral float32-equivalence, *not* byte-identity, for ML); **P7**
+cross-language wire discipline (the redis raw-bytes protocol is the *only*
+contract — no shared types, no second encoder). It composes with rather than
+restates its siblings (0002/0004/0005/0007/0009/0011 cited, not re-derived), and
+carries a dedicated concrete C++ wire contract (the `transport.py` keys/dtypes,
+parity under the P6 bar).
+
+**Why care.** The audit's deepest finding was that chocofarm *already proved it
+knows the right answer* (live λ, derived dimensions, the env↔Policy seam) and
+then applied that discipline once and stopped — the cancers are the right idea
+not propagated. This tenet is propagation by default, written ahead of the next
+large bodies of new code so they are born clean rather than audited dirty; it is
+upstream of ADR-0011 (structure born clean is structure no mechanism must later
+convert). It binds new structure at authoring time, mandates no retroactive
+sweep (the R-series owns existing cleanup, ADR-0004), and gives a C++ author an
+implement-against-this contract that keeps the language boundary a single seam.
+
 ## How to read these together
 
 The tenets form a coherent posture:
