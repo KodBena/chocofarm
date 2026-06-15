@@ -291,26 +291,41 @@ strict-where-achievable, each relaxation a named stub-gap not a convenience,
 enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing
 baseline); **P9** functional core, imperative shell — the compiled-component
 (C++) contract framed around *honest function signatures*: a computation is a
-pure function of typed, bounds-carrying, const-correct inputs (`std::span<const
-T>` over a raw `T*`) *returning its result by value* (free under guaranteed copy
-elision / NRVO — the discipline costs no performance), with effects confined to a
+pure function of typed, bounds-carrying, const-correct inputs **and outputs**
+(`std::span<const T>` / `std::string_view` over a raw `T*`, in *either*
+direction — a raw/nullable pointer is as forbidden as an output as it is as an
+input) *returning its result by value* (free under guaranteed copy elision /
+NRVO — the discipline costs no performance), with effects confined to a
 thin imperative shell, the signature naming every mutation, and the *only*
 sanctioned hidden mutation a *measured* hot-path buffer-reuse routed through an
 explicitly-typed `Workspace`/`Context&` parameter; it outlaws the
 *untyped-effectful void* (a raw-pointer-taking, `void`-returning,
-out-parameter-writing black box — the compiled form of B / P2 / P8) **and the
+out-parameter-writing black box — the compiled form of B / P2 / P8), **the
 exception** (the purest untyped effect — a control-flow escape absent from the
-signature the caller is not forced to handle): failure is a typed return value,
-`[[nodiscard]] std::expected<T, Error>` returned by value, never thrown (a
-throwing ctor becomes a `create(…) -> std::expected` factory), so the error path
-is declared in the return type and `[[nodiscard]]` makes ignoring it a compile
-error (ADR-0002 fail-loud at its strongest surface), while the functional core
-stays *total* (throw-free, neither throwing nor returning `expected`) and a
-genuine invariant violation (a bug) remains an `assert`/abort, not an `expected`.
+signature the caller is not forced to handle), **and the untyped optional** (a
+nullable raw pointer / sentinel — `const char* opt(…)` returning `nullptr`, a
+`-1` magic return — standing for "absent", the C++ form of ADR-0002's
+sentinel-instead-of-raise red flag, whose absence is invisible in the type so a
+missed check is undefined behavior). Absence and failure are **both typed return
+values, drawn apart precisely**: a *legitimately-absent* result is a
+`[[nodiscard]] std::optional<T>` ("there might be nothing, and that is a valid
+outcome"); a *fallible* one is a `[[nodiscard]] std::expected<T, Error>` ("it
+might fail, and the caller must handle the error") — never thrown (a throwing
+ctor becomes a `create(…) -> std::expected` factory), never a nullable pointer
+or sentinel. So the absence/error path is declared in the return type and
+`[[nodiscard]]` makes ignoring it a compile error (ADR-0002 fail-loud at its
+strongest surface, and a P8 honest-contract obligation — the type carries the
+nullability the body relies on), while the functional core stays *total*
+(throw-free, neither throwing nor returning `expected`) and a genuine invariant
+violation (a bug) remains an `assert`/abort, not an `expected`.
 The C++ `NetForward` MLP (`predict(const float* X)`, the `void matvec_bias(…,
 std::vector<float>& out)` internals, the throwing constructor) is the cautionary
 instance — every `cpp/src` throw is at a boundary (redis I/O, instance load, the
-manifest-validating ctor), none on the throw-free forward/search core. P9 is now
+manifest-validating ctor), none on the throw-free forward/search core — and
+`main.cpp`'s `const char* opt(…)` returning `nullptr` for an absent CLI flag is
+the untyped-optional cautionary instance (compliant: `[[nodiscard]]
+std::optional<std::string_view> opt(std::span<const std::string_view>, …)`, with
+`main` building the typed `argv` view once as the boundary ACL). P9 is now
 a mix: the error/`[[nodiscard]]` axis is **compile-enforced** (an unhandled
 `std::expected` fails the build), the input/output/mutation rules review-policed
 with the compiler `-Wall -Wextra` and a future `clang-tidy` config as the

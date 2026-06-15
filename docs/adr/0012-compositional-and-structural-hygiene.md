@@ -100,7 +100,7 @@ this shape, the named principle forbids it."
 | **H** — Defensive band-aids stacked against a hostile substrate | a new mitigation layered on an un-diagnosed cause; a reliability strategy that *is* a stack of patches | **P5** (fail loud; remove the root cause) — distinguish a justified guard from a band-aid masking an undiagnosed cause |
 | **(new, cross-language)** — two writers of one cross-boundary truth | a hand-mirrored type, offset, key, or codec on the far side of the language boundary that re-authors a fact the near side already defines (a hardcoded weight offset; a second result-blob codec) | **P7** (cross-language wire discipline) — a cross-boundary fact has exactly one authoritative definition and every side *derives* its view (reads it at runtime or generates it at build time), never re-authors it by hand; mechanically enforced at the strongest feasible level (generate/compile-from-one-source > build-time lint > runtime parity backstop). Schema-driven codegen (one schema → N derived readers) is SSOT and is encouraged, not banned |
 | **(new, call-boundary)** — a contract carried only by an unenforced or dishonest signature | an untyped function/method/dataclass signature (the contract lives nowhere checkable), or a *lying* one whose body does not honor its annotation (`hp: AdamHParams = None` whose body accepts `None`; `lr/b1/b2/eps: float` populated with jax `Array`s) | **P8** (typed signatures are the contract's SSOT) — the signature is the single source of truth of the input/output contract, honored by the body, at the **strict-where-achievable** bar, with each relaxation a named stub-gap (not a convenience); mechanically enforced by the mypy `--strict` CI gate ratcheting a monotonically-decreasing baseline (ADR-0011 Rule 1) |
-| **(new, compiled-component)** — an untyped-effectful-void / black-box mutation in a compiled (C++/new-language) component | a function taking raw pointers (`const float*`, a `T*, size_t` pair) and returning `void` while writing its result through an output parameter or mutating hidden/global state (`void matvec_bias(const float* in, …, std::vector<float>& out)`; `void require_matrix(…, int& rows, int& cols, std::vector<float>& out)`) — a black box you cannot unit-test (it mutates rather than returns), cannot compose (it is not a value-function to chain), and whose contract is invisible (the `void` + raw-pointer signature names neither the bounds, the const-ness, nor what it mutates); or **signaling failure by throwing an exception** (an untyped control-flow escape absent from the signature, which the caller is not forced to handle) | **P9** (functional core, imperative shell) — a computation is a pure function of typed, bounds-carrying, const-correct inputs (`std::span<const T>` over a raw `T*`) **returning its result by value**; every effect is named in the signature, the only sanctioned hidden mutation is a measured hot-path buffer-reuse routed through an explicitly-typed `Workspace`/`Context&` parameter, and **failure is returned as a `[[nodiscard]] std::expected<T, Error>`, never thrown** (a throwing ctor becomes a `create(…) -> std::expected` factory) — the compiled-component form of B (a second/hidden writer), of P2 (hidden state / a lying signature), and of P8 (an untyped contract), enforced by the compiler (`-Wall -Wextra`, the nodiscard warning treated as an error) and a future `clang-tidy` config (ADR-0011 Rule 1) |
+| **(new, compiled-component)** — an untyped-effectful-void / black-box mutation in a compiled (C++/new-language) component | a function taking raw pointers (`const float*`, a `T*, size_t` pair) and returning `void` while writing its result through an output parameter or mutating hidden/global state (`void matvec_bias(const float* in, …, std::vector<float>& out)`; `void require_matrix(…, int& rows, int& cols, std::vector<float>& out)`) — a black box you cannot unit-test (it mutates rather than returns), cannot compose (it is not a value-function to chain), and whose contract is invisible (the `void` + raw-pointer signature names neither the bounds, the const-ness, nor what it mutates); or **signaling failure by throwing an exception** (an untyped control-flow escape absent from the signature, which the caller is not forced to handle); or **signaling a legitimately-absent result with a nullable raw pointer or a sentinel** (`const char* opt(…)` returning `nullptr` for "not found"; a `-1` / `""` magic return) — an **untyped optional** whose absence is invisible in the type, so a missed null-check is undefined behavior, the C++ form of ADR-0002's sentinel-instead-of-raise red flag | **P9** (functional core, imperative shell) — a computation is a pure function of typed, bounds-carrying, const-correct inputs **and outputs** (`std::span<const T>` / `std::string_view` over a raw `T*`, in *either* direction) **returning its result by value**; every effect is named in the signature, the only sanctioned hidden mutation is a measured hot-path buffer-reuse routed through an explicitly-typed `Workspace`/`Context&` parameter, **a legitimately-absent result is a `[[nodiscard]] std::optional<T>`** and **a failure is a `[[nodiscard]] std::expected<T, Error>`, never a sentinel, a nullable pointer, or a throw** (a throwing ctor becomes a `create(…) -> std::expected` factory) — the compiled-component form of B (a second/hidden writer), of P2 (hidden state / a lying signature), and of P8 (an untyped/dishonest contract), enforced by the compiler (`-Wall -Wextra`, the nodiscard warning treated as an error) and a future `clang-tidy` config (ADR-0011 Rule 1) |
 
 ### The nine principles
 
@@ -442,10 +442,11 @@ the one honored authority, checked by the gate below.
 **Rule (checkable).** In a **compiled (C++/new-language) component**, a
 computation is a **pure function of typed inputs that returns its result by
 value**; effects (I/O, the redis transport, the episode/inference loop, buffer
-lifetimes, and failure) live in a thin **imperative shell** that calls the pure
-core. This is **P8's typed-contract rule carried into the compiled component**
-and **P2's no-hidden-state rule sharpened by C++**, where a raw `T*` erases the
-bounds and the const that the contract depends on. The discipline costs **no
+lifetimes, absence, and failure) live in a thin **imperative shell** that calls
+the pure core. This is **P8's typed-contract rule carried into the compiled
+component** and **P2's no-hidden-state rule sharpened by C++**, where a raw `T*`
+erases — whichever way it points — the bounds and const an input depends on, or
+the nullability an output depends on. The discipline costs **no
 performance**: it is built on **zero-cost abstractions** (a `std::span<const T>`
 compiles to the same pointer+length a hand-rolled pair would; **guaranteed copy
 elision / (N)RVO** makes return-by-value free), so the honest signature is not a
@@ -453,12 +454,23 @@ tax paid for cleanliness — it is the same machine code with the contract
 restored. Five **checkable rules a reviewer enforces yes/no from the signature
 alone**:
 
-1. **Inputs are typed, bounds-carrying, const-correct.** Favor
+1. **Inputs *and outputs* are typed, bounds-carrying, const-correct — no raw
+   or nullable pointer crosses the signature in either direction.** Favor
    `std::span<const T>` (or a typed view) over a raw `T*` or a `T*, size_t`
    pair — the span carries the extent and prevents the out-of-bounds the raw
-   pointer silently invites; a non-trivial read-only input is `const&`. *Check:
-   does any signature take a raw pointer where a `std::span<const T>` would
-   carry the extent? Is every read-only input `const`?*
+   pointer silently invites; a non-trivial read-only input is `const&`. The ban
+   is **directional-symmetric**: a raw-pointer or nullable-pointer **output** is
+   as forbidden as a raw-pointer input — a returned string is a
+   `std::string_view`, a returned-or-absent string a
+   `std::optional<std::string_view>`, never a `const char*` that may be
+   `nullptr`. A raw/nullable pointer erases the same contract whichever way it
+   points: as an input it erases the extent and const-ness; as an output it
+   erases the **nullability** (the `T*` return says nothing about whether
+   `nullptr` is a sanctioned value), so a missed null-check is undefined
+   behavior the type did not warn against. *Check: does any signature take **or
+   return** a raw `T*` / nullable pointer where a `std::span<const T>` /
+   `std::string_view` (always present) or a `std::optional<…>` (legitimately
+   absent — rule 5) would carry the contract? Is every read-only input `const`?*
 2. **Outputs are returned by value.** A function that computes a value
    **returns** it — exploiting guaranteed copy elision / (N)RVO so the return is
    free — not a `void f(…, Out& out)` that writes through an output parameter.
@@ -488,25 +500,57 @@ alone**:
    shape is the tell P7 and P8 already named and reject; "faster" with no
    measured allocation profile and no typed `Workspace` is a hand-wave, and the
    hand-wave is exactly how the cancers grew.
-5. **Errors are typed return values, not exceptions.** A fallible computation
-   reports failure as a **typed value** — a `[[nodiscard]] std::expected<T,
-   Error>` returned by value — never by throwing. An exception is the purest
-   untyped effect: a control-flow escape that appears **nowhere in the
-   signature**, that the caller is not forced to handle, and that makes the
-   function no longer a total value-function of its inputs (the rule-2/rule-3
-   violation in the one register the other four do not cover). `std::expected`
-   makes the error path a **declared part of the return type**, and
-   `[[nodiscard]]` makes *ignoring* it a **compile error** — lifting ADR-0002's
-   fail-loud to its strongest surface (compile-time > runtime in the loudness
-   hierarchy P5 defers to). The **functional core is total** — pure arithmetic
-   over already-validated inputs, it neither throws nor returns `expected`; the
-   error surface lives entirely in the **imperative shell**, at its boundaries
-   (I/O, parsing, construction). A throwing **constructor** (which cannot return
-   a value) becomes a static factory: `T::create(…) -> std::expected<T, Error>`
-   with a private `noexcept` ctor. *Check: does any function signal failure by
-   throwing rather than returning a `[[nodiscard]] std::expected`? Is the
-   boundary's error path in the return type and forced on the caller? Is the
-   core total (throw-free)?* The one thing `std::expected` does **not** absorb:
+5. **Absence and failure are BOTH typed return values — `optional` for the
+   legitimately-absent, `expected` for the fallible — never a sentinel or a
+   nullable pointer.** A result that may be **legitimately absent** is a
+   `[[nodiscard]] std::optional<T>` returned by value; a result that may
+   **fail** is a `[[nodiscard]] std::expected<T, Error>` returned by value. The
+   distinction is drawn precisely and is **not interchangeable**: `optional` =
+   "there might be nothing, and that *is* a valid, expected outcome the caller
+   chooses what to do with" (a CLI flag the user did not pass, a lookup with no
+   match — no error has occurred); `expected` = "it might **fail**, and the
+   caller must handle a named `Error`" (a malformed payload, an unreachable
+   redis — something went wrong). Choosing `optional` where the absence is
+   actually a failure throws away the diagnosis; choosing `expected` where the
+   absence is routine fabricates an error category. What is forbidden in **both**
+   cases is the same: a **nullable raw pointer** (`const char*` that may be
+   `nullptr`) or any **sentinel** (`nullptr`, `-1`, `""`, an empty-but-valid
+   value standing for "not found"). A nullable raw pointer is the **worst of
+   both** — the absence is invisible in the type (a `T*` return declares nothing
+   about whether `nullptr` is a sanctioned value) so a missed check is
+   **undefined behavior**, *and* if the absence was really a failure the error
+   carries no diagnosis. This is **ADR-0002's sentinel-instead-of-raise red flag
+   in the C++ register** — a nullable pointer or magic return is the C++
+   sentinel ADR-0002 names — lifted from convention to **compile-enforcement**:
+   `[[nodiscard]]` on the `optional`/`expected` return makes *ignoring* the
+   absence-or-error a **compile error** (compile-time > runtime in the loudness
+   hierarchy P5 defers to), where a nullable pointer's missed check compiles
+   silently. (And — composing with **P8** — a `T*` return that may be `nullptr`
+   is a **dishonest contract**: the type does not carry the nullability the body
+   relies on, the call-boundary lie P8 forbids, here in the compiled register.)
+
+   **Failure, specifically, is never an exception either.** Where the result is
+   the `expected` kind, a fallible computation reports failure as that **typed
+   value** — never by throwing. An exception is the purest untyped effect: a
+   control-flow escape that appears **nowhere in the signature**, that the
+   caller is not forced to handle, and that makes the function no longer a total
+   value-function of its inputs (the rule-2/rule-3 violation in the one register
+   the other four do not cover) — the **control-flow** twin of the nullable
+   pointer's **value** sentinel, both of them absences/failures the signature
+   hides. `std::expected` makes the error path a **declared part of the return
+   type**, and `[[nodiscard]]` makes *ignoring* it a **compile error** — lifting
+   ADR-0002's fail-loud to its strongest surface. The **functional core is
+   total** — pure arithmetic over already-validated inputs, it neither throws
+   nor returns `expected`; the error surface lives entirely in the **imperative
+   shell**, at its boundaries (I/O, parsing, construction). A throwing
+   **constructor** (which cannot return a value) becomes a static factory:
+   `T::create(…) -> std::expected<T, Error>` with a private `noexcept` ctor.
+   *Check: does any function signal an absent result with a sentinel / nullable
+   pointer instead of a `[[nodiscard]] std::optional<T>`, or a failure by
+   throwing (or by a sentinel) instead of returning a `[[nodiscard]]
+   std::expected<T, Error>`? Is the absent-or-error path in the return type and
+   forced on the caller? Is the core total (throw-free)?* The one thing
+   `std::expected` does **not** absorb:
    a genuine **invariant violation** — a state the code's own logic guarantees
    impossible, i.e. a bug — is an `assert`/contract abort, not an `expected`;
    `expected` is reserved for the *recoverable, expected* boundary conditions
@@ -578,6 +622,56 @@ produced, a missing redis key an operator can be told about) — they are
 caller passed an `in_dim_`/`hidden_` the constructor already reconciled would be
 the other category — an **invariant violation**, a bug, an `assert`/abort — and
 it never becomes an `expected`.
+
+**Worked example (the optionality axis, rules 1 & 5).** The CLI helper in
+`cpp/src/main.cpp` is the live **untyped-optional** instance:
+
+```cpp
+const char* opt(int argc, char** argv, const char* name) {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], name) == 0) return argv[i + 1];
+    return nullptr;                  // "not found" as a nullable raw pointer
+}
+```
+
+It parses `--instance`, `--phase`, `--lam`, etc., and returns `nullptr` when
+the flag is absent — and absence here **is a legitimate, expected outcome** (an
+optional flag the user simply did not pass), not a failure. So this is exactly
+the absence rule 5 names, encoded the forbidden way: an **untyped optional** (a
+nullable `const char*` whose absence is invisible in the type — a caller that
+forgets the null-check dereferences `nullptr`, undefined behavior the type never
+warned against) that is **also** a raw-pointer in *and* out (rule 1: raw `char**`
+input, raw `const char*` output). It is the C++ sentinel ADR-0002 names, and a
+P8 dishonest contract (the type does not carry the nullability the callers
+rely on). The **compliant form** makes the absence typed and the pointers views:
+
+```cpp
+[[nodiscard]] std::optional<std::string_view>
+opt(std::span<const std::string_view> args, std::string_view name);
+```
+
+— `std::optional` (not `expected`: a missing flag is routine absence, not an
+error) carries the "might be nothing" in the return type, `[[nodiscard]]` makes
+ignoring it a compile error, and `std::string_view` replaces the raw pointers in
+and out. The **imperative shell** does the one untyped→typed translation at the
+boundary, building the typed view once in `main`:
+
+```cpp
+std::vector<std::string_view> args{argv, argv + argc};   // the ACL, once
+```
+
+This is the boundary acting as the **Port/ACL** (P2) that translates the untyped
+`argv` the OS hands it into typed values the core consumes — **not an excuse to
+keep the raw pointers** flowing inward. The single `argv`→`string_view` decode
+is the sanctioned translate-at-the-edge; every signature downstream of it is
+typed. (This `opt` helper predates P9 and is **retrofitted on touch** — it falls
+in `#28`'s scope — per the no-retroactive-sweep scoping, not swept for its own
+sake.) The reflex to wave this off as "it's just CLI parsing, the absence is
+obvious" is **the exact rationalization this tenet rejects**: a nullable
+`const char*` is an untyped optional whether it parses argv or a redis payload,
+the missed null-check is the same undefined behavior, and "it's just X" is the
+scale/minimality tell P7/P8 already named — the discipline declined "just this
+once at the edge" is precisely how the cancers grew.
 
 **Cancer prevented: untestable, uncomposable black-box mutations.** A
 `void`-returning, raw-pointer-taking, out-parameter-writing function in a
@@ -902,11 +996,15 @@ prose.
   than an untyped-effectful void — at zero performance cost (zero-cost
   abstractions: a `std::span` is a pointer+length, return-by-value is free under
   (N)RVO), with the one hot-path buffer-reuse exception declared as a typed
-  `Workspace` parameter rather than hidden. Failure, too, is a **typed return
-  value** (`[[nodiscard]] std::expected<T, Error>`), not an untyped thrown
-  escape — so the error path is declared in the return type, ignoring it is a
-  **compile error** (ADR-0002 fail-loud at its strongest surface), and the core
-  stays total while the error surface lives at the shell's boundaries.
+  `Workspace` parameter rather than hidden. Absence and failure, too, are
+  **typed return values** — a legitimately-absent result a `[[nodiscard]]
+  std::optional<T>`, a failure a `[[nodiscard]] std::expected<T, Error>`, never
+  a nullable pointer or sentinel whose absence is invisible in the type (the C++
+  form of ADR-0002's sentinel red flag, a P8 dishonest contract) and never an
+  untyped thrown escape — so the absence/error path is declared in the return
+  type, ignoring it is a **compile error** (ADR-0002 fail-loud at its strongest
+  surface), and the core stays total while that surface lives at the shell's
+  boundaries.
 
 ### Negative
 
