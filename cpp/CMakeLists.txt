@@ -21,6 +21,10 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# Threads (pthread): the SearchRuntime's PoolRuntime spawns std::thread workers (src/search_runtime.cpp
+# is in chocofarm_core), so the core links Threads::Threads PUBLIC and every consumer gets it.
+find_package(Threads REQUIRED)
+
 include(FetchContent)
 
 # ---- nlohmann/json (vendored via FetchContent — the build is self-contained) ----
@@ -106,10 +110,11 @@ add_library(chocofarm_core
   src/nmcs.cpp
   src/ismcts.cpp
   src/gumbel.cpp
+  src/search_runtime.cpp
   src/runner.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chocofarm_core PUBLIC nlohmann_json::nlohmann_json ${HIREDIS_LINK} ${ZMQ_LINK})
+target_link_libraries(chocofarm_core PUBLIC nlohmann_json::nlohmann_json ${HIREDIS_LINK} ${ZMQ_LINK} Threads::Threads)
 target_compile_options(chocofarm_core PRIVATE -Wall -Wextra)
 
 add_executable(chocofarm-cpp-runner src/main.cpp)
@@ -162,6 +167,65 @@ target_compile_options(chocofarm-ismcts-dump PRIVATE -Wall -Wextra)
 add_executable(chocofarm-gumbel-dump src/gumbel_dump.cpp)
 target_link_libraries(chocofarm-gumbel-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-gumbel-dump PRIVATE -Wall -Wextra)
+
+# The SearchRuntime seam's self-contained SEAM-FAITHFULNESS check (NOT the runner): runs SerialRuntime
+# over a batch of independent tasks against a deterministic, stateless, in-process net, and asserts each
+# task's executed action matches a direct GumbelAZPolicy::decide with the same seed — proving the seam
+# does not perturb the search (docs/design/cpp-search-runtime.md §7.1). No redis, no weights, no stdin.
+# Separate from the runner (P3, one-owner).
+add_executable(chocofarm-serial-runtime-check src/serial_runtime_check.cpp)
+target_link_libraries(chocofarm-serial-runtime-check PRIVATE chocofarm_core)
+target_compile_options(chocofarm-serial-runtime-check PRIVATE -Wall -Wextra)
+
+# The SearchRuntime throughput benchmark (NOT the runner): SerialRuntime vs PoolRuntime over a batch of
+# independent Gumbel-AZ decisions against a local deterministic net, asserting bit-identical per-task
+# results then reporting decisions/s + the parallel speedup (the C++-native-MLP / local-parallel config).
+# Threads, so link Threads::Threads. Separate from the runner (P3, one-owner).
+add_executable(chocofarm-search-runtime-bench src/search_runtime_bench.cpp)
+target_link_libraries(chocofarm-search-runtime-bench PRIVATE chocofarm_core Threads::Threads)
+target_compile_options(chocofarm-search-runtime-bench PRIVATE -Wall -Wextra)
+
+# The over-the-wire SYNCHRONOUS benchmark (NOT the runner): SerialRuntime with a remote ZmqNetClient
+# leaf against the running Python InferenceServer (spun by cpp/parity/wire_bench.py), measuring the
+# wire RTT + server-forward cost per leaf. The wire-PARALLEL axis (fiber + DEALER pool) is a later chunk.
+add_executable(chocofarm-wire-bench src/wire_bench.cpp)
+target_link_libraries(chocofarm-wire-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-wire-bench PRIVATE -Wall -Wextra)
+
+# boost.context — the Option-A fiber mechanism (docs/notes/cpp-continuation-refactor-decision-2026-06-16.md).
+# The resumable-search prototype runs the UNCHANGED run_search inside a stackful fiber. Located via
+# find_package(Boost) with a find_library fallback (boost ships no pkg-config; the lib is libboost_context).
+find_package(Boost QUIET COMPONENTS context)
+if(Boost_FOUND)
+  set(BOOST_CONTEXT_LINK Boost::context)
+else()
+  find_library(BOOST_CONTEXT_LIBRARY boost_context REQUIRED)
+  find_path(BOOST_CONTEXT_INCLUDE boost/context/fiber.hpp REQUIRED)
+  add_library(boost_context_manual INTERFACE)
+  target_include_directories(boost_context_manual INTERFACE ${BOOST_CONTEXT_INCLUDE})
+  target_link_libraries(boost_context_manual INTERFACE ${BOOST_CONTEXT_LIBRARY})
+  set(BOOST_CONTEXT_LINK boost_context_manual)
+endif()
+
+# The Option-A foundation proof (NOT the runner): run the unchanged run_search inside a boost.context
+# fiber with a YieldingNetEvaluator, and assert fiber-driven == direct (the §7.1 validity precondition,
+# near-trivial under A). Separate from the runner (P3, one-owner).
+add_executable(chocofarm-fiber-proto src/fiber_proto.cpp)
+target_link_libraries(chocofarm-fiber-proto PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
+target_compile_options(chocofarm-fiber-proto PRIVATE -Wall -Wextra)
+
+# The non-blocking DEALER transport probe (NOT the runner): submits N concurrent requests to the ROUTER
+# server and recvs N replies, proving the DEALER<->ROUTER framing + the server's greedy-drain batching
+# (the wire-parallel leaf-rendezvous foundation). Reuses the shared inference_wire codec (P7).
+add_executable(chocofarm-dealer-probe src/dealer_probe.cpp)
+target_link_libraries(chocofarm-dealer-probe PRIVATE chocofarm_core)
+target_compile_options(chocofarm-dealer-probe PRIVATE -Wall -Wextra)
+
+# The over-the-wire PARALLEL benchmark (NOT the runner): K tree-fibers on one thread, batch-submitting
+# parked leaves over the DEALER so the server batches them — the third §6-Q5 axis. boost.context + libzmq.
+add_executable(chocofarm-wire-parallel-bench src/wire_parallel_bench.cpp)
+target_link_libraries(chocofarm-wire-parallel-bench PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
+target_compile_options(chocofarm-wire-parallel-bench PRIVATE -Wall -Wextra)
 
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned

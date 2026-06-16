@@ -79,6 +79,13 @@ ISMCTS_PARITY = os.path.join(REPO, "cpp", "parity", "ismcts_parity.py")
 GUMBEL_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-gumbel-dump")
 GUMBEL_LOGIC = os.path.join(REPO, "cpp", "parity", "gumbel_logic.py")
 GUMBEL_PRECISION = os.path.join(REPO, "cpp", "parity", "gumbel_precision.py")
+SERIAL_CHECK_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-serial-runtime-check")
+BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-search-runtime-bench")
+WIRE_BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-wire-bench")
+WIRE_BENCH = os.path.join(REPO, "cpp", "parity", "wire_bench.py")
+FIBER_PROTO_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-fiber-proto")
+DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
+DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
 # OPT-IN gate. The binary-dependent cpp parity tests run only with CHOCO_RUN_CPP=1 (and a freshly
 # built binary). They are slow integration checks driven by a MANUALLY-built C++ binary: a stale
@@ -321,4 +328,68 @@ def test_cpp_ismcts_aggregate_parity():
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=1200)
     assert out.returncode == 0, f"ISMCTS aggregate parity FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(SERIAL_CHECK_BIN)), reason=_CPP_SKIP)
+def test_cpp_serial_runtime_seam_faithful():
+    """The SearchRuntime SEAM-FAITHFULNESS check (cpp/src/serial_runtime_check.cpp): SerialRuntime.run
+    over a batch of independent tasks produces, for each task, the SAME executed action as a direct
+    GumbelAZPolicy::decide with the same RNG seed — proving the runtime seam does NOT perturb the search
+    (the work-stealing pool's parity precondition, docs/design/cpp-search-runtime.md §7.1). The leaf is a
+    DETERMINISTIC, STATELESS, in-process net (no redis, no weights, no RNG), so the check is fully
+    reproducible. A C++-INTERNAL self-check (NOT a cross-language parity): the binary asserts and exits
+    0/nonzero; the gate is exit 0 + 'PASS' in stdout."""
+    out = subprocess.run([SERIAL_CHECK_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
+                         cwd=REPO, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, f"SerialRuntime seam check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(BENCH_BIN)), reason=_CPP_SKIP)
+def test_cpp_pool_runtime_matches_serial():
+    """PoolRuntime (the local task-parallel runtime) produces BIT-IDENTICAL per-task results to
+    SerialRuntime — same executed action AND leaf-request count for every task — because the trees are
+    independent and deterministic (seeded), so the parallelism is EXACT, not merely aggregate-equivalent
+    (docs/design/cpp-search-runtime.md: the C++-native-MLP / local-parallel config). The benchmark binary
+    asserts this before timing and exits nonzero on any mismatch; here we run a small/fast config and gate
+    on exit 0 + 'RESULT: PASS' (this is the pool's correctness regression guard — the throughput numbers
+    it also prints are not asserted, only the bit-identity)."""
+    out = subprocess.run([BENCH_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES,
+                          "--tasks", "6", "--n-sims", "8", "--max-depth", "4", "--workers", "4",
+                          "--reps", "1"],
+                         cwd=REPO, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, f"PoolRuntime vs SerialRuntime check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(WIRE_BENCH_BIN)), reason=_CPP_SKIP)
+def test_cpp_wire_benchmark():
+    """The over-the-wire benchmark, BOTH axes (cpp/parity/wire_bench.py): spin the Python InferenceServer
+    in-process (StaticParamsSource, a dimension-matched ValueMLP — NO redis) and run, against that one
+    server, (a) the SYNCHRONOUS bench (SerialRuntime + a blocking ZmqNetClient leaf — one in-flight at a
+    time) and (b) the PARALLEL bench (K boost.context tree-fibers batch-submitting parked leaves over a
+    DEALER so the server batches them) — the §6-Q5 sync-vs-parallel comparison. The driver SKIPS (returns
+    0) if pyzmq / a binary is absent; here we gate on exit 0 (PASS or SKIP), not a throughput threshold
+    (wall time is hardware-dependent; this guard pins that BOTH wire paths RUN end to end)."""
+    out = subprocess.run([sys.executable, WIRE_BENCH], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"wire-sync benchmark FAILED:\n{out.stdout}\n{out.stderr}"
+    assert ("RESULT: PASS" in out.stdout) or ("RESULT: SKIP" in out.stdout), out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(FIBER_PROTO_BIN)), reason=_CPP_SKIP)
+def test_cpp_fiber_proto_matches_direct():
+    """Option A foundation proof (cpp/src/fiber_proto.cpp): the UNCHANGED GumbelAZPolicy::run_search,
+    driven inside a boost.context stackful fiber with a YieldingNetEvaluator that yields at each leaf,
+    produces a BIT-IDENTICAL result (executed action, improved-pi argmax, n_spent) to a direct synchronous
+    run_search fed the same scripted leaves + RNG. This is the resumable-search mechanism the wire-parallel
+    work-stealing pool needs, established WITHOUT touching the 1a/1b-validated search (the fiber preserves
+    fidelity by construction — only WHEN predict returns changes, not WHAT). Gate on exit 0 + 'RESULT:
+    PASS'."""
+    out = subprocess.run([FIBER_PROTO_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES,
+                          "--n-sims", "24", "--max-depth", "8"],
+                         cwd=REPO, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, f"fiber prototype FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
