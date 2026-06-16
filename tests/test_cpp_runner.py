@@ -574,3 +574,40 @@ def test_cpp_serve_online_reconfiguration():
     finally:
         t.close()
         conn.close()
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(CPP_BIN)), reason=_CPP_SKIP)
+def test_cpp_actor_executor_drives_persistent_runner():
+    """CppActorExecutor (the exit_loop generation executor) drives the persistent --serve runner over the
+    ActorTransport end-to-end: a generate produces real (X,PI,M,Y) records, and a SECOND generate with a
+    changed hot_search (n_sims 8->16) live-reconfigures the SAME runner (no respawn) and still produces
+    records. This is the exit_loop-facing proof of the transport switch — the generate/evaluate/close
+    contract is unchanged, so the loop is oblivious to it."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    from chocofarm.az.cpp_executor import CppActorExecutor
+    from chocofarm.az.features import feature_dim
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.model.env import Environment
+
+    env = Environment()
+    in_dim, n_slots = feature_dim(env), n_action_slots(env)
+    net = ValueMLP(in_dim, hidden=32, n_actions=n_slots, seed=0)
+    net.set_value_scale(0.0, 1.0)
+    ex = CppActorExecutor(CPP_BIN, DATA_INSTANCE, DATA_FACES, env, base_seed=7, use_jax_mlp=False,
+                          in_dim=in_dim, n_slots=n_slots)
+    try:
+        hs = dict(m=4, n_sims=8, c_puct=1.25, c_visit=50.0, c_scale=1.0, c_outcome=2, max_depth=24)
+        recs0 = ex.generate(net, 0, [0] * 6, 0.0855, 0, 1.0, None, hot_search=hs, max_steps=12)
+        assert len(recs0) > 0, "the persistent runner produced no transitions"
+        # the SAME runner live-reconfigures (n_sims 8->16, no respawn) and generates again at a new version.
+        recs1 = ex.generate(net, 1, [0] * 6, 0.0855, 0, 1.0, None,
+                            hot_search=dict(hs, n_sims=16), max_steps=12)
+        assert len(recs1) > 0
+        # each record is the (feat, pi, mask, g) shape exit_loop consumes.
+        feat, pi, mask, g = recs0[0]
+        assert feat.shape == (in_dim,)
+        assert pi.shape == (n_slots,) and mask.shape == (n_slots,)
+        assert isinstance(g, float)
+    finally:
+        ex.close()

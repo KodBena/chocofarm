@@ -13,6 +13,7 @@
 #include "chocofarm/serve.hpp"
 
 #include <cstdint>
+#include <exception>
 #include <istream>
 #include <memory>
 #include <optional>
@@ -90,9 +91,16 @@ json handle_configure(ServeState& st, const json& msg) {
         auto inst = load_instance(cfg->instance_path, cfg->faces_path);
         if (!inst)
             return err_reply(ctl::ERR_INVALID_CONFIG, "instance load failed: " + inst.error().message);
-        st.inst = std::make_unique<Instance>(std::move(*inst));
-        st.env = std::make_unique<Environment>(*st.inst);
-        st.fb = std::make_unique<FeatureBuilder>(*st.env);
+        try {
+            st.inst = std::make_unique<Instance>(std::move(*inst));
+            st.env = std::make_unique<Environment>(*st.inst);
+            st.fb = std::make_unique<FeatureBuilder>(*st.env);
+        } catch (const std::exception& e) {
+            // building the env/feature geometry is the one throw surface here (e.g. std::bad_alloc on the
+            // world-set / distance arrays); translate it to a typed reply, never an abort (P9 / ADR-0002).
+            st.inst.reset(); st.env.reset(); st.fb.reset();  // leave no half-built context (serving() stays false)
+            return err_reply(ctl::ERR_INVALID_CONFIG, std::string("env build raised: ") + e.what());
+        }
         st.instance_path = cfg->instance_path;
         st.faces_path = cfg->faces_path;
     } else if (cfg->instance_path != st.instance_path || cfg->faces_path != st.faces_path) {
@@ -139,46 +147,55 @@ json handle_generate(ServeState& st, RedisClient& redis, const json& msg) {
                          "config_epoch " + std::to_string(req_epoch) + " != live epoch " +
                          std::to_string(st.epoch));
 
-    // gate 2 — version (weight reload), INDEPENDENT of the epoch: reload the net only when version
-    // advances. The policy holds the OLD net by reference, so destroy it BEFORE replacing the net.
-    if (version != st.loaded_version) {
-        auto wp = redis.read_weights(st.run, "gen", version);
-        if (!wp)
-            return err_reply(ctl::ERR_WEIGHT_READ, wp.error().message);
-        auto nf = NetForward::create(*wp);
-        if (!nf)
-            return err_reply(ctl::ERR_WEIGHT_READ, "net build failed: " + nf.error().message);
-        st.policy.reset();
-        st.net.emplace(std::move(*nf));
-        st.loaded_version = version;
-        st.policy_built_for_epoch = -1;  // force a rebuild against the new net
+    // gate 2 + the compute, wrapped so a search-internal throw (e.g. std::bad_alloc from the unbounded
+    // _Node arena) becomes a typed ERR_GENERATE_FAILED reply, NOT a process abort — the throw-free-loop
+    // contract: a failed generate is a REPLY, not a std::terminate (ADR-0002 / P9). run_episodes's OWN
+    // boundary failures (a missing weight payload, a failed redis write) are already typed std::expected
+    // returns; this catch additionally covers the recoverable exhaustion surface the search can raise.
+    try {
+        // gate 2 — version (weight reload), INDEPENDENT of the epoch: reload the net only when version
+        // advances. The policy holds the OLD net by reference, so destroy it BEFORE replacing the net.
+        if (version != st.loaded_version) {
+            auto wp = redis.read_weights(st.run, "gen", version);
+            if (!wp)
+                return err_reply(ctl::ERR_WEIGHT_READ, wp.error().message);
+            auto nf = NetForward::create(*wp);
+            if (!nf)
+                return err_reply(ctl::ERR_WEIGHT_READ, "net build failed: " + nf.error().message);
+            st.policy.reset();
+            st.net.emplace(std::move(*nf));
+            st.loaded_version = version;
+            st.policy_built_for_epoch = -1;  // force a rebuild against the new net
+        }
+
+        // (re)build the policy if the net reloaded or the HOT config changed since the last build.
+        if (st.policy == nullptr || st.policy_built_for_epoch != st.epoch) {
+            st.policy = std::make_unique<GumbelAZPolicy>(st.gc, *st.net, *st.env);
+            st.policy_built_for_epoch = st.epoch;
+        }
+
+        // replay via the SHARED episode loop (no second weight read — the net is already loaded; P1).
+        RunnerConfig rcfg;
+        rcfg.run = st.run;
+        rcfg.phase = "gen";  // the C++ actor only generates; eval stays in-process Python (ADR-0008)
+        rcfg.version = version;
+        rcfg.episodes = episodes;
+        rcfg.lam = lam;
+        rcfg.max_steps = max_steps;
+        rcfg.seed = seed;
+        rcfg.res_token = res_token;
+        auto written = run_episodes(*st.env, *st.fb, *st.policy, redis, rcfg, nullptr);
+        if (!written)
+            return err_reply(ctl::ERR_GENERATE_FAILED, written.error().message);
+
+        json j = ok_reply();
+        j[key(ctl::KEY_WRITTEN)] = *written;
+        j[key(ctl::KEY_CONFIG_EPOCH)] = st.epoch;     // echo — the client asserts the round-trip matched
+        j[key(ctl::KEY_VERSION)] = version;
+        return j;
+    } catch (const std::exception& e) {
+        return err_reply(ctl::ERR_GENERATE_FAILED, std::string("generate raised: ") + e.what());
     }
-
-    // (re)build the policy if the net reloaded or the HOT config changed since the last build.
-    if (st.policy == nullptr || st.policy_built_for_epoch != st.epoch) {
-        st.policy = std::make_unique<GumbelAZPolicy>(st.gc, *st.net, *st.env);
-        st.policy_built_for_epoch = st.epoch;
-    }
-
-    // replay via the SHARED episode loop (no second weight read — the net is already loaded; P1).
-    RunnerConfig rcfg;
-    rcfg.run = st.run;
-    rcfg.phase = "gen";  // the C++ actor only generates; eval stays in-process Python (ADR-0008)
-    rcfg.version = version;
-    rcfg.episodes = episodes;
-    rcfg.lam = lam;
-    rcfg.max_steps = max_steps;
-    rcfg.seed = seed;
-    rcfg.res_token = res_token;
-    auto written = run_episodes(*st.env, *st.fb, *st.policy, redis, rcfg, nullptr);
-    if (!written)
-        return err_reply(ctl::ERR_GENERATE_FAILED, written.error().message);
-
-    json j = ok_reply();
-    j[key(ctl::KEY_WRITTEN)] = *written;
-    j[key(ctl::KEY_CONFIG_EPOCH)] = st.epoch;     // echo — the client asserts the round-trip matched
-    j[key(ctl::KEY_VERSION)] = version;
-    return j;
 }
 
 json handle_ping(const ServeState& st) {

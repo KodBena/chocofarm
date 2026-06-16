@@ -68,6 +68,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WIRE_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "wire_spec.hpp")
 RESULT_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "result_spec.hpp")
 ACTOR_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "actor_config.hpp")
+ACTOR_CPP = os.path.join(REPO, "cpp", "src", "actor_config.cpp")
 CONTROL_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "control_spec.hpp")
 WEIGHTS_PY = os.path.join(REPO, "chocofarm", "az", "weights.py")
 TRANSPORT_CPP = os.path.join(REPO, "cpp", "src", "transport.cpp")
@@ -118,6 +119,13 @@ def _cpp_int_array(src: str, name: str) -> list[int]:
     if m is None:
         raise KeyError(f"C++ int-array {name!r} not found in the mirror header")
     return [int(x) for x in re.findall(r"-?\d+", m.group(1))]
+
+
+def _cpp_jat_keys(src: str) -> list[str]:
+    """Parse the `j.at("<key>")` field names a C++ nlohmann parse body reads — used to drift-check a
+    hand-written from_json's read set against the spec's field array, so the parse body cannot become a
+    third (un-netted) hand-author of the field set."""
+    return re.findall(r'\.at\(\s*"([^"]*)"\s*\)', src)
 
 
 # ===========================================================================
@@ -451,6 +459,27 @@ def test_drift_catch_actor_config_mut_flip_fails():
     bad = _perturb_cpp_str_array_first(src, "ACTOR_CONFIG_MUT", "hot")  # instance -> hot, a one-sided flip
     with pytest.raises(AssertionError):
         assert _cpp_str_array(bad, "ACTOR_CONFIG_MUT") == list(actor_config.MUT_CLASSES)
+
+
+def test_actor_config_from_json_reads_every_field():
+    """actor_config_from_json (cpp/src/actor_config.cpp) hand-types each `j.at("<field>")` parse key. Pin
+    that the keys it reads are EXACTLY the drift-netted field set (ACTOR_CONFIG_FIELDS / the Python
+    FIELD_NAMES) — without this leg the .cpp parse body is a THIRD hand-author of the field set OUTSIDE
+    the header drift leg: a future renamed/added knob could red the header leg yet leave a stale or absent
+    `j.at`, silently pinning the knob at its GumbelConfig struct default (the ADR-0002 silent-wrong the
+    drift net exists to backstop). This leg nets the parse keys too."""
+    keys = _cpp_jat_keys(_read(ACTOR_CPP))
+    assert sorted(keys) == sorted(actor_config.FIELD_NAMES), (sorted(keys), sorted(actor_config.FIELD_NAMES))
+
+
+def test_drift_catch_actor_config_cpp_missing_field_fails():
+    """NEGATIVE proof: dropping one field's `j.at` from the .cpp parse makes the agreement FAIL — so a
+    forgotten parse key on a future field-set change reds (the vacuity guard for the leg above)."""
+    src = _read(ACTOR_CPP)
+    bad = re.sub(r'\.at\(\s*"m"\s*\)', '.at("__removed__")', src, count=1)
+    assert bad != src, "the .cpp m-field perturbation changed nothing — the self-check is a no-op"
+    with pytest.raises(AssertionError):
+        assert sorted(_cpp_jat_keys(bad)) == sorted(actor_config.FIELD_NAMES)
 
 
 # ---- LEG 4 (cont.) — CONTROL-PROTOCOL vocabulary (the message-type + error-tag sets the client

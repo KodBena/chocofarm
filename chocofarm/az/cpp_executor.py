@@ -12,9 +12,11 @@ re-implemented a bare generate→train→publish loop) for the full ExIt run.
 
 Division of labour — the C++ actor owns GENERATION, exit_loop owns the rest (the env<->actor seam):
   * generate(): publishes the frozen net to redis (the SAME `az:w:<run>:<phase>:<version>` weight seam
-    the runner reads via `read_weights`/`NetForward`), subprocesses `chocofarm-cpp-runner --policy gumbel`
-    to play E episodes against those weights, and reads the four (X, PI, M, Y) float32 result blocks back
-    into exit_loop's flat `list[_Record]`. The value target is the actor's own pure-MC λ-return.
+    the runner reads via `read_weights`/`NetForward`), drives a PERSISTENT `chocofarm-cpp-runner --serve`
+    over the ActorTransport (a `configure` when the live search knobs changed — m/n_sims/c_* are HOT, so a
+    retune lands WITHOUT a respawn — then a `generate` control message) to play E episodes against those
+    weights, and reads the four (X, PI, M, Y) float32 result blocks back into exit_loop's flat
+    `list[_Record]`. The value target is the actor's own pure-MC λ-return.
   * evaluate(): runs exit_loop's OWN greedy `GumbelPolicy` eval on the trained net IN-PROCESS (Python).
     The eval measures the net's greedy rate — a language-agnostic quantity — and "swap into GENERATION"
     leaves eval to the loop. No subprocess, no redis: a pure-Python search over the passed net.
@@ -43,14 +45,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import re
-import subprocess
-import sys
 import uuid
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from chocofarm.az.actor_config import ActorConfig
+from chocofarm.az.actor_transport import GenerateRequest, SubprocessActorTransport
 from chocofarm.az.result_spec import RESULT_DTYPE
 from chocofarm.az.transport import RedisTransport, connect, result_keys
 
@@ -59,18 +60,12 @@ if TYPE_CHECKING:
     from chocofarm.az.transport import _Record
     from chocofarm.model.env import Environment
 
-# the hot-search knobs the runner accepts as --gumbel-<knob> (ints m/n_sims/c_outcome/max_depth;
-# floats c_*). Threaded verbatim from exit_loop's per-iteration `hot_search` dict so a live retune —
-# including the now-HOT search budget m/n_sims (the SH bracket is recomputed per decide) — lands on
-# the actor. "n_sims".replace('_','-') == "n-sims", so the loop emits --gumbel-n-sims correctly.
-_RUNNER_HOT_KNOBS = ("m", "n_sims", "c_puct", "c_visit", "c_scale", "c_outcome", "max_depth")
-
-
 class CppActorExecutor:
-    """An exit_loop executor whose GENERATION is the C++ Gumbel actor (a subprocess of
-    `chocofarm-cpp-runner --policy gumbel`) and whose EVALUATION is exit_loop's own in-process Python
+    """An exit_loop executor whose GENERATION is the C++ Gumbel actor — a PERSISTENT
+    `chocofarm-cpp-runner --serve` driven over the ActorTransport (online-reconfigured when the live HOT
+    search knobs change, no respawn) — and whose EVALUATION is exit_loop's own in-process Python
     `GumbelPolicy`. A drop-in for `ParallelExecutor`: the same generate/evaluate/close surface, so
-    `exit_loop.run` is oblivious to which actor produced the transitions."""
+    `exit_loop.run` is oblivious both to which actor produced the transitions and to the transport."""
 
     def __init__(self, runner_path: str, instance: str, faces: str, env: "Environment",
                  base_seed: int, use_jax_mlp: bool, in_dim: int, n_slots: int,
@@ -80,8 +75,9 @@ class CppActorExecutor:
         self.faces = faces
         self.env = env
         self.base_seed = int(base_seed)
-        # m/n_sims are HOT (they ride the per-iteration hot_search into generate/evaluate as
-        # --gumbel-m / --gumbel-n-sims), so they are not frozen ctor state. use_jax_mlp is RESTART.
+        # m/n_sims are HOT (they ride the per-iteration hot_search into the ActorConfig the `configure`
+        # control message carries — see _actor_config / reconfigure), so they are not frozen ctor state.
+        # use_jax_mlp is RESTART (a Python-side forward selector the C++ actor never consumes).
         self.use_jax_mlp = bool(use_jax_mlp)
         self.in_dim = int(in_dim)
         self.n_slots = int(n_slots)
@@ -94,15 +90,24 @@ class CppActorExecutor:
         # construction), the same connection discipline ParallelExecutor uses — not a bare redis.Redis.
         self._conn = connect()
         self.transport = RedisTransport(self._conn)
+        # the persistent C++ actor (the ActorTransport, actor_transport.py): spawned LAZILY on the first
+        # generate (AFTER the fail-loud guards pass), so constructing the executor — and exercising those
+        # guards — needs no built binary. Held across generations so a HOT reconfigure (m/n_sims/c_*)
+        # rebuilds the runner's policy without a respawn. `_cur_config`/`_cur_epoch` track the live config
+        # and the runner-assigned epoch, so `configure` is sent only when the projected ActorConfig changes.
+        self._actor: SubprocessActorTransport | None = None
+        self._cur_config: ActorConfig | None = None
+        self._cur_epoch: int = 0
 
     def generate(self, net: "ValueMLP", version: int, worlds: list[int], lam: float,
                  explore_plies: int, lam_blend: float, n_step: int | None,
                  hot_search: dict[str, Any] | None = None,
                  max_steps: int = 40) -> list["_Record"]:
-        """Publish `net` at `("gen", version)`, subprocess the C++ Gumbel actor to play `len(worlds)`
-        episodes against it, and read the (X, PI, M, Y) blocks back as a flat `list[_Record]`. The C++
-        runner draws its OWN per-episode worlds (seeded from `base_seed + version`), so `worlds` is used
-        only for its COUNT — the actor's reproducibility rides its seed, not the parent's world list."""
+        """Publish `net` at `("gen", version)`, drive the persistent C++ Gumbel actor (configure-on-change
+        + a generate control message) to play `len(worlds)` episodes against it, and read the (X, PI, M, Y)
+        blocks back as a flat `list[_Record]`. The C++ runner draws its OWN per-episode worlds (seeded from
+        `base_seed + version`), so `worlds` is used only for its COUNT — the actor's reproducibility rides
+        its seed, not the parent's world list."""
         # Part-B guard (ADR-0002): the runner emits the pure-MC λ-return only — refuse a blend it cannot
         # honor rather than silently training on the wrong target. (td_lambda is a schema-validated float
         # in [0,1], never None — so `< 1.0` is the whole blend region; cf. exit_loop.py's sibling checks.)
@@ -126,40 +131,65 @@ class CppActorExecutor:
         self.transport.publish_weights(net, "gen", version, self.run)
         tok = f"{self.run}-gen-{version}"
         n_eps = len(worlds)
-        cmd = [self.runner, "--instance", self.instance, "--faces", self.faces,
-               "--run", self.run, "--phase", "gen", "--version", str(version), "--res-token", tok,
-               "--episodes", str(n_eps), "--lam", str(lam), "--max-steps", str(max_steps),
-               "--seed", str(self.base_seed + version), "--policy", "gumbel"]
-        # m/n_sims/c_* are all HOT — emitted from the live hot_search bag (the runner's GumbelConfig
-        # defaults apply for any knob hot_search omits, e.g. a bare generate() in a unit test).
-        for knob in _RUNNER_HOT_KNOBS:
-            if knob in hs:
-                cmd += [f"--gumbel-{knob.replace('_', '-')}", str(hs[knob])]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.gen_timeout_s)
-        if proc.returncode != 0:   # a runner failure is loud (ADR-0002), never a silent empty buffer
-            sys.stderr.write(proc.stdout + proc.stderr)
-            raise RuntimeError(
-                f"CppActorExecutor: runner failed (rc={proc.returncode}) at gen version {version}")
+        # Drive the persistent runner over the ActorTransport. Adopt the live config FIRST: project
+        # hot_search + instance/faces into the ActorConfig and `configure` ONLY when it changed — the
+        # runner rebuilds its policy live on a HOT change (m/n_sims/c_*) without tearing down the env; an
+        # instance change is a loud reject. The runner assigns the config_epoch, carried back in the
+        # generate reply (the two-gate desync check, §2.2). The per-generation scalars (version/seed/lam/
+        # episodes/max_steps/res_token) ride the message; the version->seed derivation is the determinism
+        # anchor (§9), never sticky config, and the runner reloads weights when `version` advances.
+        actor = self._ensure_actor()
+        cfg = self._actor_config(hs)
+        if cfg != self._cur_config:
+            self._cur_epoch = actor.reconfigure(cfg)
+            self._cur_config = cfg
+        result = actor.generate(GenerateRequest(
+            config_epoch=self._cur_epoch, version=version, seed=self.base_seed + version, lam=lam,
+            episodes=n_eps, max_steps=max_steps, res_token=tok))
         records, n_found = self._read_records(tok, n_eps)
-        # Reconcile what we READ against what the runner reports it WROTE (`<prog>: wrote N episode(s)` on
-        # stderr, main.cpp). The transport redis is allkeys-lru, so a result blob can be evicted between
-        # the runner's write and the parent's read under memory pressure — which would otherwise silently
-        # shrink (or empty) the training buffer. ADR-0002: a non-empty-requested generation must never
-        # collapse to a smaller buffer without a loud failure (the Python pool gets this structurally via
-        # its meta channel; the C++ path has no meta, so reconcile against the reported count).
-        m = re.search(r"wrote (\d+) episode", proc.stderr)
-        if m is not None:
-            written = int(m.group(1))
-            if n_found != written:
-                raise RuntimeError(
-                    f"CppActorExecutor: read {n_found} non-empty episode block(s) but the runner reported "
-                    f"writing {written} at gen version {version} — result blob(s) went missing (LRU "
-                    "eviction under transport memory pressure?). Refusing to train on a silently-shrunk buffer.")
-        elif not records and n_eps > 0:   # couldn't parse the count; floor: a requested gen that read nothing is loud
+        # Reconcile what we READ against what the runner reports it WROTE (the structured `written` reply —
+        # the typed replacement for the old `wrote N episode` stderr scrape, always present now). The
+        # transport redis is LRU-evicting, so a result blob can be evicted between the runner's write and
+        # the parent's read under memory pressure; a non-empty-requested generation must never collapse to
+        # a smaller buffer without a loud failure (ADR-0002 — the same guard the Python pool gets via its
+        # structural meta channel).
+        if n_found != result.written:
             raise RuntimeError(
-                f"CppActorExecutor: read no episode blocks for {n_eps} requested episodes at gen version "
-                f"{version}, and could not parse the runner's written-count from its output to reconcile.")
+                f"CppActorExecutor: read {n_found} non-empty episode block(s) but the runner reported "
+                f"writing {result.written} at gen version {version} — result blob(s) went missing (LRU "
+                "eviction under transport memory pressure?). Refusing to train on a silently-shrunk buffer.")
         return records
+
+    def _ensure_actor(self) -> SubprocessActorTransport:
+        """Spawn the persistent C++ `--serve` runner on first use (LAZY — so constructing the executor
+        and firing the fail-loud guards above needs no built binary) and probe its readiness with a ping.
+        The spawn + ping are the loud-at-first-generate readiness check: a missing binary, or a runner
+        that died on startup (e.g. redis unreachable), raises a `ControlError` here, not a silent hang
+        (ADR-0002 / P5). The runner is held across generations (the no-respawn win)."""
+        if self._actor is None:
+            actor = SubprocessActorTransport(self.runner, recv_timeout_s=self.gen_timeout_s,
+                                             extra_args=("--run", self.run))
+            actor.ping()  # readiness: the runner spawned + speaks the protocol (serving=False pre-configure)
+            self._actor = actor
+        return self._actor
+
+    def _actor_config(self, hs: dict[str, Any]) -> ActorConfig:
+        """Project the live hot_search bag (the per-iteration HOT search knobs) + the runner's instance/
+        faces into the ActorConfig the `configure` message carries (the Port/ACL — the executor is the
+        boundary that projects the hp-derived knobs into the C++ actor's config). All 7 GumbelConfig knobs
+        must be present (exit_loop's hot_search provides them); a missing one is a loud failure, never a
+        silent default that would train under a different search than the operator set (ADR-0002)."""
+        try:
+            return ActorConfig(
+                instance_path=self.instance, faces_path=self.faces,
+                m=int(hs["m"]), n_sims=int(hs["n_sims"]), c_puct=float(hs["c_puct"]),
+                c_visit=float(hs["c_visit"]), c_scale=float(hs["c_scale"]),
+                c_outcome=int(hs["c_outcome"]), max_depth=int(hs["max_depth"]))
+        except KeyError as e:
+            raise RuntimeError(
+                f"CppActorExecutor: hot_search is missing the search knob {e} — the C++ actor's ActorConfig "
+                "needs all of m/n_sims/c_puct/c_visit/c_scale/c_outcome/max_depth (exit_loop's per-iteration "
+                "hot_search provides them; a partial bag cannot configure the runner).") from e
 
     def _read_records(self, tok: str, n_eps: int) -> tuple[list["_Record"], int]:
         """Read each episode's four float32 blocks (deriving n from the Y block length — the runner
@@ -175,8 +205,12 @@ class CppActorExecutor:
         for idx in range(n_eps):
             xk, pik, mk, yk = result_keys(tok, idx)
             xb, pib, mb, yb = conn.get(xk), conn.get(pik), conn.get(mk), conn.get(yk)
-            if yb is None or xb is None:
-                continue   # an empty episode (the runner wrote nothing) OR an evicted blob — reconciled by caller
+            if yb is None or xb is None or pib is None or mb is None:
+                # an empty episode (the runner wrote nothing) OR an evicted blob (any of the FOUR
+                # independent TTL'd keys can LRU-evict) — counted as not-found and reconciled by the
+                # caller's written-vs-n_found check. Guarding ALL four (not just X/Y) keeps that clean
+                # diagnostic instead of an opaque np.frombuffer(None) TypeError on an evicted PI/M (ADR-0002).
+                continue
             n = len(yb) // dt.itemsize
             if n == 0:
                 continue
@@ -214,6 +248,13 @@ class CppActorExecutor:
         return totR, totT, ets
 
     def close(self) -> None:
+        # reap the persistent actor (graceful shutdown then bounded SIGTERM/SIGKILL — actor_transport),
+        # THEN close redis. Both paths are best-effort + idempotent (close runs on every exit path).
+        if self._actor is not None:
+            try:
+                self._actor.close()
+            except Exception:
+                pass
         try:
             self._conn.close()
         except Exception:
