@@ -97,11 +97,15 @@ class EnvConfig:
 
 @dataclass
 class SearchConfig:
-    """chocofarm/az/gumbel_search.py — `m`/`n_sims`/`use_jax_mlp` bake into the constructed search
-    (RESTART); the `c_*`/`max_depth` knobs are read off `self` per selection (HOT)."""
+    """chocofarm/az/gumbel_search.py — `m`/`n_sims` and the `c_*`/`max_depth` knobs are ALL HOT: the
+    Sequential-Halving bracket is recomputed per `decide()` from `self.m`/`self.n_sims` (the
+    `_sequential_halving` `n_phases`/`per_phase` arithmetic), exactly as the `c_*` knobs are read off
+    `self` per selection — so all flow live through the per-iteration `hot_search` snapshot
+    (ADR-0012 P4: a value read per use is a live cell, never baked at construction). `use_jax_mlp` is
+    RESTART: it binds the forward fn at construction, and the parallel worker is numpy-only (R14)."""
 
-    m: int = hp(12, Mut.RESTART, "Gumbel root actions; sizes the SH bracket")
-    n_sims: int = hp(48, Mut.RESTART, "sim budget; baked into the SH phase loop")
+    m: int = hp(12, Mut.HOT, "Gumbel root actions; sizes the SH bracket (recomputed per decide → HOT)")
+    n_sims: int = hp(48, Mut.HOT, "sim budget; the SH phase loop is sized per decide → HOT")
     c_puct: float = hp(1.25, Mut.HOT, "PUCT exploration coeff (read per selection)")
     c_visit: float = hp(50.0, Mut.HOT, "Danihelka sigma additive const")
     c_scale: float = hp(1.0, Mut.HOT, "Danihelka sigma multiplicative scale")

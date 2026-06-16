@@ -59,9 +59,11 @@ if TYPE_CHECKING:
     from chocofarm.az.transport import _Record
     from chocofarm.model.env import Environment
 
-# the hot-search knobs the runner accepts as --gumbel-<knob> (floats c_*; ints c_outcome/max_depth).
-# threaded verbatim from exit_loop's per-iteration `hot_search` dict so a live retune lands on the actor.
-_RUNNER_HOT_KNOBS = ("c_puct", "c_visit", "c_scale", "c_outcome", "max_depth")
+# the hot-search knobs the runner accepts as --gumbel-<knob> (ints m/n_sims/c_outcome/max_depth;
+# floats c_*). Threaded verbatim from exit_loop's per-iteration `hot_search` dict so a live retune —
+# including the now-HOT search budget m/n_sims (the SH bracket is recomputed per decide) — lands on
+# the actor. "n_sims".replace('_','-') == "n-sims", so the loop emits --gumbel-n-sims correctly.
+_RUNNER_HOT_KNOBS = ("m", "n_sims", "c_puct", "c_visit", "c_scale", "c_outcome", "max_depth")
 
 
 class CppActorExecutor:
@@ -71,15 +73,15 @@ class CppActorExecutor:
     `exit_loop.run` is oblivious to which actor produced the transitions."""
 
     def __init__(self, runner_path: str, instance: str, faces: str, env: "Environment",
-                 base_seed: int, m: int, n_sims: int, use_jax_mlp: bool, in_dim: int, n_slots: int,
+                 base_seed: int, use_jax_mlp: bool, in_dim: int, n_slots: int,
                  gen_timeout_s: int = 3600) -> None:
         self.runner = runner_path
         self.instance = instance
         self.faces = faces
         self.env = env
         self.base_seed = int(base_seed)
-        self.m = int(m)
-        self.n_sims = int(n_sims)
+        # m/n_sims are HOT (they ride the per-iteration hot_search into generate/evaluate as
+        # --gumbel-m / --gumbel-n-sims), so they are not frozen ctor state. use_jax_mlp is RESTART.
         self.use_jax_mlp = bool(use_jax_mlp)
         self.in_dim = int(in_dim)
         self.n_slots = int(n_slots)
@@ -127,8 +129,9 @@ class CppActorExecutor:
         cmd = [self.runner, "--instance", self.instance, "--faces", self.faces,
                "--run", self.run, "--phase", "gen", "--version", str(version), "--res-token", tok,
                "--episodes", str(n_eps), "--lam", str(lam), "--max-steps", str(max_steps),
-               "--seed", str(self.base_seed + version), "--policy", "gumbel",
-               "--gumbel-m", str(self.m), "--gumbel-n-sims", str(self.n_sims)]
+               "--seed", str(self.base_seed + version), "--policy", "gumbel"]
+        # m/n_sims/c_* are all HOT — emitted from the live hot_search bag (the runner's GumbelConfig
+        # defaults apply for any knob hot_search omits, e.g. a bare generate() in a unit test).
         for knob in _RUNNER_HOT_KNOBS:
             if knob in hs:
                 cmd += [f"--gumbel-{knob.replace('_', '-')}", str(hs[knob])]
@@ -199,8 +202,7 @@ class CppActorExecutor:
         HOT eval_seed; the serial path is the one that tracks eval_seed exactly.)"""
         from chocofarm.az.gumbel_search import GumbelPolicy
         hs = dict(hot_search) if hot_search else {}
-        pol = GumbelPolicy(net, self.env, m=self.m, n_sims=self.n_sims,
-                           use_jax_mlp=self.use_jax_mlp, **hs)
+        pol = GumbelPolicy(net, self.env, use_jax_mlp=self.use_jax_mlp, **hs)
         rng = np.random.default_rng(self._eval_seed)
         totR = totT = 0.0
         ets: list[float] = []

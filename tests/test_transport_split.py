@@ -86,7 +86,7 @@ def test_task_rng_fold_is_byte_for_byte_preserved():
     the `_W` module global); the BODY is byte-for-byte the pre-promotion fold."""
     # build a Worker WITHOUT _worker_init (no env/redis/numba): only the seed fold is under test, and
     # __init__'s numpy-only guard passes in this jax-free test process.
-    wk = W.Worker(env=None, fb=None, redis=None, base_seed=4242, m=None, n_sims=None)
+    wk = W.Worker(env=None, fb=None, redis=None, base_seed=4242)
 
     def reference(version, kind, idx):
         kind_tag = {"gen": 1_000_003, "eval": 7_000_037}[kind]
@@ -115,7 +115,7 @@ def test_phase_does_not_enter_the_rng_fold():
     assert "phase" not in rng_params, rng_params
     # and operationally: the gen fold for (version, idx) is unchanged whether or not an eval phase
     # ever published — the fold has no phase input to perturb it.
-    wk = W.Worker(env=None, fb=None, redis=None, base_seed=99, m=None, n_sims=None)
+    wk = W.Worker(env=None, fb=None, redis=None, base_seed=99)
     a = wk.task_rng(5, "gen", 2).integers(0, 2 ** 31, size=4).tolist()
     b = wk.task_rng(5, "gen", 2).integers(0, 2 ** 31, size=4).tolist()
     assert a == b

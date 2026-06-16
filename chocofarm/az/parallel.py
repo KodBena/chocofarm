@@ -108,13 +108,15 @@ class ParallelExecutor:
     redis key strings and no pool internals — only the per-iteration choreography (publish → fan-out →
     gather) and the public surface the loop depends on."""
 
-    def __init__(self, n_workers: int, cores: list[int] | None, base_seed: int, m: int,
-                 n_sims: int) -> None:
+    def __init__(self, n_workers: int, cores: list[int] | None, base_seed: int) -> None:
         self.n_workers = int(n_workers)
         self.cores = list(cores)[:self.n_workers] if cores else list(range(self.n_workers))
         self.run = uuid.uuid4().hex[:12]            # namespace this run's redis keys
         self.transport = transport.RedisTransport(_connect())   # parent connection (publish + read)
-        self.pool = worker_pool.WorkerPool(self.n_workers, self.cores, base_seed, m, n_sims)
+        # The search budget m/n_sims is HOT now (it rides the per-iteration hot_search into each
+        # generate/evaluate task), so it is no longer a pool-construction arg — the worker applies it
+        # on the (phase, version) search rebuild exactly as it does the c_* knobs.
+        self.pool = worker_pool.WorkerPool(self.n_workers, self.cores, base_seed)
 
     @property
     def r(self) -> Any:

@@ -207,8 +207,9 @@ def test_every_leaf_has_a_facet():
 def test_known_facet_split():
     """Spot-check the design §4 facet reading: lr/l2/betas/eps are ALL HOT (audit item M — the
     Optimizer owns the inject_hyperparams transform; lr/betas/eps are set per step from the live
-    AdamHParams, l2 is a traced loss arg), alpha is HOT (traced call-arg), the net shape / search
-    bracket / master seed stay RESTART, the env constants are INSTANCE."""
+    AdamHParams, l2 is a traced loss arg), alpha is HOT (traced call-arg), the search BUDGET m/n_sims
+    is HOT now (the SH bracket is recomputed per decide — ADR-0012 P4; only search.use_jax_mlp stays
+    RESTART), the net shape / master seed stay RESTART, the env constants are INSTANCE."""
     facets = {}
     a = ExperimentConfig(experiment_id="f")
     for g, mut, fld, _av, _bv in reg._iter_facet_diffs(a, a):
@@ -220,7 +221,9 @@ def test_known_facet_split():
     assert facets["train.eps"] is Mut.HOT      # audit M: live injected hparam, set per step
     assert facets["train.alpha"] is Mut.HOT
     assert facets["train.beta"] is Mut.HOT
-    assert facets["search.m"] is Mut.RESTART
+    assert facets["search.m"] is Mut.HOT       # SH bracket recomputed per decide → HOT
+    assert facets["search.n_sims"] is Mut.HOT  # SH phase loop sized per decide → HOT
+    assert facets["search.use_jax_mlp"] is Mut.RESTART  # binds the forward fn — stays RESTART
     assert facets["search.c_puct"] is Mut.HOT
     assert facets["arch.hidden"] is Mut.RESTART
     assert facets["env.teleport_overhead"] is Mut.INSTANCE
@@ -493,32 +496,40 @@ def test_hot_change_does_not_refuse(isolated_id):
 def test_hot_search_knob_change_does_not_refuse(isolated_id):
     """The audit's Finding 1: HOT SEARCH knobs (c_puct/max_depth) are genuinely per-iteration (the
     search object is rebuilt each iteration). A change to them must be APPLIED at the refresh, not
-    refused — the consolidation reads them off snap.cfg into the rebuilt search."""
+    refused — the consolidation reads them off snap.cfg into the rebuilt search. The search BUDGET
+    m/n_sims is HOT too now (the SH bracket is recomputed per decide — ADR-0012 P4), so a mid-run
+    change to it is likewise applied, not refused (it rides the same hot_search bag)."""
     r = _redis_or_skip()
     try:
         launched = ExperimentConfig(experiment_id=isolated_id)
         reg.write_config(isolated_id, launched, r=r)
         snap = reg.ConfigSnapshot.launch(isolated_id, launched_with=launched, r=r)
-        reg.set_fields(isolated_id, {"search.c_puct": "2.5", "search.max_depth": "10"}, r=r)
-        snap.refresh(iteration=1, r=r)   # must NOT raise (these are HOT)
+        reg.set_fields(isolated_id, {"search.c_puct": "2.5", "search.max_depth": "10",
+                                     "search.m": "8", "search.n_sims": "32"}, r=r)
+        snap.refresh(iteration=1, r=r)   # must NOT raise (these are HOT — incl. the SH budget)
         assert snap.cfg.search.c_puct == 2.5
         assert snap.cfg.search.max_depth == 10
+        assert snap.cfg.search.m == 8        # HOT now: SH bracket recomputed per decide
+        assert snap.cfg.search.n_sims == 32  # HOT now: SH phase loop sized per decide
     finally:
         r.close()
 
 
 def test_search_restart_knob_refuses(isolated_id):
-    """search.m / n_sims / use_jax_mlp are RESTART (they size the SH bracket / bind the forward),
-    so a mid-run change to them DOES refuse (the counterpart to the HOT-search-knob test)."""
+    """search.use_jax_mlp is RESTART (it binds the forward fn at construction, and the parallel worker
+    is numpy-only by R14), so a mid-run change to it DOES refuse — the counterpart to the
+    HOT-search-knob test. (m/n_sims USED to be RESTART here; they were reclassified HOT once the SH
+    bracket was confirmed recomputed per decide — ADR-0012 P4 — and their live-apply is now covered by
+    test_hot_search_knob_change_does_not_refuse.)"""
     r = _redis_or_skip()
     try:
         launched = ExperimentConfig(experiment_id=isolated_id)
         reg.write_config(isolated_id, launched, r=r)
         snap = reg.ConfigSnapshot.launch(isolated_id, launched_with=launched, r=r)
-        reg.set_fields(isolated_id, {"search.m": "8"}, r=r)
+        reg.set_fields(isolated_id, {"search.use_jax_mlp": "true"}, r=r)
         with pytest.raises(reg.RestartRequired) as ei:
             snap.refresh(iteration=1, r=r)
-        assert "search.m" in str(ei.value)
+        assert "search.use_jax_mlp" in str(ei.value)
     finally:
         r.close()
 

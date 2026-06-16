@@ -72,19 +72,20 @@ class WorkerPool:
     `map(task_fn, tasks, phase, run)` each fan-out (it runs `imap_unordered` under the bounded
     per-result drain); `close()` at the end (bounded teardown) or use as a context manager."""
 
-    def __init__(self, n_workers: int, cores: list[int], base_seed: int, m: int,
-                 n_sims: int) -> None:
+    def __init__(self, n_workers: int, cores: list[int], base_seed: int) -> None:
         import multiprocessing as mp
         from chocofarm.az.worker import _worker_init
         self.n_workers = int(n_workers)
         # spawn (KEPT, MORE justified by R14): a clean fresh-interpreter child. fork would COPY the
         # parent's live JAX/XLA runtime + its native threads into the child, violating the numpy-only
         # contract worker.py enforces (and re-creating the deadlock-prone cross-runtime residue).
+        # The search budget m/n_sims is no longer an initarg — it is HOT and rides the per-iteration
+        # hot_search into each task (worker.ensure_net applies it on the (phase,version) rebuild).
         ctx = mp.get_context("spawn")
         self.pool = ctx.Pool(
             processes=self.n_workers,
             initializer=_worker_init,
-            initargs=(list(cores), base_seed, m, n_sims),
+            initargs=(list(cores), base_seed),
         )
 
     def map(self, task_fn: Callable[..., Any], tasks: list[Any], phase: str,

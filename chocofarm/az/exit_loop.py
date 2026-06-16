@@ -309,9 +309,10 @@ def run(args: argparse.Namespace) -> None:
         # reference lines as flat series (drawn at every iteration so TB renders them)
         print(f"streaming to TensorBoard -> {args.tb_logdir}", flush=True)
 
-    # RESTART knobs used below (seed / m / n_sims / workers / cores) come from the seeded config
-    # (cfg0), the same single authority the net/trainer were built from. `seed` folds the master RNG
-    # (RESTART — changing it mid-run breaks the parallel≈serial determinism contract).
+    # RESTART knobs used below (seed / workers / cores) come from the seeded config (cfg0), the same
+    # single authority the net/trainer were built from. `seed` folds the master RNG (RESTART —
+    # changing it mid-run breaks the parallel≈serial determinism contract). m/n_sims are HOT (they
+    # ride the per-iteration hot_search), so they are NOT read here at construction.
     master_seed = cfg0.loop.seed
     # `window`/`iters` are HOT but read at LOOP CONSTRUCTION (the ReplayBuffer / `range` bound are
     # built once); source them from cfg0 — the single construction-time authority — so a --resume
@@ -348,19 +349,19 @@ def run(args: argparse.Namespace) -> None:
     if args.cpp_runner:
         from chocofarm.az.cpp_executor import CppActorExecutor
         executor = CppActorExecutor(args.cpp_runner, args.cpp_instance, args.cpp_faces, env,
-                                    master_seed, cfg0.search.m, cfg0.search.n_sims,
-                                    cfg0.search.use_jax_mlp, in_dim, n_slots)
+                                    master_seed, cfg0.search.use_jax_mlp, in_dim, n_slots)
         print(f"C++ Gumbel ACTOR generation (runner={args.cpp_runner}); eval/train/replay/checkpoint "
               f"in-process; weights + transitions over redis run={executor.run}. Value target is the "
               f"actor's pure-MC λ-return (Part-B blend is fail-loud-guarded — not yet on the C++ wire).",
               flush=True)
     elif cfg0.par.workers and cfg0.par.workers > 0:
         from chocofarm.az.parallel import ParallelExecutor
-        # workers / cores / seed / m / n_sims are RESTART (the pool is built once before the loop);
-        # read them off the seeded config (cfg0), the single construction-time authority.
+        # workers / cores / seed are RESTART (the pool is built once before the loop); read them off
+        # the seeded config (cfg0). m/n_sims are HOT now — they ride the per-iteration hot_search into
+        # each generate/evaluate (applied on the worker's (phase, version) search rebuild), not the
+        # pool ctor.
         cores = [int(c) for c in cfg0.par.cores.split(",")] if cfg0.par.cores else None
-        executor = ParallelExecutor(cfg0.par.workers, cores, master_seed,
-                                    cfg0.search.m, cfg0.search.n_sims)
+        executor = ParallelExecutor(cfg0.par.workers, cores, master_seed)
         print(f"parallel actor/learner: {cfg0.par.workers} workers pinned to cores "
               f"{executor.cores}; weights + transitions over redis (raw bytes, no pickle) "
               f"run={executor.run}", flush=True)
@@ -402,12 +403,14 @@ def run(args: argparse.Namespace) -> None:
         max_steps = snap.cfg.env.max_steps   # HOT rollout cap (per-call, not instance)
         # HOT search knobs (read off the live snapshot; the search object is rebuilt every iteration
         # below — and in the worker on each version bump — so a manual change to these lands live,
-        # hp-registry §3.4). `m`/`n_sims`/`use_jax_mlp` are RESTART (cfg0): they size the SH bracket /
-        # bind the forward fn and are baked at launch.
-        # the HOT search-knob bag is heterogeneous (c_* are floats, c_outcome/max_depth ints), so it
-        # is typed dict[str, Any] — the same kwargs bag splatted into GumbelAZSearch and threaded to
-        # the worker; Any keeps the int/float params honest under the splat (no runtime change).
+        # hp-registry §3.4). `m`/`n_sims` are HOT too now (the SH bracket is recomputed per decide),
+        # so they ride this same bag; only `use_jax_mlp` stays RESTART (cfg0 — it binds the forward fn
+        # at construction, and the parallel worker is numpy-only by the R14 contract).
+        # the HOT search-knob bag is heterogeneous (c_* are floats, m/n_sims/c_outcome/max_depth
+        # ints), so it is typed dict[str, Any] — the same kwargs bag splatted into GumbelAZSearch and
+        # threaded to the worker; Any keeps the int/float params honest under the splat.
         hot_search: dict[str, Any] = dict(
+            m=snap.cfg.search.m, n_sims=snap.cfg.search.n_sims,
             c_puct=snap.cfg.search.c_puct, c_visit=snap.cfg.search.c_visit,
             c_scale=snap.cfg.search.c_scale, c_outcome=snap.cfg.search.c_outcome,
             max_depth=snap.cfg.search.max_depth)
@@ -427,8 +430,7 @@ def run(args: argparse.Namespace) -> None:
                                          explore_plies, lam_blend, n_step,
                                          hot_search=hot_search, max_steps=max_steps)
         else:
-            search = GumbelAZSearch(net, env, m=cfg0.search.m, n_sims=cfg0.search.n_sims,
-                                    use_jax_mlp=cfg0.search.use_jax_mlp, **hot_search)
+            search = GumbelAZSearch(net, env, use_jax_mlp=cfg0.search.use_jax_mlp, **hot_search)
             recs_all = []
             for world in gen_worlds:
                 recs_all.extend(generate_episode(env, search, fb, world, lam, gen_rng,
@@ -471,8 +473,7 @@ def run(args: argparse.Namespace) -> None:
             totR, totT, ets = executor.evaluate(net, it, eval_worlds, lam,
                                                 hot_search=hot_search, max_steps=max_steps)
         else:
-            eval_pol = GumbelPolicy(net, env, m=cfg0.search.m, n_sims=cfg0.search.n_sims,
-                                    use_jax_mlp=cfg0.search.use_jax_mlp, **hot_search)
+            eval_pol = GumbelPolicy(net, env, use_jax_mlp=cfg0.search.use_jax_mlp, **hot_search)
             ev_rng = np.random.default_rng(eval_seed)
             totR = totT = 0.0; ets = []
             for w in eval_worlds:

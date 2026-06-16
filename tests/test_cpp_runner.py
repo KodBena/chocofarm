@@ -459,7 +459,7 @@ def test_cpp_actor_executor_partb_fails_loud():
     from chocofarm.az.features import feature_dim
     from chocofarm.model.env import Environment
     env = Environment()
-    ex = CppActorExecutor(CPP_BIN, DATA_INSTANCE, DATA_FACES, env, base_seed=7, m=12, n_sims=8,
+    ex = CppActorExecutor(CPP_BIN, DATA_INSTANCE, DATA_FACES, env, base_seed=7,
                           use_jax_mlp=False, in_dim=feature_dim(env), n_slots=n_action_slots(env))
     try:
         # explore_plies=0 isolates the Part-B guard (else the explore_plies guard could fire first).
@@ -484,7 +484,7 @@ def test_cpp_actor_executor_explore_plies_fails_loud():
     from chocofarm.az.features import feature_dim
     from chocofarm.model.env import Environment
     env = Environment()
-    ex = CppActorExecutor(CPP_BIN, DATA_INSTANCE, DATA_FACES, env, base_seed=7, m=12, n_sims=8,
+    ex = CppActorExecutor(CPP_BIN, DATA_INSTANCE, DATA_FACES, env, base_seed=7,
                           use_jax_mlp=False, in_dim=feature_dim(env), n_slots=n_action_slots(env))
     try:
         with pytest.raises(RuntimeError, match="explore_plies"):

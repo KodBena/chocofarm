@@ -154,7 +154,7 @@ def test_worker_child_is_jax_free():
 
     ctx = mp.get_context("spawn")
     pool = ctx.Pool(processes=1, initializer=_worker_init,
-                    initargs=([0], _BASE_SEED, _M, _NS))
+                    initargs=([0], _BASE_SEED))
     try:
         ans = pool.apply(_child_jax_probe, ((),))
     finally:
@@ -180,12 +180,12 @@ def test_gen_eval_namespace_no_collision_real_redis():
     gen_worlds = [int(env.worlds[k]) for k in (10, 200)]
     eval_worlds = [int(env.worlds[k]) for k in (5, 6)]
 
-    ex = ParallelExecutor(n_workers=1, cores=[0], base_seed=_BASE_SEED, m=_M, n_sims=_NS)
+    ex = ParallelExecutor(n_workers=1, cores=[0], base_seed=_BASE_SEED)
     r = ex.r
     run = ex.run
     try:
         ex.generate(net, 0, gen_worlds, 0.0855, _EXPLORE, lam_blend=1.0, n_step=None,
-                    max_steps=_MAXST)
+                    hot_search={"m": _M, "n_sims": _NS}, max_steps=_MAXST)
         gen_blob = r.get(f"az:w:{run}:gen:0:b")
 
         # simulate a train step: mutate the net so the eval (post-train) weights differ from gen's
@@ -194,7 +194,8 @@ def test_gen_eval_namespace_no_collision_real_redis():
         net.Wv = net.Wv + 0.5 * rng.standard_normal(net.Wv.shape)
 
         # eval fan-out at the SAME it=0 — completes only if the worker reads az:w:<run>:eval:0
-        ex.evaluate(net, 0, eval_worlds, 0.0855, max_steps=_MAXST)
+        ex.evaluate(net, 0, eval_worlds, 0.0855, hot_search={"m": _M, "n_sims": _NS},
+                    max_steps=_MAXST)
         eval_blob = r.get(f"az:w:{run}:eval:0:b")
     finally:
         for ph in ("gen", "eval"):
@@ -249,8 +250,7 @@ def test_ensure_net_reload_gate():
         mk, bk = T.weight_keys("runX", phase, version)
         fake.set_blob(mk, manifest.encode("utf-8")); fake.set_blob(bk, blob)
 
-    wk = W.Worker(env=env, fb=FeatureBuilder(env), redis=fake,
-                  base_seed=_BASE_SEED, m=4, n_sims=8)
+    wk = W.Worker(env=env, fb=FeatureBuilder(env), redis=fake, base_seed=_BASE_SEED)
 
     def loaded_w1sum():
         return float(np.asarray(wk.net.W1, np.float64).sum())
@@ -299,10 +299,10 @@ def test_parallel_one_worker_bit_identical_to_serial():
     serial_wire = _to_wire(serial_recs)
     assert len(serial_recs) > 0, "serial path produced no transitions (test is vacuous)"
 
-    ex = ParallelExecutor(n_workers=1, cores=[0], base_seed=_BASE_SEED, m=_M, n_sims=_NS)
+    ex = ParallelExecutor(n_workers=1, cores=[0], base_seed=_BASE_SEED)
     try:
         par_recs = ex.generate(net, 0, worlds, 0.0855, _EXPLORE, lam_blend=1.0, n_step=None,
-                               max_steps=_MAXST)
+                               hot_search={"m": _M, "n_sims": _NS}, max_steps=_MAXST)
     finally:
         try:
             ex.r.delete(f"az:w:{ex.run}:gen:0:m", f"az:w:{ex.run}:gen:0:b")

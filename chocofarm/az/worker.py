@@ -27,7 +27,8 @@ eval) — confirmed and kept that way.
 This module owns what ONE worker does per episode and nothing about the redis wire protocol (that is
 `transport.py`) or the process pool (that is `worker_pool.py`).  Concretely it owns: the `Worker`
 object (env / feature-builder / net / search / current (phase, version) / redis connection /
-base_seed / m / n_sims) held as the per-process module singleton `_WORKER`; the spawn-pool
+base_seed — the search budget m/n_sims now rides the per-iteration hot_search (HOT), not the ctor)
+held as the per-process module singleton `_WORKER`; the spawn-pool
 initializer `_worker_init` (single-thread env pinning, the numpy-only guard, faulthandler+SIGUSR1,
 core pinning, env/FeatureBuilder/numba-warmup build, `_WORKER` construction); the `(phase, version)`
 reload-gate `Worker.ensure_net`; the worker-count-invariant seed fold `Worker.task_rng` (built on the
@@ -66,7 +67,9 @@ class Worker:
     """The per-process unit of work (item L / R14 — promoted from the `_W` module-global dict).  ONE
     instance per worker process, built in `_worker_init` and held as the module singleton `_WORKER`.
     It owns the env / feature-builder / net / search, the current `(phase, version)` (the reload
-    gate), the redis connection, and the RESTART-fixed `base_seed` / `m` / `n_sims`.
+    gate), the redis connection, and the RESTART-fixed `base_seed`. The search budget `m`/`n_sims`
+    is now HOT (it rides the per-iteration `hot_search`, applied on each `(phase, version)` rebuild),
+    so it is no longer ctor state — exactly as `c_puct`/… already were.
 
     The two module-level task entrypoints (`_gen_task` / `_eval_task`, resolved by the spawn pool by
     qualified name) delegate to `generate_episode` / `eval_episode`; the shared net-reload + rng-fold
@@ -75,13 +78,11 @@ class Worker:
     enters the rng (so parallel≈serial bit-identity is preserved by construction)."""
 
     def __init__(self, env: "Environment", fb: "FeatureBuilder", redis: Any, base_seed: int,
-                 m: int, n_sims: int, core: int | None = None, widx: int = 0) -> None:
+                 core: int | None = None, widx: int = 0) -> None:
         self.env = env
         self.fb = fb
         self.redis = redis
         self.base_seed = base_seed
-        self.m = m
-        self.n_sims = n_sims
         self.core = core
         self.widx = widx
         self.net: "ValueMLP | None" = None
@@ -152,12 +153,13 @@ class Worker:
         gen→eval transition (a version-only gate would serve the stale pre-train weights at eval).
         The it→it+1 transition still reloads because `version` bumps.
 
-        `hot_search` (hp-registry §3.4): the live HOT search knobs (c_puct/c_visit/c_scale/c_outcome/
-        max_depth) for THIS iteration, sized by the parent's per-iteration snapshot.  The
+        `hot_search` (hp-registry §3.4): the live HOT search knobs (m/n_sims/c_puct/c_visit/c_scale/
+        c_outcome/max_depth) for THIS iteration, sized by the parent's per-iteration snapshot.  The
         `(phase, version)` pair changes every phase/iteration (the parent re-publishes weights each
         phase), so the worker rebuilds its search on the change and the live HOT knobs are picked up
         at that natural refresh point — the seam §3.2 names ('the worker's natural refresh coincides
-        with the parent's poll').  `m`/`n_sims` are RESTART (set once at construction)."""
+        with the parent's poll').  `m`/`n_sims` ride `hot_search` too now (HOT — the SH bracket is
+        recomputed per decide), so they are applied at the same rebuild as the `c_*` knobs."""
         if self.phase == phase and self.version == version and self.net is not None:
             return
         from chocofarm.az.gumbel_search import GumbelAZSearch
@@ -165,7 +167,7 @@ class Worker:
         net = transport.unpack_net(manifest, blob)
         self.net = net
         hs = dict(hot_search) if hot_search else {}
-        self.search = GumbelAZSearch(net, self.env, m=self.m, n_sims=self.n_sims, **hs)
+        self.search = GumbelAZSearch(net, self.env, **hs)
         self.phase = phase
         self.version = version
 
@@ -222,7 +224,7 @@ class Worker:
         assert self.net is not None
         from chocofarm.az.gumbel_search import GumbelPolicy
         hs = dict(hot_search) if hot_search else {}
-        pol = GumbelPolicy(self.net, self.env, m=self.m, n_sims=self.n_sims, **hs)
+        pol = GumbelPolicy(self.net, self.env, **hs)
         R, T, _ = self.env.simulate(pol, world, lam, rng, max_steps=max_steps)
         return float(R), float(T)
 
@@ -231,7 +233,7 @@ class Worker:
 _WORKER: "Worker | None" = None
 
 
-def _worker_init(core_list: list[int], base_seed: int, m: int, n_sims: int) -> None:
+def _worker_init(core_list: list[int], base_seed: int) -> None:
     """Process-pool initializer: pin THIS worker to its core, build env/feature-builder, open the
     redis connection, warm the numba kernel, and construct the per-process `Worker` singleton (whose
     constructor LOCKS the numpy-only contract).  The net is loaded lazily on the first task (when the
@@ -297,7 +299,7 @@ def _worker_init(core_list: list[int], base_seed: int, m: int, n_sims: int) -> N
     Worker._assert_jax_free()
 
     global _WORKER
-    _WORKER = Worker(env, FeatureBuilder(env), transport.connect(), base_seed, m, n_sims,
+    _WORKER = Worker(env, FeatureBuilder(env), transport.connect(), base_seed,
                      core=core, widx=widx)
 
 
