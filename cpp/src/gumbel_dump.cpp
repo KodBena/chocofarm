@@ -32,15 +32,20 @@
 //   std::optional<std::string_view>; load_instance returns a typed std::expected reported loudly. The
 //   scripted tables being non-empty is the fixture's own invariant (checked at parse, then asserted).
 //
-//   Protocol:
+//   Protocol (TWO leaf modes — COARSE 1a vs FINE 1b — selected by --leaf-logits-rows):
 //     argv: --instance <p> --faces <p> [--m N --n-sims N --c-puct f --c-visit f --c-scale f
-//           --c-outcome N --max-depth N --lam f --prefix "s s s"]  (--prefix advances the real
-//           (loc,bw,coll) by a deterministic slot sequence against the true world bw[0] before the
-//           search, so the fixed input state can be mid-episode);
+//           --c-outcome N --max-depth N --lam f --prefix "s s s" --leaf-logits-rows N]  (--prefix
+//           advances the real (loc,bw,coll) by a deterministic slot sequence against bw[0] before the
+//           search; --leaf-logits-rows N>0 selects the FINE per-slot-logits mode — see line 4);
 //     stdin: line 1 = space-separated gumbel values (doubles, the gumbel FIFO);
-//            line 2 = space-separated leaf value/logit-base pairs flattened as "v0 lb0 v1 lb1 ..."
-//                     (doubles, the leaf FIFO: each consecutive pair is one leaf's (value, logit_base));
-//            line 3 = OPTIONAL space-separated world indices (ints; absent/empty -> sample_world=bw[0]).
+//            line 2 = the leaf VALUE FIFO. In COARSE mode (--leaf-logits-rows absent/0) this is the
+//                     flattened value/logit-base pairs "v0 lb0 v1 lb1 ..." (each pair = one leaf's
+//                     (value, logit_base) for the s·0.25 ramp). In FINE mode it is one value per leaf
+//                     "v0 v1 v2 ..." (the per-slot logits come from line 4 instead);
+//            line 3 = OPTIONAL space-separated world indices (ints; absent/empty -> sample_world=bw[0]);
+//            line 4 = (FINE mode only) the flattened FULL-PRECISION per-slot logits table, n_slots
+//                     doubles per leaf row, --leaf-logits-rows rows total: "r0c0 r0c1 ... r1c0 ..." (the
+//                     near-tie inputs the float32 seam discriminates on — gumbel_precision.py).
 //     stdout: three ints — the executed action slot, the improved-π argmax slot, then the total
 //             root-action sims spent (n_spent; = n_sims on a faithful non-empty-belief search — the
 //             SH full-budget invariant the harness checks against the Python side).
@@ -50,6 +55,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -75,33 +81,60 @@ namespace {
 [[nodiscard]] double to_double(std::string_view s) { return std::atof(std::string(s).c_str()); }
 
 // The scripted, RNG-free leaf evaluator (a NetEvaluator). Consumed in CALL ORDER, cycled modulo its
-// length. Each call delivers one (value, logit_base) pair; the returned logits ramp logits[s] =
-// logit_base + s·0.25 over the full slot space (coarse, well-separated -> no near-tie). The Python
-// reference builds the SAME ramp from the SAME (value, logit_base) table, so the masked-softmax priors
-// are identical (precision-insensitive).
+// length. TWO leaf modes share one class:
+//   * COARSE (1a, gumbel_logic.py): each call delivers one (value, logit_base) pair; the returned logits
+//     ramp logits[s] = logit_base + s·0.25 over the full slot space (well-separated -> NO near-tie). The
+//     Python reference builds the SAME ramp from the SAME (value, logit_base) table (precision-
+//     insensitive: the discrete outcome is identical float32-vs-float64).
+//   * FINE (1b, gumbel_precision.py): each call delivers one value off the value FIFO + one FULL-
+//     PRECISION per-slot logits ROW off a logits table (n_slots doubles per row). The rows carry tiny
+//     per-slot deltas at the float32-epsilon scale, so the masked-softmax prior near-ties and the
+//     float32 storage (the 1b prior seam) rounds it differently than float64 — the precision hazard.
+// The mode is selected by which table is non-empty: a non-empty `logit_rows_` (one or more length-
+// n_slots rows) takes the FINE path; otherwise the COARSE (logit_bases_) ramp.
 class ScriptedNet final : public chocofarm::NetEvaluator {
   public:
+    // COARSE constructor (the 1a (value, logit_base) ramp).
     ScriptedNet(std::vector<double> values, std::vector<double> logit_bases, int n_slots)
         : values_(std::move(values)), logit_bases_(std::move(logit_bases)), n_slots_(n_slots) {}
+
+    // FINE constructor (the 1b full-precision per-slot logits table). `logit_rows` is a list of length-
+    // n_slots rows, consumed in call order (cycled). The COARSE logit_bases_ is left empty.
+    ScriptedNet(std::vector<double> values, std::vector<std::vector<double>> logit_rows, int n_slots)
+        : values_(std::move(values)), logit_rows_(std::move(logit_rows)), n_slots_(n_slots) {}
 
     std::expected<chocofarm::NetPrediction, chocofarm::Error> predict(
         std::span<const float> x) const override {
         (void)x;  // the scripted leaf ignores the features (it is keyed only on call order)
-        assert(!values_.empty() && !logit_bases_.empty() && "gumbel_dump: empty scripted leaf table");
+        assert(!values_.empty() && "gumbel_dump: empty scripted value table");
         size_t i = call_++;
-        double v = values_[i % values_.size()];
-        double lb = logit_bases_[i % logit_bases_.size()];
         chocofarm::NetPrediction pred;
-        pred.value = static_cast<float>(v);
+        pred.value = static_cast<float>(values_[i % values_.size()]);
         pred.logits.resize(static_cast<size_t>(n_slots_));
-        for (int s = 0; s < n_slots_; ++s)
-            pred.logits[static_cast<size_t>(s)] = static_cast<float>(lb + s * 0.25);  // coarse ramp
+        if (!logit_rows_.empty()) {
+            // FINE: copy the full-precision per-slot logits row (narrowed to float32, the net's logit
+            // dtype — the Python reference's leaf_logits_table rows are float64, softmaxed in float64 and
+            // the PRIOR narrowed to float32; the C++ logits narrow to float32 here as the wire dtype, but
+            // the masked softmax that builds the prior runs in float64 in evaluate(), as in Python).
+            const std::vector<double>& row = logit_rows_[i % logit_rows_.size()];
+            assert(row.size() == static_cast<size_t>(n_slots_) &&
+                   "gumbel_dump: fine logits row width != n_slots");
+            for (int s = 0; s < n_slots_; ++s)
+                pred.logits[static_cast<size_t>(s)] = static_cast<float>(row[static_cast<size_t>(s)]);
+        } else {
+            // COARSE: the well-separated ramp logits[s] = logit_base + s·0.25.
+            assert(!logit_bases_.empty() && "gumbel_dump: empty scripted leaf table");
+            double lb = logit_bases_[i % logit_bases_.size()];
+            for (int s = 0; s < n_slots_; ++s)
+                pred.logits[static_cast<size_t>(s)] = static_cast<float>(lb + s * 0.25);
+        }
         return pred;
     }
 
   private:
     std::vector<double> values_;
-    std::vector<double> logit_bases_;
+    std::vector<double> logit_bases_;               // COARSE mode: per-leaf logit base (ramp)
+    std::vector<std::vector<double>> logit_rows_;   // FINE mode: per-leaf full-precision logits rows
     int n_slots_;
     mutable size_t call_ = 0;  // call-order index (mutable: predict is const per the port)
 };
@@ -156,6 +189,9 @@ int main(int argc, char** argv) {
     if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = to_int(*v);
     if (auto v = opt(args, "--max-depth")) cfg.max_depth = to_int(*v);
     double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
+    // FINE leaf mode (1b): --leaf-logits-rows N>0 means line 2 is one value per leaf and line 4 carries
+    // the full-precision per-slot logits table (N rows of n_slots doubles). Absent/0 = COARSE 1a mode.
+    int leaf_logits_rows = opt(args, "--leaf-logits-rows") ? to_int(*opt(args, "--leaf-logits-rows")) : 0;
 
     auto inst = chocofarm::load_instance(*instance, *faces);
     if (!inst) { std::cerr << "gumbel-dump: FATAL: " << inst.error().message << "\n"; return 1; }
@@ -191,7 +227,7 @@ int main(int argc, char** argv) {
         double v;
         while (iss >> v) gumbels.push_back(v);
     }
-    // line 2: flattened (value, logit_base) pairs.
+    // line 2: in COARSE mode, flattened (value, logit_base) pairs; in FINE mode, one value per leaf.
     std::vector<double> leaf_flat;
     {
         std::string line;
@@ -209,20 +245,57 @@ int main(int argc, char** argv) {
             while (iss >> v) world_idxs.push_back(v);
         }
     }
-    if (gumbels.empty() || leaf_flat.size() < 2) {
-        std::cerr << "gumbel-dump: FATAL: need a non-empty gumbel FIFO (line 1) AND at least one "
-                     "(value, logit_base) leaf pair (line 2) on stdin\n";
-        return 1;
-    }
-    // split the flattened pairs into the value FIFO + the logit-base FIFO.
-    std::vector<double> values, logit_bases;
-    for (size_t i = 0; i + 1 < leaf_flat.size(); i += 2) {
-        values.push_back(leaf_flat[i]);
-        logit_bases.push_back(leaf_flat[i + 1]);
+    // line 4 (FINE mode only): the flattened full-precision per-slot logits table.
+    std::vector<double> logits_flat;
+    if (leaf_logits_rows > 0) {
+        std::string line;
+        if (std::getline(std::cin, line)) {
+            std::istringstream iss(line);
+            double v;
+            while (iss >> v) logits_flat.push_back(v);
+        }
     }
 
-    ScriptedNet net(std::move(values), std::move(logit_bases), chocofarm::n_action_slots(env));
-    chocofarm::GumbelAZPolicy policy(cfg, net, env);
+    int n_slots = chocofarm::n_action_slots(env);
+    // build the scripted net: FINE mode (--leaf-logits-rows N>0) uses line 2 as the value FIFO + line 4
+    // as the per-slot logits table; COARSE mode splits line 2 into (value, logit_base) pairs.
+    std::unique_ptr<ScriptedNet> net;
+    if (leaf_logits_rows > 0) {
+        if (leaf_flat.empty() ||
+            logits_flat.size() != static_cast<size_t>(leaf_logits_rows) * static_cast<size_t>(n_slots)) {
+            std::cerr << "gumbel-dump: FATAL: FINE mode needs a non-empty value FIFO (line 2) AND a "
+                         "line-4 logits table of exactly leaf-logits-rows*n_slots doubles (got "
+                      << logits_flat.size() << ", expected "
+                      << static_cast<size_t>(leaf_logits_rows) * static_cast<size_t>(n_slots) << ")\n";
+            return 1;
+        }
+        std::vector<std::vector<double>> rows;
+        rows.reserve(static_cast<size_t>(leaf_logits_rows));
+        for (int r = 0; r < leaf_logits_rows; ++r) {
+            std::vector<double> row(logits_flat.begin() + static_cast<long>(r) * n_slots,
+                                    logits_flat.begin() + static_cast<long>(r + 1) * n_slots);
+            rows.push_back(std::move(row));
+        }
+        net = std::make_unique<ScriptedNet>(std::move(leaf_flat), std::move(rows), n_slots);
+    } else {
+        if (gumbels.empty() || leaf_flat.size() < 2) {
+            std::cerr << "gumbel-dump: FATAL: need a non-empty gumbel FIFO (line 1) AND at least one "
+                         "(value, logit_base) leaf pair (line 2) on stdin\n";
+            return 1;
+        }
+        std::vector<double> values, logit_bases;
+        for (size_t i = 0; i + 1 < leaf_flat.size(); i += 2) {
+            values.push_back(leaf_flat[i]);
+            logit_bases.push_back(leaf_flat[i + 1]);
+        }
+        net = std::make_unique<ScriptedNet>(std::move(values), std::move(logit_bases), n_slots);
+    }
+    if (gumbels.empty()) {
+        std::cerr << "gumbel-dump: FATAL: need a non-empty gumbel FIFO (line 1)\n";
+        return 1;
+    }
+
+    chocofarm::GumbelAZPolicy policy(cfg, *net, env);
     ScriptedGumbelSource src(std::move(gumbels), std::move(world_idxs));
 
     chocofarm::GumbelAZPolicy::Decision dec = policy.run_search(loc, bw, collected, lam, src);

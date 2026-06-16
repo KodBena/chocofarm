@@ -41,8 +41,13 @@ the discrete STRUCTURE only) adds:
     gumbel/world/leaf draws, plus the two structural Danihelka invariants (executed==SH-survivor; SH
     spends the full n_sims budget). PRECISION-INSENSITIVE (coarse, well-separated scripted leaf, no
     near-ties) so the discrete outcome is float32-vs-float64 identical — this is the 1a structure
-    check; the mixed-precision near-tie path is 1b (NOT covered). NO redis (the scripted leaf is
-    in-process).
+    check. NO redis (the scripted leaf is in-process).
+  * OPT-IN (needs chocofarm-gumbel-dump): the PHASE 1b mixed-precision NEAR-TIE parity
+    (cpp/parity/gumbel_precision.py) — on FINE scripted leaf (value, full-precision per-slot logits)
+    drawn so the DISCRETE output sits on the float32-prior knife-edge, the MIXED-precision C++ matches
+    Python EXACTLY (N/N) while the all-float64 DISCRIMINATION control (CHOCO_GUMBEL_UNIFORM=1) diverges
+    on a non-trivial fraction — proving the float32 PRIOR precision (not the structure) decides the
+    near-ties (non-vacuous, the 1b analogue of the 1a mutation control). NO redis (in-process leaf).
 
 Public Domain (The Unlicense).
 """
@@ -73,6 +78,7 @@ ISMCTS_LOGIC = os.path.join(REPO, "cpp", "parity", "ismcts_logic.py")
 ISMCTS_PARITY = os.path.join(REPO, "cpp", "parity", "ismcts_parity.py")
 GUMBEL_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-gumbel-dump")
 GUMBEL_LOGIC = os.path.join(REPO, "cpp", "parity", "gumbel_logic.py")
+GUMBEL_PRECISION = os.path.join(REPO, "cpp", "parity", "gumbel_precision.py")
 
 # OPT-IN gate. The binary-dependent cpp parity tests run only with CHOCO_RUN_CPP=1 (and a freshly
 # built binary). They are slow integration checks driven by a MANUALLY-built C++ binary: a stale
@@ -279,6 +285,25 @@ def test_cpp_gumbel_logic_parity():
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, f"Gumbel logic check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(GUMBEL_BIN)), reason=_CPP_SKIP)
+def test_cpp_gumbel_precision_parity():
+    """The PHASE 1b mixed-precision NEAR-TIE parity (cpp/parity/gumbel_precision.py): the numerical-
+    FIDELITY twin of the 1a STRUCTURE check above. On REALISTIC FINE scripted leaf (value, full-
+    precision per-slot logits) — drawn so the search's DISCRETE output (the SH survivor + the improved-pi
+    argmax) sits on the float32-prior knife-edge — the MIXED-precision C++ search reproduces Python's
+    DELIBERATE float32-prior x float64-Q precision EXACTLY (executed action AND improved-pi argmax,
+    N/N), while the DISCRIMINATION control (CHOCO_GUMBEL_UNIFORM=1, the genuine 1a all-float64 port)
+    DIVERGES from the SAME Python reference on a NON-TRIVIAL fraction (~34/144). The harness ASSERTS
+    BOTH: mixed==Python N/N proves byte-faithfulness; uniform-diverges>=10 proves the parity is NOT
+    vacuous (the 1b analogue of the 1a mutation control — the float32 PRIOR precision, not the structure,
+    decides the near-ties). NO redis (the scripted leaf is in-process). RESULT: PASS gates both."""
+    out = subprocess.run([sys.executable, GUMBEL_PRECISION], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"Gumbel precision check FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
 
 

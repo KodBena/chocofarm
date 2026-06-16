@@ -12,13 +12,55 @@
 //   maps are keyed by action SLOT, but every order-sensitive scan is over legal_slots (a list), never
 //   the std::map's sorted-key order.
 //
-//   1a / 1b SEAM (READ): the σ-transform / v_mix / softmax run in ONE consistent precision (`double`)
-//   here. The Python search runs them at a DELIBERATE float32-prior × float64-Q mixed precision
-//   (value_target.py — the byte-identity seam), which a uniform-precision port diverges from on
-//   NEAR-TIE inputs. The prior/Q precision is localized in `evaluate` (the prior), `v_mix_1a`, and
-//   `improved_policy` below — the ONLY places 1b changes to make the prior float32 + the prior-weighted
-//   product float32-weak. 1a's parity is precision-insensitive (coarse inputs, no near-ties), so the
-//   discrete outcome is identical float32-vs-float64 — proving the structure is faithful.
+//   1b SEAM (TIGHTENED — this file is the byte-identity port of value_target.py's mixed precision):
+//   the σ-transform / v_mix / PUCT / log-prior reproduce numpy's DELIBERATE float32-prior × float64-Q
+//   promotion EXACTLY. The float32 enters at FOUR places the Python rule's comments flag
+//   (value_target.py:209-249, gumbel_search.py:397-426/436-458), each localized below. ALL FOUR read
+//   the prior through ONE invariant (toggleable by CHOCO_GUMBEL_UNIFORM, the discrimination control):
+//     * MIXED (default, faithful): every prior read is the FLOAT32 stored prior (`node.prior`) — the
+//       precision Python's float32 `root.prior` carries. This is the byte-faithful path.
+//     * UNIFORM (`kUniform`, CHOCO_GUMBEL_UNIFORM=1): every prior read is the FULL-FLOAT64 prior
+//       (`node.prior_d`, the pre-narrowing masked-softmax) — the genuine 1a all-`double` port. The
+//       toggle is ONE rule over ALL FOUR read sites (`prior_read` below), NOT a per-site gate (an
+//       earlier draft gated only v_mix/PUCT but left the dominant log-prior path float32 in BOTH arms,
+//       which made the control VACUOUS — the float32 effect leaked into both arms; see the audit).
+//
+//     1. `evaluate` stores BOTH `node.prior` (float32, the net's wire dtype the Python search
+//        side-reads as root.prior) AND `node.prior_d` (the same masked-softmax in full float64). The
+//        masked softmax that BUILDS the prior runs in float64 either way; only the STORED `prior` is
+//        narrowed. The downstream LOG-PRIOR root logit (`run_search`: logits[s]=log(prior_read(s))) is
+//        the DOMINANT float32 effect on the discrete output (~1e-7 on log(prior)): it feeds the
+//        Gumbel-top-k `logit+g` AND the SH cut key `g+logit+σ·q̂`, so the float32-vs-double prior FLIPS
+//        the SH survivor and the improved-π argmax on near-tie inputs. This is the seam the
+//        discrimination control actually proves load-bearing on the DISCRETE output.
+//     2. `v_mix_mixed` computes the prior-weighted blend in FLOAT32: numpy weak-promotes
+//        `prior[s](f32) * q(pyfloat) → f32`, and `pyfloat += f32 → f32`, so `pw_num`/`pw_den`/`v_bar`
+//        AND the whole `(v_net + ΣN·v̄)/(1+ΣN)` return are float32 (the v_mix result is np.float32).
+//     3. `improved_policy` completes UNVISITED slots with `σ·v_mix` rounded to FLOAT32 (numpy
+//        `pyfloat(σ) * f32(vm) → f32`), added to the float64 root logit (numpy `f64 + f32 → f64`);
+//        VISITED slots use the full-float64 `σ·q` (q is a Python float there). The masked softmax /
+//        argmax over `completed` then run in float64 (matching _masked_softmax / np.argmax).
+//     4. `puct_select` scores `q + c_puct·p·√ΣN/(1+n)` in FLOAT32 (numpy `p(f32)` weak-promotes the
+//        whole U-term and the `q +` to float32), so the interior near-tie argmax is decided in float32.
+//   The SH cut key `g + logit + σ·q̂`'s σ·q̂ stays float64 on BOTH sides (g/logits/sigma float64, q̂ a
+//   Python float); the float32 enters that key ONLY through `logits = log(prior)` (seam 1).
+//
+//   HONEST SCOPE OF SEAMS 2/3/4 (verified, see the 1b audit): the VALUE fidelity of v_mix / σ·v_mix /
+//   PUCT is byte-faithful to numpy (the 1e-4 value bar, P6) and the mixed path implements them so the
+//   completed-Q / improved-π LOGITS match Python bit-for-bit. But on the DISCRETE output they are
+//   near-unobservable in THIS search: v_mix (seams 2/3) feeds ONLY the improved-π UNVISITED-slot
+//   completion, and an unvisited slot never wins the argmax (σ amplifies any visited-q lead; v_mix is a
+//   blend that never exceeds the best visited q); PUCT (seam 4) CAN flip the survivor via interior
+//   child selection but only on a ~1e-8 interior tie that fine inputs essentially never hit. So the
+//   DISCRETE discrimination below rests on seam 1 (the prior precision). We do NOT over-claim that all
+//   four seams flip the discrete output — claiming so would be the hack the audit names.
+//
+//   DISCRIMINATION CONTROL (CHOCO_GUMBEL_UNIFORM=1): `kUniform` reads the FULL-float64 prior at every
+//   site (seams 1-4), i.e. the genuine 1a uniform-`double` port. On the COARSE 1a inputs (no near-ties)
+//   uniform==mixed (the structure check is precision-insensitive); on the FINE near-tie inputs
+//   (cpp/parity/gumbel_precision.py) the uniform port DIVERGES from Python on a LARGE fraction while
+//   the mixed port matches N/N — the load-bearing proof that the float32 PRIOR precision, not the
+//   structure, is what 1b fixed (the 1b analogue of the 1a mutation control).
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/gumbel.hpp"
@@ -49,6 +91,29 @@ enum class Mutate { None, ShBudget, Puct };
     return Mutate::None;
 }
 const Mutate kMutate = read_mutate();  // read once (a process-lifetime test seam)
+
+// The 1b DISCRIMINATION control (test-only): CHOCO_GUMBEL_UNIFORM=1 reverts the three float32 seams
+// (v_mix, the unvisited σ·v_mix completion, the PUCT score) to the 1a uniform-`double` precision, so
+// the precision parity harness can prove the float32 path — not the structure — is what decides the
+// near-ties. Default (unset) is the FAITHFUL mixed precision (float32-prior × float64-Q) that matches
+// Python's value_target.py byte-for-byte. No production path sets it.
+[[nodiscard]] bool read_uniform() {
+    const char* u = std::getenv("CHOCO_GUMBEL_UNIFORM");
+    return u != nullptr && std::strcmp(u, "1") == 0;
+}
+const bool kUniform = read_uniform();  // read once (a process-lifetime test seam)
+
+// The ONE prior-precision rule shared by ALL FOUR float32 prior read sites (the log-prior logit build,
+// v_mix, the σ·v_mix completion, PUCT). MIXED (default) reads the float32 stored prior — the precision
+// Python's float32 root.prior carries. UNIFORM (kUniform) reads the full-float64 pre-narrowing prior —
+// the genuine 1a all-`double` port. Localizing the toggle HERE (one invariant over all readers, not a
+// per-site gate) is what makes the discrimination control non-vacuous: under kUniform NO read site sees
+// the float32 narrowing, so the dominant log-prior effect is double in the uniform arm and float32 in
+// the mixed arm — the discrete divergence the control proves.
+[[nodiscard]] double prior_read(const GumbelNode& node, int s) {
+    return kUniform ? node.prior_d[static_cast<size_t>(s)]
+                    : static_cast<double>(node.prior[static_cast<size_t>(s)]);
+}
 }  // namespace
 
 // ---- belief key: the (count, first, last) fingerprint (mirrors _belief_key) -----------------------
@@ -84,27 +149,60 @@ namespace {
 //   v_mix = (v_net + ΣN·v̄)/(1+ΣN),  v̄ = Σ_{N>0} π(b)Q(b) / Σ_{N>0} π(b)   (PRIOR-weighted).
 // Returns v_net unchanged when nothing was visited or all visited priors are 0.
 //
-// 1b SEAM: 1a runs the prior-weighted product (`prior[s]·q`) in `double` — the prior here is the
-// float32 `node.prior` widened to double, and ΣN is an exact int. The Python rule keeps `prior[s]·q`
-// at float32 (a numpy-weak-promotion against a Python-float q) and `sum_n·v̄` at v̄'s dtype. On COARSE,
-// well-separated inputs this product's value is identical to many ULP, so 1a's `double` matches the
-// discrete outcome; 1b makes `pw_num`/`pw_den` float32 to be ULP-faithful on near-tie inputs.
-[[nodiscard]] double v_mix_1a(const GumbelNode& node, double root_value) {
+// 1b SEAM (seam 2): the Python rule computes this ENTIRELY in float32 — `prior[s](f32) * q(pyfloat)`
+// weak-promotes to f32; `pyfloat(0.0) += f32 → f32` so `pw_num`/`pw_den`/`v_bar` are f32; `sum_n(pyint)
+// * v_bar(f32) → f32` and `root_value(pyfloat) + f32 → f32`, `/ (1+sum_n)(pyint) → f32`, so the WHOLE
+// return is np.float32 (value_target.py:226-249, "the v_mix return is np.float32"). We mirror it with
+// `float` arithmetic: narrow `prior[s]·q` to float (numpy-weak), accumulate/divide/blend in float, and
+// widen the float32 result to double ONCE for the (lossless) return — exactly the value Python's f32
+// v_mix carries when it flows into the f64 `logits[s] + σ·vm` add downstream. `kUniform` runs the 1a
+// uniform-`double` path (the discrimination control: diverges from Python on the fine near-tie inputs).
+[[nodiscard]] double v_mix_mixed(const GumbelNode& node, double root_value) {
     long sum_n = 0;
-    double pw_num = 0.0, pw_den = 0.0;
+    if (kUniform) {
+        // the genuine 1a all-`double` path: the FULL-float64 prior (prior_read -> prior_d) and double
+        // arithmetic throughout (the discrimination control — diverges from Python on fine near-ties).
+        double pw_num = 0.0, pw_den = 0.0;
+        for (int s : node.legal_slots) {
+            auto nit = node.N.find(s);
+            int n = (nit != node.N.end()) ? nit->second : 0;
+            if (n > 0) {
+                sum_n += n;
+                double p = prior_read(node, s);  // full-float64 prior (kUniform)
+                pw_num += p * node.q(s);
+                pw_den += p;
+            }
+        }
+        if (sum_n > 0 && pw_den > 0.0) {
+            double v_bar = pw_num / pw_den;
+            return (root_value + static_cast<double>(sum_n) * v_bar)
+                   / (1.0 + static_cast<double>(sum_n));
+        }
+        return root_value;
+    }
+    // mixed precision (default): float32 prior-weighted blend, byte-faithful to numpy's weak promotion.
+    float pw_num = 0.0f, pw_den = 0.0f;
     for (int s : node.legal_slots) {
         auto nit = node.N.find(s);
         int n = (nit != node.N.end()) ? nit->second : 0;
         if (n > 0) {
             sum_n += n;
-            double p = static_cast<double>(node.prior[static_cast<size_t>(s)]);  // 1b: float32 prior
-            pw_num += p * node.q(s);
-            pw_den += p;
+            float p = node.prior[static_cast<size_t>(s)];               // the stored float32 prior
+            // numpy `f32 * pyfloat → f32` casts the WEAK Python operand to float32 FIRST, then
+            // multiplies in float32 (verified: cast-first, NOT a f64 multiply narrowed). Mirror it by
+            // casting `q` to float before the multiply, so the product is computed in true float32.
+            pw_num += p * static_cast<float>(node.q(s));                // f32 * f32(q) → f32
+            pw_den += p;                                                // pyfloat(0) += f32 → f32
         }
     }
-    if (sum_n > 0 && pw_den > 0.0) {
-        double v_bar = pw_num / pw_den;
-        return (root_value + static_cast<double>(sum_n) * v_bar) / (1.0 + static_cast<double>(sum_n));
+    if (sum_n > 0 && pw_den > 0.0f) {
+        float v_bar = pw_num / pw_den;                                  // f32 / f32 → f32
+        // numpy weak-promotes the Python-float `root_value` to float32 BEFORE the add (verified:
+        // `pyfloat + f32` casts the weak operand to f32 first, then adds in f32 — NOT f64-then-narrow).
+        float rv = static_cast<float>(root_value);
+        float vmix = (rv + static_cast<float>(sum_n) * v_bar)          // f32 + (pyint*f32→f32) → f32
+                     / (1.0f + static_cast<float>(sum_n));             // / (pyint) → f32
+        return static_cast<double>(vmix);                             // lossless widen for the f64 add
     }
     return root_value;
 }
@@ -153,9 +251,10 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const std::vec
     const NetPrediction& np = *pred;
 
     // the prior = masked softmax of the net logits over the legal slots (mirrors predict_both: the net
-    // emits raw logits, the search softmaxes them under the mask). 1b SEAM: `node.prior` is the float32
-    // prior array the Python search side-reads (root.prior, float32). We store float32 here so the
-    // σ-transform reads the same precision Python does.
+    // emits raw logits, the search softmaxes them under the mask). 1b SEAM 1: `node.prior` is the float32
+    // prior array the Python search side-reads (root.prior, float32) — the precision the mixed path reads.
+    // We ALSO keep `node.prior_d`, the SAME masked softmax in full float64, so the discrimination control
+    // (kUniform) can read the genuine pre-narrowing double prior at every site (prior_read).
     std::vector<double> logits_d(static_cast<size_t>(n_slots_), -1e30);
     // collect the legal slots (env.legal_actions order, then TERMINATE) — the SAME order Python's
     // root.legal carries (legal_actions list, with TERMINATE always legal appended by the mask).
@@ -173,6 +272,9 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const std::vec
         logits_d[static_cast<size_t>(s)] = static_cast<double>(np.logits[static_cast<size_t>(s)]);
     }
     std::vector<double> prior_d = masked_softmax_1a(logits_d, node.legal_slots, n_slots_);
+    // store BOTH: the full-float64 prior (prior_d, read by the uniform discrimination arm) AND its
+    // float32 narrowing (prior, read by the default mixed arm — the precision Python's root.prior holds).
+    node.prior_d = prior_d;
     node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
     for (int s = 0; s < n_slots_; ++s)
         node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_d[static_cast<size_t>(s)]);
@@ -196,12 +298,29 @@ int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
         auto nit = node.N.find(s);
         int n = (nit != node.N.end()) ? nit->second : 0;
         double q = (n > 0) ? (node.W.at(s) / static_cast<double>(n)) : base_v;
-        double p = static_cast<double>(node.prior[static_cast<size_t>(s)]);
-        double u = cfg_.c_puct * p * sqrt_total / (1.0 + static_cast<double>(n));
-        // MUTATION (test-only): a wrong PUCT flips the exploration U-term sign -> a different interior
-        // action is selected -> different backups -> a different survivor/argmax. The faithful path is
-        // `q + u`.
-        double v = (kMutate == Mutate::Puct) ? (q - u) : (q + u);
+        // 1b SEAM (seam 4): Python computes `q + c_puct·p·√ΣN/(1+n)` with `p` the float32 prior scalar,
+        // which numpy weak-promotes through the WHOLE U-term and the `q +` to float32 — so the interior
+        // near-tie argmax is decided in FLOAT32 (gumbel_search.py:397-426). Mirror it: cast the Python-
+        // float operands to float so each numpy op runs in true float32 (cast-first weak promotion).
+        // `kUniform` runs the 1a uniform-`double` path (the discrimination control).
+        double v;
+        if (kUniform) {
+            double p = prior_read(node, s);  // full-float64 prior (the genuine 1a all-`double` path)
+            double u = cfg_.c_puct * p * sqrt_total / (1.0 + static_cast<double>(n));
+            v = (kMutate == Mutate::Puct) ? (q - u) : (q + u);
+        } else {
+            float p = node.prior[static_cast<size_t>(s)];                       // stored float32 prior
+            float u = static_cast<float>(cfg_.c_puct) * p                        // pyfloat·f32 → f32
+                      * static_cast<float>(sqrt_total)                           // ·pyfloat → f32
+                      / (1.0f + static_cast<float>(n));                          // /(pyint) → f32
+            float vf = (kMutate == Mutate::Puct)
+                           ? (static_cast<float>(q) - u)                         // q(pyfloat) ± f32 → f32
+                           : (static_cast<float>(q) + u);
+            v = static_cast<double>(vf);  // lossless widen; the float32 ordering drives the argmax
+        }
+        // strict `>` first-wins over node.legal_slots (mirrors Python `if v > best_v`). best_v starts at
+        // -inf (the first slot always wins); thereafter the comparison is between the float32-rounded
+        // scores (widened to double, an order-preserving widen) — the near-tie side Python lands on.
         if (v > best_v) {
             best_v = v;
             best_a = s;
@@ -379,13 +498,27 @@ int GumbelAZPolicy::sequential_halving(std::vector<GumbelNode>& nodes, const Loc
 std::vector<double> GumbelAZPolicy::improved_policy(const GumbelNode& root,
                                                     const std::vector<double>& logits) const {
     double sigma = sigma_scale_1a(root, cfg_.c_visit, cfg_.c_scale);
-    double vm = v_mix_1a(root, root.value);
+    double vm = v_mix_mixed(root, root.value);   // float32-faithful v_mix (returned widened to double)
     std::vector<double> completed(static_cast<size_t>(n_slots_), -1e30);
     for (int s : root.legal_slots) {
         auto nit = root.N.find(s);
         int n = (nit != root.N.end()) ? nit->second : 0;
-        double q = (n > 0) ? root.q(s) : vm;  // unvisited completed by v_mix
-        completed[static_cast<size_t>(s)] = logits[static_cast<size_t>(s)] + sigma * q;
+        // 1b SEAM (seam 3): `completed[s] = logits[s] + σ·q`, where `logits[s]` is a float64 root logit
+        // (an element of the float64 `logits` array) and σ is a Python float. For VISITED slots q is a
+        // Python float (root.q), so `σ·q` is float64 → the whole term is float64. For UNVISITED slots q
+        // is `vm`, an np.float32 (v_mix's float32 return), so numpy `pyfloat(σ)·f32(vm) → f32` and then
+        // `f64(logits[s]) + f32 → f64` (the float32-rounded σ·vm added in float64). Mirror EXACTLY:
+        // visited → full double; unvisited → round σ·vm to float (cast-first weak promotion), then add
+        // in double. `kUniform` runs the 1a uniform-`double` path (the discrimination control).
+        if (n > 0) {
+            completed[static_cast<size_t>(s)] = logits[static_cast<size_t>(s)] + sigma * root.q(s);
+        } else if (kUniform) {
+            completed[static_cast<size_t>(s)] = logits[static_cast<size_t>(s)] + sigma * vm;
+        } else {
+            float sigma_vm = static_cast<float>(sigma) * static_cast<float>(vm);  // pyfloat·f32 → f32
+            completed[static_cast<size_t>(s)] =
+                logits[static_cast<size_t>(s)] + static_cast<double>(sigma_vm);   // f64 + f32 → f64
+        }
     }
     return masked_softmax_1a(completed, root.legal_slots, n_slots_);
 }
@@ -411,9 +544,15 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const std::v
 
     // root logits = log(prior) over legal slots (the masked-softmax prior is the reference; its log is
     // the root logit). -1e30 on illegal (mirrors _decide_root's logits build).
+    // 1b SEAM 1 (the DOMINANT float32 effect on the discrete output): Python reads `prior[s]` off the
+    // float32 `root.prior` here, so `math.log(max(prior[s], 1e-12))` is a log of a float32 scalar — the
+    // ~1e-7 float32 narrowing perturbs every root logit, and these logits feed BOTH the Gumbel-top-k
+    // (logit+g) AND the SH cut key (g+logit+σ·q̂), so the float32-vs-double prior FLIPS the survivor and
+    // the improved-π argmax on near-tie inputs. `prior_read` routes the precision: float32 in the
+    // default mixed arm (matching Python), full-float64 in the uniform discrimination arm.
     std::vector<double> logits(static_cast<size_t>(n_slots_), -1e30);
     for (int s : nodes[0].legal_slots) {
-        double p = static_cast<double>(nodes[0].prior[static_cast<size_t>(s)]);
+        double p = prior_read(nodes[0], s);
         logits[static_cast<size_t>(s)] = std::log(std::max(p, 1e-12));
     }
 
