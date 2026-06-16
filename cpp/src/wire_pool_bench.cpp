@@ -37,7 +37,6 @@
 //              pool_dps=<n> leaves=<n> wall=<s>" + exit 0, or a loud failure.
 //
 // Public Domain (The Unlicense).
-#include <boost/context/fiber.hpp>
 #include <zmq.h>
 
 #include <atomic>
@@ -58,13 +57,12 @@
 
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
-#include "chocofarm/fiber_leaf.hpp"
+#include "chocofarm/fiber_tree.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/inference_wire.hpp"
 #include "chocofarm/instance.hpp"
+#include "chocofarm/net_evaluator.hpp"
 #include "chocofarm/runtime_config.hpp"
-
-namespace ctxb = boost::context;
 
 namespace {
 [[nodiscard]] std::optional<std::string_view> opt(std::span<const std::string_view> args,
@@ -105,53 +103,10 @@ namespace {
     return true;
 }
 
-class ScriptedGumbelSource final : public chocofarm::GumbelSource {
-  public:
-    explicit ScriptedGumbelSource(std::vector<double> table) : table_(std::move(table)) {}
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override { return bw.empty() ? 0u : bw[0]; }
-    std::vector<double> gumbel(int n) override {
-        std::vector<double> out(static_cast<size_t>(n));
-        for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = table_[(idx_++) % table_.size()];
-        return out;
-    }
-
-  private:
-    std::vector<double> table_;
-    size_t idx_ = 0;
-};
-
-// One tree in a fiber. Heap-allocated for a STABLE address (the fiber captures references to its members).
-struct TreeState {
-    chocofarm::FiberLeafChannel ch;
-    chocofarm::YieldingNetEvaluator ynet;
-    chocofarm::GumbelAZPolicy policy;
-    ScriptedGumbelSource src;
-    chocofarm::GumbelAZPolicy::Decision decision;
-    ctxb::fiber fib;
-    bool running = false;
-
-    TreeState(const chocofarm::GumbelConfig& cfg, const chocofarm::Environment& env,
-              std::vector<double> table)
-        : ynet(ch), policy(cfg, ynet, env), src(std::move(table)) {}
-
-    void start(const chocofarm::Loc& loc, const std::vector<uint32_t>& bw, const std::set<int>& coll,
-               double lam) {
-        fib = ctxb::fiber{std::allocator_arg, ctxb::fixedsize_stack(512 * 1024),
-                          [this, &loc, &bw, &coll, lam](ctxb::fiber&& caller) {
-                              ch.caller = std::move(caller);
-                              decision = policy.run_search(loc, bw, coll, lam, src);
-                              ch.at_leaf = false;
-                              return std::move(ch.caller);
-                          }};
-        fib = std::move(fib).resume();
-        running = ch.at_leaf;
-    }
-    void resume_with(const chocofarm::NetPrediction& pred) {
-        ch.value = pred;
-        fib = std::move(fib).resume();
-        running = ch.at_leaf;
-    }
-};
+// The fiber<->driver channel, the YieldingNetEvaluator, the scripted Gumbel source, and the per-tree
+// TreeState are the ONE-home shared primitives — chocofarm::{FiberLeafChannel, YieldingNetEvaluator}
+// (fiber_leaf.hpp), CyclicGumbelSource (cyclic_gumbel.hpp), TreeState (fiber_tree.hpp). This bench is now
+// only the GREEDY-ASYNC T×K DRIVER over those primitives (the corr-id transport + the work loop).
 
 const std::vector<double> kGtable{0.40, -0.65, 1.10, 0.05, -0.30, 0.85, -1.20, 0.55,
                                   0.20, -0.45, 0.95, -0.10, 0.70};
@@ -229,7 +184,7 @@ int main(int argc, char** argv) {
         std::deque<int> my_tasks;
         for (int i = tid; i < n_tasks; i += T) my_tasks.push_back(i);
 
-        std::vector<std::unique_ptr<TreeState>> slots(static_cast<size_t>(K));
+        std::vector<std::unique_ptr<chocofarm::TreeState>> slots(static_cast<size_t>(K));
         std::unordered_map<uint64_t, int> inflight;  // corr-id -> slot id of its outstanding leaf
         long my_leaves = 0;
         int my_decided = 0;
@@ -246,7 +201,7 @@ int main(int argc, char** argv) {
         auto fill = [&](int s) -> bool {
             while (!my_tasks.empty()) {
                 int ti = my_tasks.front(); my_tasks.pop_front();
-                slots[static_cast<size_t>(s)] = std::make_unique<TreeState>(cfg, env, script_for(ti));
+                slots[static_cast<size_t>(s)] = std::make_unique<chocofarm::TreeState>(cfg, env, script_for(ti));
                 slots[static_cast<size_t>(s)]->start(loc, bw, coll, lam);
                 if (slots[static_cast<size_t>(s)]->running) { submit(s); return true; }
                 ++my_decided;  // finished immediately (degenerate); count + try the next task
