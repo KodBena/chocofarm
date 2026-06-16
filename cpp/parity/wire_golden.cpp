@@ -12,13 +12,19 @@
 //   tests/test_cpp_runner.py). The ALWAYS-ON leg is the pure-Python constant-agreement test that needs
 //   no compiler; this program is the stronger end-to-end check when a C++ toolchain is present.
 //
+//   The wire round-trip drives the SHARED C++ codec (chocofarm/inference_wire.hpp) — the SAME
+//   encode/decode the ZmqNetClient uses — so this golden leg covers the production codec, not a
+//   bespoke passthrough (ADR-0012 P1: one codec, derived from the wire_spec SSOT). The codec header is
+//   itself dependency-free (no zmq), so this program still compiles with a bare `g++ -std=c++23`.
+//
 //   Protocol (stdin → stdout, all little-endian, length-prefixed by an explicit count so the harness
 //   needs no shared framing of its own):
 //
 //     argv[1] == "wire":
-//       Decode ONE inference REQUEST frame, then ONE inference RESPONSE frame, re-encode each from the
-//       decoded fields using ONLY the mirror constants, and emit the two re-encoded frames back. The
-//       Python side asserts the bytes returned == the bytes sent (exact inverse, no drift).
+//       DECODE ONE inference REQUEST frame to its (in_dim, X) fields and ONE RESPONSE frame to its
+//       (value, logits) fields via the shared codec, then RE-ENCODE each from those decoded fields and
+//       emit the two re-encoded frames. The Python side asserts the bytes returned == the bytes sent
+//       (exact inverse through the production codec — decode∘encode is identity, no drift).
 //         stdin : [u32 req_len][req_bytes][u32 resp_len][resp_bytes]
 //         stdout: [u32 req_len][req_bytes][u32 resp_len][resp_bytes]   (re-encoded)
 //
@@ -41,6 +47,7 @@
 #include <string_view>
 #include <vector>
 
+#include "chocofarm/inference_wire.hpp"
 #include "chocofarm/result_spec.hpp"
 #include "chocofarm/wire_spec.hpp"
 
@@ -77,50 +84,23 @@ bool read_framed(std::vector<unsigned char>& out) {
     return read_exact(out, n);
 }
 
-// ---- inference wire: decode a request/response by the wire_spec mirror, re-encode identically ----
-// Decode a REQUEST [ver:u8][in_dim:u32][X:f32×in_dim] into (in_dim, X bytes), then RE-ENCODE from the
-// decoded fields using ONLY wire_spec mirror constants. Returns the re-encoded frame (empty on error).
+// ---- inference wire: DECODE→RE-ENCODE through the SHARED codec (chocofarm/inference_wire.hpp) ----
+// Decode a REQUEST [ver:u8][in_dim:u32][X:f32×in_dim] to its X field via the shared codec, then
+// RE-ENCODE from that field. decode∘encode is identity, so the harness asserting bytes-out==bytes-in
+// proves the production codec (the one ZmqNetClient uses) round-trips the Python-encoded golden frame.
+// Returns the re-encoded frame, or empty on a decode error (loud caller exit — layout drift).
 std::vector<unsigned char> roundtrip_request(std::span<const unsigned char> frame) {
-    namespace w = chocofarm::wire;
-    if (frame.size() < w::HEADER_BYTES) return {};
-    w::version_t ver = frame[0];
-    if (ver != w::PROTOCOL_VERSION) return {};   // unknown protocol byte is loud (caller sees empty)
-    w::count_t in_dim = 0;
-    std::memcpy(&in_dim, frame.data() + w::VERSION_BYTES, w::COUNT_BYTES);
-    std::size_t want = w::HEADER_BYTES + static_cast<std::size_t>(in_dim) * w::FLOAT_BYTES;
-    if (frame.size() != want) return {};         // length-prefix must match the byte count exactly
-
-    // re-encode from the decoded (ver, in_dim, payload) — derive every width from the mirror, never a
-    // hardcoded "5-byte header" / "4-byte float".
-    std::vector<unsigned char> out;
-    out.reserve(want);
-    out.push_back(static_cast<unsigned char>(w::PROTOCOL_VERSION));
-    const unsigned char* dimp = reinterpret_cast<const unsigned char*>(&in_dim);
-    out.insert(out.end(), dimp, dimp + w::COUNT_BYTES);
-    out.insert(out.end(), frame.begin() + static_cast<long>(w::HEADER_BYTES), frame.end());
-    return out;
+    auto decoded = chocofarm::wire::decode_request(frame);
+    if (!decoded) return {};   // unknown protocol byte / wrong length is loud (caller sees empty)
+    return chocofarm::wire::encode_request(*decoded);
 }
 
-// Decode a RESPONSE [ver:u8][n_actions:u32][value:f32][logits:f32×n_actions], re-encode identically.
+// Decode a RESPONSE [ver:u8][n_actions:u32][value:f32][logits:f32×n_actions] to its (value, logits)
+// fields via the shared codec, then re-encode from them — same exact-inverse proof for the response.
 std::vector<unsigned char> roundtrip_response(std::span<const unsigned char> frame) {
-    namespace w = chocofarm::wire;
-    std::size_t fixed = w::HEADER_BYTES + w::FLOAT_BYTES;   // header + the value scalar
-    if (frame.size() < fixed) return {};
-    w::version_t ver = frame[0];
-    if (ver != w::PROTOCOL_VERSION) return {};
-    w::count_t n_actions = 0;
-    std::memcpy(&n_actions, frame.data() + w::VERSION_BYTES, w::COUNT_BYTES);
-    std::size_t want = fixed + static_cast<std::size_t>(n_actions) * w::FLOAT_BYTES;
-    if (frame.size() != want) return {};
-
-    std::vector<unsigned char> out;
-    out.reserve(want);
-    out.push_back(static_cast<unsigned char>(w::PROTOCOL_VERSION));
-    const unsigned char* np = reinterpret_cast<const unsigned char*>(&n_actions);
-    out.insert(out.end(), np, np + w::COUNT_BYTES);
-    // value scalar + logits block are copied through byte-exact (the codec carries f32 bytes verbatim).
-    out.insert(out.end(), frame.begin() + static_cast<long>(w::HEADER_BYTES), frame.end());
-    return out;
+    auto decoded = chocofarm::wire::decode_response(frame);
+    if (!decoded) return {};
+    return chocofarm::wire::encode_response(decoded->value, decoded->logits);
 }
 
 int run_wire() {

@@ -65,6 +65,35 @@ if(NOT HIREDIS_FOUND)
     "or point CMAKE_PREFIX_PATH at it. It is the runner's one system dependency (see cpp/README.md).")
 endif()
 
+# ---- libzmq (system dependency — the Shape B inference client's transport) ----
+# The C++ ZmqNetClient (the remote NetEvaluator, docs/design/zmq-inference-service.md) speaks the libzmq
+# C API (zmq.h). Located via pkg-config exactly like hiredis (cppzmq's zmq.hpp is NOT used / required),
+# with a manual find_path/find_library fallback. This is the second documented system dependency.
+set(ZMQ_FOUND FALSE)
+if(PkgConfig_FOUND)
+  pkg_check_modules(ZMQ IMPORTED_TARGET libzmq)
+  if(ZMQ_FOUND)
+    set(ZMQ_LINK PkgConfig::ZMQ)
+  endif()
+endif()
+if(NOT ZMQ_FOUND)
+  find_path(ZMQ_INCLUDE_DIR zmq.h)
+  find_library(ZMQ_LIBRARY zmq)
+  if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+    add_library(zmq_manual INTERFACE)
+    target_include_directories(zmq_manual INTERFACE ${ZMQ_INCLUDE_DIR})
+    target_link_libraries(zmq_manual INTERFACE ${ZMQ_LIBRARY})
+    set(ZMQ_LINK zmq_manual)
+    set(ZMQ_FOUND TRUE)
+  endif()
+endif()
+if(NOT ZMQ_FOUND)
+  message(FATAL_ERROR
+    "libzmq not found. Install it (Debian/Ubuntu: libzmq3-dev; Fedora/openSUSE: zeromq-devel / "
+    "libzmq5) or point CMAKE_PREFIX_PATH at it. It is the inference client's system dependency "
+    "(the C API zmq.h; cppzmq is NOT required — see cpp/README.md).")
+endif()
+
 # ---- the runner core (a library so tests/tools can link it; main is a thin shell) ----
 add_library(chocofarm_core
   src/instance.cpp
@@ -72,13 +101,14 @@ add_library(chocofarm_core
   src/features.cpp
   src/transport.cpp
   src/net.cpp
+  src/zmq_net_client.cpp
   src/policy.cpp
   src/nmcs.cpp
   src/ismcts.cpp
   src/runner.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chocofarm_core PUBLIC nlohmann_json::nlohmann_json ${HIREDIS_LINK})
+target_link_libraries(chocofarm_core PUBLIC nlohmann_json::nlohmann_json ${HIREDIS_LINK} ${ZMQ_LINK})
 target_compile_options(chocofarm_core PRIVATE -Wall -Wextra)
 
 add_executable(chocofarm-cpp-runner src/main.cpp)
@@ -119,3 +149,12 @@ target_compile_options(chocofarm-nmcs-dump PRIVATE -Wall -Wextra)
 add_executable(chocofarm-ismcts-dump src/ismcts_dump.cpp)
 target_link_libraries(chocofarm-ismcts-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-ismcts-dump PRIVATE -Wall -Wextra)
+
+# A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
+# RPCs the running Python inference service with feature vectors on stdin, and prints the returned
+# (value, logits) — so the cross-language round-trip test (tests/test_zmq_net_cpp.py) can drive the C++
+# client against the Python InferenceServer and hold the result to the local C++ NetForward (< 1e-4).
+# Separate from the runner (P3, one-owner): this tool owns the inference-client round-trip fixture.
+add_executable(chocofarm-zmq-net-probe src/zmq_net_probe.cpp)
+target_link_libraries(chocofarm-zmq-net-probe PRIVATE chocofarm_core)
+target_compile_options(chocofarm-zmq-net-probe PRIVATE -Wall -Wextra)

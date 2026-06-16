@@ -54,10 +54,14 @@ include `nmcs.hpp` (ADR-0012 P1: one home, derive-don't-duplicate).
 
 ## Build
 
-The build is self-contained except for **one documented system dependency,
-hiredis** (Debian/Ubuntu `libhiredis-dev`; Fedora/openSUSE `hiredis-devel`).
-nlohmann/json is fetched by CMake `FetchContent` (pinned `v3.11.3`), or a
-system `nlohmann_json` ≥ 3.2 is used if installed.
+The build is self-contained except for **two documented system dependencies**:
+**hiredis** (Debian/Ubuntu `libhiredis-dev`; Fedora/openSUSE `hiredis-devel`) —
+the redis wire — and **libzmq** (Debian/Ubuntu `libzmq3-dev`; Fedora/openSUSE
+`zeromq-devel`) — the Shape B inference client's transport, used via the C API
+`zmq.h` (cppzmq's `zmq.hpp` is **not** required). Both are located by
+`pkg-config` (with a `find_path`/`find_library` fallback). nlohmann/json is
+fetched by CMake `FetchContent` (pinned `v3.11.3`), or a system `nlohmann_json`
+≥ 3.2 is used if installed.
 
 ```sh
 cmake -S cpp -B cpp/build && cmake --build cpp/build

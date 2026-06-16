@@ -80,9 +80,13 @@ int main(int argc, char** argv) {
                       << net->in_dim() << "\n";
             return 3;
         }
-        chocofarm::NetPrediction pred = net->predict(X);  // std::vector<float> binds to std::span
-        std::cout << pred.value;
-        for (float l : pred.logits) std::cout << ' ' << l;
+        // predict() now returns the NetEvaluator port's std::expected (shared with the remote
+        // ZmqNetClient). NetForward's LOCAL compute is total, so this never takes the error arm — but
+        // P9 [[nodiscard]] forces us to handle it, so a future fallible swap can't silently drop it.
+        auto pred = net->predict(X);  // std::vector<float> binds to std::span
+        if (!pred) { std::cerr << "net-dump: " << pred.error().message << "\n"; return 4; }
+        std::cout << pred->value;
+        for (float l : pred->logits) std::cout << ' ' << l;
         std::cout << "\n";
     }
     return 0;

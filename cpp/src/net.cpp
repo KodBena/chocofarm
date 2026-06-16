@@ -200,9 +200,11 @@ std::expected<NetForward, Error> NetForward::create(const WeightPayload& payload
     return nf;
 }
 
-NetPrediction NetForward::predict(std::span<const float> x) const {
+std::expected<NetPrediction, Error> NetForward::predict(std::span<const float> x) const {
     // x.size() == in_dim() is the caller's invariant (the manifest-validating create() reconciled the
     // dims). A mismatch is a programmer bug, not a boundary failure — an assert, not an Error (P9).
+    // This LOCAL forward is TOTAL: it always returns the VALUE arm. The std::expected return is the
+    // NetEvaluator port shape (shared with the fallible remote ZmqNetClient), not a real error surface.
     assert(static_cast<int>(x.size()) == in_dim_ && "NetForward::predict: x length != in_dim");
 
     // forward_core, verbatim, B=1, float32:

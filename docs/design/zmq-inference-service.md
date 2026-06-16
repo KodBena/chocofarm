@@ -320,4 +320,47 @@ What landed:
 The two SSOT modules are `mypy --strict`-clean and added to `STRICT_CLEAN`. The default suite grew from
 182 to 192 passed with 10 skipped (+2 opt-in C++ golden legs).
 
+### Amendment 2026-06-16 — the C++ `ZmqNetClient` landed (the P9 `cpp/` pass; ADR-0005 Rule 8: append)
+
+The forward-looking record above is preserved as written. §9 sequenced the C++ `ZmqNetClient` to "wait
+on the ADR-0012 P9 `cpp/` pass so it lands on the compliant `NetEvaluator` port" — that pass has landed,
+so the C++ remote half is now built (the Python half landed in the 2026-06-15 amendment):
+
+- **The `NetEvaluator` PORT extracted** — `cpp/include/chocofarm/net_evaluator.hpp`: the abstract base
+  the search compiles against (the §1 zero-cost ACL, the C++ twin of `net_port.py`'s `Net` Protocol),
+  carrying the `NetPrediction` struct + `[[nodiscard]] std::expected<NetPrediction, Error> predict(
+  std::span<const float>) const = 0`. `NetForward` (the local impl) now `final : public NetEvaluator`;
+  its `predict` is TOTAL (the local matmul cannot fail) so it always returns the value arm — the error
+  arm exists only to share the fallible-by-contract port with the remote impl (P9 rule 5).
+- **The C++ `ZmqNetClient` built** — `cpp/include/chocofarm/zmq_net_client.hpp` + `cpp/src/
+  zmq_net_client.cpp`: the REMOTE `NetEvaluator`, a blocking `ZMQ_REQ` socket on the **libzmq C API**
+  (`zmq.h`) wrapped in RAII (move-only ctx+socket; cppzmq's `zmq.hpp` is NOT a dependency). A factory
+  `create(endpoint, recv_timeout_ms) -> std::expected<ZmqNetClient, Error>` over a private ctor (a
+  failed ctx/socket/connect is a typed Error, not a throw). `predict` encodes→sends→recvs→decodes and
+  returns the de-standardized value + RAW logits, or a TYPED failure (a recv timeout via `ZMQ_RCVTIMEO`
+  on a server-down, a transport error, or a malformed/wrong-length reply rejected by the codec) — never
+  a silent fallback (§5).
+- **The wire codec unified to ONE C++ home** — `cpp/include/chocofarm/inference_wire.hpp`: a
+  header-only encode/decode derived from the `wire_spec.hpp` SSOT (P1/P7), shared by the `ZmqNetClient`
+  AND the #23 golden round-trip (`cpp/parity/wire_golden.cpp` was refactored to DRIVE this codec rather
+  than its prior inline passthrough — so the always-on drift net's opt-in C++ leg now covers the
+  production codec, closing the "the consumer it would generate for does not exist yet" reason the
+  2026-06-16 #23 amendment gave for deferring codegen). The codec stays dependency-free (no zmq), so the
+  golden still compiles with a bare `g++ -std=c++23`.
+- **CMake + verification** — `libzmq` is found via `pkg-config` (mirroring the hiredis pattern; a
+  `find_path`/`find_library` fallback), linked into `chocofarm_core`. A probe fixture
+  `chocofarm-zmq-net-probe` (`cpp/src/zmq_net_probe.cpp`) RPCs feature vectors so `tests/
+  test_zmq_net_cpp.py` (opt-in, `CHOCO_RUN_CPP`, NO redis — the server spins in-process with
+  `StaticParamsSource`) drives the C++ client against the Python `InferenceServer` and asserts the
+  returned `(value, logits)` match the local float32 `forward_core` (the reference the C++ `NetForward`
+  is pinned to, `net_parity.py`) within **1e-4** — measured max|Δvalue|≈2.4e-7, max|Δlogit|≈1.8e-7 over
+  N=200 vectors/case, residual ON and OFF. The loud-failure path is demonstrated: a server-down → a
+  typed timeout Error (NOT a hang), and a wrong-length reply → a typed codec rejection.
+
+**The #23 open promotion, re-stated (still open, narrowed).** The top rung (generate the mirror header
+from the Python SSOT) remains deferred and BACKLOG'd; the C++ side is now built but the mirror
+`wire_spec.hpp` is still hand-authored, joined to the SSOT by the always-on drift test — which now also
+covers the production codec (above). The honest residual is the same recorded one: the mirror constants
+are hand-written, not generated.
+
 *Public Domain (The Unlicense).*
