@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-tests/test_wire_drift.py — the MECHANICAL NET against silent Python↔C++ drift on the two #23-mechanized
-raw-binary contracts: the Shape B ZeroMQ inference WIRE frame (chocofarm/az/wire_spec.py ↔
-cpp/include/chocofarm/wire_spec.hpp) and the redis RESULT blob (chocofarm/az/result_spec.py ↔
-cpp/include/chocofarm/result_spec.hpp). Each layout has ONE authoritative home on the Python side
+tests/test_wire_drift.py — the MECHANICAL NET against silent Python↔C++ drift on the Python↔C++
+wire/config contracts: the Shape B ZeroMQ inference WIRE frame (chocofarm/az/wire_spec.py ↔
+cpp/include/chocofarm/wire_spec.hpp), the redis RESULT blob (chocofarm/az/result_spec.py ↔
+cpp/include/chocofarm/result_spec.hpp), and the actor CONTROL surface (chocofarm/az/{actor_config,
+control_spec}.py ↔ their cpp/include mirrors — the config field-set + per-field Mut-class AND the
+protocol message-type + error-tag vocabulary; agreements, not byte formats). Each layout has ONE
+authoritative home on the Python side
 (ADR-0012 P1/P7); this test is what makes "the C++ mirror DERIVES from it, never re-authors it" an
 ENFORCED fact rather than a comment (ADR-0011 Rule 4: a net quantifies over the layout, not one field).
 
-Three always-on legs (NO C++ binary, NO redis — they run in the default `pytest tests/ -q`):
+Four always-on legs (NO C++ binary, NO redis — they run in the default `pytest tests/ -q`):
 
   1. LAYOUT AGREEMENT. Parse the C++ mirror header's `constexpr` literals and assert they equal the
      Python SSOT's constants — the protocol version, the field byte-widths, the float dtype/itemsize,
@@ -26,9 +29,19 @@ Three always-on legs (NO C++ binary, NO redis — they run in the default `pytes
      transport.cpp::parse_manifest rejects anything else). That single shared literal is pinned here so
      a Python widening to float32 without the C++ reject being updated can't pass silently.
 
+  4. ACTOR-CONFIG AGREEMENT (the control-config field set + per-field Mut class — chocofarm/az/
+     actor_config.py ↔ cpp/include/chocofarm/actor_config.hpp). The C++ mirror's ACTOR_CONFIG_FIELDS /
+     ACTOR_CONFIG_MUT literal arrays equal the Python SSOT's FIELD_NAMES / MUT_CLASSES (the Mut class
+     itself READ from schema.py — the one home), with a negative-mutation self-check. A field
+     add/remove/rename or a HOT/INSTANCE flip on one side reds — the config would otherwise silently
+     desync (the persistent actor parses a knob Python never sends, or freezes a knob Python sends live).
+     Likewise the control-protocol VOCABULARY (CONTROL_MSG_TYPES / CONTROL_ERROR_TAGS ↔
+     control_spec.MSG_TYPES / ERROR_TAGS): a message-type or error tag the client BRANCHES on that drifts
+     on one side reds — the tags can mis-handle silently, unlike the fail-loud-at-parse JSON envelope keys.
+
 One opt-in leg (needs a C++ compiler; gated CHOCO_RUN_CPP, mirroring tests/test_cpp_runner.py):
 
-  4. CROSS-LANGUAGE GOLDEN ROUND-TRIP. Python encodes fixed golden vectors → a tiny standalone C++
+  5. CROSS-LANGUAGE GOLDEN ROUND-TRIP. Python encodes fixed golden vectors → a tiny standalone C++
      decoder (cpp/parity/wire_golden.cpp, compiled with a bare `g++ -std=c++23`, including ONLY the
      mirror headers) decodes them by the mirror constants and re-encodes → Python asserts the bytes
      are byte-for-byte identical. For a BYTE format the bar is byte-exactness, not float tolerance
@@ -49,11 +62,13 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from chocofarm.az import inference_wire as wire
-from chocofarm.az import result_spec, wire_spec
+from chocofarm.az import actor_config, control_spec, result_spec, wire_spec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WIRE_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "wire_spec.hpp")
 RESULT_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "result_spec.hpp")
+ACTOR_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "actor_config.hpp")
+CONTROL_HPP = os.path.join(REPO, "cpp", "include", "chocofarm", "control_spec.hpp")
 WEIGHTS_PY = os.path.join(REPO, "chocofarm", "az", "weights.py")
 TRANSPORT_CPP = os.path.join(REPO, "cpp", "src", "transport.cpp")
 GOLDEN_CPP = os.path.join(REPO, "cpp", "parity", "wire_golden.cpp")
@@ -370,7 +385,112 @@ def test_weight_blob_dtype_invariant_is_shared():
 
 
 # ===========================================================================
-# LEG 4 — CROSS-LANGUAGE GOLDEN ROUND-TRIP (opt-in; needs a C++ compiler).
+# LEG 4 — ACTOR-CONFIG AGREEMENT (always-on): the C++ control-config mirror's field set + per-field Mut
+# class equal the Python actor_config SSOT (which READS the Mut class from schema.py — the one home). The
+# actor control config (ActorConfig — the knobs the persistent Gumbel actor reconfigures live) is a
+# cross-boundary fact with one home (actor_config.py); these legs make "the C++ mirror DERIVES it, never
+# re-authors it" an ENFORCED fact (ADR-0012 P7 / ADR-0011 Rule 4 — a net over the field set + Mut class,
+# not one field), so a field add/remove/rename or a HOT/INSTANCE flip on one side reds the default suite.
+# ===========================================================================
+def test_actor_config_field_set_agrees():
+    """The control config's FIELD SET (instance/faces + the 7 GumbelConfig knobs, in order) is identical
+    in the Python SSOT (actor_config.FIELD_NAMES) and the C++ mirror (ACTOR_CONFIG_FIELDS). A field
+    added / removed / renamed on one side reds — the config would otherwise silently desync (a knob the
+    C++ parses but Python never sends, or vice versa)."""
+    src = _read(ACTOR_HPP)
+    assert _cpp_str_array(src, "ACTOR_CONFIG_FIELDS") == list(actor_config.FIELD_NAMES)
+
+
+def test_actor_config_mut_classes_agree():
+    """The per-field Mut class (the geometry paths INSTANCE, the 7 search knobs HOT) is identical in the
+    C++ mirror (ACTOR_CONFIG_MUT) and the Python SSOT (actor_config.MUT_CLASSES, which READS it from
+    schema.py's metadata['mut'] — the one home). A field that changes its HOT/INSTANCE class on one side
+    reds — this is what makes "search knobs reconfigure live, geometry is a new experiment" a
+    drift-protected fact, not a comment (it also tracks the m/n_sims RESTART→HOT flip: a regression that
+    re-froze them in the schema would red here)."""
+    src = _read(ACTOR_HPP)
+    assert _cpp_str_array(src, "ACTOR_CONFIG_MUT") == list(actor_config.MUT_CLASSES)
+    # the Mut strings are exactly the schema Mut enum values — no third vocabulary on the C++ side.
+    assert set(actor_config.MUT_CLASSES) <= {"hot", "restart", "instance"}
+
+
+def test_actor_config_field_and_mut_arrays_same_length():
+    """The C++ ACTOR_CONFIG_FIELDS and ACTOR_CONFIG_MUT carry one Mut per field — a length mismatch (a
+    field added to one array but not the other) is itself drift the net catches, independent of the
+    Python comparison."""
+    src = _read(ACTOR_HPP)
+    assert len(_cpp_str_array(src, "ACTOR_CONFIG_FIELDS")) == len(_cpp_str_array(src, "ACTOR_CONFIG_MUT"))
+
+
+def _perturb_cpp_str_array_first(src: str, name: str, new_first: str) -> str:
+    """Rewrite the FIRST string element of a C++ `std::array<std::string_view> NAME = {"a", ...}` literal
+    to `new_first` — simulating a one-sided rename/reorder a real drift would be. Asserts the
+    substitution changed the text (so the self-check can't silently no-op)."""
+    m = re.search(rf"\b{re.escape(name)}\s*=\s*\{{\s*\"([^\"]*)\"", src)
+    assert m is not None, f"could not find the first element of {name!r} to perturb"
+    out = src[:m.start(1)] + new_first + src[m.end(1):]
+    assert out != src, f"perturbation of {name!r} changed nothing — the self-check is a no-op"
+    return out
+
+
+def test_drift_catch_actor_config_field_rename_fails():
+    """NEGATIVE proof: a C++ mirror that renamed a config field (here the first, instance_path) without
+    the Python SSOT following makes the field-set agreement FAIL. If this didn't raise, the agreement
+    leg would be vacuous."""
+    src = _read(ACTOR_HPP)
+    bad = _perturb_cpp_str_array_first(src, "ACTOR_CONFIG_FIELDS", "renamed_path")
+    with pytest.raises(AssertionError):
+        assert _cpp_str_array(bad, "ACTOR_CONFIG_FIELDS") == list(actor_config.FIELD_NAMES)
+
+
+def test_drift_catch_actor_config_mut_flip_fails():
+    """NEGATIVE proof: a C++ mirror that flipped a field's Mut class (here the first entry, instance →
+    hot) without the Python SSOT following makes the Mut-class agreement FAIL — the drift-protection on
+    "geometry is INSTANCE, search knobs are HOT"."""
+    src = _read(ACTOR_HPP)
+    bad = _perturb_cpp_str_array_first(src, "ACTOR_CONFIG_MUT", "hot")  # instance -> hot, a one-sided flip
+    with pytest.raises(AssertionError):
+        assert _cpp_str_array(bad, "ACTOR_CONFIG_MUT") == list(actor_config.MUT_CLASSES)
+
+
+# ---- LEG 4 (cont.) — CONTROL-PROTOCOL vocabulary (the message-type + error-tag sets the client
+#      branches on; drift-netted because a branch tag can mis-handle silently, vs the fail-loud keys). --
+def test_control_msg_types_agree():
+    """The control-protocol message TYPE tags (configure/generate/ping/shutdown, in order) are identical
+    in the Python SSOT (control_spec.MSG_TYPES) and the C++ mirror (CONTROL_MSG_TYPES). A tag the client
+    branches on that drifts from the runner's spelling would mis-dispatch WITHOUT a loud parse error."""
+    src = _read(CONTROL_HPP)
+    assert _cpp_str_array(src, "CONTROL_MSG_TYPES") == list(control_spec.MSG_TYPES)
+
+
+def test_control_error_tags_agree():
+    """The closed ERROR-tag set (the machine tag a reply's "error" field carries) is identical in the C++
+    mirror (CONTROL_ERROR_TAGS) and the Python SSOT (control_spec.ERROR_TAGS). The client branches on
+    these tags; a one-sided rename would silently mis-handle a failure, so the set is drift-netted."""
+    src = _read(CONTROL_HPP)
+    assert _cpp_str_array(src, "CONTROL_ERROR_TAGS") == list(control_spec.ERROR_TAGS)
+
+
+def test_drift_catch_control_msg_type_rename_fails():
+    """NEGATIVE proof: a C++ mirror that renamed a message tag (here the first, configure) without the
+    Python SSOT following makes the agreement FAIL — the vacuity guard for the tag agreement."""
+    src = _read(CONTROL_HPP)
+    bad = _perturb_cpp_str_array_first(src, "CONTROL_MSG_TYPES", "reconfigure")
+    with pytest.raises(AssertionError):
+        assert _cpp_str_array(bad, "CONTROL_MSG_TYPES") == list(control_spec.MSG_TYPES)
+
+
+def test_drift_catch_control_error_tag_rename_fails():
+    """NEGATIVE proof: a C++ mirror that renamed an error tag (here the first, bad_json) without the
+    Python SSOT following makes the agreement FAIL."""
+    src = _read(CONTROL_HPP)
+    bad = _perturb_cpp_str_array_first(src, "CONTROL_ERROR_TAGS", "badjson")
+    with pytest.raises(AssertionError):
+        assert _cpp_str_array(bad, "CONTROL_ERROR_TAGS") == list(control_spec.ERROR_TAGS)
+
+
+# ===========================================================================
+# LEG 5 — CROSS-LANGUAGE GOLDEN ROUND-TRIP (opt-in; needs a C++ compiler).
 # ===========================================================================
 def _compiler() -> str | None:
     for cc in ("g++", "clang++"):
