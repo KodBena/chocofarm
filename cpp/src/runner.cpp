@@ -136,7 +136,14 @@ std::expected<int, Error> run(const Environment& env, const FeatureBuilder& fb, 
     // a typed Error here (mirrors read_weights), the loud abort the shell reports — not a stale serve.
     auto wp = redis.read_weights(cfg.run, cfg.phase, cfg.version);
     if (!wp) return std::unexpected(wp.error());  // RandomPolicy is search-free; the read is the seam proof
+    // delegate to the shared episode loop (P1). The persistent --serve loop reuses run_episodes directly,
+    // reloading the net itself on a version change rather than re-reading here every generate.
+    return run_episodes(env, fb, policy, redis, cfg, stats_out);
+}
 
+std::expected<int, Error> run_episodes(const Environment& env, const FeatureBuilder& fb,
+                                       const Policy& policy, RedisClient& redis,
+                                       const RunnerConfig& cfg, std::ostream* stats_out) {
     const std::vector<uint32_t>& worlds = env.worlds();
     int written = 0;
     for (int idx = 0; idx < cfg.episodes; ++idx) {

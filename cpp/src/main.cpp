@@ -39,6 +39,7 @@
 #include "chocofarm/nmcs.hpp"
 #include "chocofarm/policy.hpp"
 #include "chocofarm/runner.hpp"
+#include "chocofarm/serve.hpp"
 #include "chocofarm/transport.hpp"
 
 namespace {
@@ -103,6 +104,26 @@ int main(int argc, char** argv) {
     // is typed (ADR-0012 P9 — not an excuse to keep raw pointers flowing inward).
     std::vector<std::string_view> args(argv, argv + argc);
     std::string_view prog = args.empty() ? "chocofarm-cpp-runner" : args[0];
+
+    // --serve: the persistent control loop (the ActorTransport's C++ runner — serve.hpp). It needs only
+    // redis + a run id at startup; the env/policy + the search knobs arrive via the first `configure`
+    // control message on stdin (the ActorConfig). This is ADDITIVE — the one-shot path below is unchanged.
+    bool serve_mode = false;
+    for (std::string_view a : args)
+        if (a == "--serve") { serve_mode = true; break; }
+    if (serve_mode) {
+        std::optional<std::string_view> serve_run = opt(args, "--run");
+        if (!serve_run) {
+            std::cerr << prog << ": FATAL: --serve requires --run <id> (the redis weight-key namespace)\n";
+            return 2;
+        }
+        auto redis = chocofarm::RedisClient::create();  // CHOCO_TRANSPORT_REDIS_* contract (no hardcoded port)
+        if (!redis) {
+            std::cerr << prog << ": FATAL: " << redis.error().message << "\n";
+            return 1;
+        }
+        return chocofarm::serve(*redis, std::string(*serve_run), std::cin, std::cout);
+    }
 
     std::optional<std::string_view> instance = opt(args, "--instance");
     std::optional<std::string_view> faces = opt(args, "--faces");

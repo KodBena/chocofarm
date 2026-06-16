@@ -494,3 +494,83 @@ def test_cpp_actor_executor_explore_plies_fails_loud():
         # by the swap-turns test; here we only assert the explore_plies>0 refusal.
     finally:
         ex.close()
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(CPP_BIN)), reason=_CPP_SKIP)
+def test_cpp_serve_online_reconfiguration():
+    """The persistent --serve runner (the ActorTransport's C++ side) drives the FULL online-
+    reconfiguration capability end-to-end against redis: configure -> generate -> LIVE-retune n_sims on
+    the SAME process (the env/policy context preserved, no respawn) -> generate at a new version (the
+    weight-reload gate) -> read the records back, reconciling `written`. Plus the two loud rejects: a
+    stale config_epoch (config_epoch_mismatch) and an instance/faces change (instance_knob_changed). This
+    is the cross-language integration proof of the protocol the fake-runner unit tests
+    (test_actor_transport.py) pin in pure Python — the m/n_sims-HOT online-reconfig the whole thread
+    exists to deliver, exercised against the real C++ Gumbel actor."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    import uuid
+    from chocofarm.az import transport
+    from chocofarm.az.actor_config import ActorConfig
+    from chocofarm.az.actor_transport import ControlError, GenerateRequest, SubprocessActorTransport
+    from chocofarm.az.features import feature_dim
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.az.result_spec import RESULT_DTYPE
+    from chocofarm.az.transport import result_keys
+    from chocofarm.model.env import Environment
+
+    env = Environment()
+    net = ValueMLP(feature_dim(env), hidden=32, n_actions=n_action_slots(env), seed=0)
+    net.set_value_scale(0.0, 1.0)
+    conn = transport.connect()
+    tp = transport.RedisTransport(conn)
+    run = uuid.uuid4().hex[:12]
+
+    def read_back(tok, n):
+        found = 0
+        for idx in range(n):
+            xk, pik, mk, yk = result_keys(tok, idx)
+            if conn.get(yk):
+                found += 1
+                conn.delete(xk, pik, mk, yk)
+        return found
+
+    def cfg(n_sims):
+        return ActorConfig(DATA_INSTANCE, DATA_FACES, m=4, n_sims=n_sims, c_puct=1.25, c_visit=50.0,
+                           c_scale=1.0, c_outcome=2, max_depth=24)
+
+    tp.publish_weights(net, "gen", 0, run)
+    t = SubprocessActorTransport(CPP_BIN, extra_args=("--run", run))
+    try:
+        epoch = t.reconfigure(cfg(8))
+        assert epoch == 1
+        tok0 = run + "-gen-0"
+        res = t.generate(GenerateRequest(config_epoch=epoch, version=0, seed=7, lam=0.0855,
+                                         episodes=6, max_steps=12, res_token=tok0))
+        assert res.written >= 1 and res.config_epoch == 1 and res.version == 0
+        assert read_back(tok0, 6) == res.written, "written must reconcile with the redis read-back"
+
+        # THE CAPABILITY: live-retune n_sims 8->16 with NO process/env teardown, then generate at a new
+        # version (the weight-reload gate, independent of the config epoch).
+        epoch2 = t.reconfigure(cfg(16))
+        assert epoch2 == 2
+        tp.publish_weights(net, "gen", 1, run)
+        tok1 = run + "-gen-1"
+        res2 = t.generate(GenerateRequest(config_epoch=epoch2, version=1, seed=8, lam=0.0855,
+                                          episodes=6, max_steps=12, res_token=tok1))
+        assert res2.written >= 1 and res2.config_epoch == 2 and res2.version == 1
+        assert read_back(tok1, 6) == res2.written
+
+        # the two loud rejects (the gates / the INSTANCE-knob ACL).
+        with pytest.raises(ControlError) as ei:
+            t.generate(GenerateRequest(config_epoch=1, version=1, seed=9, lam=0.0855, episodes=2,
+                                       max_steps=12, res_token=run + "-bad"))
+        assert ei.value.tag == "config_epoch_mismatch"
+        with pytest.raises(ControlError) as ei2:
+            t.reconfigure(ActorConfig("other.json", DATA_FACES, m=4, n_sims=16, c_puct=1.25,
+                                      c_visit=50.0, c_scale=1.0, c_outcome=2, max_depth=24))
+        assert ei2.value.tag == "instance_knob_changed"
+        # the runner survived both rejects and still serves (ping after the errors).
+        assert t.ping().serving is True
+    finally:
+        t.close()
+        conn.close()

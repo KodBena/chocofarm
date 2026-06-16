@@ -27,9 +27,13 @@
 #pragma once
 
 #include <array>
+#include <expected>
 #include <string>
 #include <string_view>
 
+#include <nlohmann/json.hpp>
+
+#include "chocofarm/error.hpp"   // Error — the boundary failure type from_json returns by value
 #include "chocofarm/gumbel.hpp"  // GumbelConfig — the 7 search knobs ActorConfig carries (reused, P1)
 
 namespace chocofarm {
@@ -42,6 +46,13 @@ struct ActorConfig {
     std::string faces_path;     // INSTANCE — the DERIVED face cover alongside the instance
     GumbelConfig gumbel{};      // HOT — m / n_sims / c_puct / c_visit / c_scale / c_outcome / max_depth
 };
+
+// Parse a `configure` message's "config" object into a validated ActorConfig (the Port/ACL —
+// validate-don't-coerce, ADR-0012 P2 / P9 rule 5). A missing/wrong-typed field, or an out-of-domain
+// value (m<1, an empty path, ...), is a typed Error returned by value — never a throw, never a coerced
+// default. The field set it reads is the one drift-netted against actor_config.py; the domain checks
+// mirror the Python schema.check_invariants. Implemented in src/actor_config.cpp.
+[[nodiscard]] std::expected<ActorConfig, Error> actor_config_from_json(const nlohmann::json& j);
 
 // ── The drift-net manifest (parsed as TEXT by tests/test_wire_drift.py) ──────────────────────────────
 // The FLAT wire field set (the JSON keys), in the SAME order as actor_config.FIELD_NAMES. A field

@@ -96,4 +96,15 @@ struct RunnerConfig {
                                             const Policy& policy, RedisClient& redis,
                                             const RunnerConfig& cfg, std::ostream* stats_out = nullptr);
 
+// The episode loop, factored out of run() (P1 — one loop, two entry points). For each of cfg.episodes
+// episodes it folds the per-episode seed over (cfg.seed, idx), draws the world, and run_episode +
+// write_results. It does NOT read weights — the CALLER owns the net lifecycle: the one-shot run() reads
+// once up front and delegates here, while the persistent --serve loop (serve.hpp) reloads the net only
+// when `version` advances and then calls this with the already-rebuilt policy. `stats_out` is the same
+// optional P6 aggregate-stat sink run() forwards.
+[[nodiscard]] std::expected<int, Error> run_episodes(const Environment& env, const FeatureBuilder& fb,
+                                                     const Policy& policy, RedisClient& redis,
+                                                     const RunnerConfig& cfg,
+                                                     std::ostream* stats_out = nullptr);
+
 }  // namespace chocofarm

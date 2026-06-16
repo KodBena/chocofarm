@@ -112,6 +112,8 @@ add_library(chocofarm_core
   src/gumbel.cpp
   src/search_runtime.cpp
   src/runner.cpp
+  src/actor_config.cpp
+  src/serve.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(chocofarm_core PUBLIC nlohmann_json::nlohmann_json ${HIREDIS_LINK} ${ZMQ_LINK} Threads::Threads)
