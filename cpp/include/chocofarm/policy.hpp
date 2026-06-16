@@ -44,6 +44,14 @@ namespace chocofarm {
 // constant, not a #define), referenced by the search configs' defaults rather than re-typed.
 inline constexpr double UCB_C = 0.7;
 
+// One decision + its improved-policy target (the AZ training PI row): the executed action and a
+// (n_slots,) probability target over the action slots, 0.0 (exactly) on illegal slots. Mirrors the
+// Python search's `(executed_action, improved_pi)`.
+struct ActionAndPi {
+    Action action;
+    std::vector<float> pi;  // (n_action_slots,) the improved-policy target; illegal-slot mass == 0.0
+};
+
 // The injected decision contract. `decide` mirrors Python's
 // Policy.decide(env, loc, bw, collected, lam, rng): returns ("t", i) / ("d", i) / TERMINATE.
 class Policy {
@@ -52,6 +60,17 @@ class Policy {
     virtual Action decide(const Environment& env, const Loc& loc,
                           const std::vector<uint32_t>& bw, const std::set<int>& collected,
                           double lam, std::mt19937_64& rng) const = 0;
+
+    // Decide AND return the improved-policy target (the PI block the AZ learner trains on). The DEFAULT
+    // (search-free policies — RandomPolicy/NMCS/ISMCTS) is decide() + a UNIFORM distribution over the
+    // legal action set + the always-legal TERMINATE slot (the natural target for a non-search policy;
+    // illegal-slot mass == 0.0). A SEARCH policy (GumbelAZPolicy) OVERRIDES this with its real
+    // σ-transformed improved-π. The runner records this per decision as the PI row (mirrors Python's
+    // generate_episode using the search's improved_pi). Not pure — the default is defined in policy.cpp.
+    [[nodiscard]] virtual ActionAndPi decide_target(const Environment& env, const Loc& loc,
+                                                    const std::vector<uint32_t>& bw,
+                                                    const std::set<int>& collected, double lam,
+                                                    std::mt19937_64& rng) const;
 };
 
 // Uniform over the legal action set (+ always-legal TERMINATE). Uses ONLY the env's own dynamics
