@@ -121,4 +121,37 @@ class SerialRuntime final : public SearchRuntime {
     const NetEvaluator& net_;
 };
 
+// PoolRuntime: a task-parallel runtime — N worker threads, each running WHOLE independent trees one at
+// a time off a shared atomic task cursor (work-stealing at whole-tree granularity). This is the right
+// parallel mechanism for a LOCAL (synchronous) leaf: a tree never blocks (the leaf is an in-process
+// forward), so a worker runs a tree to completion and takes the next — no tree-step migration, no fiber,
+// no shared per-tree state, hence NO single-writer-per-tree obligation (each tree is touched by exactly
+// one worker for its whole life). It is the "parallel tree descent + backprop" abstraction for the
+// local-net case (the C++-native MLP config). Because each task is an independent, deterministic (seeded)
+// tree, PoolRuntime's per-task Decision is BIT-IDENTICAL to SerialRuntime's — the parallelism is exact,
+// not merely aggregate-equivalent. (The step-granularity unified work-stealing pool, with its
+// single-writer obligation + a fiber rendezvous, is for the WIRE case where a tree must park during the
+// RTT — that is the next chunk; this is the local case it does not need.)
+//
+// Thread-safety (verified): the search has no global mutable state (action_to_slot/n_action_slots are
+// pure functions — the Python id(env) slot-cache was not mirrored), env methods are const over const
+// state, each decision copies its own loc/bw/collected + holds its own RNG + _Node arena, and the shared
+// net is called concurrently through per-task CountingNetEvaluator wrappers (so the only mutation, the
+// count, is per-worker). A thread-safe net (a stateless or const-read NetEvaluator — DetNet, NetForward)
+// is the one precondition.
+class PoolRuntime final : public SearchRuntime {
+  public:
+    // `n_workers` OS threads (clamped to ≥1, and at run() to ≤ the task count). On the 4-vCPU host pin
+    // with --cores 0,1,2,3 and size n_workers ≤ 4 (the ~1.9× contention ceiling, CLAUDE.md).
+    PoolRuntime(const NetEvaluator& net, int n_workers)
+        : net_(net), n_workers_(n_workers > 0 ? n_workers : 1) {}
+
+    [[nodiscard]] std::expected<std::vector<Decision>, Error>
+    run(const Environment& env, std::span<const SearchTask> tasks) const override;
+
+  private:
+    const NetEvaluator& net_;
+    int n_workers_;
+};
+
 }  // namespace chocofarm

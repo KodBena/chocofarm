@@ -6,7 +6,11 @@
 // Public Domain (The Unlicense).
 #include "chocofarm/search_runtime.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <random>
+#include <thread>
 
 #include "chocofarm/gumbel.hpp"
 
@@ -31,6 +35,41 @@ SerialRuntime::run(const Environment& env, std::span<const SearchTask> tasks) co
         Action executed = policy.decide(env, task.loc, task.bw, task.collected, task.lam, rng);
         out.push_back(Decision{executed, counter.count()});
     }
+    return out;
+}
+
+std::expected<std::vector<Decision>, Error>
+PoolRuntime::run(const Environment& env, std::span<const SearchTask> tasks) const {
+    // Pre-size the result so each worker writes its own DISJOINT indices (no contention, no lock on the
+    // output). A shared atomic cursor hands out the next task index; a worker runs that whole tree
+    // exactly as SerialRuntime does (a fresh CountingNetEvaluator + a seeded RNG per task), so its
+    // per-task Decision is bit-identical to the serial one. Independent trees + a thread-safe net mean
+    // no shared mutable state across workers (see the header's thread-safety note).
+    std::vector<Decision> out(tasks.size());
+    std::atomic<std::size_t> cursor{0};
+
+    auto worker = [&]() {
+        std::size_t i;
+        while ((i = cursor.fetch_add(1, std::memory_order_relaxed)) < tasks.size()) {
+            const SearchTask& task = tasks[i];
+            CountingNetEvaluator counter(net_);
+            GumbelAZPolicy policy(task.cfg, counter, env);
+            std::mt19937_64 rng(task.seed);
+            Action executed = policy.decide(env, task.loc, task.bw, task.collected, task.lam, rng);
+            out[i] = Decision{executed, counter.count()};
+        }
+    };
+
+    // Never spawn more threads than tasks (an idle thread does nothing useful); at least one.
+    int nw = std::max(1, std::min(n_workers_, static_cast<int>(tasks.size())));
+    if (nw == 1) {  // degenerate: run inline (the serial path), no thread spawn
+        worker();
+        return out;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(nw));
+    for (int t = 0; t < nw; ++t) threads.emplace_back(worker);
+    for (std::thread& th : threads) th.join();
     return out;
 }
 

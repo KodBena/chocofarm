@@ -80,6 +80,7 @@ GUMBEL_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-gumbel-dump")
 GUMBEL_LOGIC = os.path.join(REPO, "cpp", "parity", "gumbel_logic.py")
 GUMBEL_PRECISION = os.path.join(REPO, "cpp", "parity", "gumbel_precision.py")
 SERIAL_CHECK_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-serial-runtime-check")
+BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-search-runtime-bench")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
@@ -340,3 +341,20 @@ def test_cpp_serial_runtime_seam_faithful():
                          cwd=REPO, capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, f"SerialRuntime seam check FAILED:\n{out.stdout}\n{out.stderr}"
     assert "PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(BENCH_BIN)), reason=_CPP_SKIP)
+def test_cpp_pool_runtime_matches_serial():
+    """PoolRuntime (the local task-parallel runtime) produces BIT-IDENTICAL per-task results to
+    SerialRuntime — same executed action AND leaf-request count for every task — because the trees are
+    independent and deterministic (seeded), so the parallelism is EXACT, not merely aggregate-equivalent
+    (docs/design/cpp-search-runtime.md: the C++-native-MLP / local-parallel config). The benchmark binary
+    asserts this before timing and exits nonzero on any mismatch; here we run a small/fast config and gate
+    on exit 0 + 'RESULT: PASS' (this is the pool's correctness regression guard — the throughput numbers
+    it also prints are not asserted, only the bit-identity)."""
+    out = subprocess.run([BENCH_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES,
+                          "--tasks", "6", "--n-sims", "8", "--max-depth", "4", "--workers", "4",
+                          "--reps", "1"],
+                         cwd=REPO, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, f"PoolRuntime vs SerialRuntime check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
