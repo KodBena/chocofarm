@@ -192,6 +192,14 @@ add_executable(chocofarm-wire-bench src/wire_bench.cpp)
 target_link_libraries(chocofarm-wire-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-wire-bench PRIVATE -Wall -Wextra)
 
+# The C++-NATIVE LOCAL MLP axis (the third leaf-eval regime): the SAME SerialRuntime batch as wire-bench,
+# but with an in-process NetForward (read off the SAME redis weight seam, on weights the harness publishes
+# from the SAME pack_net the wire server is seeded from) — so it compares "local forward" vs "wire RTT +
+# server forward" on the IDENTICAL net (float32-equivalent). No socket, no boost (local + serial).
+add_executable(chocofarm-local-mlp-bench src/local_mlp_bench.cpp)
+target_link_libraries(chocofarm-local-mlp-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-local-mlp-bench PRIVATE -Wall -Wextra)
+
 # boost.context — the Option-A fiber mechanism (docs/notes/cpp-continuation-refactor-decision-2026-06-16.md).
 # The resumable-search prototype runs the UNCHANGED run_search inside a stackful fiber. Located via
 # find_package(Boost) with a find_library fallback (boost ships no pkg-config; the lib is libboost_context).
