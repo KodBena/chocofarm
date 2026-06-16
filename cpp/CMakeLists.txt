@@ -214,6 +214,19 @@ add_executable(chocofarm-fiber-proto src/fiber_proto.cpp)
 target_link_libraries(chocofarm-fiber-proto PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
 target_compile_options(chocofarm-fiber-proto PRIVATE -Wall -Wextra)
 
+# The non-blocking DEALER transport probe (NOT the runner): submits N concurrent requests to the ROUTER
+# server and recvs N replies, proving the DEALER<->ROUTER framing + the server's greedy-drain batching
+# (the wire-parallel leaf-rendezvous foundation). Reuses the shared inference_wire codec (P7).
+add_executable(chocofarm-dealer-probe src/dealer_probe.cpp)
+target_link_libraries(chocofarm-dealer-probe PRIVATE chocofarm_core)
+target_compile_options(chocofarm-dealer-probe PRIVATE -Wall -Wextra)
+
+# The over-the-wire PARALLEL benchmark (NOT the runner): K tree-fibers on one thread, batch-submitting
+# parked leaves over the DEALER so the server batches them — the third §6-Q5 axis. boost.context + libzmq.
+add_executable(chocofarm-wire-parallel-bench src/wire_parallel_bench.cpp)
+target_link_libraries(chocofarm-wire-parallel-bench PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
+target_compile_options(chocofarm-wire-parallel-bench PRIVATE -Wall -Wextra)
+
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned
 # (value, logits) — so the cross-language round-trip test (tests/test_zmq_net_cpp.py) can drive the C++

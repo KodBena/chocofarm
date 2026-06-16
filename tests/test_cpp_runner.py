@@ -364,14 +364,14 @@ def test_cpp_pool_runtime_matches_serial():
 
 
 @pytest.mark.skipif(not (_RUN_CPP and os.path.exists(WIRE_BENCH_BIN)), reason=_CPP_SKIP)
-def test_cpp_wire_sync_benchmark():
-    """The over-the-wire SYNCHRONOUS benchmark (cpp/parity/wire_bench.py): spin the Python InferenceServer
-    in-process (StaticParamsSource, a dimension-matched ValueMLP — NO redis) and run the C++ SerialRuntime
-    driving the Gumbel-AZ search where every leaf is a blocking REQ round-trip to the server. This is the
-    'over-the-wire synchronous' axis of the §6-Q5 benchmark — one in-flight leaf at a time, measuring the
-    wire RTT + (un-batched) server-forward cost the wire-PARALLEL fiber+DEALER pool exists to amortize.
-    The driver SKIPS (returns 0) if pyzmq is absent; here we gate on exit 0 (PASS or SKIP), not a throughput
-    threshold (the wall time is hardware-dependent; this guard pins that the wire path RUNS end to end)."""
+def test_cpp_wire_benchmark():
+    """The over-the-wire benchmark, BOTH axes (cpp/parity/wire_bench.py): spin the Python InferenceServer
+    in-process (StaticParamsSource, a dimension-matched ValueMLP — NO redis) and run, against that one
+    server, (a) the SYNCHRONOUS bench (SerialRuntime + a blocking ZmqNetClient leaf — one in-flight at a
+    time) and (b) the PARALLEL bench (K boost.context tree-fibers batch-submitting parked leaves over a
+    DEALER so the server batches them) — the §6-Q5 sync-vs-parallel comparison. The driver SKIPS (returns
+    0) if pyzmq / a binary is absent; here we gate on exit 0 (PASS or SKIP), not a throughput threshold
+    (wall time is hardware-dependent; this guard pins that BOTH wire paths RUN end to end)."""
     out = subprocess.run([sys.executable, WIRE_BENCH], cwd=REPO,
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=600)

@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-cpp/parity/wire_bench.py — the over-the-wire SYNCHRONOUS benchmark driver (Shape B).
+cpp/parity/wire_bench.py — the over-the-wire benchmark driver (Shape B), BOTH axes.
 
 Spins the Python InferenceServer in-process (StaticParamsSource — NO redis) with a dimension-matched
 ValueMLP (in_dim = feature_dim(env), n_actions = n_action_slots(env), the same instance the C++ env
-loads), then runs the C++ `chocofarm-wire-bench` against it: SerialRuntime driving the Gumbel-AZ search
-where every leaf is a blocking REQ round-trip to the server. It reports the wire-synchronous throughput
-(decisions/s) and the per-leaf round-trip cost — the "over-the-wire synchronous" axis of the §6-Q5
-benchmark (one in-flight leaf at a time, the cost the wire-PARALLEL fiber+DEALER pool exists to hide).
+loads), then runs, against that ONE server:
 
-Prints "RESULT: PASS ..." + exit 0 on a clean run, or a loud failure + nonzero. Opt-in: needs the C++
-binary built and pyzmq present (the wrapping test in tests/test_cpp_runner.py gates on CHOCO_RUN_CPP=1).
+  * the over-the-wire SYNCHRONOUS bench (chocofarm-wire-bench): SerialRuntime, one in-flight leaf at a
+    time — the wire RTT + un-batched single-row forward cost; and
+  * the over-the-wire PARALLEL bench (chocofarm-wire-parallel-bench): K tree-fibers on one thread,
+    batch-submitting parked leaves over a DEALER so the server batches them into one forward.
+
+It reports both throughputs + the parallel/sync speedup — the §6-Q5 comparison. The parallel bench is the
+ROUND-SYNCHRONOUS MVP (a barrier per round), so its win is modest and capped by per-round latency; the
+continuous greedy-async work-stealing pool is the production refinement (a bigger win). Prints
+"RESULT: PASS ..." + exit 0, or a loud failure / SKIP (pyzmq or a binary absent).
 
 Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -24,15 +29,22 @@ import threading
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 
-WIRE_BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-wire-bench")
+BUILD = os.path.join(REPO, "cpp", "build")
+SYNC_BIN = os.path.join(BUILD, "chocofarm-wire-bench")
+PAR_BIN = os.path.join(BUILD, "chocofarm-wire-parallel-bench")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 ENDPOINT = "tcp://127.0.0.1:5762"
 
 
+def _dps(text: str, key: str) -> float | None:
+    m = re.search(key + r"=([0-9.eE+-]+)", text)
+    return float(m.group(1)) if m else None
+
+
 def main() -> int:
-    if not os.path.exists(WIRE_BENCH_BIN):
-        print(f"RESULT: SKIP (binary not built: {WIRE_BENCH_BIN})")
+    if not os.path.exists(SYNC_BIN):
+        print(f"RESULT: SKIP (binary not built: {SYNC_BIN})")
         return 0
     try:
         import zmq  # noqa: F401
@@ -51,34 +63,46 @@ def main() -> int:
     from chocofarm.az.transport import pack_net
     from chocofarm.model.env import Environment
 
-    # the live instance the C++ instance.json mirrors — so feature_dim / n_action_slots match the C++ env.
     env = Environment()
     in_dim, n_actions = feature_dim(env), n_action_slots(env)
     net = ValueMLP(in_dim, hidden=24, n_actions=n_actions, seed=17,
                    y_mean=0.0, y_std=1.0, residual=False)
     params, y_mean, y_std = params_from_manifest_blob(*pack_net(net))
-    src = StaticParamsSource(params, y_mean, y_std)
-
-    server = InferenceServer(src, bind=ENDPOINT, max_batch=256)
+    server = InferenceServer(StaticParamsSource(params, y_mean, y_std), bind=ENDPOINT, max_batch=256)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     print(f"[wire_bench] server up: in_dim={in_dim} n_actions={n_actions} endpoint={ENDPOINT}", flush=True)
 
-    rc = 1
+    common = ["--instance", DATA_INSTANCE, "--faces", DATA_FACES, "--endpoint", ENDPOINT,
+              "--n-sims", "12", "--max-depth", "8"]
+    rc = 0
     try:
-        out = subprocess.run(
-            [WIRE_BENCH_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES,
-             "--endpoint", ENDPOINT, "--tasks", "8", "--n-sims", "12", "--max-depth", "8"],
-            cwd=REPO, capture_output=True, text=True, timeout=300)
-        sys.stdout.write(out.stdout)
-        if out.returncode != 0 or "RESULT: PASS" not in out.stdout:
-            sys.stderr.write(out.stderr)
-            print(f"RESULT: FAIL (wire-bench rc={out.returncode})")
-            rc = 3
+        sync = subprocess.run([SYNC_BIN, *common, "--tasks", "16"],
+                              cwd=REPO, capture_output=True, text=True, timeout=300)
+        sys.stdout.write(sync.stdout)
+        if sync.returncode != 0 or "RESULT: PASS" not in sync.stdout:
+            sys.stderr.write(sync.stderr)
+            print("RESULT: FAIL (wire-sync bench)")
+            return 3
+        sync_dps = _dps(sync.stdout, "wire_sync_dps")
+
+        if os.path.exists(PAR_BIN):
+            par = subprocess.run([PAR_BIN, *common, "--trees", "16"],
+                                 cwd=REPO, capture_output=True, text=True, timeout=300)
+            sys.stdout.write(par.stdout)
+            if par.returncode != 0 or "RESULT: PASS" not in par.stdout:
+                sys.stderr.write(par.stderr)
+                print("RESULT: FAIL (wire-parallel bench)")
+                return 3
+            par_dps = _dps(par.stdout, "wire_parallel_dps")
+            if sync_dps and par_dps:
+                print(f"RESULT: PASS wire_sync_dps={sync_dps:.3f} wire_parallel_dps={par_dps:.3f} "
+                      f"speedup={par_dps / sync_dps:.3f}")
+            else:
+                print("RESULT: PASS (both ran; dps parse incomplete)")
         else:
-            rc = 0
+            print(f"RESULT: PASS (wire-sync only; parallel binary not built: {PAR_BIN})")
     finally:
-        # clean shutdown (no socket killed cross-thread): flip stop, let the bounded poll see it, then close.
         server.stop()
         t.join(timeout=5.0)
         server.close()
