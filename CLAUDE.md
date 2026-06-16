@@ -15,8 +15,9 @@ dual bound (`bounds/`), eval (`eval/`), an hp registry (`hp/`), analysis
 (`analysis/`), and an extensive `docs/` corpus.
 
 For orientation, read `docs/STATUS.md` and the latest handoff
-(`docs/handoff-2026-06-15-architecture-refactor.md`, which supersedes the
-repository-condition section of the prior `docs/handoff-2026-06-15.md`). For architectural decisions, the canonical
+(`docs/handoff-2026-06-16-zmq-async-gumbel.md`, which supersedes the
+repository-condition section of the prior
+`docs/handoff-2026-06-15-architecture-refactor.md`). For architectural decisions, the canonical
 reference is `docs/adr/`; the condensed reference is `docs/adr-synopsis.md`.
 **Read the synopsis before substantive work**; consult specific ADRs when the
 synopsis points to one.
