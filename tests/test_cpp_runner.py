@@ -393,3 +393,22 @@ def test_cpp_fiber_proto_matches_direct():
                          cwd=REPO, capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, f"fiber prototype FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(CPP_BIN)), reason=_CPP_SKIP)
+def test_cpp_actor_loop_turns():
+    """The goal-2 assembly (chocofarm/az/cpp_actor_loop.py): one ExIt iteration driven by the C++ Gumbel
+    ACTOR — publish weights -> chocofarm-cpp-runner --policy gumbel generates transitions (improved-π PI)
+    -> JaxTrainer.train_step -> repeat. Proves the full generate->train->publish cycle turns with the C++
+    runtime as the actor (vs exit_loop's Python worker). Needs redis (the transport) + the runner built +
+    jax; skips otherwise. Gate on exit 0 + 'DONE' (the loop completed an iteration)."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    out = subprocess.run([sys.executable, "-m", "chocofarm.az.cpp_actor_loop", "--runner", CPP_BIN,
+                          "--instance", DATA_INSTANCE, "--faces", DATA_FACES,
+                          "--iters", "1", "--episodes", "4", "--n-sims", "8", "--gumbel-max-depth", "6",
+                          "--hidden", "32", "--epochs", "1", "--run", "cpp-actor-loop-test"],
+                         cwd=REPO, env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"C++-actor loop FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "DONE" in out.stdout, out.stdout
