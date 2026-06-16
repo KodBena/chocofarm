@@ -106,6 +106,7 @@ add_library(chocofarm_core
   src/nmcs.cpp
   src/ismcts.cpp
   src/gumbel.cpp
+  src/search_runtime.cpp
   src/runner.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -162,6 +163,15 @@ target_compile_options(chocofarm-ismcts-dump PRIVATE -Wall -Wextra)
 add_executable(chocofarm-gumbel-dump src/gumbel_dump.cpp)
 target_link_libraries(chocofarm-gumbel-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-gumbel-dump PRIVATE -Wall -Wextra)
+
+# The SearchRuntime seam's self-contained SEAM-FAITHFULNESS check (NOT the runner): runs SerialRuntime
+# over a batch of independent tasks against a deterministic, stateless, in-process net, and asserts each
+# task's executed action matches a direct GumbelAZPolicy::decide with the same seed — proving the seam
+# does not perturb the search (docs/design/cpp-search-runtime.md §7.1). No redis, no weights, no stdin.
+# Separate from the runner (P3, one-owner).
+add_executable(chocofarm-serial-runtime-check src/serial_runtime_check.cpp)
+target_link_libraries(chocofarm-serial-runtime-check PRIVATE chocofarm_core)
+target_compile_options(chocofarm-serial-runtime-check PRIVATE -Wall -Wextra)
 
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned

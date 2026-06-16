@@ -79,6 +79,9 @@ ISMCTS_PARITY = os.path.join(REPO, "cpp", "parity", "ismcts_parity.py")
 GUMBEL_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-gumbel-dump")
 GUMBEL_LOGIC = os.path.join(REPO, "cpp", "parity", "gumbel_logic.py")
 GUMBEL_PRECISION = os.path.join(REPO, "cpp", "parity", "gumbel_precision.py")
+SERIAL_CHECK_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-serial-runtime-check")
+DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
+DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
 # OPT-IN gate. The binary-dependent cpp parity tests run only with CHOCO_RUN_CPP=1 (and a freshly
 # built binary). They are slow integration checks driven by a MANUALLY-built C++ binary: a stale
@@ -322,3 +325,18 @@ def test_cpp_ismcts_aggregate_parity():
                          capture_output=True, text=True, timeout=1200)
     assert out.returncode == 0, f"ISMCTS aggregate parity FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(SERIAL_CHECK_BIN)), reason=_CPP_SKIP)
+def test_cpp_serial_runtime_seam_faithful():
+    """The SearchRuntime SEAM-FAITHFULNESS check (cpp/src/serial_runtime_check.cpp): SerialRuntime.run
+    over a batch of independent tasks produces, for each task, the SAME executed action as a direct
+    GumbelAZPolicy::decide with the same RNG seed — proving the runtime seam does NOT perturb the search
+    (the work-stealing pool's parity precondition, docs/design/cpp-search-runtime.md §7.1). The leaf is a
+    DETERMINISTIC, STATELESS, in-process net (no redis, no weights, no RNG), so the check is fully
+    reproducible. A C++-INTERNAL self-check (NOT a cross-language parity): the binary asserts and exits
+    0/nonzero; the gate is exit 0 + 'PASS' in stdout."""
+    out = subprocess.run([SERIAL_CHECK_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
+                         cwd=REPO, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, f"SerialRuntime seam check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "PASS" in out.stdout, out.stdout
