@@ -21,11 +21,18 @@
 //   byte-identity.
 //
 //   ADR-0012 P9: the forward core is a pure value-function — `predict(std::span<const float>)`
-//   takes a typed, bounds-carrying input and RETURNS its result by value (NetPrediction), no raw
-//   pointers, no out-parameters. The throwing manifest-validating constructor becomes the static
-//   factory `NetForward::create(const WeightPayload&) -> std::expected<NetForward, Error>` over a
-//   private noexcept ctor (a throwing ctor cannot return a value; a malformed manifest is a
-//   recoverable boundary failure, not a throw — rule 5).
+//   takes a typed, bounds-carrying input and RETURNS its result by value, no raw pointers, no
+//   out-parameters. The throwing manifest-validating constructor becomes the static factory
+//   `NetForward::create(const WeightPayload&) -> std::expected<NetForward, Error>` over a private
+//   noexcept ctor (a throwing ctor cannot return a value; a malformed manifest is a recoverable
+//   boundary failure, not a throw — rule 5).
+//
+//   NetForward IS a `NetEvaluator` (the port the search holds — net_evaluator.hpp / design §1). Its
+//   `predict` overrides the port's `std::expected<NetPrediction, Error>` signature, but its compute is
+//   TOTAL (the local matmul cannot fail — the only error surface is create()'s manifest validation),
+//   so it always returns the VALUE arm. The error arm exists for the port's sake: the REMOTE impl
+//   (ZmqNetClient) lives on the same port and DOES fail (timeout / server-down), so the search holds
+//   one fallible-by-contract port whether the leaf is local or remote.
 //
 // Public Domain (The Unlicense).
 #pragma once
@@ -35,21 +42,16 @@
 #include <vector>
 
 #include "chocofarm/error.hpp"
+#include "chocofarm/net_evaluator.hpp"
 #include "chocofarm/transport.hpp"
 
 namespace chocofarm {
 
-// One forward result: the de-standardized leaf value + the policy logits over the action slots (empty
-// when the net is value-only — `Wp` absent in the manifest, mirroring forward_core's `logits=None`).
-struct NetPrediction {
-    float value = 0.0f;             // de-standardized: v_std*y_std + y_mean (the λ-penalized return scale)
-    std::vector<float> logits;      // raw policy logits over n_actions slots (NOT softmaxed; empty if none)
-};
-
-// The value+policy MLP forward, reconstructed FROM the manifest-bound weights. Holds float32 copies of
-// each weight (the parametric hot-path precision the Python `_predict_both_f32` runs at) keyed by name,
-// derives all dims/toggles from their shapes, and computes one forward per `predict`.
-class NetForward {
+// The value+policy MLP forward, reconstructed FROM the manifest-bound weights. The LOCAL `NetEvaluator`
+// impl (design §1): holds float32 copies of each weight (the parametric hot-path precision the Python
+// `_predict_both_f32` runs at) keyed by name, derives all dims/toggles from their shapes, and computes
+// one forward per `predict`. (`NetPrediction` lives in net_evaluator.hpp — the shared port return type.)
+class NetForward final : public NetEvaluator {
   public:
     // Build from the manifest-bound payload (transport.read_weights). Validates that the required
     // params (W1/b1/W2/b2/Wv/bv) are present and shape-consistent, and derives in_dim, hidden,
@@ -60,12 +62,15 @@ class NetForward {
     [[nodiscard]] static std::expected<NetForward, Error> create(const WeightPayload& payload);
 
     // Run forward_core's graph once on a length-`in_dim()` float32 feature vector and return the
-    // de-standardized value + the policy logits (the search's leaf-evaluator entry point). The input
-    // is a typed bounds-carrying view (std::span<const float>) — a std::vector<float> binds
-    // implicitly — and the result is returned BY VALUE (P9 rules 1 & 2). The caller guarantees
-    // x.size() == in_dim() (an invariant the manifest-validating ctor already reconciled); a mismatch
-    // is a programmer bug (an assert), not a boundary Error.
-    [[nodiscard]] NetPrediction predict(std::span<const float> x) const;
+    // de-standardized value + the policy logits (the search's leaf-evaluator entry point — the
+    // NetEvaluator port override). The input is a typed bounds-carrying view (std::span<const float>)
+    // — a std::vector<float> binds implicitly — and the result is returned BY VALUE (P9 rules 1 & 2).
+    // The compute is TOTAL: this LOCAL forward cannot fail, so it ALWAYS returns the value arm of the
+    // std::expected (the error arm exists only to share the fallible-by-contract port with the remote
+    // ZmqNetClient — design §1). The caller guarantees x.size() == in_dim() (an invariant the
+    // manifest-validating ctor already reconciled); a mismatch is a programmer bug (an assert), not a
+    // boundary Error.
+    [[nodiscard]] std::expected<NetPrediction, Error> predict(std::span<const float> x) const override;
 
     [[nodiscard]] int in_dim() const { return in_dim_; }
     [[nodiscard]] int hidden() const { return hidden_; }
