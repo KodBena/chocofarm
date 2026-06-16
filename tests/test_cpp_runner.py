@@ -32,6 +32,18 @@ three layers:
     (cpp/parity/ismcts_parity.py) — ISMCTS aggregates within MC CI. Both SKIPPED when the
     fixture/redis is absent.
 
+The Gumbel-AZ Policy (the Danihelka Gumbel-AlphaZero search, ported behind the SAME seam — PHASE 1a,
+the discrete STRUCTURE only) adds:
+  * ALWAYS-ON: GumbelPolicy is a Policy subclass (the seam invariant the C++ GumbelAZPolicy mirrors —
+    a drop-in alongside RandomPolicy / NMCSPolicy / ISMCTSPolicy with zero env/runner core edits).
+  * OPT-IN (needs chocofarm-gumbel-dump): the DETERMINISTIC STRUCTURE logic check
+    (cpp/parity/gumbel_logic.py) — same executed action AND improved-pi argmax on identical scripted
+    gumbel/world/leaf draws, plus the two structural Danihelka invariants (executed==SH-survivor; SH
+    spends the full n_sims budget). PRECISION-INSENSITIVE (coarse, well-separated scripted leaf, no
+    near-ties) so the discrete outcome is float32-vs-float64 identical — this is the 1a structure
+    check; the mixed-precision near-tie path is 1b (NOT covered). NO redis (the scripted leaf is
+    in-process).
+
 Public Domain (The Unlicense).
 """
 import os
@@ -59,6 +71,8 @@ NMCS_LOGIC = os.path.join(REPO, "cpp", "parity", "nmcs_logic.py")
 NMCS_PARITY = os.path.join(REPO, "cpp", "parity", "nmcs_parity.py")
 ISMCTS_LOGIC = os.path.join(REPO, "cpp", "parity", "ismcts_logic.py")
 ISMCTS_PARITY = os.path.join(REPO, "cpp", "parity", "ismcts_parity.py")
+GUMBEL_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-gumbel-dump")
+GUMBEL_LOGIC = os.path.join(REPO, "cpp", "parity", "gumbel_logic.py")
 
 # OPT-IN gate. The binary-dependent cpp parity tests run only with CHOCO_RUN_CPP=1 (and a freshly
 # built binary). They are slow integration checks driven by a MANUALLY-built C++ binary: a stale
@@ -94,6 +108,17 @@ def test_ismcts_policy_is_a_policy_subclass():
     from chocofarm.solvers.ismcts import ISMCTSPolicy
     assert issubclass(ISMCTSPolicy, Policy)
     assert SOLVERS["ismcts"] is ISMCTSPolicy
+
+
+def test_gumbel_policy_is_a_policy_subclass():
+    """P2: the Gumbel-AlphaZero search is a `Policy` subclass — the SAME seam invariant the C++
+    GumbelAZPolicy mirrors (a drop-in alongside RandomPolicy / NMCSPolicy / ISMCTSPolicy with zero
+    env/runner core edits). GumbelPolicy is the eval wrapper (temperature 0 = the SH survivor) in
+    chocofarm.az.gumbel_search; it is NOT in the classical SOLVERS registry (it is the net-using AZ
+    self-play search, constructed with an already-loaded net), so we pin only the Policy-subclass
+    contract — the seam the C++ port stands behind."""
+    from chocofarm.az.gumbel_search import GumbelPolicy
+    assert issubclass(GumbelPolicy, Policy)
 
 
 def test_random_policy_only_picks_legal_actions():
@@ -231,6 +256,29 @@ def test_cpp_ismcts_logic_parity():
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, f"ISMCTS logic check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(GUMBEL_BIN)), reason=_CPP_SKIP)
+def test_cpp_gumbel_logic_parity():
+    """The DETERMINISTIC Gumbel-AZ STRUCTURE logic check (cpp/parity/gumbel_logic.py): with the RNG +
+    leaf abstracted behind a scripted, RNG-free seam (rng.gumbel->a fixed FIFO; sample_world->bw[0];
+    the leaf (value, coarse logits)->a fixed cycled table), the C++ Gumbel-AZ search and the Python
+    Gumbel-AZ search EXECUTE THE SAME ACTION and produce the SAME improved-pi argmax on fixed
+    (loc, belief) inputs — across (n_sims, m, c_puct, max_depth, prefix). This validates the discrete
+    structure + selection logic, the part that MUST be exact, independent of RNG AND of float32-vs-
+    float64 precision (the scripted leaf is COARSE, well-separated -> NO near-ties, so the discrete
+    outcome is precision-insensitive). It ALSO pins the two structural Danihelka invariants
+    (executed==SH-survivor; SH spends the full n_sims budget). This is PHASE 1a (structure only); the
+    mixed-precision near-tie path is PHASE 1b (NOT covered). NO redis (the scripted leaf is in-process).
+
+    NOTE: the mutation control (--mutate sh-budget|puct, which mutates the C++ binary and asserts it
+    diverges from the unmodified Python) is exercised by running gumbel_logic.py with those flags; this
+    guard runs the FAITHFUL pass (must PASS)."""
+    out = subprocess.run([sys.executable, GUMBEL_LOGIC], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"Gumbel logic check FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
 
 

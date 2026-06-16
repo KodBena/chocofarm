@@ -32,8 +32,10 @@
 
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
+#include "chocofarm/gumbel.hpp"
 #include "chocofarm/instance.hpp"
 #include "chocofarm/ismcts.hpp"
+#include "chocofarm/net.hpp"
 #include "chocofarm/nmcs.hpp"
 #include "chocofarm/policy.hpp"
 #include "chocofarm/runner.hpp"
@@ -54,7 +56,7 @@ void usage(std::string_view prog) {
         "  --max-steps <int>   live episode horizon (default 40)\n"
         "  --seed <uint>       per-episode RNG seed base (default 0)\n"
         "  --res-token <id>    result-key namespace token (required)\n"
-        "  --policy <name>     search policy: random | nmcs | ismcts (default random)\n"
+        "  --policy <name>     search policy: random | nmcs | ismcts | gumbel (default random)\n"
         "  --nmcs-level <int>      NMCS nesting level (default 1; 2 is the milestone)\n"
         "  --nmcs-playouts <int>   worlds per level-0 playout (default 3)\n"
         "  --nmcs-step-samples <i> worlds per per-move eval (default 2)\n"
@@ -64,6 +66,13 @@ void usage(std::string_view prog) {
         "  --ismcts-iterations <i> ISMCTS determinized walks per decision (default 300)\n"
         "  --ismcts-c <float>      ISMCTS UCB1 exploration constant (default UCB_C=0.7)\n"
         "  --ismcts-max-depth <i>  ISMCTS recursion depth cap (default 24)\n"
+        "  --gumbel-m <int>        Gumbel-Top-k root actions sampled (default 12)\n"
+        "  --gumbel-n-sims <int>   Gumbel Sequential-Halving simulation budget (default 48)\n"
+        "  --gumbel-c-puct <f>     Gumbel PUCT exploration constant (default 1.25)\n"
+        "  --gumbel-c-visit <f>    Gumbel σ-transform visit prefactor (default 50)\n"
+        "  --gumbel-c-scale <f>    Gumbel σ-transform scale (default 1.0)\n"
+        "  --gumbel-c-outcome <i>  Gumbel immediate-outcome determinizations (default 2)\n"
+        "  --gumbel-max-depth <i>  Gumbel interior descent depth cap (default 24)\n"
         "  --parity-stats <p>  ALSO write per-episode aggregate stats (JSON lines) to <p>\n"
         "Connection: CHOCO_TRANSPORT_REDIS_HOST/PORT/DB env (default 127.0.0.1:6380 db0).\n";
 }
@@ -114,10 +123,32 @@ int main(int argc, char** argv) {
     if (auto v = opt(args, "--max-steps")) cfg.max_steps = to_int(*v);
     if (auto v = opt(args, "--seed")) cfg.seed = to_u64(*v);
 
-    // strategy selection over the env<->Policy seam: --policy random|nmcs (P2 — the runner core never
-    // names a concrete Policy; this is the ONE place a policy is chosen). NMCS knobs are live CLI
-    // scalars too (P4), defaulting to NMCSConfig's.
+    // strategy selection over the env<->Policy seam: --policy random|nmcs|ismcts|gumbel (P2 — the
+    // runner core never names a concrete Policy; this is the ONE place a policy is chosen). The
+    // per-search knobs are live CLI scalars too (P4), defaulting to each search's config defaults.
     std::string_view policy_name = opt(args, "--policy").value_or("random");
+
+    // ---- the boundary: every fallible step returns a typed Error reported loudly here (P9 / ADR-0002) ----
+    auto inst = chocofarm::load_instance(*instance, *faces);
+    if (!inst) {
+        std::cerr << prog << ": FATAL: " << inst.error().message << "\n";
+        return 1;
+    }
+    chocofarm::Environment env(*inst);
+    chocofarm::FeatureBuilder fb(env);
+
+    auto redis = chocofarm::RedisClient::create();  // CHOCO_TRANSPORT_REDIS_* contract (no hardcoded port)
+    if (!redis) {
+        std::cerr << prog << ": FATAL: " << redis.error().message << "\n";
+        return 1;
+    }
+
+    // The Gumbel search consumes the net at the leaf (the NetEvaluator port). Build it from the SAME
+    // weight-read seam (P1) BEFORE the policy so the local NetForward outlives the policy / run(). 1a
+    // SEAM: the interim local NetForward is the leaf; the SSOT path swaps in a ZmqNetClient with no
+    // policy edit (design §1). It must outlive `policy` (the GumbelAZPolicy holds a const NetEvaluator&)
+    // so it is declared here, in the enclosing scope.
+    std::optional<chocofarm::NetForward> gumbel_net;
 
     std::unique_ptr<chocofarm::Policy> policy;
     if (policy_name == "random") {
@@ -137,25 +168,32 @@ int main(int argc, char** argv) {
         if (auto v = opt(args, "--ismcts-c")) ic.c = to_double(*v);
         if (auto v = opt(args, "--ismcts-max-depth")) ic.max_depth = to_int(*v);
         policy = std::make_unique<chocofarm::ISMCTSPolicy>(ic);  // single-observer ISMCTS (P2 drop-in)
+    } else if (policy_name == "gumbel") {
+        chocofarm::GumbelConfig gc;  // defaults match GumbelConfig (m=12, n_sims=48, c_puct=1.25, ...)
+        if (auto v = opt(args, "--gumbel-m")) gc.m = to_int(*v);
+        if (auto v = opt(args, "--gumbel-n-sims")) gc.n_sims = to_int(*v);
+        if (auto v = opt(args, "--gumbel-c-puct")) gc.c_puct = to_double(*v);
+        if (auto v = opt(args, "--gumbel-c-visit")) gc.c_visit = to_double(*v);
+        if (auto v = opt(args, "--gumbel-c-scale")) gc.c_scale = to_double(*v);
+        if (auto v = opt(args, "--gumbel-c-outcome")) gc.c_outcome = to_int(*v);
+        if (auto v = opt(args, "--gumbel-max-depth")) gc.max_depth = to_int(*v);
+        // read the leaf net off the SAME weight-read seam (P1) and build the local NetForward leaf.
+        auto wp = redis->read_weights(cfg.run, cfg.phase, cfg.version);
+        if (!wp) {
+            std::cerr << prog << ": FATAL: " << wp.error().message << "\n";
+            return 1;
+        }
+        auto nf = chocofarm::NetForward::create(*wp);
+        if (!nf) {
+            std::cerr << prog << ": FATAL: " << nf.error().message << "\n";
+            return 1;
+        }
+        gumbel_net.emplace(std::move(*nf));
+        policy = std::make_unique<chocofarm::GumbelAZPolicy>(gc, *gumbel_net, env);  // Gumbel-AZ (drop-in)
     } else {
         // ADR-0002 / P5: an unknown policy is a loud abort at the boundary (a CLI misuse).
         std::cerr << prog << ": FATAL: unknown --policy: " << policy_name
-                  << " (expected random | nmcs | ismcts)\n";
-        return 1;
-    }
-
-    // ---- the boundary: every fallible step returns a typed Error reported loudly here (P9 / ADR-0002) ----
-    auto inst = chocofarm::load_instance(*instance, *faces);
-    if (!inst) {
-        std::cerr << prog << ": FATAL: " << inst.error().message << "\n";
-        return 1;
-    }
-    chocofarm::Environment env(*inst);
-    chocofarm::FeatureBuilder fb(env);
-
-    auto redis = chocofarm::RedisClient::create();  // CHOCO_TRANSPORT_REDIS_* contract (no hardcoded port)
-    if (!redis) {
-        std::cerr << prog << ": FATAL: " << redis.error().message << "\n";
+                  << " (expected random | nmcs | ismcts | gumbel)\n";
         return 1;
     }
 
