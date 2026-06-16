@@ -227,6 +227,12 @@ add_executable(chocofarm-wire-parallel-bench src/wire_parallel_bench.cpp)
 target_link_libraries(chocofarm-wire-parallel-bench PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
 target_compile_options(chocofarm-wire-parallel-bench PRIVATE -Wall -Wextra)
 
+# The production-shaped wire-PARALLEL POOL benchmark (NOT the runner): T threads x K fibers, greedy-async
+# DEALER drain (no per-round barrier), batch/threads from runtime_config (SSOT). boost.context + libzmq + threads.
+add_executable(chocofarm-wire-pool-bench src/wire_pool_bench.cpp)
+target_link_libraries(chocofarm-wire-pool-bench PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK} Threads::Threads)
+target_compile_options(chocofarm-wire-pool-bench PRIVATE -Wall -Wextra)
+
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned
 # (value, logits) — so the cross-language round-trip test (tests/test_zmq_net_cpp.py) can drive the C++

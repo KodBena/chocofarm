@@ -32,6 +32,7 @@ sys.path.insert(0, REPO)
 BUILD = os.path.join(REPO, "cpp", "build")
 SYNC_BIN = os.path.join(BUILD, "chocofarm-wire-bench")
 PAR_BIN = os.path.join(BUILD, "chocofarm-wire-parallel-bench")
+POOL_BIN = os.path.join(BUILD, "chocofarm-wire-pool-bench")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 ENDPOINT = "tcp://127.0.0.1:5762"
@@ -95,11 +96,23 @@ def main() -> int:
                 print("RESULT: FAIL (wire-parallel bench)")
                 return 3
             par_dps = _dps(par.stdout, "wire_parallel_dps")
+            pool_dps = None
+            if os.path.exists(POOL_BIN):
+                # the production greedy-async pool: T threads x K fibers, batch via fibers not threads.
+                pool = subprocess.run([POOL_BIN, *common, "--tasks", "32", "--threads", "2", "--batch", "16"],
+                                      cwd=REPO, capture_output=True, text=True, timeout=300)
+                sys.stdout.write(pool.stdout)
+                if pool.returncode != 0 or "RESULT: PASS" not in pool.stdout:
+                    sys.stderr.write(pool.stderr)
+                    print("RESULT: FAIL (wire-pool bench)")
+                    return 3
+                pool_dps = _dps(pool.stdout, "pool_dps")
             if sync_dps and par_dps:
+                extra = f" wire_pool_dps={pool_dps:.3f} pool_speedup={pool_dps / sync_dps:.3f}" if pool_dps else ""
                 print(f"RESULT: PASS wire_sync_dps={sync_dps:.3f} wire_parallel_dps={par_dps:.3f} "
-                      f"speedup={par_dps / sync_dps:.3f}")
+                      f"speedup={par_dps / sync_dps:.3f}{extra}")
             else:
-                print("RESULT: PASS (both ran; dps parse incomplete)")
+                print("RESULT: PASS (ran; dps parse incomplete)")
         else:
             print(f"RESULT: PASS (wire-sync only; parallel binary not built: {PAR_BIN})")
     finally:
