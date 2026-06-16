@@ -70,14 +70,24 @@ if TYPE_CHECKING:
 ForwardFn = Callable[[dict[str, "npt.NDArray[Any]"], Any, Any],
                      tuple[Any, "Any | None"]]
 
-# A drained request: (identity_frame, feature_row) — the ROUTER identity bytes to scatter the response
-# back to, and the decoded float32 feature vector (shape (in_dim,)).
-DrainedRequest = tuple[bytes, "npt.NDArray[np.float32]"]
+# A batch row: (identity_frame, feature_row) — the ROUTER identity bytes to scatter the response back
+# to, and the decoded float32 feature vector (shape (in_dim,)). This is `run_microbatch`'s VALUE-LEVEL
+# input: the pure batching core knows only identities and rows, never the transport envelope.
+BatchRow = tuple[bytes, "npt.NDArray[np.float32]"]
+
+# A drained request: (identity_frame, envelope_frames, feature_row). `envelope_frames` are the ROUTER
+# frames BETWEEN the identity and the payload (`frames[1:-1]`) — the transport-routing envelope the
+# server echoes back VERBATIM. For a REQ client this is the single empty delimiter `[b""]` (so the
+# reply is byte-identical to the legacy `[identity][b""][resp]`); for a DEALER client carrying an
+# 8-byte correlation id it is `[corr_id]`; for a bare single-frame DEALER it is `[]`. The server never
+# PARSES the envelope — it round-trips it opaquely — so the correlation id needs no cross-language wire
+# format (it is a transport concern, kept OUT of the value codec; ADR-0012 P7 serialization⊥transport).
+DrainedRequest = tuple[bytes, list[bytes], "npt.NDArray[np.float32]"]
 
 
 def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
                    y_mean: float, y_std: float,
-                   requests: list[DrainedRequest]) -> list[tuple[bytes, bytes]]:
+                   requests: list[BatchRow]) -> list[tuple[bytes, bytes]]:
     """The PURE microbatch core (design §3): STACK the drained requests' feature rows into one
     `(B, in_dim)` float32 matrix, run ONE `forward_fn(params, Xb, jnp)`, DE-STANDARDIZE the value
     (v = v_std·y_std + y_mean), and SCATTER `(value, logits[i])` back per request as an encoded
@@ -241,9 +251,12 @@ class InferenceServer:
 
     def _drain(self) -> list[DrainedRequest]:
         """Greedy-drain (design §3): BLOCK until ≥1 request is queued, then drain ALL currently-queued
-        requests non-blocking up to `max_batch`. Each ROUTER frame is `[identity][empty][payload]`;
-        the payload is decoded at the BOUNDARY (a malformed frame is rejected loudly — its identity is
-        skipped from the batch, never zero-filled into the forward). Returns `[(identity, X), …]`, or an
+        requests non-blocking up to `max_batch`. Each ROUTER frame is `[identity][envelope…][payload]`;
+        the identity is `frames[0]`, the payload is `frames[-1]`, and the ENVELOPE is everything between
+        (`frames[1:-1]` — a REQ delimiter, a DEALER correlation id, or nothing — captured opaquely and
+        echoed VERBATIM in the reply, never parsed). The payload is decoded at the BOUNDARY (a malformed
+        frame is rejected loudly — its identity is skipped from the batch, never zero-filled into the
+        forward). Returns `[(identity, envelope, X), …]`, or an
         EMPTY list if it woke on the stop-check interval with nothing queued (the loop then re-checks
         `_stop` and re-blocks — a clean shutdown path, no socket killed from another thread).
 
@@ -267,13 +280,14 @@ class InferenceServer:
             except zmq.Again:
                 break   # nothing more currently queued — drain whatever accumulated, run the batch
             ident = frames[0]
+            envelope = frames[1:-1]   # transport-routing frames (REQ delimiter / DEALER corr-id / none)
             payload = frames[-1]
             try:
                 X = decode_request(payload)
             except Exception as exc:   # malformed request: loud reject of THIS frame, batch unaffected
                 self._reject(ident, exc)
                 continue
-            drained.append((ident, X))
+            drained.append((ident, envelope, X))
         return drained
 
     def _reject(self, ident: bytes, exc: Exception) -> None:
@@ -285,12 +299,19 @@ class InferenceServer:
 
     def _serve_batch(self, drained: list[DrainedRequest]) -> None:
         """Run ONE microbatch over the drained requests and scatter each encoded response back to its
-        identity frame (`[identity][empty][response]`, the ROUTER reply envelope). Reloads params first
-        if the published version changed (between-batch reload, design §3)."""
+        identity, ECHOING that request's transport envelope verbatim (`[identity][envelope…][response]`).
+        The envelope is opaque routing the server round-trips unchanged: for a REQ client it is the empty
+        delimiter (so the reply is byte-identical to the legacy `[identity][b""][resp]`), for a DEALER
+        client it carries the correlation id the C++ pool matches replies on. `run_microbatch` is the
+        VALUE core — it sees only `(identity, row)`, never the envelope — so the responses come back 1:1
+        in drained order and re-pair with their envelopes by position. Reloads params first if the
+        published version changed (between-batch reload, design §3)."""
         reloaded = self._params_source.poll()
         params, y_mean, y_std = reloaded if reloaded is not None else self._params_source.current()
-        for ident, resp in run_microbatch(self._forward_fn, params, y_mean, y_std, drained):
-            self._sock.send_multipart([ident, b"", resp])
+        rows = [(ident, X) for ident, _envelope, X in drained]
+        for (ident, resp), (_ident, envelope, _X) in zip(
+                run_microbatch(self._forward_fn, params, y_mean, y_std, rows), drained):
+            self._sock.send_multipart([ident, *envelope, resp])
 
     def serve_forever(self) -> None:
         """The greedy-drain loop: block for ≥1 request, drain to the cap, run one forward, scatter,

@@ -9,17 +9,22 @@
 //
 //   Concurrency model (why it is race-free without a TSan-gated single-writer protocol): each thread
 //   OWNS a disjoint subset of the tasks, its own DEALER socket, its own K fiber slots, and its own
-//   counters — no tree migrates between threads, so there is no shared per-tree state. Single-writer-
-//   per-tree is structural. Reply→tree correlation is positional FIFO PER SOCKET: one DEALER peer
-//   submits-then-the-server-replies in submit order (per-peer ordering, design §4.1), and each slot has
-//   exactly one leaf outstanding at a time, so a FIFO of slot ids matches replies to slots with no
-//   echoed-id. (The flip side, acknowledged: with no corr-id, a violation of one-peer-in-order — a
-//   shared socket, a mid-run reconnect that changes identity, or a server-side drop of a malformed
-//   frame — would silently apply a reply to the WRONG slot, caught only by the eventual recv timeout
-//   (a value misalignment, not a crash). This bench never triggers it (one socket/thread, no malformed
-//   sends); the production pool adds the echoed u64 corr-id — design §4.1.) The batch_size /
-//   thread_pool_size knobs come from the ONE home runtime_config.hpp
-//   (fibers_per_thread = ceil(batch/threads) is derived there).
+//   counters — no tree migrates between threads YET, so there is no shared per-tree state and single-
+//   writer-per-tree is structural. Reply→tree correlation is by an ECHOED u64 CORRELATION ID, not
+//   positional FIFO: each submit stamps the request with a globally-unique corr-id (a shared atomic
+//   counter), carries it as a leading zmq frame `[corr-id][payload]`, and the server echoes that frame
+//   verbatim in the reply (it round-trips the envelope opaquely — the corr-id is a TRANSPORT concern, it
+//   never enters the value codec, ADR-0012 P7 serialization⊥transport). The worker looks the reply's
+//   corr-id up in its `inflight` map to find the slot; an unknown corr-id is a LOUD failure (ADR-0002),
+//   not a silent wrong-slot apply. This buys two things the positional FIFO could not: (1) it is robust
+//   to any reply-reorder, a server-side drop, or a reconnect — correlation no longer rides on submit
+//   order; (2) it keeps WORK-STEALING / tree MIGRATION open as a performance lever — the corr-id is
+//   globally unique, so promoting `inflight` to a shared registry lets ANY worker route ANY reply to a
+//   tree regardless of which thread submitted its leaf (the positional FIFO structurally pinned a tree
+//   to its submitting thread). The coming Zobrist-hashed eval cache (a mutex-pool transposition table)
+//   introduces shared state regardless, so paying for correlation now is not premature — it is the
+//   foundation both that cache and migration build on. The batch_size / thread_pool_size knobs come from
+//   the ONE home runtime_config.hpp (fibers_per_thread = ceil(batch/threads) is derived there).
 //
 //   ADR-0012 P9: the fibers + the DEALERs are the effect, confined to this driver; the search core is
 //   unchanged + oblivious (the YieldingNetEvaluator, fiber_leaf.hpp). A leaf RPC failure aborts that
@@ -38,6 +43,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <iostream>
 #include <memory>
@@ -47,6 +53,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "chocofarm/env.hpp"
@@ -73,24 +80,29 @@ namespace {
     return std::chrono::duration<double>(b - a).count();
 }
 
-[[nodiscard]] std::vector<unsigned char> recv_payload(void* sock, bool& ok) {
-    std::vector<unsigned char> last;
-    ok = false;
+// Receive one reply and split it into its echoed correlation id (the LEADING frame, an opaque u64 the
+// server round-tripped) and the response payload (the LAST frame). Fails loud (returns false) on a
+// recv error or a malformed envelope (fewer than 2 frames, or a leading frame that is not 8 bytes) —
+// ADR-0002: a desynchronized wire is never silently papered over.
+[[nodiscard]] bool recv_corr_payload(void* sock, uint64_t& corr, std::vector<unsigned char>& payload) {
+    std::vector<std::vector<unsigned char>> frames;
     int more = 1;
     while (more) {
         zmq_msg_t m;
         zmq_msg_init(&m);
         if (zmq_msg_recv(&m, sock, 0) < 0) {
             zmq_msg_close(&m);
-            return {};
+            return false;
         }
         const auto* d = static_cast<const unsigned char*>(zmq_msg_data(&m));
-        last.assign(d, d + zmq_msg_size(&m));
+        frames.emplace_back(d, d + zmq_msg_size(&m));
         more = zmq_msg_more(&m);
         zmq_msg_close(&m);
     }
-    ok = true;
-    return last;
+    if (frames.size() < 2 || frames.front().size() != sizeof(uint64_t)) return false;
+    std::memcpy(&corr, frames.front().data(), sizeof(uint64_t));   // opaque round-trip: native bytes
+    payload = std::move(frames.back());
+    return true;
 }
 
 class ScriptedGumbelSource final : public chocofarm::GumbelSource {
@@ -199,6 +211,9 @@ int main(int argc, char** argv) {
     std::atomic<long> leaf_total{0};
     std::atomic<int> decided_total{0};
     std::atomic<bool> failed{false};
+    // globally-unique correlation ids across ALL worker threads — the per-thread `inflight` maps key on
+    // these now, and a future shared tree-registry (work-stealing/migration) keys on them unchanged.
+    std::atomic<uint64_t> corr_seq{0};
 
     auto worker = [&](int tid) {
         void* sock = zmq_socket(zctx, ZMQ_DEALER);
@@ -215,14 +230,17 @@ int main(int argc, char** argv) {
         for (int i = tid; i < n_tasks; i += T) my_tasks.push_back(i);
 
         std::vector<std::unique_ptr<TreeState>> slots(static_cast<size_t>(K));
-        std::deque<int> fifo;  // slot ids, submit order (per-peer reply order matches)
+        std::unordered_map<uint64_t, int> inflight;  // corr-id -> slot id of its outstanding leaf
         long my_leaves = 0;
         int my_decided = 0;
 
         auto submit = [&](int s) {
             std::vector<unsigned char> req = chocofarm::wire::encode_request(slots[static_cast<size_t>(s)]->ch.features);
+            uint64_t corr = corr_seq.fetch_add(1, std::memory_order_relaxed);
+            // frame 1: the corr-id (opaque u64, the server echoes it back verbatim). frame 2: the payload.
+            if (zmq_send(sock, &corr, sizeof(corr), ZMQ_SNDMORE) < 0) { failed.store(true); return; }
             if (zmq_send(sock, req.data(), req.size(), 0) < 0) { failed.store(true); return; }
-            fifo.push_back(s);
+            inflight.emplace(corr, s);
         };
         // (re)fill slot s with the next task; submit its first leaf. Returns true if a leaf was submitted.
         auto fill = [&](int s) -> bool {
@@ -237,13 +255,15 @@ int main(int argc, char** argv) {
         };
 
         for (int s = 0; s < K && !failed.load(); ++s) fill(s);
-        while (!fifo.empty() && !failed.load()) {
-            bool ok = false;
-            std::vector<unsigned char> payload = recv_payload(sock, ok);
-            if (!ok) { failed.store(true); break; }
+        while (!inflight.empty() && !failed.load()) {
+            uint64_t corr = 0;
+            std::vector<unsigned char> payload;
+            if (!recv_corr_payload(sock, corr, payload)) { failed.store(true); break; }
             auto decoded = chocofarm::wire::decode_response(payload);
             if (!decoded) { failed.store(true); break; }
-            int s = fifo.front(); fifo.pop_front();  // FIFO: this reply is for slot s's outstanding leaf
+            auto it = inflight.find(corr);
+            if (it == inflight.end()) { failed.store(true); break; }  // unknown corr-id: a desync, loud
+            int s = it->second; inflight.erase(it);  // corr-id: this reply is for slot s's outstanding leaf
             chocofarm::NetPrediction pred;
             pred.value = decoded->value;
             pred.logits = std::move(decoded->logits);
