@@ -14,8 +14,12 @@ composes are already built + verified:
   * TensorBoard (tensorboardX), streaming to tb/az so the run shows up on the daemon (:6006).
 
 It is DELIBERATELY minimal — no held-out eval / replay-window / Part-B value target / parallel
-worker-pool (those live in exit_loop.py). Its job is to demonstrate the C++ actor IN the loop, turning
-and streaming, so the C++ runtime (goal 1) + the production pool (goal 2) have a real actor-learner home
+worker-pool (those live in exit_loop.py). For the FULL ExIt run with the C++ actor, prefer the SWAP:
+`chocofarm/az/cpp_executor.CppActorExecutor` injects the C++ Gumbel actor into exit_loop's GENERATION
+step (`python -m chocofarm.az.exit_loop --cpp-runner cpp/build/chocofarm-cpp-runner`), so the held-out
+eval, replay window, JAX training, checkpointing, and hp registry are all inherited unchanged. This
+standalone loop remains the minimal, dependency-light demonstration: its job is to show the C++ actor IN
+the loop, turning and streaming, so the C++ runtime + the production pool have a real actor-learner home
 to plug into. The value target Y is the runner's own λ-return (the pure-MC limit); the net's y_mean/y_std
 are re-pinned to the buffer's Y stats each iter (exit_loop's standardization discipline) so the value MSE
 stays O(1).

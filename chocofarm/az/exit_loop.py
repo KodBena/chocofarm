@@ -337,10 +337,24 @@ def run(args: argparse.Namespace) -> None:
     snap = hpreg.ConfigSnapshot.launch(experiment_id, launched_with=cfg0)
     lam = snap.cfg.loop.lam   # the live HOT λ; refreshed per iteration below
 
-    # --- Part A: persistent core-pinned process pool (parallel actor/learner). workers<=0 keeps
-    #     the in-process serial path (the true serial baseline for the A/B). ---
+    # --- the GENERATION actor (the env<->actor seam): exit_loop's eval/replay/train/checkpoint are
+    #     generic over an injected executor with the (generate / evaluate / close) contract.
+    #       --cpp-runner  -> the C++ Gumbel actor drives GENERATION (eval stays in-process Python);
+    #       --workers>0   -> Part A's core-pinned Python process pool (the parallel actor/learner);
+    #       else          -> the in-process serial path (the true serial A/B baseline).
+    #     --cpp-runner takes precedence over --workers (it is a launch-time choice of actor, read off
+    #     args like --resume/--init-weights, not a HOT registry field). ---
     executor = None
-    if cfg0.par.workers and cfg0.par.workers > 0:
+    if args.cpp_runner:
+        from chocofarm.az.cpp_executor import CppActorExecutor
+        executor = CppActorExecutor(args.cpp_runner, args.cpp_instance, args.cpp_faces, env,
+                                    master_seed, cfg0.search.m, cfg0.search.n_sims,
+                                    cfg0.search.use_jax_mlp, in_dim, n_slots)
+        print(f"C++ Gumbel ACTOR generation (runner={args.cpp_runner}); eval/train/replay/checkpoint "
+              f"in-process; weights + transitions over redis run={executor.run}. Value target is the "
+              f"actor's pure-MC λ-return (Part-B blend is fail-loud-guarded — not yet on the C++ wire).",
+              flush=True)
+    elif cfg0.par.workers and cfg0.par.workers > 0:
         from chocofarm.az.parallel import ParallelExecutor
         # workers / cores / seed / m / n_sims are RESTART (the pool is built once before the loop);
         # read them off the seeded config (cfg0), the single construction-time authority.
@@ -548,6 +562,20 @@ def main() -> None:
                          "distinct core (Part A). 0 = serial in-process (the A/B baseline).")
     ap.add_argument("--cores", type=str, default="0,1,2,3",
                     help="comma-separated cores to pin workers to (Part A; default 0,1,2,3)")
+    # --- the C++ Gumbel actor as the GENERATION executor (swaps into exit_loop's generation; eval +
+    #     train + replay + checkpoint stay in-process). Takes precedence over --workers. ---
+    ap.add_argument("--cpp-runner", type=str, default=None,
+                    help="path to chocofarm-cpp-runner; if set, the C++ Gumbel actor drives GENERATION "
+                         "(eval/train/replay/checkpoint stay in-process). Overrides --workers. The C++ "
+                         "actor plays temperature-0 greedy generation, so it requires --explore-plies 0 "
+                         "and pure-MC (the default value target); the exploration prefix and the Part-B "
+                         "blend are not yet wired across the C++ wire (both fail loud — use --workers for "
+                         "them).")
+    ap.add_argument("--cpp-instance", type=str, default="chocofarm/data/instance.json",
+                    help="instance JSON the C++ runner loads (must describe the SAME env as the "
+                         "Python Environment, so the (X,PI,M,Y) dims match the net)")
+    ap.add_argument("--cpp-faces", type=str, default="chocofarm/data/faces.json",
+                    help="faces JSON the C++ runner loads (alongside --cpp-instance)")
     # --- Part B: lower-variance value target (mutually exclusive; default = pure MC) ---
     ap.add_argument("--td-lambda", type=float, default=1.0,
                     help="TD(λ) blend weight on the value target (Part B): 1.0 = pure MC (current "

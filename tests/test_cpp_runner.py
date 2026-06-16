@@ -412,3 +412,85 @@ def test_cpp_actor_loop_turns():
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, f"C++-actor loop FAILED:\n{out.stdout}\n{out.stderr}"
     assert "DONE" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not _RUN_CPP, reason=_CPP_SKIP)
+def test_cpp_actor_exit_loop_swap_turns():
+    """The SWAP (chocofarm/az/cpp_executor.CppActorExecutor): the C++ Gumbel actor injected into the
+    PRODUCTION exit_loop as the GENERATION executor — so the held-out eval, replay window, JAX training,
+    checkpointing, and hp registry are all inherited unchanged while the C++ runner produces the
+    transitions. Proves one full exit_loop iteration turns through the C++ actor (vs the Python pool) and
+    writes a checkpoint. Needs redis + the runner + jax; gate on exit 0, 'DONE 1 iters', and a real ckpt."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    import shutil
+    import tempfile
+    ckpt = tempfile.mkdtemp(prefix="cpp_exit_swap_")
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", "chocofarm.az.exit_loop", "--cpp-runner", CPP_BIN,
+             "--cpp-instance", DATA_INSTANCE, "--cpp-faces", DATA_FACES,
+             "-I", "1", "-E", "4", "-W", "2", "--epochs", "1", "--m", "12", "--n-sims", "6",
+             "--eval-n", "1", "--explore-plies", "0", "--hidden", "32", "--lam", "0.0855", "--seed", "7",
+             "--ckpt-dir", ckpt],  # experiment-id defaults to the UNIQUE tmpdir basename — a fresh
+            #                        registry seed each run (so --explore-plies 0 is not overridden by a
+            #                        stale re-bound blob), and no cross-run registry pollution under a fixed id
+            cwd=REPO, env={**os.environ, "PYTHONPATH": REPO},
+            capture_output=True, text=True, timeout=600)
+        assert out.returncode == 0, f"C++-actor exit_loop SWAP FAILED:\n{out.stdout}\n{out.stderr}"
+        assert "DONE 1 iters" in out.stdout, out.stdout
+        assert "C++ Gumbel ACTOR generation" in out.stdout, out.stdout
+        assert os.path.exists(os.path.join(ckpt, "net_iter000.npz")), "no checkpoint written"
+        assert os.path.exists(os.path.join(ckpt, "history.json")), "no history written"
+    finally:
+        shutil.rmtree(ckpt, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _RUN_CPP, reason=_CPP_SKIP)
+def test_cpp_actor_executor_partb_fails_loud():
+    """ADR-0002: the C++ actor emits the pure-MC λ-return, so requesting a Part-B blend
+    (td_lambda<1 or n_step) must FAIL LOUD at generate() — never silently train on a pure-MC target the
+    operator did not ask for. The guard fires BEFORE any weight publish / subprocess, so a None net is
+    fine. Needs redis only for the executor's connection in __init__."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    from chocofarm.az.actions import n_action_slots
+    from chocofarm.az.cpp_executor import CppActorExecutor
+    from chocofarm.az.features import feature_dim
+    from chocofarm.model.env import Environment
+    env = Environment()
+    ex = CppActorExecutor(CPP_BIN, DATA_INSTANCE, DATA_FACES, env, base_seed=7, m=12, n_sims=8,
+                          use_jax_mlp=False, in_dim=feature_dim(env), n_slots=n_action_slots(env))
+    try:
+        # explore_plies=0 isolates the Part-B guard (else the explore_plies guard could fire first).
+        with pytest.raises(RuntimeError, match="pure-MC"):
+            ex.generate(None, 0, [0, 1], 0.0855, 0, lam_blend=0.5, n_step=None)
+        with pytest.raises(RuntimeError, match="pure-MC"):
+            ex.generate(None, 0, [0, 1], 0.0855, 0, lam_blend=1.0, n_step=3)
+    finally:
+        ex.close()
+
+
+@pytest.mark.skipif(not _RUN_CPP, reason=_CPP_SKIP)
+def test_cpp_actor_executor_explore_plies_fails_loud():
+    """ADR-0002: the C++ actor plays the temperature-0 SH survivor every ply, so it cannot honor the
+    temperature-1 explore_plies exploration prefix both Python paths apply. Requesting explore_plies>0 must
+    FAIL LOUD at generate() — never silently generate zero-exploration self-play (the same fail-loud
+    standard the Part-B guard sets). The guard fires before any subprocess, so a None net is fine."""
+    if not _redis_up():
+        pytest.skip("redis not reachable on the CHOCO_TRANSPORT_REDIS_* contract")
+    from chocofarm.az.actions import n_action_slots
+    from chocofarm.az.cpp_executor import CppActorExecutor
+    from chocofarm.az.features import feature_dim
+    from chocofarm.model.env import Environment
+    env = Environment()
+    ex = CppActorExecutor(CPP_BIN, DATA_INSTANCE, DATA_FACES, env, base_seed=7, m=12, n_sims=8,
+                          use_jax_mlp=False, in_dim=feature_dim(env), n_slots=n_action_slots(env))
+    try:
+        with pytest.raises(RuntimeError, match="explore_plies"):
+            ex.generate(None, 0, [0, 1], 0.0855, 4, lam_blend=1.0, n_step=None)
+        # pure-MC + explore_plies=0 passes both guards (it would proceed to publish/subprocess) — assert
+        # the two guards do NOT fire on the supported default-shape call by reaching past them is covered
+        # by the swap-turns test; here we only assert the explore_plies>0 refusal.
+    finally:
+        ex.close()
