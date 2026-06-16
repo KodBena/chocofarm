@@ -5,22 +5,30 @@
 //   byte-identity). A drop-in `Policy` alongside RandomPolicy / NMCSPolicy / ISMCTSPolicy: the runner
 //   takes `const Policy&` and never names this class, so adding it is ZERO edits to the search/env core.
 //
-//   *** PHASE 1a SCOPE (structure only) ***
-//   This port mirrors the DISCRETE ALGORITHM: Gumbel-Top-k root sampling, Sequential Halving (the
+//   *** PHASE 1a SCOPE (structure) ***
+//   The port mirrors the DISCRETE ALGORITHM: Gumbel-Top-k root sampling, Sequential Halving (the
 //   per-phase budget accounting + the full-budget remainder loop), PUCT descent, the _Node W/N arena,
 //   the c_outcome outcome-averaging, the improved-π σ-transform, and the executed action = the SH
-//   survivor (temperature 0). The σ-transform / v_mix / softmax are computed in ONE consistent
-//   precision (float64) here — this is the 1a choice. The Python search runs the σ-transform at a
-//   DELIBERATE float32-prior × float64-Q mixed precision (value_target.py:226-280, the byte-identity
-//   seam) that a uniform-precision port diverges from on NEAR-TIE inputs.
+//   survivor (temperature 0). 1a validated this structure exact-action on COARSE, well-separated
+//   scripted leaf inputs (NO near-ties), so the discrete outcome was identical float32-vs-float64 —
+//   proving the SELECTION LOGIC is faithful WITHOUT yet chasing the precision.
 //
-//   *** 1b SEAM (the part 1b must tighten) ***
-//   The prior/Q precision is LOCALIZED in gumbel.cpp's σ-transform helpers (`v_mix_1a`,
-//   `improved_policy_1a`, and the prior built in `evaluate`). 1a runs everything in `double`. 1b makes
-//   the prior float32 and the prior-weighted v_mix product float32-weak (mirroring value_target.py's
-//   Python-float promotion) and adds a near-tie / fine-input parity. The 1a parity is exact-action on
-//   COARSE, well-separated scripted leaf inputs (NO near-ties) so the discrete outcome is identical
-//   regardless of float32-vs-float64 — proving the STRUCTURE + selection logic is faithful.
+//   *** PHASE 1b (DONE — the precision FIDELITY) ***
+//   The Python search runs the σ-transform at a DELIBERATE float32-prior × float64-Q mixed precision
+//   (value_target.py:209-249, the byte-identity seam) that a uniform-precision port diverges from on
+//   NEAR-TIE inputs. 1b makes the C++ reproduce that promotion EXACTLY, localized in gumbel.cpp at four
+//   spots (each toggleable by CHOCO_GUMBEL_UNIFORM, the discrimination control):
+//     1. `evaluate` stores `node.prior` as float32 (the in-search masked-softmax prior; the softmax
+//        that BUILDS it stays float64, only the stored prior is narrowed);
+//     2. `v_mix_mixed` computes the prior-weighted blend ENTIRELY in float32 (numpy's f32×pyfloat weak
+//        promotion — the v_mix RETURN is np.float32);
+//     3. `improved_policy` completes UNVISITED slots with σ·v_mix rounded to float32 (numpy
+//        pyfloat·f32→f32, added to the float64 root logit), VISITED slots in full float64;
+//     4. `puct_select` scores `q + c_puct·p·√ΣN/(1+n)` in float32 (the float32 prior weak-promotes the
+//        U-term), deciding the interior near-tie argmax at float32.
+//   The SH cut key (g+logit+σ·q̂) and the Gumbel-top-k (logit+g) are float64 on BOTH sides (numpy:
+//   g/logits/sigma float64, q̂ a Python float) — no float32 there. cpp/parity/gumbel_precision.py proves
+//   the FINE near-tie parity (mixed N/N exact, uniform diverges X/N — the load-bearing discrimination).
 //
 //   The leaf goes through the injected NetEvaluator port (net_evaluator.hpp / design §1): the search
 //   is its first real consumer. The production decide() wires a NetForward (or a remote ZmqNetClient);
@@ -90,7 +98,14 @@ using GBeliefKey = std::tuple<int, uint32_t, uint32_t>;
 struct GumbelNode {
     bool evaluated = false;                 // has `evaluate` populated this node?
     double value = 0.0;                     // scalar net value V at this belief
-    std::vector<float> prior;               // (n_slots,) masked-softmax prior P(s,·) (1b: the float32 seam)
+    std::vector<float> prior;               // (n_slots,) masked-softmax prior P(s,·) — FLOAT32 (1b seam 1:
+                                            //   the in-search prior the Python search side-reads as
+                                            //   root.prior, a float32 array; softmaxed in f64, stored f32)
+    std::vector<double> prior_d;            // (n_slots,) the SAME masked-softmax prior in FULL float64 —
+                                            //   the pre-narrowing double prior. The DISCRIMINATION control
+                                            //   (kUniform) reads THIS at every site so the uniform arm is
+                                            //   the genuine 1a all-float64 port; the mixed (default) arm
+                                            //   reads the float32 `prior`. See gumbel.cpp seam map.
     std::vector<int> legal_slots;           // legal action slots, in env.legal_actions + TERMINATE order
     std::map<int, double> W;                // action-slot -> summed λ-penalized return
     std::map<int, int> N;                   // action-slot -> selection count
@@ -148,8 +163,9 @@ class GumbelAZPolicy final : public Policy {
   private:
     // Populate node.value/prior/legal_slots from one net forward (mirrors _evaluate). The leaf goes
     // through the injected NetEvaluator: it returns (value, logits); the prior is the masked softmax of
-    // logits over the legal slots (mirrors predict_both). 1b SEAM: the prior precision is localized
-    // here (float32) and in the σ-transform helpers.
+    // logits over the legal slots (mirrors predict_both). 1b SEAM 1: the masked softmax runs in float64
+    // (mlp._masked_softmax), then the STORED prior is narrowed to float32 — the precision the Python
+    // search side-reads (root.prior). `kUniform` widens it back at every read site (discrimination ctl).
     double evaluate(GumbelNode& node, const Loc& loc, const std::vector<uint32_t>& bw,
                     const std::set<int>& collected) const;
 
@@ -182,12 +198,16 @@ class GumbelAZPolicy final : public Policy {
 
     // AlphaZero PUCT select: argmax q + c_puct·p·√(ΣN)/(1+n) over node.legal_slots, strict-`>`
     // first-wins, unvisited Q completed by the node's own net value (mirrors _puct_select). Returns the
-    // selected action slot.
+    // selected action slot. 1b SEAM 4: the score is computed in FLOAT32 (the float32 prior weak-promotes
+    // the whole U-term + the `q +`), so the interior near-tie argmax matches Python; `kUniform` runs it
+    // in `double` (discrimination control).
     [[nodiscard]] int puct_select(const GumbelNode& node) const;
 
     // The improved-π target over the legal set: π′ = softmax(logit + σ(completedQ)) (mirrors
-    // _improved_policy → value_target.improved_policy). 1b SEAM: the prior/Q precision in v_mix +
-    // sigma·q is localized here; 1a runs `double`. Returns an (n_slots,) row (0 on illegal).
+    // _improved_policy → value_target.improved_policy). 1b SEAMS 2+3: v_mix (the unvisited completion)
+    // runs the float32 prior-weighted blend, and the unvisited slots' σ·v_mix is rounded to float32 (the
+    // visited slots use full-float64 σ·q); the masked softmax over the completed logits then runs in
+    // float64. `kUniform` reverts both to `double`. Returns an (n_slots,) row (0 on illegal).
     [[nodiscard]] std::vector<double> improved_policy(const GumbelNode& root,
                                                       const std::vector<double>& logits) const;
 
