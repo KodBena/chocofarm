@@ -81,6 +81,8 @@ GUMBEL_LOGIC = os.path.join(REPO, "cpp", "parity", "gumbel_logic.py")
 GUMBEL_PRECISION = os.path.join(REPO, "cpp", "parity", "gumbel_precision.py")
 SERIAL_CHECK_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-serial-runtime-check")
 BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-search-runtime-bench")
+WIRE_BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-wire-bench")
+WIRE_BENCH = os.path.join(REPO, "cpp", "parity", "wire_bench.py")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
@@ -358,3 +360,19 @@ def test_cpp_pool_runtime_matches_serial():
                          cwd=REPO, capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, f"PoolRuntime vs SerialRuntime check FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(WIRE_BENCH_BIN)), reason=_CPP_SKIP)
+def test_cpp_wire_sync_benchmark():
+    """The over-the-wire SYNCHRONOUS benchmark (cpp/parity/wire_bench.py): spin the Python InferenceServer
+    in-process (StaticParamsSource, a dimension-matched ValueMLP — NO redis) and run the C++ SerialRuntime
+    driving the Gumbel-AZ search where every leaf is a blocking REQ round-trip to the server. This is the
+    'over-the-wire synchronous' axis of the §6-Q5 benchmark — one in-flight leaf at a time, measuring the
+    wire RTT + (un-batched) server-forward cost the wire-PARALLEL fiber+DEALER pool exists to amortize.
+    The driver SKIPS (returns 0) if pyzmq is absent; here we gate on exit 0 (PASS or SKIP), not a throughput
+    threshold (the wall time is hardware-dependent; this guard pins that the wire path RUNS end to end)."""
+    out = subprocess.run([sys.executable, WIRE_BENCH], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, f"wire-sync benchmark FAILED:\n{out.stdout}\n{out.stderr}"
+    assert ("RESULT: PASS" in out.stdout) or ("RESULT: SKIP" in out.stdout), out.stdout

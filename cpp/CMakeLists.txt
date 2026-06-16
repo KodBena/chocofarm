@@ -185,6 +185,13 @@ add_executable(chocofarm-search-runtime-bench src/search_runtime_bench.cpp)
 target_link_libraries(chocofarm-search-runtime-bench PRIVATE chocofarm_core Threads::Threads)
 target_compile_options(chocofarm-search-runtime-bench PRIVATE -Wall -Wextra)
 
+# The over-the-wire SYNCHRONOUS benchmark (NOT the runner): SerialRuntime with a remote ZmqNetClient
+# leaf against the running Python InferenceServer (spun by cpp/parity/wire_bench.py), measuring the
+# wire RTT + server-forward cost per leaf. The wire-PARALLEL axis (fiber + DEALER pool) is a later chunk.
+add_executable(chocofarm-wire-bench src/wire_bench.cpp)
+target_link_libraries(chocofarm-wire-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-wire-bench PRIVATE -Wall -Wextra)
+
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned
 # (value, logits) — so the cross-language round-trip test (tests/test_zmq_net_cpp.py) can drive the C++
