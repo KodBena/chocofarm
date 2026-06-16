@@ -198,11 +198,15 @@ class Worker:
             return (idx, 0, 0, 0)
         feat_dim = recs[0][0].shape[0]
         n_slots = recs[0][1].shape[0]
-        # stack into contiguous float32 blocks, write raw bytes (no pickle)
-        X = np.empty((n, feat_dim), dtype=np.float32)
-        PI = np.empty((n, n_slots), dtype=np.float32)
-        M = np.empty((n, n_slots), dtype=np.float32)
-        Y = np.empty(n, dtype=np.float32)
+        # stack into contiguous float32 blocks, write raw bytes (no pickle). The block dtype is the
+        # result_spec SSOT (ADR-0012 P1) — the ONE home of "the result blocks are float32", shared
+        # with transport.read_and_delete_results and the C++ write_results; write_results re-validates
+        # it at the boundary (ADR-0002 fail-loud).
+        from chocofarm.az.result_spec import RESULT_DTYPE
+        X = np.empty((n, feat_dim), dtype=RESULT_DTYPE)
+        PI = np.empty((n, n_slots), dtype=RESULT_DTYPE)
+        M = np.empty((n, n_slots), dtype=RESULT_DTYPE)
+        Y = np.empty(n, dtype=RESULT_DTYPE)
         for i, (f, pi, mask, g) in enumerate(recs):
             X[i] = f; PI[i] = pi; M[i] = mask; Y[i] = g
         transport.write_results(self.redis, res_token, idx, X, PI, M, Y)

@@ -28,6 +28,26 @@ control vs 0/240 on the old `bw[0]` check). Remaining is test-only; production `
   "never discard experiment output"), and Bonferroni/Holm-correct the gate. Scope: ISMCTS + Random
   (NMCS parity is retired — below).
 
+## #23 wire/result drift net — promote the floor to codegen when the C++ build lands (deferred 2026-06-16)
+
+The Python↔C++ wire frame (`wire_spec.py`) and result blob (`result_spec.py`) are mechanized against
+silent drift by `tests/test_wire_drift.py` (one SSOT per layout; always-on layout-agreement +
+codec-derives-from-spec legs that fail `pytest tests/ -q` on a format-constant or codec drift; an
+opt-in `CHOCO_RUN_CPP` C++ golden round-trip). Per ADR-0012 P7's hierarchy (generate/compile-from-one-
+source > build-time lint > runtime parity), the always-on test is the **floor** (a lint failing the
+default gate) and the golden is the **backstop** — the **top rung (codegen) is deferred for a concrete
+reason: the C++ consumer doesn't exist yet** (the `ZmqNetClient` + the redis-client `cpp/` build are
+deferred to the P9 `cpp/` pass; there is no `cpp/build/` in any gate). When that pass lands and the C++
+side is built in a gate:
+
+- **Generate `cpp/include/chocofarm/{wire_spec,result_spec}.hpp` from the Python SSOT** (a tiny
+  build-step that emits the `constexpr` mirror from `wire_spec.py`/`result_spec.py`), so the mirror is
+  *derived, not hand-written* — closing the residual gap that the headers are hand-authored today,
+  joined to the SSOT only by the runtime test. The drift test stays as the backstop.
+- **Add the one-line C++ cross-check** `prod(shape) * sizeof(double) == len` in `transport.cpp::
+  parse_manifest` (today C++ derives a weight's element count from `len/sizeof(double)` and Python from
+  `prod(shape)`; consistent only because one writer emits both — assert it).
+
 ## Possible cpp refactor (minor, non-blocking)
 
 - A shared `Sampler` (just `sample_world`) under `WorldSource` (NMCS) and `ISMCTSSource` (ISMCTS),

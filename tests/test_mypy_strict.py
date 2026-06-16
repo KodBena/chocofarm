@@ -122,6 +122,8 @@ STRICT_CLEAN = [
     # (so there is no `no-untyped-call` into the kernel seam the way mlp.py has) — the JAX/zmq backends
     # are imported lazily inside function bodies. net_port imports ValueMLP only under TYPE_CHECKING. So
     # each is genuinely strict-clean WITHOUT pulling a deferred module into the enforced set.
+    "chocofarm/az/wire_spec.py",        # the ZMQ wire-frame layout SSOT (#23); pure constants, no deps
+    "chocofarm/az/result_spec.py",      # the redis result-blob format SSOT (#23); numpy dtype constants
     "chocofarm/az/inference_wire.py",   # pure codec (struct + numpy); no jax/zmq at all
     "chocofarm/az/net_port.py",         # the Net Protocol + local adapter; ValueMLP under TYPE_CHECKING
     "chocofarm/az/inference_server.py", # forward_core via typed ForwardFn; jax/zmq lazy in bodies
