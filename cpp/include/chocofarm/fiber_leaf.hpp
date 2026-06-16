@@ -6,8 +6,9 @@
 //   returning a value, but it suspends the fiber to the driver (which evaluates the leaf — locally, or
 //   by batching it over a DEALER to the inference server) and resumes with the value. This is what
 //   decouples "many trees in flight (a big MLP-eval batch)" from "many OS threads": one thread
-//   multiplexes K fibers. (fiber_proto.cpp + wire_parallel_bench.cpp inline equivalents predating this
-//   header — retrofit to it on touch.)
+//   multiplexes K fibers. The per-tree fiber FIXTURE built on these primitives lives in fiber_tree.hpp
+//   (TreeState), and the scripted RNG-free leaf source in cyclic_gumbel.hpp; the wire-parallel/pool
+//   benches and the Option-A proof (fiber_proto.cpp) all share THESE types — no inlined copies remain.
 //
 // Public Domain (The Unlicense).
 #pragma once

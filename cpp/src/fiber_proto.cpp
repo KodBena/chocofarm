@@ -23,8 +23,6 @@
 //              "RESULT: FAIL ..." + exit 3.
 //
 // Public Domain (The Unlicense).
-#include <boost/context/fiber.hpp>
-
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -35,13 +33,13 @@
 #include <string_view>
 #include <vector>
 
+#include "chocofarm/cyclic_gumbel.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
+#include "chocofarm/fiber_tree.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/instance.hpp"
 #include "chocofarm/net_evaluator.hpp"
-
-namespace ctxb = boost::context;
 
 namespace {
 [[nodiscard]] std::optional<std::string_view> opt(std::span<const std::string_view> args,
@@ -75,74 +73,11 @@ class DetNet final : public chocofarm::NetEvaluator {
     int n_slots_;
 };
 
-// A scripted, RNG-free Gumbel source (a fixed gumbel FIFO cycled mod its length; sample_world -> bw[0]),
-// identical across the two runs by construction (mirrors gumbel_dump's scripted source).
-class ScriptedGumbelSource final : public chocofarm::GumbelSource {
-  public:
-    explicit ScriptedGumbelSource(std::vector<double> table) : table_(std::move(table)) {}
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override { return bw.empty() ? 0u : bw[0]; }
-    std::vector<double> gumbel(int n) override {
-        std::vector<double> out(static_cast<size_t>(n));
-        for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = table_[(idx_++) % table_.size()];
-        return out;
-    }
-
-  private:
-    std::vector<double> table_;
-    size_t idx_ = 0;
-};
-
-// The fiber<->driver channel: the yielding net writes the leaf row + a flag and yields; the driver writes
-// the evaluated leaf value back and resumes.
-struct YieldCtx {
-    ctxb::fiber caller;                    // continuation to yield back to (updated each ping-pong)
-    std::span<const float> leaf_features;  // OUT: the row predict() wants evaluated
-    chocofarm::NetPrediction leaf_value;   // IN: the evaluated leaf, fed back to predict()
-    bool at_leaf = false;                  // OUT: true when predict() yielded (vs the search finished)
-};
-
-// The leaf evaluator the FIBERED search holds: its predict() does NOT compute — it parks the feature row
-// and YIELDS the fiber to the driver, returning the driver-supplied value on resume. To the unchanged
-// search this looks like an ordinary (if slow) predict() returning a value — the whole point of Option A.
-class YieldingNetEvaluator final : public chocofarm::NetEvaluator {
-  public:
-    explicit YieldingNetEvaluator(YieldCtx& ctx) : ctx_(ctx) {}
-    std::expected<chocofarm::NetPrediction, chocofarm::Error> predict(
-        std::span<const float> x) const override {
-        ctx_.leaf_features = x;
-        ctx_.at_leaf = true;
-        ctx_.caller = std::move(ctx_.caller).resume();  // yield to the driver; resumes here when it returns
-        return ctx_.leaf_value;                         // the driver set the evaluated leaf
-    }
-
-  private:
-    YieldCtx& ctx_;
-};
-
-// Run `policy.run_search` (the policy already holds a YieldingNetEvaluator) inside a fiber, feeding each
-// yielded leaf through `real_net` (the total DetNet). Returns the Decision the fibered search produced.
-chocofarm::GumbelAZPolicy::Decision run_fibered(
-    const chocofarm::GumbelAZPolicy& policy, const chocofarm::NetEvaluator& real_net,
-    const chocofarm::Loc& loc, const std::vector<uint32_t>& bw, const std::set<int>& collected,
-    double lam, chocofarm::GumbelSource& src, YieldCtx& ctx, int& leaves) {
-    chocofarm::GumbelAZPolicy::Decision decision;
-    leaves = 0;
-    ctxb::fiber fib{std::allocator_arg, ctxb::fixedsize_stack(512 * 1024),
-                    [&](ctxb::fiber&& caller) {
-                        ctx.caller = std::move(caller);
-                        decision = policy.run_search(loc, bw, collected, lam, src);
-                        ctx.at_leaf = false;  // the search finished
-                        return std::move(ctx.caller);
-                    }};
-    fib = std::move(fib).resume();  // run to the first leaf-yield (or finish)
-    while (ctx.at_leaf) {
-        auto pred = real_net.predict(ctx.leaf_features);  // the driver evaluates the parked leaf
-        ctx.leaf_value = pred.value();                    // DetNet is total — value arm always
-        ++leaves;
-        fib = std::move(fib).resume();  // resume the search; on return ctx.at_leaf marks next leaf vs finish
-    }
-    return decision;
-}
+// The scripted Gumbel source + the fiber-leaf primitives + the per-tree fiber state are now the ONE-home
+// shared types (ADR-0012 P1): CyclicGumbelSource (cyclic_gumbel.hpp), FiberLeafChannel +
+// YieldingNetEvaluator (fiber_leaf.hpp), TreeState (fiber_tree.hpp). Driving this proof through the SAME
+// TreeState the wire benches multiplex means it validates the real shared primitive, not a proof-only
+// copy — the §7.1 validity precondition now bears directly on the type the pool/parallel benches run.
 
 [[nodiscard]] int argmax(const std::vector<double>& v) {
     int best = 0;
@@ -187,18 +122,22 @@ int main(int argc, char** argv) {
                                0.20, -0.45, 0.95, -0.10, 0.70};
 
     // --- direct (synchronous) run: the reference ---
-    ScriptedGumbelSource src_direct(gtable);
+    chocofarm::CyclicGumbelSource src_direct(gtable);
     chocofarm::GumbelAZPolicy direct_policy(cfg, net, env);
     chocofarm::GumbelAZPolicy::Decision direct = direct_policy.run_search(loc, bw, collected, lam, src_direct);
 
-    // --- fibered run: the same unchanged run_search, driven through a fiber + a yielding leaf ---
-    YieldCtx ctx;
-    YieldingNetEvaluator ynet(ctx);
-    chocofarm::GumbelAZPolicy fiber_policy(cfg, ynet, env);
-    ScriptedGumbelSource src_fiber(gtable);
+    // --- fibered run: the SAME unchanged run_search, driven through the shared TreeState (a fiber + the
+    //     yielding leaf), feeding each parked leaf through the total DetNet. A stack local that never moves
+    //     (the fiber captures `this`); one tree, so no heap/vector is needed. ---
+    chocofarm::TreeState ts(cfg, env, gtable);
+    ts.start(loc, bw, collected, lam);  // advance to the first parked leaf (or finish)
     int leaves = 0;
-    chocofarm::GumbelAZPolicy::Decision fib =
-        run_fibered(fiber_policy, net, loc, bw, collected, lam, src_fiber, ctx, leaves);
+    while (ts.running) {
+        auto pred = net.predict(ts.ch.features);  // DetNet is total → the value arm always
+        ts.resume_with(pred.value());
+        ++leaves;
+    }
+    const chocofarm::GumbelAZPolicy::Decision fib = ts.decision;
 
     // --- compare: executed action slot, improved-pi argmax, n_spent ---
     const bool exec_ok = (direct.action == fib.action);

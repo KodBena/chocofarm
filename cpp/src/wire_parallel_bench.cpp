@@ -16,9 +16,10 @@
 //   the production refinement; this MVP measures the batching throughput win first (ADR-0009 measure-first).
 //
 //   ADR-0012 P9: the fiber + the DEALER are the effect, confined to this driver; the search core stays a
-//   pure value-function. A leaf RPC timeout/decode failure aborts loudly (ADR-0002). NOTE (P1 cleanup):
-//   the YieldCtx/YieldingNetEvaluator + the scripted fixtures are inlined here AND in fiber_proto.cpp;
-//   extracting them into a shared fiber-leaf header is the noted cleanup when the production pool lands.
+//   pure value-function. A leaf RPC timeout/decode failure aborts loudly (ADR-0002). The fiber-leaf
+//   primitives + the per-tree fixture are now the ONE-home shared types (ADR-0012 P1): FiberLeafChannel +
+//   YieldingNetEvaluator (fiber_leaf.hpp), CyclicGumbelSource (cyclic_gumbel.hpp), TreeState
+//   (fiber_tree.hpp) — the SAME types the wire-pool bench and the Option-A proof use.
 //
 //   Protocol:  wire-parallel-bench --instance <p> --faces <p> --endpoint <tcp://h:p>
 //                  [--trees K --n-sims N --m N --max-depth N --c-outcome N --lam f --timeout-ms N]
@@ -26,11 +27,9 @@
 //              first_batch=<b> leaves=<n> wall=<s>" + exit 0, or a loud failure.
 //
 // Public Domain (The Unlicense).
-#include <boost/context/fiber.hpp>
 #include <zmq.h>
 
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -43,12 +42,11 @@
 
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
+#include "chocofarm/fiber_tree.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/inference_wire.hpp"
 #include "chocofarm/instance.hpp"
 #include "chocofarm/net_evaluator.hpp"
-
-namespace ctxb = boost::context;
 
 namespace {
 [[nodiscard]] std::optional<std::string_view> opt(std::span<const std::string_view> args,
@@ -85,76 +83,10 @@ namespace {
     return last;
 }
 
-// The fiber<->multiplexer channel (the Option-A primitive — inlined; see file header P1 note).
-struct YieldCtx {
-    ctxb::fiber caller;
-    std::span<const float> leaf_features;
-    chocofarm::NetPrediction leaf_value;
-    bool at_leaf = false;
-};
-class YieldingNetEvaluator final : public chocofarm::NetEvaluator {
-  public:
-    explicit YieldingNetEvaluator(YieldCtx& ctx) : ctx_(ctx) {}
-    std::expected<chocofarm::NetPrediction, chocofarm::Error> predict(
-        std::span<const float> x) const override {
-        ctx_.leaf_features = x;
-        ctx_.at_leaf = true;
-        ctx_.caller = std::move(ctx_.caller).resume();
-        return ctx_.leaf_value;
-    }
-
-  private:
-    YieldCtx& ctx_;
-};
-class ScriptedGumbelSource final : public chocofarm::GumbelSource {
-  public:
-    explicit ScriptedGumbelSource(std::vector<double> table) : table_(std::move(table)) {}
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override { return bw.empty() ? 0u : bw[0]; }
-    std::vector<double> gumbel(int n) override {
-        std::vector<double> out(static_cast<size_t>(n));
-        for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = table_[(idx_++) % table_.size()];
-        return out;
-    }
-
-  private:
-    std::vector<double> table_;
-    size_t idx_ = 0;
-};
-
-// One tree, heap-allocated for a STABLE address (the fiber captures references to these members; a move
-// would dangle them — so TreeState lives behind a unique_ptr and never moves after start()).
-struct TreeState {
-    YieldCtx ctx;
-    YieldingNetEvaluator ynet;
-    chocofarm::GumbelAZPolicy policy;
-    ScriptedGumbelSource src;
-    chocofarm::GumbelAZPolicy::Decision decision;
-    ctxb::fiber fib;
-    bool running = false;
-
-    TreeState(const chocofarm::GumbelConfig& cfg, const chocofarm::Environment& env,
-              std::vector<double> table)
-        : ynet(ctx), policy(cfg, ynet, env), src(std::move(table)) {}
-
-    void start(const chocofarm::Loc& loc, const std::vector<uint32_t>& bw, const std::set<int>& coll,
-               double lam) {
-        fib = ctxb::fiber{std::allocator_arg, ctxb::fixedsize_stack(512 * 1024),
-                          [this, &loc, &bw, &coll, lam](ctxb::fiber&& caller) {
-                              ctx.caller = std::move(caller);
-                              decision = policy.run_search(loc, bw, coll, lam, src);
-                              ctx.at_leaf = false;
-                              return std::move(ctx.caller);
-                          }};
-        fib = std::move(fib).resume();  // advance to the first leaf (or finish)
-        running = ctx.at_leaf;
-    }
-
-    void resume_with(const chocofarm::NetPrediction& pred) {
-        ctx.leaf_value = pred;
-        fib = std::move(fib).resume();  // resume to the next leaf (or finish)
-        running = ctx.at_leaf;
-    }
-};
+// The fiber<->driver channel, the YieldingNetEvaluator, the scripted Gumbel source, and the per-tree
+// TreeState are the ONE-home shared primitives — chocofarm::{FiberLeafChannel, YieldingNetEvaluator}
+// (fiber_leaf.hpp), CyclicGumbelSource (cyclic_gumbel.hpp), TreeState (fiber_tree.hpp). This bench is now
+// only the ROUND-SYNCHRONOUS multiplexer DRIVER over those primitives (batch-submit, recv, resume).
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -206,13 +138,13 @@ int main(int argc, char** argv) {
               << " endpoint=" << *endpoint << " n_slots=" << chocofarm::n_action_slots(env) << "\n";
 
     // K independent tree-fibers (per-tree rotated gumbel script so the trees differ).
-    std::vector<std::unique_ptr<TreeState>> trees;
+    std::vector<std::unique_ptr<chocofarm::TreeState>> trees;
     trees.reserve(static_cast<size_t>(K));
     for (int i = 0; i < K; ++i) {
         std::vector<double> table(gtable.size());
         for (size_t j = 0; j < gtable.size(); ++j)
             table[j] = gtable[(j + static_cast<size_t>(i)) % gtable.size()];
-        trees.push_back(std::make_unique<TreeState>(cfg, env, std::move(table)));
+        trees.push_back(std::make_unique<chocofarm::TreeState>(cfg, env, std::move(table)));
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -231,7 +163,7 @@ int main(int argc, char** argv) {
         ++rounds;
         for (int i : active) {
             std::vector<unsigned char> req =
-                chocofarm::wire::encode_request(trees[static_cast<size_t>(i)]->ctx.leaf_features);
+                chocofarm::wire::encode_request(trees[static_cast<size_t>(i)]->ch.features);
             if (zmq_send(sock, req.data(), req.size(), 0) < 0) {
                 std::cerr << "wire-parallel-bench: FATAL: send failed: " << zmq_strerror(zmq_errno())
                           << "\n";
