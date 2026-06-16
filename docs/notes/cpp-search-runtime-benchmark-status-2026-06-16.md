@@ -1,68 +1,68 @@
 <!-- docs/notes/cpp-search-runtime-benchmark-status-2026-06-16.md -->
 
-# Session status: the C++ SearchRuntime benchmark — 2 of 3 axes landed, verified
+# Session status: goal 1 (the 3-way benchmark) COMPLETE + verified; goal 2 (AZ loop) scoped
 
 **Status:** Autonomous-session record. Everything below is on `feat/cpp-search-runtime-serial` (off
-current `main` = `c85b97a`), each commit built green at `-std=c++23 -Wall -Wextra` and gated on a
-passing check. No end-of-world blockers — the two unbuilt pieces are sized work, not blocked work.
+`main` = `c85b97a`), each commit built green at `-std=c++23 -Wall -Wextra` and gated on a passing
+check (opt-in `CHOCO_RUN_CPP=1` for the binary-dependent ones). No end-of-world blockers.
 
-## The question answered: is the Python batched server ready? YES.
+## The Python batched server is ready (the opening question)
 
-`chocofarm/az/inference_server.py` is built and tested: `InferenceServer(ParamsSource, bind, max_batch)`
-+ the greedy-drain microbatch loop + `serve_forever()`, with `StaticParamsSource` (params injected, no
-redis). `test_zmq_net_cpp.py` already spins it in-process and drives the C++ `ZmqNetClient` against it.
-The wire benchmark below confirms it end to end against the real search.
+`chocofarm/az/inference_server.py` — `InferenceServer(ParamsSource, bind, max_batch)` + the greedy-drain
+microbatch loop + `serve_forever()`, with `StaticParamsSource` (params injected, no redis). Driven end
+to end below against the real C++ search over the wire.
 
-## What landed (verified, pushed)
+## GOAL 1 — the three-way benchmark: DONE
 
-| commit | what | verification |
+| axis | what | measured (4-vCPU host, deterministic/representative net) |
 | — | — | — |
-| `6831601` | `SearchRuntime` seam + `SerialRuntime` (wraps the unchanged `decide`, zero edits to the 1a/1b search) | `chocofarm-serial-runtime-check`: SerialRuntime ≡ per-task `decide`, 6/6 |
-| `9d9167d` | the A-vs-B decision memo → **Option A (fiber)**, now confirmed by you + boost.context approved | — (decision record) |
-| `c7a5c40` | `PoolRuntime` — local task-parallel tree search + the serial-vs-parallel benchmark | bit-identical to serial; **3.55× at the real budget**, scaling 1.00/1.99/3.25× at 1/2/4 workers |
-| `5725d89` | over-the-wire **synchronous** benchmark (SerialRuntime + ZmqNetClient vs the batched server) | end to end: **6.6 decisions/s, ~6.2 ms/leaf** |
+| **C++-native MLP (local)** | `SerialRuntime` + `PoolRuntime` (`c7a5c40`) | **3.55×** at the real budget; **1.00 / 1.99 / 3.25×** at 1/2/4 workers; **bit-identical** to serial (exact, not aggregate) |
+| **over-the-wire synchronous** | `SerialRuntime` + a blocking `ZmqNetClient` (`5725d89`) | **9.8 dec/s, ~4–6 ms/leaf** (the un-batched single-row JAX forward + RTT) |
+| **over-the-wire parallel** | K boost.context tree-fibers + batched DEALER (`02d0606`) | **13.97 dec/s, 1.43× over sync** (same 390 leaves; first batch = 16) |
 
-## The three benchmark axes (your goal 1)
+Plus the load-bearing foundations, each proven in isolation and mechanized:
+- **Option A (fiber) proven** (`c109755`): the UNCHANGED `run_search` runs inside a boost.context fiber, a
+  `YieldingNetEvaluator` yields at each leaf — result **bit-identical** to the direct run (executed /
+  improved-π argmax / n_spent), at the real budget (94 leaves through the fiber). Fidelity preserved by
+  construction; no continuation rewrite of the 1a/1b search.
+- **DEALER batched transport verified** (`chocofarm-dealer-probe`): 32 concurrent submits, server batches,
+  positional FIFO holds (32/32).
 
-- ✅ **C++-native MLP (local)** — serial *and* parallel. The "parallel tree descent + backprop"
-  abstraction you named is real and measured: near-linear scaling, **bit-identical** to serial (exact,
-  not aggregate — independent deterministic trees), and it needs **no fibers** (a local leaf never
-  blocks). On the 4-vCPU host it clears the ~1.9× Python-substrate ceiling because it's a fresh C++
-  pool over CPU-bound trees.
-- ✅ **Over-the-wire synchronous** — 6.6 dps, ~6.2 ms/leaf. That 6.2 ms is the **un-batched single-row
-  JAX forward + RTT**: exactly the cost the wire-parallel config amortizes by batching. The wire path
-  (C++ encode → server `forward_core` → C++ decode) runs faithfully end to end.
-- ⏳ **Over-the-wire parallel** — needs the fiber + DEALER work-stealing pool (below). Not built.
+### Honest reads (not to be mistaken for limits of the approach)
+- The wire-parallel **1.43×** is the **round-synchronous MVP** (a barrier per round: submit-all, recv-all,
+  resume-all). The win is capped by per-round RTT, NOT the batched forward. The continuous **greedy-async
+  work-stealing pool** (per-tree corr-id, no barrier — the production design) is the path to the full
+  batching win; the MVP proves the mechanism end to end and that parallel > sync.
+- Fair local-vs-wire needs `NetForward` on the **same** weights (the local bench uses a cheap `DetNet`,
+  the wire benches the real `ValueMLP`/JAX). A small refinement.
+- P1 cleanup: `YieldCtx`/`YieldingNetEvaluator` are inlined in both `fiber_proto.cpp` and
+  `wire_parallel_bench.cpp` — extract to a shared fiber-leaf header when the production pool lands.
 
-**Honest fairness caveat:** the local bench uses a cheap deterministic net; the wire bench uses the
-real `ValueMLP`/JAX. A fully apples-to-apples local-vs-wire needs `NetForward` on the **same** weights
-(read via the manifest) — a small refinement, noted, not yet done.
+## GOAL 2 — a test AZ loop: scoped (the actor scaffold already exists)
 
-## What is NOT built, and the precise plan (sized, not blocked)
+`cpp/src/runner.cpp` ALREADY runs E self-play episodes via an injected `Policy` and writes the four
+(X, PI, M, Y) AZ transition blocks to redis (mirroring `worker.py`'s `generate_episode`) — it is the
+actor, wired today to `RandomPolicy` with the Gumbel search "deferred." The concrete remaining work:
 
-**1. Over-the-wire parallel = the fiber + DEALER work-stealing pool (the 3rd axis).** Per the decision
-memo, Option A + boost.context:
-  - (a) `YieldingNetEvaluator` + a boost.context fiber wrapper, proven in isolation: run the **unchanged**
-    `run_search` in a fiber, the leaf yields, assert fiber-driven ≡ direct (near-trivial under A).
-  - (b) the unified work-stealing pool over `{SELECT, BACKPROP, FAIL}`, workers running trees as fibers,
-    **single-writer-per-tree gated by a TSan test before it's trusted** (§8.2).
-  - (c) the `DealerRendezvous` (non-blocking submit/poll) + the echoed-`u64`-corr_id wire amendment
-    (a P7-disciplined `wire_spec` SSOT bump).
-  - (d) wire it in as the third `--net` mode of the benchmark.
-  This is the careful systems chunk — deliberately not rushed unverified overnight; the boost
-  integration is worth a fresh, focused pass.
-
-**2. A test AZ loop (your goal 2).** Prerequisite: the full `Decision` (`improved_pi` the trainer
-target + `n_spent`), which needs the production `RngGumbelSource` exposed (move it from `gumbel.cpp`'s
-anonymous namespace to the header — behaviour-preserving, re-verified by `gumbel_logic.py` +
-`gumbel_precision.py`) so the runtime drives `run_search` directly. Then: a C++ Gumbel-AZ episode that
-emits AZ transitions (features, improved-π, value target) → the existing redis transport → the existing
-Python learner does a training step → publishes weights → the C++ side reloads. The Python AZ stack
-(`exit_loop`, `worker`, `train`) already exists; this is the actor-side wiring + one turn of the loop.
+1. **The full `Decision` (`improved_pi` + `n_spent`)** — expose the production `RngGumbelSource` (move it
+   from `gumbel.cpp`'s anonymous namespace to the header; behaviour-preserving, re-verified by
+   `gumbel_logic.py` + `gumbel_precision.py`) so the runtime/runner drives `run_search` and captures the
+   improved-π **as the PI target** (today the runner uses `policy.decide()`, which discards it).
+2. **Wire `GumbelAZPolicy` + a `NetForward`** (local, from published weights) into `run_episode` as the
+   actor policy, emitting improved-π into the PI block.
+3. **One turn of the loop:** the C++ actor generates Gumbel transitions → the existing redis transport →
+   the existing Python learner (`worker.py`/`exit_loop`) trains a step → publishes weights → the C++ side
+   reloads (the version-gated seam already exists). A short run proves the loop turns.
 
 ## Locked decisions
-Option A (fiber) for the resumable search; boost.context as the fiber mechanism; the work-stealing
-pool is the spine (transport + scheduling swappable beneath it); the pool is born-clean structure,
-only the DEALER transport is the measure-first-gated optimization.
+Option A (fiber) + boost.context (installed, linked via `find_package(Boost COMPONENTS context)` + a
+find_library fallback); the unified work-stealing pool is the spine; the pool is born-clean structure,
+only the DEALER transport is the measure-first-gated optimization; the greedy-async (no-barrier) pool is
+the wire-parallel production refinement past the round-synchronous MVP.
+
+## The session's commits (feat/cpp-search-runtime-serial)
+`6831601` seam+SerialRuntime · `9d9167d` Option-A decision · `c7a5c40` PoolRuntime+local bench ·
+`5725d89` wire-sync bench · `c109755` fiber proof · `02d0606` wire-parallel bench + DEALER ·
+(`af67596` → this memo)
 
 *Public Domain (The Unlicense).*
