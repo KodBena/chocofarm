@@ -1,5 +1,15 @@
 # A centralized, live, redis-backed hyperparameter registry (2026-06-15)
 
+> **Dated amendment (2026-06-16) — `search.m` / `search.n_sims` reclassified RESTART → HOT.** This spec's
+> §4.1 facet table and §9 summary classify `search.m` / `search.n_sims` as **RESTART** ("baked into the SH
+> phase loop"). That was wrong against the code: the Sequential-Halving bracket is recomputed per
+> `decide()` from `self.m` / `self.n_sims` (read identically to the HOT `c_puct`), so they are now
+> `Mut.HOT` in `chocofarm/hp/schema.py` and flow live through the per-iteration `hot_search` snapshot (the
+> C++ actor online-reconfiguration thread). Per ADR-0005 Rule 8 the RESTART entries below are left as the
+> point-in-time record; read this note as their correction. Rationale + scope:
+> `docs/design/cpp-actor-daemon.md` (the build amendment) + the `schema.py` `SearchConfig` docstring.
+> `use_jax_mlp` remains the one RESTART search knob.
+
 A design specification, not an implementation. It answers one operational question: **how
 do we change a hyperparameter — the motivating case is a manual learning-rate drop — on a
 running chocofarm experiment, without restarting it, without clobbering a second experiment

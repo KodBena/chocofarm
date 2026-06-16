@@ -1,5 +1,12 @@
 # Separating training from optimization — an ACL + structural refactor that makes hot hyperparameters fall out (2026-06-15)
 
+> **Dated amendment (2026-06-16) — `search.m` / `search.n_sims` are now HOT.** §4's facet table (the
+> `search.m/n_sims | RESTART | … a structural bracket, a shape not a coefficient` row) is **superseded**:
+> the SH bracket is recomputed per `decide()` from `self.m` / `self.n_sims`, so they were reclassified
+> `Mut.RESTART → Mut.HOT` in `chocofarm/hp/schema.py` and now drive the per-iteration `hot_search` flow.
+> Per ADR-0005 Rule 8 the original row is left intact as the point-in-time record; read this note as its
+> correction. See `docs/design/cpp-actor-daemon.md` (the build amendment).
+
 A design-and-audit note, analysis only — no code was changed and no job was
 run. The question, handed down with the just-landed hyperparameter registry
 (`feat/hp-registry`): **training and optimization are conflated in this

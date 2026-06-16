@@ -31,7 +31,9 @@ cpp/
     runner.hpp              the runner: read weights → run E episodes → write (X,PI,M,Y)
   src/
     instance.cpp env.cpp features.cpp transport.cpp policy.cpp nmcs.cpp ismcts.cpp runner.cpp
-    main.cpp                the runner entrypoint (live scalars as CLI args; --policy random|nmcs|ismcts)
+    main.cpp                the runner entrypoint (live scalars as CLI args; --policy random|nmcs|ismcts|gumbel, + --serve)
+    serve.cpp               the persistent --serve control loop (the ActorTransport runner; serve.hpp)
+    actor_config.cpp        actor_config_from_json — the Port/ACL parse of a `configure` message (actor_config.hpp)
     mask_dump.cpp           a tiny PARITY fixture (replay → dump mask/features); not the runner (P3)
     nmcs_dump.cpp           a tiny PARITY fixture (scripted-source NMCS search → selected action); not the runner (P3)
     ismcts_dump.cpp         a tiny PARITY fixture (scripted-source ISMCTS search → selected action); not the runner (P3)
@@ -90,6 +92,40 @@ cpp/build/chocofarm-cpp-runner \
 `lam` / `episodes` / `max-steps` are **live CLI scalars** (P4), never baked in.
 A missing weight payload is a **loud abort** (non-zero exit + the same message
 `read_weights` raises), never a silent stale serve.
+
+## Persistent `--serve` mode (the ActorTransport runner)
+
+`--serve` runs the **Gumbel actor** (`--policy gumbel`'s `GumbelAZPolicy`) as a **long-lived process**
+that holds the env + net + policy live across generations and speaks a JSON-line control protocol on
+**stdin/stdout** — the C++ side of the Python `ActorTransport` (`chocofarm/az/actor_transport.py`). This
+is what makes **online reconfiguration** possible: a HOT search-knob change (`m` / `n_sims` / `c_*`)
+rebuilds the policy without tearing down the env or respawning; an instance/faces change is a loud
+reject (a new experiment). It is **additive** — the one-shot `--policy …` runner above is unchanged.
+(The Gumbel actor itself, `--policy gumbel`, landed before this mode; the "Gumbel deferred" framing in
+the intro above predates it and is a separate README cleanup.)
+
+```sh
+cpp/build/chocofarm-cpp-runner --serve --run R   # then JSON-line control messages arrive on stdin
+```
+
+Weights and the (X, PI, M, Y) result blocks stay on the **same redis bytes-store**; only the small
+control messages ride the pipe (ADR-0012 P7: serialization ⊥ transport — the protocol is the SSOT
+`chocofarm/az/control_spec.py` ↔ `cpp/include/chocofarm/control_spec.hpp`, drift-netted; the pipe is the
+swappable mechanism, a ZeroMQ daemon a future second impl behind the same seam). The control vocabulary
+(transport-agnostic):
+
+| message | reply |
+| --- | --- |
+| `configure {config:{<ActorConfig>}}` | `{ok, config_epoch}` — build env once / rebuild policy on a HOT change; loud-reject an instance change |
+| `generate {config_epoch, version, seed, lam, episodes, max_steps, res_token}` | `{ok, written, config_epoch, version}` — two independent gates: `config_epoch` (config adoption) + `version` (weight reload) |
+| `ping` | `{ok, serving, config_epoch}` |
+| `shutdown` | `{ok}` then exit |
+
+Every boundary failure is a typed structured error reply (`{ok:false, error:<tag>, detail}`) — never a
+throw, a coerced default, or a silent hang (ADR-0002 / P9; the loop is throw-free). `exit_loop`'s
+`CppActorExecutor` drives this via `SubprocessActorTransport`, so the loop is oblivious to the
+persistent-vs-one-shot switch. The `--serve` env/net/policy lifecycle reuses `run_episodes` (factored out
+of the one-shot `run()`, P1) and reloads the net only when `version` advances.
 
 ## The NMCS Policy (nested Monte-Carlo search)
 

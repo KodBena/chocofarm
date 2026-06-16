@@ -64,6 +64,50 @@ Public Domain (The Unlicense).
 
 ---
 
+## Build amendment — §2 control protocol + §6 reconfigure BUILT (2026-06-16)
+
+> Appended by the implementation thread after building the reaped roadmap. Per ADR-0005 Rule 8 (amend
+> point-in-time records by append, never silently rewrite), this records what was actually built — so a
+> reader does not re-import the addendum's "parked" status for the pieces now in the tree. It does NOT
+> rewrite the addendum above; it corrects its disposition on the points named.
+>
+> **Decision overlay (the maintainer's directive).** Online reconfiguration of the running actor —
+> driving the HOT search knobs (and, by this directive, the now-HOT `m`/`n_sims`) via the hp interface
+> WITHOUT destroying the runner context — is the **primary motivation**, not a deferred daemon nicety.
+> So §2 (the control protocol) and §6 (reconfigure-without-restart) were **UN-PARKED and built** — over a
+> **subprocess-pipe `ActorTransport`**, not the §1 ZMQ ROUTER/DEALER daemon, which remains the deferred
+> Shape-C transport behind the same seam (P7: serialization ⊥ transport — the control protocol is the
+> SSOT, the mechanism is swappable).
+>
+> **Corrections to the addendum's technical claims.** The §6/B3 "`m`/`n_sims` MUST be RESTART" claim was
+> **wrong against the code**: the SH bracket is recomputed per `decide()` (read identically to the HOT
+> `c_puct`), and ADR-0012's own C++ guidance already names `m`/`n_sims` live per-decision scalars (P4).
+> They were reclassified **RESTART→HOT** in the hp schema. Consequently `ActorConfig` (§3) **excludes**
+> `use_jax_mlp` (a Python-side forward selector the C++ runner never consumes) and carries **no RESTART
+> field at all** — only INSTANCE (instance/faces) and HOT (the 7 GumbelConfig knobs); the §3.1 field set
+> here is therefore narrower than drafted.
+>
+> **What landed** (branch `cpp-actor-online-reconfig`):
+> - the hp schema flip + the per-iteration `hot_search` flow for `m`/`n_sims` across the serial / pool /
+>   C++ generation paths (no frozen ctor copies — P4).
+> - `chocofarm/az/actor_config.py` + `control_spec.py` (+ `cpp/include/chocofarm/actor_config.hpp`,
+>   `control_spec.hpp`), drift-netted in `tests/test_wire_drift.py` (field-set, Mut-class read from
+>   `schema.py`, message/error-tag vocabulary, each with a negative-mutation self-check).
+> - `chocofarm/az/actor_transport.py` — the `ActorTransport` Port + `SubprocessActorTransport` (bounded
+>   recv = the pipe analog of `ZMQ_RCVTIMEO`), tested against a fake runner (`tests/test_actor_transport.py`).
+> - `cpp/src/serve.cpp` — the `--serve` control loop; `actor_config_from_json` (validate-don't-coerce);
+>   `run_episodes` extracted from `run()` (P1). It reuses the proven episode loop; the two gates; the loud
+>   `instance_knob_changed` reject.
+> - `CppActorExecutor` rewired onto the Port (its `exit_loop` contract unchanged; `written` from the
+>   structured reply, retiring the stderr scrape). Online reconfig verified end-to-end against the real
+>   actor + redis (`test_cpp_serve_online_reconfiguration`, `test_cpp_actor_executor_drives_persistent_runner`).
+>
+> **Still deferred (unchanged):** §8.2 Part-B + §8.1 `explore_plies` (the executor still loud-refuses
+> them — a genuine C++-search dependency, not transport); §1 (ROUTER/DEALER), §5 (daemon lifecycle), and
+> the §10 daemon-rollout steps remain the Shape-C spec this note holds.
+
+---
+
 ## 0. Problem statement — what is being replaced and why
 
 `chocofarm/az/cpp_executor.py::CppActorExecutor` is an `exit_loop` generation executor whose self-play
