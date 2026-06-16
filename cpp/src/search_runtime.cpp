@@ -16,6 +16,20 @@
 
 namespace chocofarm {
 
+namespace {
+// Map the search's full Decision (action + improved-π in double + n_spent) onto the runtime Decision
+// (improved-π narrowed to float32, the wire/trainer dtype), stamping the per-decision leaf-request count.
+// Shared by both runtimes so the mapping has one home (P1).
+[[nodiscard]] Decision to_decision(const GumbelAZPolicy::Decision& dec, int leaf_requests) {
+    Decision d;
+    d.executed = dec.action;
+    d.improved_pi.assign(dec.improved.begin(), dec.improved.end());  // double -> float32
+    d.n_spent = dec.n_spent;
+    d.leaf_requests = leaf_requests;
+    return d;
+}
+}  // namespace
+
 std::expected<std::vector<Decision>, Error>
 SerialRuntime::run(const Environment& env, std::span<const SearchTask> tasks) const {
     std::vector<Decision> out;
@@ -27,13 +41,14 @@ SerialRuntime::run(const Environment& env, std::span<const SearchTask> tasks) co
         CountingNetEvaluator counter(net_);
         GumbelAZPolicy policy(task.cfg, counter, env);
         std::mt19937_64 rng(task.seed);
-        // decide() builds the production RngGumbelSource off `rng` internally and returns the executed
-        // action (the SH survivor, temperature 0) — the UNCHANGED search entry point. SerialRuntime over
-        // a LOCAL total net cannot fail here (the leaf is total); the seam's error arm is the contract a
-        // future remote-leaf pool needs, so run() returns the fallible expected even though this impl
-        // always takes the value arm.
-        Action executed = policy.decide(env, task.loc, task.bw, task.collected, task.lam, rng);
-        out.push_back(Decision{executed, counter.count()});
+        // decide_with_target() builds the production RngGumbelSource off `rng` internally and returns the
+        // FULL Decision (executed action + improved-π + n_spent) — the UNCHANGED search entry point.
+        // SerialRuntime over a LOCAL total net cannot fail here (the leaf is total); the seam's error arm
+        // is the contract a future remote-leaf pool needs, so run() returns the fallible expected even
+        // though this impl always takes the value arm.
+        GumbelAZPolicy::Decision dec =
+            policy.decide_with_target(env, task.loc, task.bw, task.collected, task.lam, rng);
+        out.push_back(to_decision(dec, counter.count()));
     }
     return out;
 }
@@ -55,8 +70,9 @@ PoolRuntime::run(const Environment& env, std::span<const SearchTask> tasks) cons
             CountingNetEvaluator counter(net_);
             GumbelAZPolicy policy(task.cfg, counter, env);
             std::mt19937_64 rng(task.seed);
-            Action executed = policy.decide(env, task.loc, task.bw, task.collected, task.lam, rng);
-            out[i] = Decision{executed, counter.count()};
+            GumbelAZPolicy::Decision dec =
+                policy.decide_with_target(env, task.loc, task.bw, task.collected, task.lam, rng);
+            out[i] = to_decision(dec, counter.count());
         }
     };
 

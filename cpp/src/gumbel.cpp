@@ -622,12 +622,27 @@ class RngGumbelSource final : public GumbelSource {
 };
 }  // namespace
 
+GumbelAZPolicy::Decision GumbelAZPolicy::decide_with_target(
+    const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+    const std::set<int>& collected, double lam, std::mt19937_64& rng) const {
+    (void)env;  // the policy holds its own env_ ref (the seam passes env for the contract; same object)
+    RngGumbelSource src(rng);
+    return run_search(loc, bw, collected, lam, src);
+}
+
+ActionAndPi GumbelAZPolicy::decide_target(const Environment& env, const Loc& loc,
+                                          const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                                          double lam, std::mt19937_64& rng) const {
+    // The AZ runner's PI source: one search, the executed action + the REAL improved-π (float32).
+    Decision dec = decide_with_target(env, loc, bw, collected, lam, rng);
+    return ActionAndPi{dec.action, std::vector<float>(dec.improved.begin(), dec.improved.end())};
+}
+
 Action GumbelAZPolicy::decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
                               const std::set<int>& collected, double lam,
                               std::mt19937_64& rng) const {
-    (void)env;  // the policy holds its own env_ ref (the seam passes env for the contract; same object)
-    RngGumbelSource src(rng);
-    return run_search(loc, bw, collected, lam, src).action;
+    // decide() is decide_with_target() composed with `.action` (DRY — one search entry point).
+    return decide_with_target(env, loc, bw, collected, lam, rng).action;
 }
 
 }  // namespace chocofarm

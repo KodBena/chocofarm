@@ -36,24 +36,20 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
     for (int ply = 0; ply < max_steps; ++ply) {
         if (bw.empty()) break;  // mirrors generate_episode's len(bw)==0 break
 
-        // decide (the env<->Policy seam): lam is a live per-decision scalar (P4).
-        Action action = policy.decide(env, loc, bw, collected, lam, rng);
+        // decide + the improved-policy target (the env<->Policy seam): a SEARCH policy (Gumbel) returns
+        // its real σ-transformed improved-π; a search-free policy returns the uniform-over-legal default
+        // (illegal-slot mass == 0.0, the M invariant). lam is a live per-decision scalar (P4). PI is now
+        // the policy's improved-π, so the C++ Gumbel actor emits a CORRECT AZ training target (not the
+        // uniform fallback the runner used while the search was deferred).
+        ActionAndPi ap = policy.decide_target(env, loc, bw, collected, lam, rng);
+        Action action = ap.action;
 
         // the §2.2 feature vector + the legality mask for THIS belief (mirrors generate_episode:
         // fb.build then legal_mask_from_features). The mask is the logic-exact M (bit-exact parity).
         std::vector<double> feat = fb.build(loc.pt, bw, collected);
         std::vector<float> mask = legal_mask(env, bw, collected);
-
-        // PI: the policy's own action distribution. RandomPolicy is uniform over the legal action
-        // set (the legal_actions + the always-legal TERMINATE slot) — the natural improved-policy
-        // target for a search-free policy. Normalized over exactly the mask's 1-slots, 0 elsewhere
-        // (so illegal-slot mass is == 0.0, the same invariant M carries).
-        std::vector<float> pi(n_slots, 0.0f);
-        std::vector<Action> legal = env.legal_actions(bw, collected);
-        int n_choices = static_cast<int>(legal.size()) + 1;  // + TERMINATE
-        float u = 1.0f / static_cast<float>(n_choices);
-        for (const Action& a : legal) pi[action_to_slot(env, a)] = u;
-        pi[term_slot(env)] = u;  // TERMINATE share
+        std::vector<float> pi = std::move(ap.pi);  // the improved-policy target (the PI block)
+        (void)n_slots;
 
         if (action.kind == ActionKind::Terminate) {
             // the TERMINATE decision executes no step (mirrors generate_episode): record it, break.

@@ -11,7 +11,26 @@
 
 #include <algorithm>
 
+#include "chocofarm/features.hpp"
+
 namespace chocofarm {
+
+// ---- Policy::decide_target default — decide() + a uniform-over-legal improved-policy target ---------
+// The search-free default (RandomPolicy/NMCS/ISMCTS): the executed action + a UNIFORM PI over the legal
+// action set + the always-legal TERMINATE slot, 0.0 (exactly) on illegal slots (the M invariant — the
+// same uniform target the runner built inline for RandomPolicy). A search policy (GumbelAZPolicy)
+// overrides this with its real σ-transformed improved-π.
+ActionAndPi Policy::decide_target(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+                                  const std::set<int>& collected, double lam,
+                                  std::mt19937_64& rng) const {
+    Action action = decide(env, loc, bw, collected, lam, rng);
+    std::vector<float> pi(static_cast<size_t>(n_action_slots(env)), 0.0f);
+    std::vector<Action> legal = env.legal_actions(bw, collected);
+    const float u = 1.0f / static_cast<float>(legal.size() + 1);  // legal + TERMINATE
+    for (const Action& a : legal) pi[static_cast<size_t>(action_to_slot(env, a))] = u;
+    pi[static_cast<size_t>(term_slot(env))] = u;
+    return ActionAndPi{action, std::move(pi)};
+}
 
 // ---- GreedyBase: the λ-rational myopic leaf base (mirrors solvers.base.GreedyPolicy) -------------
 Action GreedyBase::decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
