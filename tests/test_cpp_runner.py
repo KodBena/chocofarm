@@ -83,6 +83,7 @@ SERIAL_CHECK_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-serial-runtime-
 BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-search-runtime-bench")
 WIRE_BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-wire-bench")
 WIRE_BENCH = os.path.join(REPO, "cpp", "parity", "wire_bench.py")
+FIBER_PROTO_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-fiber-proto")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
@@ -376,3 +377,19 @@ def test_cpp_wire_sync_benchmark():
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, f"wire-sync benchmark FAILED:\n{out.stdout}\n{out.stderr}"
     assert ("RESULT: PASS" in out.stdout) or ("RESULT: SKIP" in out.stdout), out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(FIBER_PROTO_BIN)), reason=_CPP_SKIP)
+def test_cpp_fiber_proto_matches_direct():
+    """Option A foundation proof (cpp/src/fiber_proto.cpp): the UNCHANGED GumbelAZPolicy::run_search,
+    driven inside a boost.context stackful fiber with a YieldingNetEvaluator that yields at each leaf,
+    produces a BIT-IDENTICAL result (executed action, improved-pi argmax, n_spent) to a direct synchronous
+    run_search fed the same scripted leaves + RNG. This is the resumable-search mechanism the wire-parallel
+    work-stealing pool needs, established WITHOUT touching the 1a/1b-validated search (the fiber preserves
+    fidelity by construction — only WHEN predict returns changes, not WHAT). Gate on exit 0 + 'RESULT:
+    PASS'."""
+    out = subprocess.run([FIBER_PROTO_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES,
+                          "--n-sims", "24", "--max-depth", "8"],
+                         cwd=REPO, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, f"fiber prototype FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout

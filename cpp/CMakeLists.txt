@@ -192,6 +192,28 @@ add_executable(chocofarm-wire-bench src/wire_bench.cpp)
 target_link_libraries(chocofarm-wire-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-wire-bench PRIVATE -Wall -Wextra)
 
+# boost.context — the Option-A fiber mechanism (docs/notes/cpp-continuation-refactor-decision-2026-06-16.md).
+# The resumable-search prototype runs the UNCHANGED run_search inside a stackful fiber. Located via
+# find_package(Boost) with a find_library fallback (boost ships no pkg-config; the lib is libboost_context).
+find_package(Boost QUIET COMPONENTS context)
+if(Boost_FOUND)
+  set(BOOST_CONTEXT_LINK Boost::context)
+else()
+  find_library(BOOST_CONTEXT_LIBRARY boost_context REQUIRED)
+  find_path(BOOST_CONTEXT_INCLUDE boost/context/fiber.hpp REQUIRED)
+  add_library(boost_context_manual INTERFACE)
+  target_include_directories(boost_context_manual INTERFACE ${BOOST_CONTEXT_INCLUDE})
+  target_link_libraries(boost_context_manual INTERFACE ${BOOST_CONTEXT_LIBRARY})
+  set(BOOST_CONTEXT_LINK boost_context_manual)
+endif()
+
+# The Option-A foundation proof (NOT the runner): run the unchanged run_search inside a boost.context
+# fiber with a YieldingNetEvaluator, and assert fiber-driven == direct (the §7.1 validity precondition,
+# near-trivial under A). Separate from the runner (P3, one-owner).
+add_executable(chocofarm-fiber-proto src/fiber_proto.cpp)
+target_link_libraries(chocofarm-fiber-proto PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
+target_compile_options(chocofarm-fiber-proto PRIVATE -Wall -Wextra)
+
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned
 # (value, logits) — so the cross-language round-trip test (tests/test_zmq_net_cpp.py) can drive the C++
