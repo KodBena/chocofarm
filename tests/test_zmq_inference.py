@@ -365,3 +365,78 @@ def _concurrent_predict(endpoint, batch):
     for th in threads:
         th.join()
     return values, logit_rows
+
+
+@pytest.mark.skipif(not (_RUN_ZMQ and _pyzmq_available()),
+                    reason="opt-in zmq corr-id: set CHOCO_RUN_ZMQ=1 (and have pyzmq); a server spins in-process")
+def test_server_echoes_corr_id_envelope_across_a_batch():
+    """The corr-id correlation contract — the C++ pool's reply→tree routing, mechanized at the Python
+    boundary (ADR-0011: lock the contract, don't trust the class). A DEALER client stamps each request
+    with a LEADING 8-byte correlation-id frame `[corr-id][request]`; the server ROUND-TRIPS that frame
+    VERBATIM in the reply `[corr-id][response]` WITHOUT parsing it — the corr-id is transport routing,
+    kept OUT of the value codec (ADR-0012 P7 serialization⊥transport), so it carries no cross-language
+    format to drift, and its only validation is the consumer's own lookup (fail-loud on an unknown id,
+    C++-side).
+
+    The crux is the BATCH: B requests with DISTINCT corr-ids AND distinct payloads are fired on ONE
+    socket so the greedy drain stacks them into one forward, and each reply's echoed corr-id must select
+    the request whose value it carries. The corr-ids are deliberately NOT in submit order, so a
+    positional FIFO would mis-route — only true id-correlation passes. This is exactly what lets a worker
+    route a batched reply to the right tree (and, promoted to a shared registry, enables work-stealing
+    tree migration)."""
+    import struct
+
+    import zmq
+
+    from chocofarm.az.inference_server import InferenceServer
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.az.transport import pack_net
+
+    in_dim, n_actions, B = 9, 5, 12
+    rng = np.random.default_rng(31337)
+    net = ValueMLP(in_dim=in_dim, hidden=16, n_actions=n_actions, seed=5,
+                   y_mean=0.3, y_std=1.7, residual=False)
+    params, y_mean, y_std = params_from_manifest_blob(*pack_net(net))
+    src = StaticParamsSource(params, y_mean, y_std)
+
+    endpoint = "tcp://127.0.0.1:5708"
+    server = InferenceServer(src, bind=endpoint, max_batch=256)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    X = rng.standard_normal((B, in_dim)).astype(np.float32)
+    ref_v, _ = _py_forward_f32(params, X, y_mean, y_std)
+    # distinct 64-bit corr-ids, NOT in submit order (a multiplicative hash of j) — a positional match
+    # would route these wrong; only the echoed id gets them right.
+    corr_ids = [(0xC0FFEE01 + j * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF for j in range(B)]
+    by_corr = {struct.pack("<Q", c): j for j, c in enumerate(corr_ids)}
+    assert len(by_corr) == B, "corr-ids must be distinct for the routing assertion to mean anything"
+
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.DEALER)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.RCVTIMEO, 10000)
+    sock.connect(endpoint)
+    seen: dict[int, bool] = {}
+    try:
+        for j in range(B):
+            sock.send_multipart([struct.pack("<Q", corr_ids[j]), wire.encode_request(X[j])])
+        for _ in range(B):
+            frames = sock.recv_multipart()
+            assert len(frames) == 2, f"expected [corr-id][response], got {len(frames)} frames"
+            corr_echo, resp = frames[0], frames[-1]
+            assert corr_echo in by_corr, f"server echoed an unknown/garbled corr-id: {corr_echo.hex()}"
+            j = by_corr[corr_echo]
+            assert j not in seen, f"corr-id for request {j} came back twice"
+            seen[j] = True
+            v, _l = wire.decode_response(resp)
+            assert abs(float(v) - float(ref_v[j])) < 1e-4, (
+                f"corr-id {corr_echo.hex()} routed to request {j}, but value {v} != ref {ref_v[j]}")
+        assert len(seen) == B, "not every request received its echoed reply"
+    finally:
+        sock.close(0)
+        ctx.term()
+        server.stop()
+        t.join(timeout=5.0)
+        server.close()
+    print(f"[zmq corr-id] B={B} requests batched, each routed by echoed id (out-of-order ids)")
