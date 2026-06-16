@@ -15,10 +15,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <utility>
 
 #include <hiredis/hiredis.h>
 #include <nlohmann/json.hpp>
+
+#include "chocofarm/result_spec.hpp"  // the result-blob format SSOT mirror (dtype/order; drift-checked)
 
 namespace chocofarm {
 

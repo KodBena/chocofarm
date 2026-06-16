@@ -45,6 +45,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from chocofarm.az import result_spec
+
 if TYPE_CHECKING:
     from chocofarm.az.mlp import ValueMLP
 
@@ -209,10 +211,15 @@ class RedisTransport:
         dpipe = self.r.pipeline(transaction=False)
         for k, (idx, n, fd, ns, xk, pik, mk, yk) in enumerate(order):
             xb, pib, mb, yb = blobs[4 * k:4 * k + 4]
-            X = np.frombuffer(xb, dtype=np.float32).reshape(n, fd)
-            PI = np.frombuffer(pib, dtype=np.float32).reshape(n, ns)
-            M = np.frombuffer(mb, dtype=np.float32).reshape(n, ns)
-            Y = np.frombuffer(yb, dtype=np.float32)
+            # dtype DERIVED from the result_spec SSOT (ADR-0012 P1) — not a hardcoded `np.float32`
+            # here that could silently drift from the worker's write / the C++ write_results. The
+            # block ORDER (X, PI, M, Y) and ranks are result_spec.BLOCK_ORDER / BLOCK_RANK; the keys
+            # come back in that order from result_keys, so this decode IS the spec.
+            dt = result_spec.RESULT_DTYPE
+            X = np.frombuffer(xb, dtype=dt).reshape(n, fd)
+            PI = np.frombuffer(pib, dtype=dt).reshape(n, ns)
+            M = np.frombuffer(mb, dtype=dt).reshape(n, ns)
+            Y = np.frombuffer(yb, dtype=dt)
             for i in range(n):
                 out.append((X[i], PI[i], M[i], float(Y[i])))
             dpipe.delete(xk, pik, mk, yk)
@@ -237,7 +244,20 @@ def write_results(conn: Any, res_token: str, idx: int, X: npt.NDArray[Any], PI: 
                   M: npt.NDArray[Any], Y: npt.NDArray[Any]) -> None:
     """Worker-side result WRITE: pipeline the four contiguous float32 blocks (X/PI/M/Y) under the
     per-task result keys, each with the result TTL set in the same SET round-trip (the aborted-iteration
-    self-clean safety net). No pickle — `tobytes()` of contiguous arrays."""
+    self-clean safety net). No pickle — `tobytes()` of contiguous arrays.
+
+    The block dtype is VALIDATED against the result_spec SSOT at this boundary (ADR-0002 / ADR-0012 P2,
+    Port/ACL translate-and-validate): a block whose dtype is not the spec's float32 is a LOUD reject,
+    never a silent write of bytes the reader (`read_and_delete_results` / the C++ write_results' f32
+    consumer) would misread. The reshape on read is policed by the C++ size sanity-check too; this
+    pins the producer side to the ONE dtype both sides derive from."""
+    want = result_spec.RESULT_DTYPE
+    for name, blk in ((result_spec.BLOCK_X, X), (result_spec.BLOCK_PI, PI),
+                      (result_spec.BLOCK_M, M), (result_spec.BLOCK_Y, Y)):
+        if np.dtype(blk.dtype) != want:
+            raise ValueError(
+                f"write_results block {name!r} has dtype {blk.dtype!s}, expected {want.str} "
+                f"(result_spec.RESULT_DTYPE) — refusing to write a blob the reader would misdecode")
     xk, pik, mk, yk = result_keys(res_token, idx)
     ttl = _result_ttl()
     pipe = conn.pipeline(transaction=False)

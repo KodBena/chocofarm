@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-chocofarm/az/inference_wire.py — the ONE wire codec for the Shape B batched ZeroMQ inference service
+chocofarm/az/inference_wire.py — the ONE wire CODEC for the Shape B batched ZeroMQ inference service
 (docs/design/zmq-inference-service.md §2). Both the server (inference_server.py) and the client
-(zmq_net_client.py) import THIS — there is exactly one place the request/response frame is spelled, so
+(zmq_net_client.py) import THIS — there is exactly one place the request/response frame is encoded, so
 a Python↔Python (and, later, a Python↔C++ ZmqNetClient) codec cannot silently drift (ADR-0012 P7: a
 cross-boundary fact has one authoritative home; every side derives its view, none re-authors it).
+
+The frame's BYTE LAYOUT is NOT spelled here — it is DERIVED from the single-source-of-truth
+`chocofarm/az/wire_spec.py` (the protocol version, the byte order, the u8/u32 header widths, the f32
+dtype). This codec composes those constants into its `struct.Struct` formats; the C++ side derives the
+SAME layout from `cpp/include/chocofarm/wire_spec.hpp`, whose constants are drift-checked against the
+Python spec in the default test suite (tests/test_wire_drift.py). So a layout change has ONE edit point
+(wire_spec.py) and a mechanical net catches a one-sided change (ADR-0012 P1/P7, ADR-0011 Rule 4).
 
 The frame is the `NetPrediction` contract `cpp/include/chocofarm/net.hpp` already defines, on the wire:
 length-prefixed LITTLE-ENDIAN float32, fronted by a one-byte protocol-version header so a codec
@@ -33,16 +40,22 @@ import struct
 import numpy as np
 import numpy.typing as npt
 
-# The protocol-version header byte. Bump on ANY frame-layout change so an old client/server pairing
-# fails loudly at decode (unknown byte) instead of misreading the next field as a float.
-PROTOCOL_VERSION = 1
+from chocofarm.az import wire_spec
 
-# Little-endian fixed headers (the `<` pins byte order so x86↔ARM↔C++ agree): a request header is
-# [ver:u8][in_dim:u32]; a response header is [ver:u8][n_actions:u32]. f32 is 4 bytes, all little-endian.
-_REQ_HEADER = struct.Struct("<BI")    # ver (u8), in_dim (u32)
-_RESP_HEADER = struct.Struct("<BI")   # ver (u8), n_actions (u32)
-_F32 = np.dtype("<f4")                 # explicit little-endian float32 (the wire dtype, both directions)
-_F32_BYTES = 4
+# The protocol-version header byte — DERIVED from the wire_spec SSOT (ADR-0012 P1), re-exported so
+# existing importers (the codec tests, the server/client) keep `inference_wire.PROTOCOL_VERSION`. Bump
+# it in wire_spec.py so an old client/server pairing fails loudly at decode (unknown byte) instead of
+# misreading the next field as a float, and the C++ mirror is reconciled by the drift test.
+PROTOCOL_VERSION = wire_spec.PROTOCOL_VERSION
+
+# The fixed-header / value struct formats + the f32 dtype are all DERIVED from wire_spec.py — there is
+# no `"<BI"` / `"<f4"` literal here (that would be a second author of the layout, ADR-0012 P7). A
+# request header is [ver:u8][in_dim:u32]; a response header is [ver:u8][n_actions:u32]; the value is a
+# single LE f32. f32 is `wire_spec.FLOAT_BYTES` (4) bytes, all little-endian.
+_REQ_HEADER = struct.Struct(wire_spec.REQ_HEADER_FMT)     # ver (u8), in_dim (u32)
+_RESP_HEADER = struct.Struct(wire_spec.RESP_HEADER_FMT)   # ver (u8), n_actions (u32)
+_F32 = np.dtype(wire_spec.FLOAT_DTYPE)                     # explicit little-endian float32 (both directions)
+_F32_BYTES = wire_spec.FLOAT_BYTES
 
 
 class WireError(ValueError):
@@ -107,7 +120,7 @@ def encode_response(value: float, logits: npt.NDArray[np.floating] | None) -> by
         la = np.ascontiguousarray(logits, dtype=_F32).ravel()
         n_actions = int(la.shape[0])
         logit_bytes = la.tobytes()
-    return _RESP_HEADER.pack(PROTOCOL_VERSION, n_actions) + struct.pack("<f", float(value)) + logit_bytes
+    return _RESP_HEADER.pack(PROTOCOL_VERSION, n_actions) + struct.pack(wire_spec.VALUE_FMT, float(value)) + logit_bytes
 
 
 def decode_response(frame: bytes) -> tuple[float, npt.NDArray[np.float32] | None]:
@@ -122,7 +135,7 @@ def decode_response(frame: bytes) -> tuple[float, npt.NDArray[np.float32] | None
     ver, n_actions = _RESP_HEADER.unpack_from(frame)
     if ver != PROTOCOL_VERSION:
         raise WireError(f"response protocol byte {ver} != supported {PROTOCOL_VERSION} (codec mismatch)")
-    (value,) = struct.unpack_from("<f", frame, _RESP_HEADER.size)
+    (value,) = struct.unpack_from(wire_spec.VALUE_FMT, frame, _RESP_HEADER.size)
     body = frame[fixed:]
     want = n_actions * _F32_BYTES
     if len(body) != want:

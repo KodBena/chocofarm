@@ -247,4 +247,77 @@ built** (the C++ `ZmqNetClient` remains deferred to the P9 `cpp/` pass, exactly 
 The four modules are `mypy --strict`-clean and in `STRICT_CLEAN`; pyzmq (27.1, ships py.typed) needs
 no `ignore_missing_imports` override. The new dependency is **pyzmq** on the shared scratch venv.
 
+### Amendment 2026-06-16 — #23 mechanized: one SSOT per layout + a drift net (ADR-0005 Rule 8: append)
+
+The forward-looking record above (§2 "designed but not yet generated", §6 "one frame spec, two codecs;
+#23's mechanization target") and `docs/design/cpp-gumbel-search-port.md`'s "#23 result-format codegen"
+phrasing are preserved as written. As of this amendment **#23 is mechanized.**
+
+**Where this sits on P7's own enforcement hierarchy (stated honestly).** ADR-0012 P7 orders the
+mechanisms *generate-or-compile-from-one-source > build-time lint > runtime parity test*, names the
+static result format as "exactly what codegen/lint is warranted [for]," and **forbids justifying a
+weaker bar with a scale / minimality / "proportionate" / "for now" argument** — that argument shape is
+the tell P7 exists to reject. So this amendment does NOT claim "enforce-by-test instead of codegen
+because codegen is heavy" (that would be exactly the forbidden shape). The honest mapping:
+
+- **The always-on layout-agreement test IS P7's FLOOR.** P7's floor is "a build-time lint that fails
+  the build on a Python/C++ format-constant disagreement." There is **no C++ build in any default
+  gate** (the C++ side — `ZmqNetClient` and the redis-client `cpp/` build — is deferred; there is no
+  `cpp/build/` in CI), so a literal compile-time lint has no build to attach to yet. `tests/
+  test_wire_drift.py`'s always-on legs are the available form of that floor: they parse the C++ mirror
+  headers' constants and **fail the standard `pytest tests/ -q` gate** on a format-constant
+  disagreement, with no C++ build or fixtures required. This catches drift *unconditionally on every
+  run*, which is strictly stronger than P7's "backstop" caveat ("catches drift only if it runs, with
+  the right fixtures, after the drift exists").
+- **The opt-in C++ golden round-trip IS P7's BACKSTOP** (the runtime parity test) — the stronger
+  end-to-end check when a C++ toolchain is present.
+- **The top rung (generate/compile-from-one-source) is deferred for a CONCRETE reason, not a
+  minimality one: the consumer it would generate for does not exist yet.** Codegen emits a derived
+  reader for a specific compiled consumer; the C++ codec is deferred to the P9 `cpp/` pass (§9). When
+  that pass lands and the C++ side is built in a gate, the floor SHOULD be promoted to the top rung —
+  generate `wire_spec.hpp` / `result_spec.hpp` from the Python SSOT so the mirror is *derived, not
+  hand-written* (the residual gap today: the mirror headers are hand-authored, joined to the SSOT only
+  by this test). **This is recorded as the open promotion**, per ADR-0011 Rule 1 (declare the
+  enforcement surface so the weaker-than-top choice is challengeable), and BACKLOG'd.
+
+What landed:
+
+- **Two single-source-of-truth layout modules** (the "one home per layout", ADR-0012 P1/P7):
+  `chocofarm/az/wire_spec.py` (the ZMQ wire frame's protocol version, byte order, field widths, f32
+  dtype) and `chocofarm/az/result_spec.py` (the redis result blob's dtype, block order X/PI/M/Y, ranks).
+  The Python codecs DERIVE from them (`inference_wire.py` builds its `struct.Struct` formats from
+  `wire_spec`; `transport.py` reads `result_spec.RESULT_DTYPE` / `BLOCK_ORDER`, never a hardcoded
+  `np.float32` / `<f4`). The C++ mirror headers (`cpp/include/chocofarm/{wire_spec,result_spec}.hpp`)
+  declare the SAME constants for the deferred C++ side to derive from. (Provenance note: the SSOT
+  modules + mirror headers are part of the same uncommitted working-tree batch as this drift net —
+  earlier prose calling them "already landed" overstates a separate provenance the VCS does not
+  corroborate; they and the net are one change.)
+- **The drift net** — `tests/test_wire_drift.py`, several always-on legs in the default suite (no C++
+  binary, no redis): a LAYOUT-AGREEMENT leg parses the C++ mirror headers' `constexpr` literals and
+  asserts equality with the Python SSOT (version, widths, dtype, block order/ranks); a
+  CODEC-DERIVES-FROM-SPEC leg that drives the ACTUAL codecs and asserts the bytes they emit/decode are
+  exactly the spec's little-endian-f32 bytes (built from an independent spec-derived reference, and —
+  for the result blob — round-tripped through `write_results`→`read_and_delete_results` over an
+  in-memory fake redis), so a codec that drifted its OWN float interpretation away from the spec (e.g.
+  read the payload as `>f4`) reds even though the mirror constants still agree; a NEGATIVE mutation
+  self-check proving the agreement fails on a deliberate one-sided perturbation (so the net is
+  demonstrated to catch drift, not merely pass); a WEIGHT-MANIFEST leg pinning the one shared `<f8`
+  cross-language literal. Plus one OPT-IN leg (`CHOCO_RUN_CPP=1`): Python encodes golden vectors → a
+  standalone C++ decoder (`cpp/parity/wire_golden.cpp`, compiled with a bare `g++ -std=c++23` over ONLY
+  the mirror headers) round-trips them → byte-exact assertion. A deliberate one-sided drift of the real
+  C++ header was confirmed to red the default suite, then reverted; and a codec-side float-dtype drift
+  (`_F32`/the reader dtype → `>f4`) was confirmed to red the codec-derives-from-spec legs.
+- **The weight manifest (contract #3) deliberately NOT over-mechanized.** It is a self-describing JSON
+  manifest (each entry carries its own name/shape/dtype/off/len), so a reader derives the layout from
+  the bytes — it is the **dynamic** layout P7 line 348-352 explicitly sanctions a runtime-read manifest
+  for ("absorbed, not drifted"), and gets no separate spec module. The ONE cross-language fact the
+  manifest does not make a reader re-derive — "the weight blob is float64 (`<f8`)" — is pinned by the
+  drift net's weight-manifest leg. (Residual, recorded: the C++ `parse_manifest` derives a weight's
+  element count from `len/sizeof(double)` while Python `unpack_into` uses `prod(shape)`; both are
+  consistent today because one writer (`pack`) emits both, but C++ does not cross-check
+  `prod(shape)*8 == len` — a one-line hardening for the `cpp/` pass.)
+
+The two SSOT modules are `mypy --strict`-clean and added to `STRICT_CLEAN`. The default suite grew from
+182 to 192 passed with 10 skipped (+2 opt-in C++ golden legs).
+
 *Public Domain (The Unlicense).*
