@@ -105,6 +105,7 @@ add_library(chocofarm_core
   src/policy.cpp
   src/nmcs.cpp
   src/ismcts.cpp
+  src/gumbel.cpp
   src/runner.cpp
 )
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -149,6 +150,18 @@ target_compile_options(chocofarm-nmcs-dump PRIVATE -Wall -Wextra)
 add_executable(chocofarm-ismcts-dump src/ismcts_dump.cpp)
 target_link_libraries(chocofarm-ismcts-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-ismcts-dump PRIVATE -Wall -Wextra)
+
+# A sixth tiny parity fixture (NOT the runner): runs GumbelAZPolicy::run_search with a SCRIPTED,
+# RNG-free NetEvaluator leaf (coarse, well-separated (value, logits) per call — precision-INSENSITIVE,
+# 1a) + a SCRIPTED GumbelSource (gumbel -> a stdin FIFO; sample_world -> bw[0] or a stdin world-index
+# FIFO) and prints the executed action slot + the improved-π argmax slot, so the harness can feed the
+# C++ Gumbel and the Python Gumbel the SAME gumbel/world draws + the SAME scripted leaf on a fixed
+# (loc, belief) and assert the SAME executed action AND improved-π argmax — the DETERMINISTIC structure
+# + selection logic check (ADR-0012 P6), independent of RNG. No redis (the scripted leaf is in-process).
+# Separate from the runner (P3, one-owner).
+add_executable(chocofarm-gumbel-dump src/gumbel_dump.cpp)
+target_link_libraries(chocofarm-gumbel-dump PRIVATE chocofarm_core)
+target_compile_options(chocofarm-gumbel-dump PRIVATE -Wall -Wextra)
 
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned
