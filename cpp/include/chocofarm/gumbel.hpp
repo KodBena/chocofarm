@@ -158,6 +158,16 @@ class GumbelAZPolicy final : public Policy {
                                       const std::set<int>& collected, double lam,
                                       GumbelSource& src) const;
 
+    // Like decide(), but returns the FULL Decision (the executed action + the improved-π target +
+    // n_spent) — the AZ actor's per-decision record (mirrors the Python GumbelPolicy.decide_with_target).
+    // It builds the production RngGumbelSource off `rng` and runs the search, exactly as decide() does;
+    // decide() is this composed with `.action`. The runtime / the runner use this to capture the
+    // improved-π PI target the trainer consumes.
+    [[nodiscard]] Decision decide_with_target(const Environment& env, const Loc& loc,
+                                              const std::vector<uint32_t>& bw,
+                                              const std::set<int>& collected, double lam,
+                                              std::mt19937_64& rng) const;
+
     [[nodiscard]] const GumbelConfig& config() const { return cfg_; }
 
   private:

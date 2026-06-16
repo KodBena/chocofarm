@@ -57,14 +57,16 @@ struct SearchTask {
     GumbelConfig cfg{};            // the frozen budget for this decision (m, n_sims, c_puct, ...)
 };
 
-// One decision result, returned by value. CHUNK 1: the EXECUTED action (the SH survivor at temperature
-// 0) + the count of net forwards this decision issued (the structural observable — equal to the leaf
-// request sequence length; a cross-check that a re-scheduling did not change the search). `improved_pi`
-// (the trainer's policy target) and `n_spent` are added when the runtime drives run_search directly;
-// they are deliberately absent rather than present-but-empty (no lying field).
+// One decision result, returned by value: the executed action (the SH survivor at temperature 0), the
+// improved-π target (the AZ trainer's policy target — the PI block the learner consumes), the root-action
+// sims spent, and the count of net forwards (the structural observable — the leaf-request sequence
+// length, a cross-check that a re-scheduling did not change the search). The runtime drives the search
+// via GumbelAZPolicy::decide_with_target to capture all of it.
 struct Decision {
-    Action executed{};             // the executed action (the SH survivor, temperature 0)
-    int leaf_requests = 0;         // net forwards this decision issued (the structural sequence length)
+    Action executed{};                 // the executed action (the SH survivor, temperature 0)
+    std::vector<float> improved_pi;    // π′ over the full slot space — the trainer's policy target (PI)
+    int n_spent = 0;                   // root-action sims spent (= n_sims on a non-empty belief)
+    int leaf_requests = 0;             // net forwards this decision issued (the structural sequence length)
 };
 
 // A NetEvaluator decorator that counts predict() calls and delegates to an inner evaluator unchanged.
