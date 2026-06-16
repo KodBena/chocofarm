@@ -37,25 +37,19 @@ for current run-state. `main` = `51b13b9`.
      blocking. Sunk cost is roughly the REQ transport layer of `zmq_net_client.cpp`;
      the port/codec/decode survive. Let the consult set the real scope.
 
-2. **1a Gumbel-AZ structure port — DONE but UNMERGED.** Branch
-   `worktree-agent-a48030e67b35f7dd3` @ `56611e5` (off `51b13b9`). `GumbelAZPolicy`
-   ported (Gumbel-top-k → Sequential Halving → PUCT → tree), the first real intended
-   consumer of the `NetEvaluator` port. Verified: **144/144** action + improved-π
-   argmax parity vs Python on precision-insensitive scripted inputs; both Danihelka
-   invariants (executed==SH-survivor; SH spends full budget); a **genuine** mutation
-   control (mutates the real C++ search: sh-budget 120/144, puct 61/144 divergence —
-   the agent caught its own first weaker control as an undischarged hack and fixed
-   it); fresh build clean at `-std=c++23 -Wall -Wextra`; default suite **196 passed /
-   15 skipped**. Review + merge (independently re-run `cpp/parity/gumbel_logic.py`
-   first, per "workers can't blind-verify"). **Then 1b** (the deferred half).
-
-3. **1b Gumbel mixed-precision — NOT started.** The known hazard: the in-search
-   masked-softmax prior is float32 and `v_mix`/`improved_policy`/`sigma_scale` mix
-   **float32-prior × float64-Q** (`chocofarm/az/value_target.py:~209-280`, which the
-   code calls byte-identity-critical). A uniform-precision port diverges beyond 1e-4
-   on near-tie inputs. 1a left `1b SEAM` comments at the three spots in
-   `cpp/src/gumbel.cpp` (evaluate/prior, v_mix product, improved_policy/masked-softmax
-   argmax). 1b makes the precision exact + adds a near-tie/fine-input parity.
+2. **The C++ Gumbel-AZ port is COMPLETE — both phases merged to `main`** (update
+   2026-06-16). **1a** (structure: `GumbelAZPolicy` = Gumbel-top-k → Sequential Halving
+   → PUCT → tree, the first real consumer of the `NetEvaluator` port) merged at
+   `079e911`; independently verified 144/144 action+improved-π parity on
+   precision-insensitive inputs, both Danihelka invariants, a genuine mutation control
+   (sh-budget 120/144, puct 61/144). **1b** (the float32-prior × float64-Q
+   mixed-precision fidelity — `chocofarm/az/value_target.py:~209-280`'s byte-identity
+   seam, reproduced at four float32 sites in `gumbel.cpp` behind a `CHOCO_GUMBEL_UNIFORM`
+   discrimination toggle) merged into `main` as well (also pushed as
+   `origin/gumbel-1b-mixed-precision`); independently verified: `cpp/parity/gumbel_precision.py`
+   mixed **144/144** on FINE near-tie inputs + uniform-precision diverges **34/144**
+   (the non-vacuous discrimination control), 1a `gumbel_logic` still 144/144, fresh
+   build clean, suite **196 passed**. Nothing Gumbel is outstanding.
 
 ## Merged on `main` (51b13b9) — the completed arcs
 
@@ -85,7 +79,7 @@ for current run-state. `main` = `51b13b9`.
 ## The 3→2→1 plan (the current build sequence) and where it stands
 - **#3** mechanize the wire contract — **DONE** (#23).
 - **#2** C++ `ZmqNetClient` — **merged but UNDER SCRUTINY** (TL;DR #1).
-- **#1** C++ Gumbel-AZ search port — **1a DONE/unmerged, 1b pending** (TL;DR #2/#3).
+- **#1** C++ Gumbel-AZ search port — **DONE: 1a + 1b both merged to `main`** (TL;DR #2).
 
 ## consult-004 — EXPUNGED from history; do not resurrect
 A proportionality-firewall consult ("consult-004") was run by the prior session with
