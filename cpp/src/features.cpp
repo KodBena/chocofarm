@@ -244,4 +244,20 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const std::vector<ui
     return out;
 }
 
+std::vector<float> FeatureBuilder::legal_mask_from_features(std::span<const float> feat) const {
+    // Slice the §2.2 blocks that ARE the mask (design §3): the per-treasure `available` block is the
+    // legal-collect mask, the per-detector `informative` block is the legal-sense mask, TERMINATE is
+    // always legal. No belief recompute — these blocks were just written by build() from the ONE marg
+    // sweep (ADR-0012 P1). Offsets via the layout SSOT (named, not magic literals).
+    std::vector<float> m(static_cast<size_t>(N_ + nD_ + 1), 0.0f);
+    const int avail = layout_.start("available");
+    const int info = layout_.start("informative");
+    for (int i = 0; i < N_; ++i)
+        m[static_cast<size_t>(i)] = (feat[static_cast<size_t>(avail + i)] > 0.0f) ? 1.0f : 0.0f;
+    for (int j = 0; j < nD_; ++j)
+        m[static_cast<size_t>(N_ + j)] = (feat[static_cast<size_t>(info + j)] > 0.0f) ? 1.0f : 0.0f;
+    m[static_cast<size_t>(N_ + nD_)] = 1.0f;  // TERMINATE always legal (term_slot = N+nD)
+    return m;
+}
+
 }  // namespace chocofarm

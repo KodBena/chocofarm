@@ -123,9 +123,6 @@ GBeliefKey gumbel_belief_key(const std::vector<uint32_t>& bw) {
 }
 
 namespace {
-// The fixed slot for an action (the action<->slot bijection, mirrors action_to_slot).
-[[nodiscard]] int slot_of(const Environment& env, const Action& a) { return action_to_slot(env, a); }
-
 // Reconstruct an Action from its slot (the inverse of action_to_slot). Slot 0..N-1 = ("t", i);
 // N..N+nD-1 = ("d", j); N+nD = TERMINATE.
 [[nodiscard]] Action action_of_slot(const Environment& env, int slot) {
@@ -241,7 +238,7 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const std::vec
     // build the feature vector + the legal mask, run one forward through the net port (the leaf seam).
     std::vector<double> feat64 = fb_.build(loc.pt, bw, collected);
     std::vector<float> feat(feat64.begin(), feat64.end());  // the wire dtype the port consumes (float32)
-    std::vector<float> mask = legal_mask(env_, bw, collected);
+    std::vector<float> mask = fb_.legal_mask_from_features(feat);  // reuse build's belief sweep (P1)
 
     auto pred = net_.predict(feat);
     // The local NetForward / the scripted leaf always return the value arm; a remote leaf's failure is
@@ -256,11 +253,16 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const std::vec
     // We ALSO keep `node.prior_d`, the SAME masked softmax in full float64, so the discrimination control
     // (kUniform) can read the genuine pre-narrowing double prior at every site (prior_read).
     std::vector<double> logits_d(static_cast<size_t>(n_slots_), -1e30);
-    // collect the legal slots (env.legal_actions order, then TERMINATE) — the SAME order Python's
-    // root.legal carries (legal_actions list, with TERMINATE always legal appended by the mask).
+    // collect the legal slots from the MASK (the available/informative blocks build() already produced
+    // — no second env.legal_actions → marginals sweep). Treasure slots 0..N-1 then detector slots
+    // N..N+nD-1 (id order), then TERMINATE — the SAME order env.legal_actions yields (available = the
+    // collect test, informative = env.informative), so node.legal_slots is bit-identical.
     node.legal_slots.clear();
-    std::vector<Action> legal = env_.legal_actions(bw, collected);
-    for (const Action& a : legal) node.legal_slots.push_back(slot_of(env_, a));
+    const int N = env_.N(), nD = env_.n_detectors();
+    for (int i = 0; i < N; ++i)
+        if (mask[static_cast<size_t>(i)] != 0.0f) node.legal_slots.push_back(i);
+    for (int j = 0; j < nD; ++j)
+        if (mask[static_cast<size_t>(N + j)] != 0.0f) node.legal_slots.push_back(N + j);
     node.legal_slots.push_back(term_slot_);  // TERMINATE is always legal
     // build the masked-softmax prior from the net logits. The net carries n_slots logits (the policy
     // head emits over the full slot space); illegal slots are masked.

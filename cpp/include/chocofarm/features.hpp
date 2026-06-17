@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <set>
+#include <span>
 #include <vector>
 
 #include "chocofarm/env.hpp"
@@ -48,6 +49,16 @@ class FeatureBuilder {
     // the live belief + collected set. Returns a length-`dim()` float64 vector.
     std::vector<double> build(const Point& loc, const std::vector<uint32_t>& bw,
                               const std::set<int>& collected) const;
+
+    // The legal-action mask sliced from an ALREADY-BUILT feature vector (mirrors
+    // actions.legal_mask_from_features): the per-treasure `available` block IS the collect-legal mask,
+    // the per-detector `informative` block IS the sense-legal mask, TERMINATE always legal. The hot-path
+    // mask — it REUSES build()'s belief sweep instead of recomputing it via env.legal_actions →
+    // marginals (ADR-0012 P1: marg has ONE home, build's; the mask consumes it). `feat` is the
+    // length-dim() vector build() returned. Bit-identical to legal_mask(env, bw, collected) for the same
+    // state: available == (marg>0 ∧ ¬collected) == the collect test; informative == (0<cnt<nb) ==
+    // env.informative.
+    [[nodiscard]] std::vector<float> legal_mask_from_features(std::span<const float> feat) const;
 
   private:
     const Environment& env_;
