@@ -216,6 +216,22 @@ add_executable(chocofarm-belief-sweep-bench src/belief_sweep_bench.cpp)
 target_link_libraries(chocofarm-belief-sweep-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-belief-sweep-bench PRIVATE -Wall -Wextra)
 
+# The belief DECISION DIAGRAM (ZDD) on-ramp probe (NOT the runner): the §B.4(a) staged measure-first gate
+# (belief_features_and_decision_diagram_note.md Part B; docs/design/cpp-belief-zdd-onramp.md). STAGE 1 —
+# build a hand-rolled ZDD Z from REALISTIC beliefs (worlds() narrowed by random CONSISTENT observation
+# sequences, NOT random subsets), assert faithful-rep (set(enumerate(Z))==set(bw), count(Z)==nb), and
+# report |Z| vs nb (+ a random-subset control; excl. the t=0 full-set outlier from the headline) — the
+# (a)->(b) decision number. STAGE 2 — answer all-marginals (forward x backward sweep) + per-detector
+# NON-CONSTRUCTING disjoint-count and assert they EQUAL chocofarm::belief_features's integer counts
+# bit-exact (§B.2/§B.3 logic invariant), then the identical Phase-2 *inv makes the feature vector
+# byte-identical. Pure compute (no redis/net). The ZDD engine (probe/belief_zdd.cpp) is compiled into
+# THIS TU (not chocofarm_core) until B.4(b) graduates (scope discipline). Separate executable (ADR-0012
+# P3, one-owner). Public Domain.
+add_executable(chocofarm-belief-zdd-probe src/belief_zdd_probe.cpp probe/belief_zdd.cpp)
+target_include_directories(chocofarm-belief-zdd-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/probe)
+target_link_libraries(chocofarm-belief-zdd-probe PRIVATE chocofarm_core)
+target_compile_options(chocofarm-belief-zdd-probe PRIVATE -Wall -Wextra)
+
 # The ISOLATED belief-FILTER microbench + bit-exact A/B (NOT the runner): times the branchless
 # chocofarm::filter_inplace against the former branchy erase(remove_if) across belief sizes, and asserts
 # byte-identical output. The belief UPDATE side of the same O(nb) belief problem (the K=32 native profile's

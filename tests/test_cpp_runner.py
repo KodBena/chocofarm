@@ -86,6 +86,7 @@ WIRE_BENCH = os.path.join(REPO, "cpp", "parity", "wire_bench.py")
 FIBER_PROTO_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-fiber-proto")
 BELIEF_CACHE_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-belief-cache-check")
 BELIEF_ORACLE_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-belief-sweep-oracle-check")
+BELIEF_ZDD_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-belief-zdd-probe")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
@@ -124,6 +125,25 @@ def test_cpp_belief_sweep_oracle():
     binary is cwd-independent; cwd=REPO / PYTHONPATH are kept only for parity with the other cpp gates."""
     out = subprocess.run([BELIEF_ORACLE_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
                          cwd=REPO, capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": REPO})
+    sys.stdout.write(out.stdout)
+    sys.stderr.write(out.stderr)
+    assert out.returncode == 0 and "RESULT: PASS" in out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(BELIEF_ZDD_BIN)), reason=_CPP_SKIP)
+def test_cpp_belief_zdd_probe():
+    """The §B.4(a) ZDD on-ramp (belief_features_and_decision_diagram_note.md Part B). STAGE 1: build a
+    hand-rolled ZDD from REALISTIC beliefs (worlds() narrowed by random CONSISTENT observation sequences
+    — the search's information sets, NOT random subsets which have |Z|~nb), prove faithful representation
+    (set(enumerate(Z))==set(bw), count(Z)==nb) so |Z| is trustworthy, and measure |Z| vs nb (the (a)->(b)
+    decision number; a random-subset control shows the win is structure, not small nb). STAGE 2: answer
+    bit_cnt (all-marginals sweep) + det_cnt (non-constructing disjoint count) off Z and assert they EQUAL
+    chocofarm::belief_features's integer counts bit-exact (the §B.3 logic invariant), then the identical
+    Phase-2 *inv makes the feature vector byte-identical. ADR-0011: net the diagram, don't trust it. Pure
+    compute (no FeatureBuilder, no layout file, no redis); cwd=REPO/PYTHONPATH for parity with other cpp gates."""
+    out = subprocess.run([BELIEF_ZDD_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
+                         cwd=REPO, capture_output=True, text=True, timeout=120,
                          env={**os.environ, "PYTHONPATH": REPO})
     sys.stdout.write(out.stdout)
     sys.stderr.write(out.stderr)
