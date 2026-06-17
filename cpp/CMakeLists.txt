@@ -216,6 +216,14 @@ add_executable(chocofarm-belief-sweep-bench src/belief_sweep_bench.cpp)
 target_link_libraries(chocofarm-belief-sweep-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-belief-sweep-bench PRIVATE -Wall -Wextra)
 
+# The ISOLATED belief-FILTER microbench + bit-exact A/B (NOT the runner): times the branchless
+# chocofarm::filter_inplace against the former branchy erase(remove_if) across belief sizes, and asserts
+# byte-identical output. The belief UPDATE side of the same O(nb) belief problem (the K=32 native profile's
+# ~27.6%). Separate executable (ADR-0012 P3, one-owner). No redis/net.
+add_executable(chocofarm-belief-filter-bench src/belief_filter_bench.cpp)
+target_link_libraries(chocofarm-belief-filter-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-belief-filter-bench PRIVATE -Wall -Wextra)
+
 # The SearchRuntime throughput benchmark (NOT the runner): SerialRuntime vs PoolRuntime over a batch of
 # independent Gumbel-AZ decisions against a local deterministic net, asserting bit-identical per-task
 # results then reporting decisions/s + the parallel speedup (the C++-native-MLP / local-parallel config).

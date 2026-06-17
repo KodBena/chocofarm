@@ -102,16 +102,32 @@ std::vector<Action> Environment::legal_actions(const std::vector<uint32_t>& bw,
     return acts;  // TERMINATE NOT included here (it is the always-legal extra slot)
 }
 
+// The one-owner belief compaction (env.hpp): keep worlds where ((w & mask) != 0) == want, in order.
+// filter_treasure / filter_detector are thin wrappers differing ONLY by the mask — that unification (one
+// compaction, two predicates) is the real win of this refactor (ADR-0012 P1/P3).
+//
+// Body: the IDIOMATIC std::erase_if (the C++20 erase-remove). A hand-written BRANCHLESS stream-compaction
+// (unconditional store + advance-by-keep) was tried and MEASURED on realistic observation-filtered beliefs
+// (belief_filter_bench): it ran ~1.4-1.5x SLOWER across every belief size on this i5-6600 native build
+// (speedup 0.65-0.93x). Two reasons: the belief predicate predicts well in practice (it is structured, not
+// random 50/50, so the branch the branchless form removes was rarely mispredicting), and under
+// -march=native the idiom's predicate scan auto-vectorizes whereas the branchless serial out-pointer
+// defeats vectorization. So the measured profile REFUSES the non-idiomatic deviation (ADR-0009/ADR-0011 —
+// the same "a measured reason decides" rule, here landing on keep-the-idiom). Bit-exact with the former
+// per-method erase(remove_if): erase_if IS erase(remove_if) — same kept set, same order (P6). If the filter
+// ever dominates a future profile, the measured SIMD-compress rung (AVX2 vpcompress) drops in behind this
+// signature, re-gated by belief_filter_bench against this idiom floor.
+std::size_t filter_inplace(std::vector<uint32_t>& bw, uint32_t mask, bool want) {
+    std::erase_if(bw, [&](uint32_t w) { return ((w & mask) != 0) != want; });  // drop where reading != want
+    return bw.size();
+}
+
 void Environment::filter_treasure(std::vector<uint32_t>& bw, int i, bool present) const {
-    uint32_t bit = uint32_t{1} << i;
-    auto keep = [&](uint32_t w) { return (((w & bit) != 0) == present); };
-    bw.erase(std::remove_if(bw.begin(), bw.end(), [&](uint32_t w) { return !keep(w); }), bw.end());
+    filter_inplace(bw, uint32_t{1} << i, present);   // a treasure is the single-bit mask 1<<i
 }
 
 void Environment::filter_detector(std::vector<uint32_t>& bw, int i, bool positive) const {
-    uint32_t bm = inst_.faces[i].bitmask;
-    auto keep = [&](uint32_t w) { return (((w & bm) != 0) == positive); };  // the disjunction filter
-    bw.erase(std::remove_if(bw.begin(), bw.end(), [&](uint32_t w) { return !keep(w); }), bw.end());
+    filter_inplace(bw, inst_.faces[i].bitmask, positive);   // a detector is its cover bitmask (disjunction)
 }
 
 StepResult Environment::apply(Loc& loc, std::vector<uint32_t>& bw, std::set<int>& collected,

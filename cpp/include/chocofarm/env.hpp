@@ -13,6 +13,7 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <span>
@@ -116,5 +117,14 @@ class Environment {
     std::vector<uint32_t> face_masks_;  // contiguous per-detector cover bitmasks (face_masks(); built in ctor)
     int entry_idx_ = 0;
 };
+
+// One-owner in-place belief compaction (ADR-0012 P1/P3): keep the worlds where ((w & mask) != 0) == want,
+// in order; returns the kept count. filter_treasure / filter_detector are thin wrappers differing ONLY by
+// the mask (a treasure is the single-bit mask 1<<i; a detector is its cover bitmask) — the SAME operation,
+// one compaction + two predicates (the unification is the win). Idiomatic std::erase_if body (see env.cpp:
+// a hand-branchless variant was measured slower under -march=native and rejected); bit-exact with the
+// former per-method erase(remove_if) — same kept set, same order (P6). Exposed as a free function so the
+// belief-filter A/B bench can drive the real compaction directly (the same bounded exposure as belief_features).
+std::size_t filter_inplace(std::vector<uint32_t>& bw, uint32_t mask, bool want);
 
 }  // namespace chocofarm
