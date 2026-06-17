@@ -8,6 +8,15 @@
 //   (restrict_var / restrict_cover via with_var/without_var/cover_hold/cover_fail) that maintain the
 //   belief through filtering as a ZDD op rather than a rebuild.
 //
+//   STORAGE: the COPIED value is the COMPACTED reduced diagram with a TRANSIENT hash-cons. Each mutation
+//   (the bw ctor + every restrict_*) seeds `unique_` from the live nodes at entry (so mk hash-conses) and
+//   ends in compact() — gc `nodes_` to the reachable-only reduced diagram (renumber in post-order so the
+//   id-monotonic invariant holds) and CLEAR `unique_`. Between ops the value is small (O(|Z|) nodes + an
+//   empty hash-cons), so the per-descent value-copy (nbw = bw) is O(|Z|), not O(full-build-arena): the
+//   fix for the measured OOM (the C(N,K) build seeds `unique_` huge + restricts strand dead nodes, both
+//   carried in every copy). compact() is storage-only — counts/members/features stay bit-exact (it
+//   asserts count() unchanged, ADR-0002).
+//
 //   Compiled ONLY when CHOCO_BELIEF_ZDD is ON — chocofarm_core's CMake gates this TU on the option, so
 //   the default (flat+bitset) build never compiles it (scope discipline: a WIP arm cannot red the
 //   default runner build). The build is otherwise self-contained.
@@ -27,6 +36,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -41,6 +51,88 @@ void BeliefDiagram::reset(int N) {
     nodes_.push_back(ZNode{N, 0, 0});  // TOP
     root_ = BOT;
     n_ = N;
+}
+
+// seed_unique() — repopulate the hash-cons from the live `nodes_` (the inverse of compact()'s clear), so
+// mk's MERGE arm still recognizes a pre-existing (var,lo,hi) at the start of a mutation and canonicity is
+// preserved (mk would otherwise duplicate an existing node). The terminals carry no key. O(|nodes_|).
+// PRECONDITION: `nodes_` is already CANONICAL + duplicate-free (one node per distinct (var,lo,hi)) — true
+// because it is always post-compact() (the restrict entry) or post-build (the mk fold), which the engine's
+// own invariant maintains. On a non-canonical arena two nodes could share a key and the emplace would keep
+// only one, leaving the other a stale id mk could merge onto — so seed_unique is only called on that
+// invariant. (Used only by restrict_var/restrict_cover; the bw ctor's reset() leaves unique_ empty and the
+// fold rebuilds it via mk directly, so the ctor does not call seed_unique.)
+void BeliefDiagram::seed_unique() {
+    unique_.clear();
+    unique_.reserve(nodes_.size());
+    for (uint32_t id = 2; id < nodes_.size(); ++id)
+        unique_.emplace(NodeKey{nodes_[id].var, nodes_[id].lo, nodes_[id].hi}, id);
+}
+
+// compact() — gc `nodes_` to the reachable-only reduced diagram and CLEAR `unique_` (the per-descent-copy
+// OOM fix). After a build/restrict, `nodes_` holds dead nodes (a restrict strands the pre-restrict
+// sub-DAG) and `unique_` is huge (seeded by the C(20,5) build). Here we rebuild `nodes_` to contain ONLY
+// BOT, TOP and the nodes reachable from root_, renumbered in POST-ORDER (a node is assigned its new id
+// only after both children are — children-before-parents, so the id-monotonic invariant mk asserts is
+// preserved: child new-id < parent new-id). The diagram is already the canonical reduced ZDD (mk applied
+// both reduction rules + lossless merge during the op); compact() only renumbers + drops the unreachable,
+// so canonicity, the var-ordering, and the member ORDER (var/lo/hi-structural, lo-before-hi DFS — NOT raw
+// ids) are all invariant. Path depth is bounded by N (var strictly increasing), but we use an explicit
+// stack (no recursion-depth assumption) mirroring node_count(). Fail-loud: count() must be unchanged.
+void BeliefDiagram::compact() {
+    const int64_t count_before = count();
+
+    std::vector<ZNode> fresh;
+    fresh.reserve(nodes_.size());
+    fresh.push_back(ZNode{n_, 0, 0});  // BOT -> 0
+    fresh.push_back(ZNode{n_, 0, 0});  // TOP -> 1
+
+    // remap[old id] -> new id; UINT32_MAX = not yet assigned (terminals map to themselves).
+    std::vector<uint32_t> remap(nodes_.size(), 0xFFFFFFFFu);
+    remap[BOT] = BOT;
+    remap[TOP] = TOP;
+
+    // Iterative post-order DFS from root_: push (id, children-pushed?) frames; on the second visit (both
+    // children already assigned) append the renumbered node. Terminals + already-assigned nodes are skipped.
+    std::vector<std::pair<uint32_t, bool>> stk;
+    if (root_ >= 2 && remap[root_] == 0xFFFFFFFFu) stk.emplace_back(root_, false);
+    while (!stk.empty()) {
+        auto [u, expanded] = stk.back();
+        if (u < 2 || remap[u] != 0xFFFFFFFFu) {  // terminal or assigned since pushed -> done
+            stk.pop_back();
+            continue;
+        }
+        if (!expanded) {
+            stk.back().second = true;            // mark; revisit after children
+            const ZNode& nd = nodes_[u];
+            if (nd.lo >= 2 && remap[nd.lo] == 0xFFFFFFFFu) stk.emplace_back(nd.lo, false);
+            if (nd.hi >= 2 && remap[nd.hi] == 0xFFFFFFFFu) stk.emplace_back(nd.hi, false);
+        } else {                                 // children assigned -> assign this node a fresh id
+            stk.pop_back();
+            const ZNode& nd = nodes_[u];
+            uint32_t id = static_cast<uint32_t>(fresh.size());
+            fresh.push_back(ZNode{nd.var, remap[nd.lo], remap[nd.hi]});
+            remap[u] = id;
+        }
+    }
+
+    nodes_ = std::move(fresh);
+    root_ = remap[root_];
+    unique_.clear();  // the hash-cons is transient — NOT carried in the compacted value
+
+    // ADR-0002 fail-loud: compact() MUST preserve the family AND leave NO unreachable node. Two witnesses,
+    // both cheap (O(|Z|)) and reachable in a Release/NDEBUG build (the if + abort survive; the assert is
+    // only the message). (1) count() unchanged — the family is preserved. (2) node_count() (reachable
+    // INTERNAL nodes) == nodes_.size()-2 — every node in the fresh arena is reachable from root_, so the
+    // renumber neither stranded a reachable node nor kept a dead one (count() alone is necessary-not-
+    // sufficient: distinct families can share a cardinality; this nets a structural corruption count() misses).
+    const int64_t count_after = count();
+    const int reachable_after = node_count();
+    const int internal_after = static_cast<int>(nodes_.size()) - 2;  // minus BOT, TOP
+    if (count_before != count_after || reachable_after != internal_after) {
+        assert(false && "BeliefDiagram::compact: count()/reachability changed (gc/renumber corrupted the diagram)");
+        std::abort();
+    }
 }
 
 // The ONLY function that creates internal nodes — both reduction rules + lossless merge funnel here
@@ -101,6 +193,10 @@ BeliefDiagram::BeliefDiagram(std::span<const uint32_t> bw, int N) {
     uint32_t z = BOT;
     for (uint32_t w : bw) z = zunion(z, single(w), umemo);
     root_ = z;
+    // reset() left unique_ empty; the fold populated it via mk. compact() now gc's the build arena (the
+    // C(N,K) build leaves no dead nodes here, but it CLEARS unique_ — the huge hash-cons the OOM measured —
+    // so the stored/copied value carries only the small compacted nodes_ + an empty hash-cons).
+    compact();
 }
 
 // count() — cardinality nb (§5.1). Bottom-up via ascending-id loop (valid topo order); NO 2^skip
@@ -314,13 +410,17 @@ uint32_t BeliefDiagram::cover_fail(uint32_t z, uint32_t mask, std::unordered_map
 }
 
 void BeliefDiagram::restrict_var(int t, bool present) {
+    seed_unique();  // the value arrived compacted with an empty hash-cons; rebuild it so mk hash-conses
     std::unordered_map<uint64_t, uint32_t> memo;  // keyed by input node id (params fixed for the call)
     root_ = present ? with_var(root_, t, memo) : without_var(root_, t, memo);
+    compact();      // gc the nodes the restrict stranded + clear the hash-cons (the per-descent-copy fix)
 }
 
 void BeliefDiagram::restrict_cover(uint32_t mask, bool positive) {
+    seed_unique();
     std::unordered_map<uint64_t, uint32_t> memo;
     root_ = positive ? cover_hold(root_, mask, memo) : cover_fail(root_, mask, memo);
+    compact();
 }
 
 }  // namespace chocofarm::beliefzdd

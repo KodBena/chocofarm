@@ -27,10 +27,18 @@
 //   engine is a SELF-CONTAINED, COPYABLE value — `nodes_` + `unique_` + `root_` + `n_` are all member
 //   state, so a BeliefDiagram copies cleanly (the per-node-step descent copy the search makes) and is
 //   thread-safe by construction (no shared mutable table across threads — each thread's beliefs are
-//   independent, exactly like the bitset arm's inline array). A restrict ADDS nodes to THIS arena (the
-//   pre-restrict root becomes dead but the id-monotonic invariant — every child created before its
-//   parent — is preserved, so the ascending/descending-id query loops stay valid). Through a search
-//   descent (max_depth ~ 8 filters) the arena stays small precisely when |Z| ≪ nb — the B.4(b) win.
+//   independent, exactly like the bitset arm's inline array). The COPIED VALUE is the COMPACTED REDUCED
+//   diagram: each mutation (the bw ctor + every restrict_*) ends in compact(), which gc's `nodes_` to
+//   the nodes reachable from root_ (a restrict strands the pre-restrict sub-DAG — without the gc those
+//   dead nodes accumulate across the descent) and CLEARS `unique_` (the hash-cons is transient build/
+//   restrict scratch, seeded from the live nodes at mutation entry, NOT carried in the value — the
+//   C(N,K) full_belief() build seeds it huge). So between ops the stored value holds only a small
+//   compacted `nodes_` (O(|Z|)) + an empty hash-cons, and a value-copy is O(|Z|), not O(full-build-arena)
+//   — the fix for the measured per-descent-copy OOM at the production search config. compact() renumbers
+//   in POST-ORDER, so the id-monotonic invariant (child id < parent id) — what makes the ascending/
+//   descending-id query loops valid — is preserved, and canonicity + the member ORDER (var/lo/hi-
+//   structural, not raw ids) are invariant under the renumber. Through a search descent the arena stays
+//   small precisely when |Z| ≪ nb — the B.4(b) win.
 //
 //   Counts are returned as int64_t (matching features.cpp's int64_t accumulators) so the
 //   comparison-and-cast path to BeliefFeatures is bit-identical (the §B.2/§B.3 logic invariant).
@@ -136,12 +144,32 @@ class BeliefDiagram {
     void restrict_cover(uint32_t mask, bool positive);
 
   private:
+    // The COMPACTED reduced diagram is the stored/copied value (the per-descent-copy OOM fix). Between
+    // operations `nodes_` holds ONLY BOT, TOP and the nodes reachable from `root_` (dead nodes a restrict
+    // strands are gc'd), and `unique_` is EMPTY (the hash-cons is transient build/restrict scratch, NOT
+    // carried in the value). So a value-copy is O(|Z|) (|Z| ≪ nb), not O(full-build-arena: the C(20,5)
+    // build seeds `unique_` huge and `nodes_` never compacted across restricts — the measured OOM). Each
+    // mutation (the bw ctor + every restrict_*) seeds `unique_` from the live `nodes_` at entry (so mk
+    // still hash-conses canonically), then compact()s + clears `unique_` at exit. Canonicity + the
+    // id-monotonic invariant (child id < parent id) are PRESERVED — compact() renumbers in POST-ORDER so
+    // the ascending/descending-id query sweeps (count/below/up in member_at_rank/all_marginals) stay valid;
+    // the member ORDER (var/lo/hi-structural, lo-before-hi DFS) is invariant under renumbering.
     std::vector<ZNode> nodes_;
-    std::unordered_map<NodeKey, uint32_t, NodeKeyHash> unique_;  // hash-cons (persists across restricts)
+    std::unordered_map<NodeKey, uint32_t, NodeKeyHash> unique_;  // hash-cons — TRANSIENT (empty between ops)
     uint32_t root_ = BOT;
     int n_ = 0;
 
     void reset(int N);  // seed nodes_ with BOT/TOP, clear unique_, root_=BOT, n_=N
+
+    // gc `nodes_` to the reachable-only reduced diagram (BOT, TOP + everything reachable from root_),
+    // renumbered in POST-ORDER (children before parents -> id-monotonicity preserved), remapping root_ and
+    // every lo/hi edge; then CLEAR `unique_`. Asserts count() is unchanged (ADR-0002 fail-loud — compact
+    // must preserve the family). Run at the end of every mutation so the stored/copied value is the small
+    // compacted diagram with an empty hash-cons.
+    void compact();
+    // Repopulate `unique_` from the live `nodes_` (the inverse of compact()'s clear) so mk hash-conses
+    // against the existing canonical nodes at the start of a mutation. O(|nodes_|).
+    void seed_unique();
 
     // var_of(id) returns n_ (= a value strictly greater than every real var 0..n_-1) for BOTH terminals,
     // so a terminal is always "below" every variable in the union/restrict var-comparison arms. NEVER
