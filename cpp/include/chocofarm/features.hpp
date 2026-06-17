@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "chocofarm/env.hpp"
+#include "chocofarm/feature_layout.hpp"
 
 namespace chocofarm {
 
@@ -56,6 +57,7 @@ class FeatureBuilder {
     int dim_;
     double diag_;          // bounding-box diagonal over all coords (map_diag)
     double log_nworlds_;   // log(|worlds|)
+    FeatureLayoutSpec layout_;  // the §2.2 block table, runtime-read from the Python-emitted SSOT
 };
 
 }  // namespace chocofarm

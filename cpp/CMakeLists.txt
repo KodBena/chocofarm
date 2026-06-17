@@ -103,6 +103,7 @@ add_library(chocofarm_core
   src/instance.cpp
   src/env.cpp
   src/features.cpp
+  src/feature_layout.cpp
   src/transport.cpp
   src/net.cpp
   src/zmq_net_client.cpp

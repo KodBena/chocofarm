@@ -189,3 +189,35 @@ def test_feature_group_width_mislabel_fires_loud():
     finally:
         feat.FeatureLayout.__init__ = orig_init
         feat._LAYOUTS.clear()   # evict the mislabeled layout so other tests see the real one
+
+
+# ---------------------------------------------------------------------------
+# Cross-language drift: the checked-in feature_layout.json the C++ runtime-reads
+# ---------------------------------------------------------------------------
+# The C++ FeatureBuilder runtime-reads chocofarm/data/feature_layout.json (the ordered (key, width)
+# block table + dim) to build its named slices, instead of re-encoding the layout as a positional
+# `o += N` offset ladder (ADR-0012 P7 — the C++ re-derives nothing; the single-source the runtime-read
+# buys). That artifact is GENERATED from FeatureLayout.spec(), so it must not drift from the one owner;
+# this is the same fail-loud SSOT-net idiom as tests/test_wire_drift.py. Regenerate after a layout
+# change with:
+#   PYTHONPATH=. python -c "import json; from chocofarm.model.env import Environment; \
+#     from chocofarm.az.features import FeatureLayout; \
+#     open('chocofarm/data/feature_layout.json','w').write( \
+#       json.dumps(FeatureLayout(Environment()).spec(), indent=2) + '\n')"
+_SPEC_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "chocofarm", "data", "feature_layout.json",
+)
+
+
+def test_checked_in_layout_spec_matches_owner():
+    """The C++-read feature_layout.json equals FeatureLayout.spec() for the live env — so the artifact
+    the C++ slices against cannot drift from the FeatureLayout SSOT (ADR-0002 / P7). A failure here
+    after a layout change means the file is stale: regenerate it (command in the section header)."""
+    import json
+    env = Environment()
+    with open(_SPEC_PATH) as f:
+        on_disk = json.load(f)
+    assert on_disk == FeatureLayout(env).spec(), (
+        "feature_layout.json drifted from FeatureLayout — regenerate it (see test_feature_layout.py header)"
+    )

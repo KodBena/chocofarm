@@ -1,0 +1,65 @@
+{
+  "dim": 241,
+  "blocks": [
+    {
+      "key": "marg",
+      "width": 20
+    },
+    {
+      "key": "collected",
+      "width": 20
+    },
+    {
+      "key": "available",
+      "width": 20
+    },
+    {
+      "key": "dist_t",
+      "width": 20
+    },
+    {
+      "key": "unc",
+      "width": 20
+    },
+    {
+      "key": "informative",
+      "width": 44
+    },
+    {
+      "key": "p_pos",
+      "width": 44
+    },
+    {
+      "key": "dist_d",
+      "width": 44
+    },
+    {
+      "key": "sharpness",
+      "width": 1
+    },
+    {
+      "key": "n_collected",
+      "width": 1
+    },
+    {
+      "key": "marg_sum",
+      "width": 1
+    },
+    {
+      "key": "exit_norm",
+      "width": 1
+    },
+    {
+      "key": "nonempty",
+      "width": 1
+    },
+    {
+      "key": "sum_unc",
+      "width": 1
+    },
+    {
+      "key": "dist_w",
+      "width": 3
+    }
+  ]
+}

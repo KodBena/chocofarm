@@ -171,6 +171,21 @@ class FeatureLayout:
             tags.extend(tag for _ in range(width))
         return tags
 
+    def spec(self) -> dict[str, Any]:
+        """The cross-language layout contract the C++ runtime-reads (ADR-0012 P7): the ordered block
+        table resolved for THIS env — `dim` plus the `[(key, width)]` list in layout order. The C++
+        FeatureBuilder loads this, builds its named slices from it (no positional offset ladder), and
+        validates Σwidth == its own env-derived `dim` (fail-loud). `tests/test_feature_layout.py` nets
+        the checked-in `chocofarm/data/feature_layout.json` against this method, so the emitted artifact
+        cannot drift from the one owner — the same fail-loud SSOT-net idiom as wire_spec / control_spec.
+        Block ORDER + the key SET are what would silently mislabel the vector if they drifted across the
+        language boundary; emitting concrete widths lets the C++ re-derive nothing (the single-source
+        the runtime-read buys)."""
+        return {
+            "dim": self.dim,
+            "blocks": [{"key": key, "width": width} for key, width, _group, _display in self.blocks],
+        }
+
 
 # Env-keyed memo for the layout descriptor — a WeakKeyDictionary keyed by the ENV OBJECT itself
 # (audit R9). The layout is a fixed env-derived table (same idiom as actions._SLOT_TABLES), so

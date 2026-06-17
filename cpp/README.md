@@ -93,6 +93,19 @@ cpp/build/chocofarm-cpp-runner \
 A missing weight payload is a **loud abort** (non-zero exit + the same message
 `read_weights` raises), never a silent stale serve.
 
+### Feature-layout SSOT (`CHOCO_FEATURE_LAYOUT`)
+
+The §2.2 belief featurization is laid out by the **one owner** in Python — `FeatureLayout`
+(`chocofarm/az/features.py`, audit R6). The C++ `FeatureBuilder` does **not** re-encode that block order
+as a positional `o += N` offset ladder; it **runtime-reads** the layout from
+`chocofarm/data/feature_layout.json` (emitted by `FeatureLayout.spec()`, drift-netted against the owner by
+`tests/test_feature_layout.py`) and assembles by **named block** (ADR-0012 P7 — the C++ re-derives
+nothing; the order + widths are the owner's). The path is `CHOCO_FEATURE_LAYOUT`, defaulting to
+`chocofarm/data/feature_layout.json` **relative to the working directory** — so run from the repo root (as
+every example here does), or set `CHOCO_FEATURE_LAYOUT` to the absolute path. A missing or env-mismatched
+spec (its `dim` and Σwidth must equal the env-derived `5N+3nD+6+n_tel`) is a **loud abort** (ADR-0002); the
+file is regenerated with `FeatureLayout.spec()` after any block change.
+
 ## Persistent `--serve` mode (the ActorTransport runner)
 
 `--serve` runs the **Gumbel actor** (`--policy gumbel`'s `GumbelAZPolicy`) as a **long-lived process**

@@ -17,11 +17,14 @@
 #include "chocofarm/features.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace chocofarm {
 
@@ -74,6 +77,43 @@ FeatureBuilder::FeatureBuilder(const Environment& env)
     // dim = 5N + 3nD + 6 + n_tel (derived, never hardcoded; mirrors feature_dim)
     dim_ = 5 * N_ + 3 * nD_ + 6 + n_tel_;
     log_nworlds_ = std::log(static_cast<double>(env_.worlds().size()));
+
+    // Read the §2.2 block table from the cross-language SSOT (ADR-0012 P7): the order + widths are the
+    // Python FeatureLayout's, emitted to feature_layout.json and netted by tests/test_feature_layout.py,
+    // so assemble() writes by NAMED block instead of re-encoding the layout as a positional `o += N`
+    // ladder. Path: CHOCO_FEATURE_LAYOUT (else the shipped default, resolved from the run cwd). The
+    // layout is a shipped STRUCTURAL artifact (like the hp schema), so a missing/inconsistent spec is a
+    // broken install — a LOUD abort (ADR-0002), not a boundary the search could limp past. The fallible
+    // read is the load() factory (P9 rule 5); the abort here is its invariant arm (the binary cannot
+    // featurize without its layout).
+    const char* env_path = std::getenv("CHOCO_FEATURE_LAYOUT");
+    const std::string spec_path = env_path ? std::string(env_path) : "chocofarm/data/feature_layout.json";
+    auto spec = FeatureLayoutSpec::load(spec_path, dim_);
+    if (!spec) {
+        std::cerr << "chocofarm: FATAL: FeatureBuilder: " << spec.error().message
+                  << "\n  (set CHOCO_FEATURE_LAYOUT to feature_layout.json, or run from the repo root; "
+                     "regenerate via FeatureLayout.spec() — see tests/test_feature_layout.py)\n";
+        std::abort();
+    }
+    layout_ = std::move(*spec);
+
+    // The keys this builder writes MUST equal the spec's blocks (mirrors Python's
+    // _WRITTEN_KEYS == layout.slices.keys()): a spec block we never write would leak a zero into the
+    // vector; a key we write that the spec lacks aborts in start(). count == |written| AND every written
+    // key present ⇒ the two key-sets are equal.
+    static constexpr std::array<std::string_view, 15> kWritten = {
+        "marg", "collected", "available", "dist_t", "unc",
+        "informative", "p_pos", "dist_d",
+        "sharpness", "n_collected", "marg_sum", "exit_norm", "nonempty", "sum_unc",
+        "dist_w",
+    };
+    bool keys_ok = layout_.block_count() == static_cast<int>(kWritten.size());
+    for (std::string_view k : kWritten) keys_ok = keys_ok && layout_.contains(k);
+    if (!keys_ok) {
+        std::cerr << "chocofarm: FATAL invariant: FeatureBuilder layout/writer key-set mismatch (spec has "
+                  << layout_.block_count() << " blocks; writer expects " << kWritten.size() << ")\n";
+        std::abort();
+    }
 }
 
 namespace {
@@ -171,49 +211,36 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const std::vector<ui
     const GeometryFeatures gf = geometry_features(env_, loc, N, nD, n_tel, diag_);
     const CollectedFeatures cf = collected_features(collected, N);
 
-    // --- assemble the canonical ordered block table (per-treasure N×5, per-detector nD×3, global
-    // 6+n_tel). `available` and `sum_unc` are the ONLY belief×collected couplings, so they are computed
-    // HERE (not in the pure units). The op order is UNCHANGED from the former monolith — bit-exact
-    // (P6). The `o += …` offset ladder is the SSOT target of the next step (dossier §3).
+    // --- assemble by NAMED block: the layout SSOT (audit R6 / ADR-0012 P7) owns the order + offsets,
+    // so there is no positional `o += N` ladder re-encoding it here. `available` and `sum_unc` are the
+    // only belief×collected couplings, computed in this step. Slots are independent, so the WRITE order
+    // is irrelevant; the float-op order (the sum_unc accumulation, the per-i unc/available) is UNCHANGED
+    // from the former ladder — bit-exact (P6). The per-build layout-mismatch assert is GONE: the ctor's
+    // load (Σwidth==dim==env-derived dim, no dup/neg widths ⇒ a contiguous partition) + its key-set
+    // check make the desync that assert guarded structurally unauthorable (dossier §3 — mechanize > assert).
     std::vector<double> out(dim_, 0.0);
-    int o = 0;
-    for (int i = 0; i < N; ++i) { out[o + i] = bf.marg[i]; }              // marg
-    o += N;
-    for (int i = 0; i < N; ++i) { out[o + i] = cf.coll[i]; }              // collected
-    o += N;
-    for (int i = 0; i < N; ++i) { out[o + i] = ((bf.marg[i] > 0.0) && (cf.coll[i] == 0.0)) ? 1.0 : 0.0; }
-    o += N;                                                               // available
-    for (int i = 0; i < N; ++i) { out[o + i] = gf.dist_t[i]; }            // dist_t
-    o += N;
+    { const int s = layout_.start("marg");        for (int i = 0; i < N; ++i) out[s + i] = bf.marg[i]; }
+    { const int s = layout_.start("collected");   for (int i = 0; i < N; ++i) out[s + i] = cf.coll[i]; }
+    { const int s = layout_.start("available");   for (int i = 0; i < N; ++i)
+          out[s + i] = ((bf.marg[i] > 0.0) && (cf.coll[i] == 0.0)) ? 1.0 : 0.0; }
+    { const int s = layout_.start("dist_t");      for (int i = 0; i < N; ++i) out[s + i] = gf.dist_t[i]; }
     double sum_unc = 0.0;
-    for (int i = 0; i < N; ++i) {
-        double u = bf.marg[i] * (1.0 - bf.marg[i]);                       // unc
-        out[o + i] = u;
-        if (cf.coll[i] == 0.0) sum_unc += u;         // Σ over UNCOLLECTED treasures
-    }
-    o += N;
-
-    // --- per-detector block (nD × 3): informative, p_pos, dist ---
-    for (int j = 0; j < nD; ++j) { out[o + j] = bf.informative[j]; }      // informative
-    o += nD;
-    for (int j = 0; j < nD; ++j) { out[o + j] = bf.p_pos[j]; }            // p_pos
-    o += nD;
-    for (int j = 0; j < nD; ++j) { out[o + j] = gf.dist_d[j]; }           // dist_d
-    o += nD;
-
-    // --- global block (6 + n_tel) ---
-    out[o++] = bf.sharpness;                                              // log|bw|/log Nworlds
-    out[o++] = cf.n_collected / static_cast<double>(env_.K());           // n_collected/K
-    out[o++] = bf.marg_sum / static_cast<double>(env_.K());              // Σmarg/K
-    out[o++] = gf.exit_norm;                                             // exit geometry
-    out[o++] = bf.nonempty;                                              // non-empty belief flag
-    out[o++] = sum_unc;                                                  // Σ_uncollected unc
-    for (int k = 0; k < n_tel; ++k) out[o++] = gf.dist_w[k];             // per-teleport distances
-
-    // ADR-0012 P9: dim_ is derived from the SAME N/nD/n_tel this loop walks (5N+3nD+6+n_tel), so a
-    // mismatch is impossible unless the derivation desyncs — an INVARIANT violation (a programmer
-    // bug), an assert/abort, not a recoverable boundary Error.
-    assert(o == dim_ && "FeatureBuilder::build: layout mismatch");
+    { const int s = layout_.start("unc");
+      for (int i = 0; i < N; ++i) {
+          double u = bf.marg[i] * (1.0 - bf.marg[i]);                     // unc
+          out[s + i] = u;
+          if (cf.coll[i] == 0.0) sum_unc += u;       // Σ over UNCOLLECTED treasures (order preserved)
+      } }
+    { const int s = layout_.start("informative"); for (int j = 0; j < nD; ++j) out[s + j] = bf.informative[j]; }
+    { const int s = layout_.start("p_pos");       for (int j = 0; j < nD; ++j) out[s + j] = bf.p_pos[j]; }
+    { const int s = layout_.start("dist_d");      for (int j = 0; j < nD; ++j) out[s + j] = gf.dist_d[j]; }
+    out[layout_.start("sharpness")]   = bf.sharpness;                     // log|bw|/log Nworlds
+    out[layout_.start("n_collected")] = cf.n_collected / static_cast<double>(env_.K());  // n_collected/K
+    out[layout_.start("marg_sum")]    = bf.marg_sum / static_cast<double>(env_.K());     // Σmarg/K
+    out[layout_.start("exit_norm")]   = gf.exit_norm;                     // exit geometry
+    out[layout_.start("nonempty")]    = bf.nonempty;                      // non-empty belief flag
+    out[layout_.start("sum_unc")]     = sum_unc;                          // Σ_uncollected unc
+    { const int s = layout_.start("dist_w");      for (int k = 0; k < n_tel; ++k) out[s + k] = gf.dist_w[k]; }
     return out;
 }
 
