@@ -6,12 +6,20 @@
 //
 //   build() is DECOMPOSED (docs/design refactor step 1) along the three input groups the dossier's
 //   DAG identifies — belief math (the O(nb·(N+nD)) bottleneck), separable geometry, the collected
-//   indicator — into three pure value-functions plus a thin assembler. This is hygiene only (ADR-0012
-//   P3: one axis per function; P9-rule-2: returned by value): the ops and their order are UNCHANGED,
-//   so the output is bit-identical to the former monolith (P6). `available` and `sum_unc` are the only
-//   belief×collected couplings, so they live in the assembler, which keeps belief_features a pure
-//   function of `bw` — the unit a later step hoists to a single SSOT shared with legal_mask /
-//   legal_actions (today those recompute the same marginals per leaf).
+//   indicator — into three pure value-functions plus a thin assembler. The decomposition is hygiene
+//   only (ADR-0012 P3: one axis per function; P9-rule-2: returned by value): the geometry / collected /
+//   assembler ops and their order are UNCHANGED, bit-identical to the former monolith (P6). `available`
+//   and `sum_unc` are the only belief×collected couplings, so they live in the assembler, which keeps
+//   belief_features a pure function of `bw` — the unit later hoisted to a single SSOT the legal mask
+//   shares (legal_mask_from_features slices build()'s sweep, not a recompute).
+//
+//   belief_features (the belief-math unit) was SUBSEQUENTLY rewritten to the §A.4 form
+//   (belief_features_and_decision_diagram_note.md): one fused branchless integer sweep over contiguous
+//   masks (env.face_masks()), then a pointwise Phase 2 normalizing both marg AND p_pos via `* inv`. The
+//   `* inv` for p_pos is a deliberate behavioral RE-BASELINE (was `/ nb`), so the belief block is NO
+//   LONGER byte-identical to the pre-rebaseline monolith — it sits at the P6 behavioral bar vs Python,
+//   while the legal mask it feeds (informative / available) stays bit-exact. The bit-exact oracle
+//   (belief_sweep_oracle_check) pins the rewrite against an independent naive count; see below.
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/features.hpp"
@@ -117,11 +125,23 @@ FeatureBuilder::FeatureBuilder(const Environment& env)
     }
 }
 
-// --- belief-derived intermediates: a PURE function of the world-set `bw` (the §2-decomposition unit;
-// the K=16 profile's ~81%). EXPOSED via feature_compute.hpp (its single home stays here) for the isolated
-// belief_sweep_bench + tests. DICHOTOMIZED by belief size: the nb==0 empty case (a trivial zero-return)
-// and the nb>=1 HOT path are separate children, so the hot path carries NO per-call empty guard and reads
-// with one belief-size invariant (inv = 1/nb, hoisted once). Bit-exact with the former monolith (P6).
+// --- belief-derived intermediates: a PURE, env-FREE function of the world-set `bw` + the per-detector
+// cover masks (the §2-decomposition unit; the K=16 profile's ~81%). EXPOSED via feature_compute.hpp (its
+// single home stays here) for the isolated belief_sweep_bench + the bit-exact oracle. DICHOTOMIZED by
+// belief size: the nb==0 empty case (a trivial zero-return) and the nb>=1 HOT path are separate children,
+// so the hot path carries NO per-call empty guard and reads with one belief-size invariant (inv = 1/nb).
+//
+// The nb>=1 child is the §A.4 rewrite (belief_features_and_decision_diagram_note.md). The unifying
+// reframe: both Phase-1 outputs are VERTICAL (down-the-worlds) reductions of the nb×bits matrix —
+// bit_cnt[t] = Σ_w bit_t(w) (pre-normalized marg) and det_cnt[j] = Σ_w [(w & mask_j) != 0] (the cover
+// count). Both are INTEGER and BRANCHLESS (fixed trip count, no data-dependent branch -> the vectorizer /
+// a future pos-popcount can take over) and read the masks from a CONTIGUOUS span (env.face_masks(), no
+// array-of-structs stride). Phase 2 is pointwise. Both marg and p_pos normalize via `* inv` — the SETTLED
+// convention (note decision 1): a deliberate behavioral RE-BASELINE of p_pos (was `/ nb`), so the belief
+// block is no longer byte-identical to the pre-rebaseline C++; from here `* inv` over exact integer counts
+// IS the reference, and every later rung (SIMD/pos-popcount, the Part B diagram) matches it bit-for-bit.
+// Cross-language vs Python stays at the P6 behavioral bar; the legal mask informative feeds stays bit-
+// exact. belief_sweep_oracle_check nets this against an independent naive count (ADR-0011, net the rewrite).
 namespace {
 
 // nb==0 (the empty belief): no worlds to average/cover, so every derived quantity is 0 — the struct's
@@ -136,41 +156,51 @@ namespace {
     return bf;  // marg_sum / sharpness / nonempty default to 0.0 — exactly the former nb==0 values
 }
 
-// nb>=1 (the HOT path). marg[t] = (Σ_w bit_t)·inv; cnt[j] = #worlds in detector j's cover -> p_pos =
-// cnt/nb, informative = (0 < cnt < nb). inv = 1/nb is the ONE belief-size invariant, hoisted once. (marg
-// uses ·inv, p_pos uses /nb — each preserves its former per-element float op exactly, the P6 behavioral
-// seam; unifying both on ·inv would change p_pos by ~1 ULP and is a separate parity-gated micro-opt.)
-[[nodiscard]] BeliefFeatures belief_features_nonempty(const Environment& env, std::span<const uint32_t> bw,
+// nb>=1 (the HOT path, the §A.4 rewrite). Phase 1: ONE fused sweep = two down-the-worlds integer
+// reductions; read each world ONCE and drive both accumulators (note A.3 — do NOT split: splitting
+// doubles the traffic over bw, the dominant memory cost). Phase 2: pointwise maps over the two
+// column-sums + nb, `* inv` everywhere.
+[[nodiscard]] BeliefFeatures belief_features_nonempty(std::span<const uint32_t> bw,
+                                                      std::span<const uint32_t> masks,
                                                       int N, int nD, double log_nworlds) {
+    const size_t nb = bw.size();   // >= 1 (the dispatcher guarantees it)
     BeliefFeatures bf;
     bf.marg.assign(N, 0.0);
-    std::vector<int64_t> cnt(nD, 0);
-    const size_t nb = bw.size();   // >= 1 (the dispatcher guarantees it)
-    for (uint32_t w : bw) {
-        for (int t = 0; t < N; ++t) if ((w >> t) & 1u) bf.marg[t] += 1.0;
-        for (int j = 0; j < nD; ++j) if (env.observe(j, w)) cnt[j] += 1;
-    }
-    const double inv = 1.0 / static_cast<double>(nb);
-    for (int t = 0; t < N; ++t) bf.marg[t] *= inv;
-    for (int t = 0; t < N; ++t) bf.marg_sum += bf.marg[t];
     bf.p_pos.assign(nD, 0.0);
     bf.informative.assign(nD, 0.0);
+    std::vector<int64_t> bit_cnt(N, 0);   // marg_raw: column sums of the bit matrix
+    std::vector<int64_t> det_cnt(nD, 0);  // cnt:      column sums of the masked-hit matrix
+
+    // phase 1: ONE fused sweep, both bodies branchless + integer (the O(nb*(N+nD)) cost).
+    for (uint32_t w : bw) {
+        for (int t = 0; t < N; ++t)  bit_cnt[t] += (w >> t) & 1u;
+        for (int j = 0; j < nD; ++j) det_cnt[j] += (w & masks[j]) != 0;
+    }
+
+    // phase 2: pointwise maps. marg uses ·inv exactly as before (bit-exact: (double)count is exact for
+    // count <= |worlds|); p_pos now ·inv too (the re-baseline). marg_sum accumulates in treasure-id
+    // order, unchanged from the former two-pass ladder — a P6 watch item, do not reorder.
+    const double inv = 1.0 / static_cast<double>(nb);
+    for (int t = 0; t < N; ++t) {
+        bf.marg[t]   = static_cast<double>(bit_cnt[t]) * inv;
+        bf.marg_sum += bf.marg[t];
+    }
     for (int j = 0; j < nD; ++j) {
-        bf.p_pos[j] = static_cast<double>(cnt[j]) / static_cast<double>(nb);
-        bf.informative[j] = (cnt[j] > 0 && cnt[j] < static_cast<int64_t>(nb)) ? 1.0 : 0.0;
+        bf.p_pos[j]       = static_cast<double>(det_cnt[j]) * inv;
+        bf.informative[j] = (det_cnt[j] > 0 && det_cnt[j] < static_cast<int64_t>(nb)) ? 1.0 : 0.0;
     }
     bf.sharpness = std::log(static_cast<double>(nb)) / log_nworlds;
-    bf.nonempty = 1.0;
+    bf.nonempty  = 1.0;
     return bf;
 }
 
 }  // namespace
 
 // The public sweep entry (feature_compute.hpp): dispatch on belief size to the empty / hot child.
-BeliefFeatures belief_features(const Environment& env, std::span<const uint32_t> bw,
+BeliefFeatures belief_features(std::span<const uint32_t> bw, std::span<const uint32_t> masks,
                                int N, int nD, double log_nworlds) {
     return bw.empty() ? belief_features_empty(N, nD)
-                      : belief_features_nonempty(env, bw, N, nD, log_nworlds);
+                      : belief_features_nonempty(bw, masks, N, nD, log_nworlds);
 }
 
 namespace {
@@ -290,7 +320,7 @@ const BeliefFeatures& FeatureBuilder::belief_feats_(const std::vector<uint32_t>&
     // miss: the cap is a memory backstop (mirrors _belief_cache_cap); compute, store an OWNED copy of bw
     // (a stored span would dangle), return the cached ref.
     if (belief_cache_n_ >= kBeliefCacheCap) { belief_cache_.clear(); belief_cache_n_ = 0; }
-    BeliefFeatures feats = belief_features(env_, std::span<const uint32_t>(bw), N_, nD_, log_nworlds_);
+    BeliefFeatures feats = belief_features(std::span<const uint32_t>(bw), env_.face_masks(), N_, nD_, log_nworlds_);
     auto& bucket = belief_cache_[key];
     bucket.emplace_back(bw, std::move(feats));
     ++belief_cache_n_;

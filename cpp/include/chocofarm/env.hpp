@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <set>
+#include <span>
 #include <vector>
 
 #include "chocofarm/instance.hpp"
@@ -99,12 +100,20 @@ class Environment {
     bool observe(int face_id, uint32_t world) const {
         return (world & inst_.faces[face_id].bitmask) != 0;
     }
+    // The per-detector cover bitmasks as a CONTIGUOUS view (face j's bitmask at index j) — the same
+    // masks observe() / filter_detector read one-at-a-time off inst_.faces (an array-of-structs, so
+    // `.bitmask` strides by sizeof(Face)). Homed once in the ctor so a per-world sweep over all nD
+    // detectors reads them packed, without that stride (ADR-0012 P1: env still owns the masks; this is
+    // one contiguous read of them). The belief sweep relies on the identity
+    // observe(j, w) == ((w & face_masks()[j]) != 0).
+    std::span<const uint32_t> face_masks() const { return face_masks_; }
     // Outcome still uncertain over the belief — both polarities live (SenseAction.informative).
     bool informative(int face_id, const std::vector<uint32_t>& bw) const;
 
   private:
     Instance inst_;
     std::vector<uint32_t> worlds_;
+    std::vector<uint32_t> face_masks_;  // contiguous per-detector cover bitmasks (face_masks(); built in ctor)
     int entry_idx_ = 0;
 };
 

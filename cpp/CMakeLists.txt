@@ -188,6 +188,14 @@ add_executable(chocofarm-belief-cache-check src/belief_cache_check.cpp)
 target_link_libraries(chocofarm-belief-cache-check PRIVATE chocofarm_core)
 target_compile_options(chocofarm-belief-cache-check PRIVATE -Wall -Wextra)
 
+# The belief-sweep BIT-EXACT oracle (NOT the runner): recomputes chocofarm::belief_features two independent
+# ways — the production contiguous-mask/branchless/fused sweep vs a naive env.observe count, same `* inv`
+# spec — and asserts byte-equality over a sample of beliefs. The in-language regression net the §A.4 rewrite
+# and every later rung (SIMD/pos-popcount, the Part B diagram) diff against (ADR-0011). Separate (P3, one-owner).
+add_executable(chocofarm-belief-sweep-oracle-check src/belief_sweep_oracle_check.cpp)
+target_link_libraries(chocofarm-belief-sweep-oracle-check PRIVATE chocofarm_core)
+target_compile_options(chocofarm-belief-sweep-oracle-check PRIVATE -Wall -Wextra)
+
 # The ISOLATED belief-sweep microbenchmark (NOT the runner): times chocofarm::belief_features alone (no
 # search / wire / cache / geometry) across belief sizes, so a sweep optimizer (pospopcount / inline-masks
 # / decision-diagram) iterates with a clean per-world signal. Drives the compute via feature_compute.hpp.

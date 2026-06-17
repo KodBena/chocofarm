@@ -15,16 +15,18 @@
 #include <cstdint>
 #include <span>
 
-#include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"   // BeliefFeatures (the returned value type)
 
 namespace chocofarm {
 
 // The belief-derived intermediates for `bw`: mean-bit marg over treasures + per-detector cover counts ->
-// p_pos / informative, plus marg_sum / sharpness / nonempty. Caller supplies the env-derived dims:
-// N = env.N(), nD = env.n_detectors(), log_nworlds = log(|env.worlds()|). Pure; the single home is
-// features.cpp. (geometry_features / collected_features stay file-local — only the sweep is benched.)
-[[nodiscard]] BeliefFeatures belief_features(const Environment& env, std::span<const uint32_t> bw,
+// p_pos / informative, plus marg_sum / sharpness / nonempty. The signature is env-FREE — it names its
+// TRUE inputs (ADR-0012 P9 honest signature): the world-set `bw`, the per-detector cover bitmasks
+// `masks` (= env.face_masks(), the only piece of env the sweep touches; observe(j,w) == (w&masks[j])!=0),
+// and the env-static dims N = env.N(), nD = env.n_detectors(), log_nworlds = log(|env.worlds()|). Pure;
+// the single home is features.cpp. (geometry_features / collected_features stay file-local — only the
+// sweep, the K=16 profile's ~81%, is exposed for the bench + the bit-exact oracle.)
+[[nodiscard]] BeliefFeatures belief_features(std::span<const uint32_t> bw, std::span<const uint32_t> masks,
                                              int N, int nD, double log_nworlds);
 
 }  // namespace chocofarm

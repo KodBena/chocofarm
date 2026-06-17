@@ -39,6 +39,11 @@ static std::vector<uint32_t> build_worlds(int N, int K) {
 
 Environment::Environment(const Instance& inst) : inst_(inst) {
     worlds_ = build_worlds(inst_.N, inst_.K);
+    // contiguous per-detector cover bitmasks (face_masks()): hoist faces[j].bitmask out of the
+    // array-of-structs into a packed uint32_t[nD] so the belief sweep reads them without the AoS
+    // stride (ADR-0012 P1 — one contiguous home, env still owns them). Order = face id (== faces order).
+    face_masks_.reserve(inst_.faces.size());
+    for (const Face& f : inst_.faces) face_masks_.push_back(f.bitmask);
     // resolve the entry teleport index
     entry_idx_ = 0;
     for (size_t k = 0; k < inst_.teleport_names.size(); ++k) {

@@ -204,9 +204,13 @@ def mask_bit_exact(env, n_seqs, max_steps, seed, n_slots):
 def feature_parity(env, n_seqs, max_steps, seed, feat_dim_):
     """X-port equivalence: the §2.2 feature vector the C++ FeatureBuilder produces vs Python's, for a
     matched (loc, belief). Held to the forward-roundoff bar (ABS_TOL=1e-4, the project's
-    test_jax_equivalence tolerance — ADR-0012 P6 / ADR-0009), not byte-identity: both are float64 of
-    the SAME math, so they agree to far tighter than 1e-4, but we hold the documented bar. Reports
-    the max abs diff across all matched steps."""
+    test_jax_equivalence tolerance — ADR-0012 P6 / ADR-0009), not byte-identity. Most columns are
+    float64 of the SAME math and agree to far tighter than 1e-4; the p_pos block is the one place the
+    two sides differ by a single float op — C++ computes cover-count·(1/nb) (the §A.4 re-baseline,
+    features.cpp belief_features_nonempty) while Python computes cover-count/nb (features.py) — so it
+    agrees only to ~1 ULP, still far inside the bar. (marg is UNaffected: both reduce to exact integer
+    counts ·(1/nb), bit-identical.) The bar holds precisely because cross-language parity is the P6
+    behavioral tier, not byte-identity. Reports the max abs diff across all matched steps."""
     from chocofarm.az.actions import action_to_slot
     from chocofarm.az.features import FeatureBuilder
     fb = FeatureBuilder(env)

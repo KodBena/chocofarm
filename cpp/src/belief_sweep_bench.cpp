@@ -56,6 +56,7 @@ int main(int argc, char** argv) {
     const std::vector<uint32_t> bw_full = env.worlds();
     const size_t nworlds = bw_full.size();
     const double log_nworlds = std::log(static_cast<double>(nworlds));
+    const std::span<const uint32_t> masks = env.face_masks();   // contiguous per-detector cover masks (P1)
 
     std::cout << "belief-sweep-bench: N=" << N << " nD=" << nD << " |worlds|=" << nworlds
               << " budget=" << budget << "s/point  (timing chocofarm::belief_features in isolation)\n";
@@ -77,7 +78,7 @@ int main(int argc, char** argv) {
         double el = 0.0;
         do {
             for (int i = 0; i < 16; ++i) {
-                const chocofarm::BeliefFeatures bf = chocofarm::belief_features(env, bw, N, nD, log_nworlds);
+                const chocofarm::BeliefFeatures bf = chocofarm::belief_features(bw, masks, N, nD, log_nworlds);
                 sink += bf.marg_sum + bf.sharpness;
             }
             calls += 16;

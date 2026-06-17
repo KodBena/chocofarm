@@ -85,6 +85,7 @@ WIRE_BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-wire-bench")
 WIRE_BENCH = os.path.join(REPO, "cpp", "parity", "wire_bench.py")
 FIBER_PROTO_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-fiber-proto")
 BELIEF_CACHE_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-belief-cache-check")
+BELIEF_ORACLE_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-belief-sweep-oracle-check")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
@@ -105,6 +106,23 @@ def test_cpp_belief_cache_collision_guard():
     fingerprint) and asserts each gets its OWN features + that a cache hit is bit-identical to a recompute
     (ADR-0011: net the guard, don't trust it). Runs from REPO so FeatureBuilder finds feature_layout.json."""
     out = subprocess.run([BELIEF_CACHE_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
+                         cwd=REPO, capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": REPO})
+    sys.stdout.write(out.stdout)
+    sys.stderr.write(out.stderr)
+    assert out.returncode == 0 and "RESULT: PASS" in out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(BELIEF_ORACLE_BIN)), reason=_CPP_SKIP)
+def test_cpp_belief_sweep_oracle():
+    """The belief sweep (chocofarm::belief_features) was rewritten to the §A.4 form — a fused branchless
+    integer sweep over contiguous env.face_masks(), normalizing marg AND p_pos via `* inv` (the settled
+    re-baseline). chocofarm-belief-sweep-oracle-check recomputes it two INDEPENDENT ways (production vs a
+    naive env.observe count, same *inv spec) and asserts byte-equality over a sample of beliefs — the
+    in-language bit-exact net for the rewrite and every later rung (SIMD, the Part B diagram). ADR-0011:
+    net the rewrite, don't trust it. Pure compute (no FeatureBuilder, no layout file, no redis) so the
+    binary is cwd-independent; cwd=REPO / PYTHONPATH are kept only for parity with the other cpp gates."""
+    out = subprocess.run([BELIEF_ORACLE_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
                          cwd=REPO, capture_output=True, text=True, timeout=60,
                          env={**os.environ, "PYTHONPATH": REPO})
     sys.stdout.write(out.stdout)
