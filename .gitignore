@@ -10,3 +10,4 @@ tb-archive/
 runs/
 .scratch/
 cpp/build/
+cpp/doxygen/

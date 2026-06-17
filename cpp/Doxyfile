@@ -1,0 +1,166 @@
+# Doxyfile — chocofarm C++ runner
+#
+# Purpose: generate browsable HTML docs for the cpp/ runner with full
+# Graphviz/dot call graphs (callee = CALL_GRAPH, caller = CALLER_GRAPH),
+# rendered as interactive (clickable, zoomable) SVG. The code documents itself
+# via // line comments rather than /** doxygen */ blocks, so EXTRACT_ALL=YES is
+# load-bearing: the call/caller graphs are derived from the *parsed* code, not
+# from doc comments, so every translation unit contributes regardless of its
+# comment style.
+#
+# Run from cpp/:   doxygen Doxyfile
+# Then open:       cpp/doxygen/html/index.html
+# Each function's page carries its callee graph (functions it calls) and its
+# caller graph (functions that call it); both are clickable SVG.
+#
+# Disk: OUTPUT_DIRECTORY is cpp/doxygen/, which lives on the roomy /dev/vdc
+# mount (root has <600M free). The generated HTML+SVG corpus stays off root.
+# cpp/doxygen/ is gitignored (it is generated output, like cpp/build/).
+#
+# This is a config file, not a source file, so the ADR-0006 module-docstring
+# header convention (path + purpose + Public Domain) does not apply; the intent
+# block above stands in its place. Public Domain (The Unlicense).
+
+#---------------------------------------------------------------------------
+# Project
+#---------------------------------------------------------------------------
+PROJECT_NAME           = "chocofarm C++ runner"
+PROJECT_BRIEF          = "The C++ search/sim runner (ADR-0012 Shape A): env/Policy seam, Gumbel-AZ search, NetForward leaf, and the ActorTransport serve loop."
+OUTPUT_DIRECTORY       = doxygen
+CREATE_SUBDIRS         = YES
+OUTPUT_LANGUAGE        = English
+ALLOW_UNICODE_NAMES    = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+
+#---------------------------------------------------------------------------
+# Path presentation (clean, repo-relative paths in the rendered docs)
+#---------------------------------------------------------------------------
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = .
+STRIP_FROM_INC_PATH    = include
+
+#---------------------------------------------------------------------------
+# What to extract
+#
+# EXTRACT_ALL + the EXTRACT_* family below pull in every entity — including the
+# anonymous-namespace TU-local helpers (e.g. matvec_bias) and static functions
+# that the hot paths route through — so the call graphs are complete rather
+# than stopping at the first undocumented boundary.
+#---------------------------------------------------------------------------
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_PRIV_VIRTUAL   = YES
+EXTRACT_PACKAGE        = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+EXTRACT_LOCAL_METHODS  = YES
+EXTRACT_ANON_NSPACES   = YES
+INTERNAL_DOCS          = YES
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+HIDE_SCOPE_NAMES       = NO
+SHOW_INCLUDE_FILES     = YES
+SHOW_USED_FILES        = YES
+INLINE_INFO            = YES
+SORT_MEMBER_DOCS       = YES
+SORT_MEMBERS_CTORS_1ST = YES
+GENERATE_TODOLIST      = YES
+GENERATE_BUGLIST       = YES
+
+#---------------------------------------------------------------------------
+# Input
+#---------------------------------------------------------------------------
+INPUT                  = README.md include src
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.hpp *.cpp *.h *.cc *.cxx *.md
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       = */build/* */build-profile/* */_deps/* */CMakeFiles/*
+EXCLUDE_SYMLINKS       = NO
+USE_MDFILE_AS_MAINPAGE = README.md
+
+#---------------------------------------------------------------------------
+# Source browser (cross-reference engine that feeds the call/caller graphs)
+#---------------------------------------------------------------------------
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = YES
+STRIP_CODE_COMMENTS    = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+REFERENCES_LINK_SOURCE = YES
+SOURCE_TOOLTIPS        = YES
+VERBATIM_HEADERS       = YES
+
+#---------------------------------------------------------------------------
+# C++ parsing / preprocessing (modern C++ — STL-aware, macro-expanding)
+#---------------------------------------------------------------------------
+OPTIMIZE_OUTPUT_FOR_C  = NO
+BUILTIN_STL_SUPPORT    = YES
+CPP_CLI_SUPPORT        = NO
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = YES
+INCLUDE_PATH           = include
+SKIP_FUNCTION_MACROS   = YES
+PREDEFINED             = __cplusplus=202302L
+
+#---------------------------------------------------------------------------
+# Warnings (capture to a log on the vdc mount; don't flood on the //-comment
+# style — the code is intentionally documented with line comments, not
+# doxygen blocks, so undocumented-entity warnings are noise here)
+#---------------------------------------------------------------------------
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_IF_INCOMPLETE_DOC = YES
+WARN_NO_PARAMDOC       = NO
+WARN_LOGFILE           = doxygen/doxygen-warnings.log
+
+#---------------------------------------------------------------------------
+# HTML output
+#---------------------------------------------------------------------------
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_FILE_EXTENSION    = .html
+HTML_COLORSTYLE        = AUTO_LIGHT
+HTML_DYNAMIC_SECTIONS  = YES
+GENERATE_TREEVIEW      = YES
+FULL_SIDEBAR           = YES
+DISABLE_INDEX          = NO
+SEARCHENGINE           = YES
+GENERATE_LATEX         = NO
+
+#---------------------------------------------------------------------------
+# Graphviz / dot — the bells and whistles
+#
+# Callee graph = CALL_GRAPH; caller graph = CALLER_GRAPH. Rendered as
+# interactive SVG (pan/zoom, clickable nodes). The full graph family is on:
+# class, collaboration, include / included-by, directory, and template
+# hierarchies, plus the textual references the source browser cross-links.
+#---------------------------------------------------------------------------
+HAVE_DOT               = YES
+DOT_NUM_THREADS        = 4
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+DOT_PATH               =
+DOT_CLEANUP            = YES
+
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+GROUP_GRAPHS           = YES
+UML_LOOK               = NO
+TEMPLATE_RELATIONS     = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+GRAPHICAL_HIERARCHY    = YES
+DIRECTORY_GRAPH        = YES
+DIR_GRAPH_MAX_DEPTH    = 5
+
+# Headroom so the runner's wider call/caller fans render in full rather than
+# truncating to a "N more..." stub; 0 depth = follow the graph all the way out.
+DOT_GRAPH_MAX_NODES    = 200
+MAX_DOT_GRAPH_DEPTH    = 0
