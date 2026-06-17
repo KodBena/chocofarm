@@ -118,38 +118,59 @@ FeatureBuilder::FeatureBuilder(const Environment& env)
 }
 
 // --- belief-derived intermediates: a PURE function of the world-set `bw` (the §2-decomposition unit;
-// the memoizable / hoistable core). marg[i] = mean over bw of bit i; per detector cnt = #worlds in the
-// disjunction's cover, p_pos = cnt/nb, informative = (0 < cnt < nb). Same ops + order as the former
-// inline block (bit-exact, ADR-0012 P6). The O(nb·(N+nD)) sweep here is the profile bottleneck (~81% of
-// the single-thread cost at the K=16 sweetspot), so it is EXPOSED via feature_compute.hpp (its single
-// home stays here) for the isolated belief_sweep_bench + tests to drive directly. Still the functional
-// core (P9): a pure value-function, no I/O, no state.
-BeliefFeatures belief_features(const Environment& env, std::span<const uint32_t> bw,
-                               int N, int nD, double log_nworlds) {
+// the K=16 profile's ~81%). EXPOSED via feature_compute.hpp (its single home stays here) for the isolated
+// belief_sweep_bench + tests. DICHOTOMIZED by belief size: the nb==0 empty case (a trivial zero-return)
+// and the nb>=1 HOT path are separate children, so the hot path carries NO per-call empty guard and reads
+// with one belief-size invariant (inv = 1/nb, hoisted once). Bit-exact with the former monolith (P6).
+namespace {
+
+// nb==0 (the empty belief): no worlds to average/cover, so every derived quantity is 0 — the struct's
+// scalar defaults (marg_sum/sharpness/nonempty), the vectors zero-filled. The search guards the empty
+// belief upstream (run_search), so this is rarely (if ever) on the hot path; isolating it keeps the
+// nb>=1 path free of the empty check.
+[[nodiscard]] BeliefFeatures belief_features_empty(int N, int nD) {
+    BeliefFeatures bf;
+    bf.marg.assign(N, 0.0);
+    bf.p_pos.assign(nD, 0.0);
+    bf.informative.assign(nD, 0.0);
+    return bf;  // marg_sum / sharpness / nonempty default to 0.0 — exactly the former nb==0 values
+}
+
+// nb>=1 (the HOT path). marg[t] = (Σ_w bit_t)·inv; cnt[j] = #worlds in detector j's cover -> p_pos =
+// cnt/nb, informative = (0 < cnt < nb). inv = 1/nb is the ONE belief-size invariant, hoisted once. (marg
+// uses ·inv, p_pos uses /nb — each preserves its former per-element float op exactly, the P6 behavioral
+// seam; unifying both on ·inv would change p_pos by ~1 ULP and is a separate parity-gated micro-opt.)
+[[nodiscard]] BeliefFeatures belief_features_nonempty(const Environment& env, std::span<const uint32_t> bw,
+                                                      int N, int nD, double log_nworlds) {
     BeliefFeatures bf;
     bf.marg.assign(N, 0.0);
     std::vector<int64_t> cnt(nD, 0);
-    const size_t nb = bw.size();
+    const size_t nb = bw.size();   // >= 1 (the dispatcher guarantees it)
     for (uint32_t w : bw) {
         for (int t = 0; t < N; ++t) if ((w >> t) & 1u) bf.marg[t] += 1.0;
         for (int j = 0; j < nD; ++j) if (env.observe(j, w)) cnt[j] += 1;
     }
-    if (nb) {
-        double inv = 1.0 / static_cast<double>(nb);
-        for (int t = 0; t < N; ++t) bf.marg[t] *= inv;
-    }
+    const double inv = 1.0 / static_cast<double>(nb);
+    for (int t = 0; t < N; ++t) bf.marg[t] *= inv;
     for (int t = 0; t < N; ++t) bf.marg_sum += bf.marg[t];
     bf.p_pos.assign(nD, 0.0);
     bf.informative.assign(nD, 0.0);
     for (int j = 0; j < nD; ++j) {
-        if (nb) {
-            bf.p_pos[j] = static_cast<double>(cnt[j]) / static_cast<double>(nb);
-            bf.informative[j] = (cnt[j] > 0 && cnt[j] < static_cast<int64_t>(nb)) ? 1.0 : 0.0;
-        }
+        bf.p_pos[j] = static_cast<double>(cnt[j]) / static_cast<double>(nb);
+        bf.informative[j] = (cnt[j] > 0 && cnt[j] < static_cast<int64_t>(nb)) ? 1.0 : 0.0;
     }
-    bf.sharpness = nb ? (std::log(static_cast<double>(nb)) / log_nworlds) : 0.0;
-    bf.nonempty = nb ? 1.0 : 0.0;
+    bf.sharpness = std::log(static_cast<double>(nb)) / log_nworlds;
+    bf.nonempty = 1.0;
     return bf;
+}
+
+}  // namespace
+
+// The public sweep entry (feature_compute.hpp): dispatch on belief size to the empty / hot child.
+BeliefFeatures belief_features(const Environment& env, std::span<const uint32_t> bw,
+                               int N, int nD, double log_nworlds) {
+    return bw.empty() ? belief_features_empty(N, nD)
+                      : belief_features_nonempty(env, bw, N, nD, log_nworlds);
 }
 
 namespace {
