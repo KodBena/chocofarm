@@ -116,12 +116,6 @@ const bool kUniform = read_uniform();  // read once (a process-lifetime test sea
 }
 }  // namespace
 
-// ---- belief key: the (count, first, last) fingerprint (mirrors _belief_key) -----------------------
-GBeliefKey gumbel_belief_key(const std::vector<uint32_t>& bw) {
-    if (bw.empty()) return GBeliefKey{0, 0u, 0u};
-    return GBeliefKey{static_cast<int>(bw.size()), bw.front(), bw.back()};
-}
-
 namespace {
 // Reconstruct an Action from its slot (the inverse of action_to_slot). Slot 0..N-1 = ("t", i);
 // N..N+nD-1 = ("d", j); N+nD = TERMINATE.
@@ -529,6 +523,11 @@ std::vector<double> GumbelAZPolicy::improved_policy(const GumbelNode& root,
 GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const std::vector<uint32_t>& bw,
                                                     const std::set<int>& collected, double lam,
                                                     GumbelSource& src) const {
+    // Scope the FeatureBuilder belief memo to ONE decision/tree: the node cache already folds same-node
+    // rebuilds, so the memo's increment is same-belief-different-slot reuse WITHIN the tree; beliefs
+    // narrow across decisions (low cross-decision reuse), and this keeps the long-lived serve-path builder
+    // from accumulating a process-lifetime cache. Correctness-safe (a hit is bit-identical), always sound.
+    fb_.reset_belief_cache();
     Decision out;
     // empty-belief guard (mirrors decide_with_target's len(bw)==0): the only continuation is to exit.
     if (bw.empty()) {

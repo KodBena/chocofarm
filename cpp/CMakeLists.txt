@@ -180,6 +180,14 @@ add_executable(chocofarm-serial-runtime-check src/serial_runtime_check.cpp)
 target_link_libraries(chocofarm-serial-runtime-check PRIVATE chocofarm_core)
 target_compile_options(chocofarm-serial-runtime-check PRIVATE -Wall -Wextra)
 
+# The FeatureBuilder belief-memo collision-guard check (NOT the runner): forces a (count,first,last)
+# fingerprint COLLISION between two distinct beliefs and asserts the memo's full-equality guard serves
+# each its OWN features + that a cache hit is bit-identical to a recompute (ADR-0011: net the guard,
+# don't trust it). No redis, no net — pure FeatureBuilder. Separate from the runner (P3, one-owner).
+add_executable(chocofarm-belief-cache-check src/belief_cache_check.cpp)
+target_link_libraries(chocofarm-belief-cache-check PRIVATE chocofarm_core)
+target_compile_options(chocofarm-belief-cache-check PRIVATE -Wall -Wextra)
+
 # The SearchRuntime throughput benchmark (NOT the runner): SerialRuntime vs PoolRuntime over a batch of
 # independent Gumbel-AZ decisions against a local deterministic net, asserting bit-identical per-task
 # results then reporting decisions/s + the parallel speedup (the C++-native-MLP / local-parallel config).

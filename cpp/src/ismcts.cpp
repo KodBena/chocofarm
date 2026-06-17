@@ -30,12 +30,6 @@
 
 namespace chocofarm {
 
-// ---- belief_key: the (count, first, last) information-set fingerprint (mirrors _belief_key) -------
-BeliefKey belief_key(const std::vector<uint32_t>& bw) {
-    if (bw.empty()) return BeliefKey{0, 0u, 0u};
-    return BeliefKey{static_cast<int>(bw.size()), bw.front(), bw.back()};
-}
-
 namespace {
 // The fixed slot for an action (the action<->slot bijection, mirrors action_to_slot). ISMCTS keys
 // its per-action maps by slot — a faithful stand-in for the Python Action-tuple keys (the mapping is

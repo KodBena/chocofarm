@@ -84,6 +84,7 @@ BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-search-runtime-bench")
 WIRE_BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-wire-bench")
 WIRE_BENCH = os.path.join(REPO, "cpp", "parity", "wire_bench.py")
 FIBER_PROTO_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-fiber-proto")
+BELIEF_CACHE_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-belief-cache-check")
 DATA_INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
 DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
@@ -94,6 +95,21 @@ DATA_FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 #   cmake --build cpp/build && CHOCO_RUN_CPP=1 PYTHONPATH=. python -m pytest tests/test_cpp_runner.py
 _RUN_CPP = bool(os.environ.get("CHOCO_RUN_CPP"))
 _CPP_SKIP = "opt-in cpp parity: set CHOCO_RUN_CPP=1 and build the binary fresh (cmake --build cpp/build)"
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(BELIEF_CACHE_BIN)), reason=_CPP_SKIP)
+def test_cpp_belief_cache_collision_guard():
+    """The FeatureBuilder belief-memo keys by the (count, first, last) belief fingerprint, which is
+    collision-RESISTANT, not collision-free; correctness rests on the full bw-equality guard walking a
+    fingerprint bucket. chocofarm-belief-cache-check FORCES a collision (two distinct beliefs sharing a
+    fingerprint) and asserts each gets its OWN features + that a cache hit is bit-identical to a recompute
+    (ADR-0011: net the guard, don't trust it). Runs from REPO so FeatureBuilder finds feature_layout.json."""
+    out = subprocess.run([BELIEF_CACHE_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
+                         cwd=REPO, capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": REPO})
+    sys.stdout.write(out.stdout)
+    sys.stderr.write(out.stderr)
+    assert out.returncode == 0 and "RESULT: PASS" in out.stdout
 
 
 # ---------------------------------------------------------------------------

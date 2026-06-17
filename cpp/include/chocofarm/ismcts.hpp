@@ -41,6 +41,7 @@
 #include <tuple>
 #include <vector>
 
+#include "chocofarm/belief_key.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/policy.hpp"
 
@@ -56,12 +57,10 @@ struct ISMCTSConfig {
     int max_depth = 24;     // recursion depth cap (a depth≥max_depth leaf is the bare −λ·exit_cost)
 };
 
-// The information-set node identity: a (count, first, last) fingerprint over the belief world-set
-// (mirrors ismcts.py's _belief_key). Beliefs reached by the same observations are the same set of
-// worlds regardless of path; this triple is a collision-resistant fingerprint for the modest number
-// of distinct beliefs one search reaches. This fingerprint is ISMCTS-specific — kept local.
-using BeliefKey = std::tuple<int, uint32_t, uint32_t>;
-[[nodiscard]] BeliefKey belief_key(const std::vector<uint32_t>& bw);
+// The information-set node identity: the (count, first, last) belief fingerprint — now the ONE shared
+// authority in belief_key.hpp (ADR-0012 P1), reused by the Gumbel node cache and the FeatureBuilder
+// memo. ISMCTS, Gumbel, and the featurizer each authored this triple before; they now derive from one
+// home. BeliefKey + belief_key(bw) come from chocofarm/belief_key.hpp, included above.
 
 // ISMCTS's RNG-source extension of the shared WorldSource. The generic `sample_world` draw lives in
 // the base; ISMCTS adds (a) `expand_index(n)` — the uniform draw selecting which untried action to

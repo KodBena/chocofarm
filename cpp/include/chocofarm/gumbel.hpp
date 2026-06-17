@@ -59,6 +59,7 @@
 #include <tuple>
 #include <vector>
 
+#include "chocofarm/belief_key.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/net_evaluator.hpp"
@@ -85,8 +86,8 @@ struct GumbelConfig {
 // this unit does not include ismcts.hpp). Beliefs reached by the same observations are the same set of
 // worlds regardless of path; this triple fingerprints the modest number of distinct beliefs one search
 // reaches.
-using GBeliefKey = std::tuple<int, uint32_t, uint32_t>;
-[[nodiscard]] GBeliefKey gumbel_belief_key(const std::vector<uint32_t>& bw);
+using GBeliefKey = BeliefKey;  // the ONE fingerprint (belief_key.hpp), now shared with FeatureBuilder's memo
+[[nodiscard]] inline GBeliefKey gumbel_belief_key(const std::vector<uint32_t>& bw) { return belief_key(bw); }
 
 // One information-set node (a belief). Per-action aggregate W (summed λ-penalized return) / N
 // (selection count) over the info set (the ISMCTS/F7 contract), children keyed by (action-slot,

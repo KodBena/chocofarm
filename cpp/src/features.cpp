@@ -122,15 +122,6 @@ namespace {
 // the memoizable / hoistable core). marg[i] = mean over bw of bit i; per detector cnt = #worlds in the
 // disjunction's cover, p_pos = cnt/nb, informative = (0 < cnt < nb). Same ops + order as the former
 // inline block (bit-exact, ADR-0012 P6). The O(nb·(N+nD)) sweep here is the profile bottleneck.
-struct BeliefFeatures {
-    std::vector<double> marg;         // N  — per-treasure marginal P(present)
-    std::vector<double> p_pos;        // nD — detector positive-cover probability
-    std::vector<double> informative;  // nD — detector splits the belief (0/1)
-    double marg_sum = 0.0;            // Σ marg[t]  (order-fixed — a P6 watch item; do not reorder)
-    double sharpness = 0.0;           // log|bw| / log Nworlds
-    double nonempty = 0.0;            // nb ? 1.0 : 0.0
-};
-
 [[nodiscard]] BeliefFeatures belief_features(const Environment& env, std::span<const uint32_t> bw,
                                              int N, int nD, double log_nworlds) {
     BeliefFeatures bf;
@@ -162,13 +153,6 @@ struct BeliefFeatures {
 // --- per-loc static distance block: geometry is FULLY separable (one outgoing edge in the DAG). Each
 // distance normalized by the bbox diagonal. `hypot` chains TODAY (a precomputed lookup is the deferred
 // §5 move). Same ops + order as the former inline block.
-struct GeometryFeatures {
-    std::vector<double> dist_t;  // N
-    std::vector<double> dist_d;  // nD
-    std::vector<double> dist_w;  // n_tel
-    double exit_norm = 0.0;
-};
-
 [[nodiscard]] GeometryFeatures geometry_features(const Environment& env, const Point& loc,
                                                  int N, int nD, int n_tel, double diag) {
     GeometryFeatures gf;
@@ -207,8 +191,8 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const std::vector<ui
 
     // Three input groups that do not interact until assembly (the dossier's DAG): belief math (the
     // O(nb·(N+nD)) bottleneck), separable geometry, the collected indicator. Each is a pure unit.
-    const BeliefFeatures bf = belief_features(env_, std::span<const uint32_t>(bw), N, nD, log_nworlds_);
-    const GeometryFeatures gf = geometry_features(env_, loc, N, nD, n_tel, diag_);
+    const BeliefFeatures& bf = belief_feats_(bw);          // memoized by belief VALUE (P6 bit-identical hit)
+    const GeometryFeatures& gf = geometry_feats_(loc);     // memoized by loc
     const CollectedFeatures cf = collected_features(collected, N);
 
     // --- assemble by NAMED block: the layout SSOT (audit R6 / ADR-0012 P7) owns the order + offsets,
@@ -245,6 +229,10 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const std::vector<ui
 }
 
 std::vector<float> FeatureBuilder::legal_mask_from_features(std::span<const float> feat) const {
+    // `feat` MUST be this builder's build() output (length dim()). The bare span cannot carry that
+    // contract, so assert it (fail-loud, ADR-0002) — a mis-laid buffer is a programmer bug, not a
+    // recoverable boundary.
+    assert(feat.size() == static_cast<size_t>(dim_) && "legal_mask_from_features: feat is not a build() vector");
     // Slice the §2.2 blocks that ARE the mask (design §3): the per-treasure `available` block is the
     // legal-collect mask, the per-detector `informative` block is the legal-sense mask, TERMINATE is
     // always legal. No belief recompute — these blocks were just written by build() from the ONE marg
@@ -258,6 +246,36 @@ std::vector<float> FeatureBuilder::legal_mask_from_features(std::span<const floa
         m[static_cast<size_t>(N_ + j)] = (feat[static_cast<size_t>(info + j)] > 0.0f) ? 1.0f : 0.0f;
     m[static_cast<size_t>(N_ + nD_)] = 1.0f;  // TERMINATE always legal (term_slot = N+nD)
     return m;
+}
+
+void FeatureBuilder::reset_belief_cache() const {
+    belief_cache_.clear();
+    belief_cache_n_ = 0;
+    // the per-loc memo is NOT cleared — it is bounded by the env's fixed coordinate set (mirrors Python:
+    // reset_belief_cache clears _belief_cache only; _loc_cache persists).
+}
+
+// ---- the memo wrappers: a hit returns the STORED value (bit-identical to a recompute, P6); a miss
+// computes via the private pure function above, stores, returns the cached ref. ----
+const BeliefFeatures& FeatureBuilder::belief_feats_(const std::vector<uint32_t>& bw) const {
+    const BeliefKey key = belief_key(bw);   // the SAME fingerprint gumbel's node cache uses (P1)
+    if (auto it = belief_cache_.find(key); it != belief_cache_.end())
+        for (const auto& entry : it->second)
+            if (std::ranges::equal(entry.first, bw)) return entry.second;  // hit — full-equality verified
+    // miss: the cap is a memory backstop (mirrors _belief_cache_cap); compute, store an OWNED copy of bw
+    // (a stored span would dangle), return the cached ref.
+    if (belief_cache_n_ >= kBeliefCacheCap) { belief_cache_.clear(); belief_cache_n_ = 0; }
+    BeliefFeatures feats = belief_features(env_, std::span<const uint32_t>(bw), N_, nD_, log_nworlds_);
+    auto& bucket = belief_cache_[key];
+    bucket.emplace_back(bw, std::move(feats));
+    ++belief_cache_n_;
+    return bucket.back().second;
+}
+
+const GeometryFeatures& FeatureBuilder::geometry_feats_(const Point& loc) const {
+    if (auto it = loc_cache_.find(loc); it != loc_cache_.end()) return it->second;  // hit
+    GeometryFeatures feats = geometry_features(env_, loc, N_, nD_, n_tel_, diag_);
+    return loc_cache_.emplace(loc, std::move(feats)).first->second;
 }
 
 }  // namespace chocofarm
