@@ -14,13 +14,11 @@ seam (`model/`, `solvers/`), an AlphaZero/Gumbel stack (`az/`), a provable
 dual bound (`bounds/`), eval (`eval/`), an hp registry (`hp/`), analysis
 (`analysis/`), and an extensive `docs/` corpus.
 
-For orientation, read `docs/STATUS.md` and the latest handoff
-(`docs/handoff-2026-06-16-zmq-async-gumbel.md`, which supersedes the
-repository-condition section of the prior
-`docs/handoff-2026-06-15-architecture-refactor.md`). For architectural decisions, the canonical
+For orientation, read `docs/STATUS.md`. For architectural decisions, the canonical
 reference is `docs/adr/`; the condensed reference is `docs/adr-synopsis.md`.
 **Read the synopsis before substantive work**; consult specific ADRs when the
-synopsis points to one.
+synopsis points to one. (There is no standing handoff document: the live state of
+the work lives in the git log and the branch, not in immutable prose.)
 
 ## Authoritative documents
 
@@ -51,13 +49,11 @@ consume documentation partially.
 
 Concretely:
 
-- Orientation documents — `docs/STATUS.md`, the current handoff,
-  `docs/adr-synopsis.md`, every ADR cited, this CLAUDE.md, every consult or
-  design note relied on — are read end to end before any claim about them is
-  made. The same applies to any further document those orientation documents
-  point at, when that document is the one being relied on. (The handoff itself
-  states this: "to cite a document one has merely skimmed constitutes a silent
-  failure of duty.")
+- Orientation documents — `docs/STATUS.md`, `docs/adr-synopsis.md`, every ADR
+  cited, this CLAUDE.md, every consult or design note relied on — are read end
+  to end before any claim about them is made. The same applies to any further document those orientation documents
+  point at, when that document is the one being relied on. (As the maxim goes:
+  to cite a document one has merely skimmed constitutes a silent failure of duty.)
 - A `grep` hit, a search-tool preview, or any partial render is a pointer to
   read the file, not a substitute for reading it. Acting on a fragment is the
   silent failure this section names.
@@ -79,9 +75,9 @@ either way, do not bluff.
 Implementation is incomplete until the documentation reflects it. Before
 declaring a task done, audit:
 
-- Does `docs/STATUS.md` or the current handoff describe an orientation surface
-  this change affects, and is it still accurate? **Status documents record
-  slowly-aging decisions and rationale, not a live task queue** (ADR-0005
+- Does `docs/STATUS.md` describe an orientation surface this change affects, and
+  is it still accurate? **Status documents record slowly-aging decisions and
+  rationale, not a live task queue** (ADR-0005
   Rule 6 — the 24-seconds-stale handoff is the cautionary instance: a
   "pending" item narrated in immutable prose that was done before the prose
   was read). The live queue belongs in the commit log and the branch state,
@@ -147,7 +143,8 @@ an audit recommendation without it being in scope.
 ## Operational facts (orientation)
 
 These orient a contributor running the code; they are stable enough to record
-here, but the handoff is the live source for the current run state.
+here, but the git log and the branch state are the live source for the current
+run state.
 
 - **Python interpreter:** `/home/bork/w/vdc/venvs/generic/bin/python` (JAX,
   optax, numba) — the shared scratch environment the scripts run from. Tests:
