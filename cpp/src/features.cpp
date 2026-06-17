@@ -123,6 +123,21 @@ FeatureBuilder::FeatureBuilder(const Environment& env)
                   << layout_.block_count() << " blocks; writer expects " << kWritten.size() << ")\n";
         std::abort();
     }
+
+    // Resolve the block start offsets ONCE (the key-set is now verified present): build() and
+    // legal_mask_from_features read these instead of a per-block hash lookup (FeatureLayoutSpec::start,
+    // 2.3% in the K=32 profile). Bit-identical — the same offsets start() returns. Designated init in
+    // declaration order so the compiler nets each field against its key.
+    off_ = BlockOffsets{
+        .marg = layout_.start("marg"),               .collected = layout_.start("collected"),
+        .available = layout_.start("available"),     .dist_t = layout_.start("dist_t"),
+        .unc = layout_.start("unc"),                 .informative = layout_.start("informative"),
+        .p_pos = layout_.start("p_pos"),             .dist_d = layout_.start("dist_d"),
+        .sharpness = layout_.start("sharpness"),     .n_collected = layout_.start("n_collected"),
+        .marg_sum = layout_.start("marg_sum"),       .exit_norm = layout_.start("exit_norm"),
+        .nonempty = layout_.start("nonempty"),       .sum_unc = layout_.start("sum_unc"),
+        .dist_w = layout_.start("dist_w"),
+    };
 }
 
 // --- belief-derived intermediates: a PURE, env-FREE function of the world-set `bw` + the per-detector
@@ -250,36 +265,37 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const std::vector<ui
     const GeometryFeatures& gf = geometry_feats_(loc);     // memoized by loc
     const CollectedFeatures cf = collected_features(collected, N);
 
-    // --- assemble by NAMED block: the layout SSOT (audit R6 / ADR-0012 P7) owns the order + offsets,
-    // so there is no positional `o += N` ladder re-encoding it here. `available` and `sum_unc` are the
-    // only belief×collected couplings, computed in this step. Slots are independent, so the WRITE order
-    // is irrelevant; the float-op order (the sum_unc accumulation, the per-i unc/available) is UNCHANGED
-    // from the former ladder — bit-exact (P6). The per-build layout-mismatch assert is GONE: the ctor's
-    // load (Σwidth==dim==env-derived dim, no dup/neg widths ⇒ a contiguous partition) + its key-set
-    // check make the desync that assert guarded structurally unauthorable (dossier §3 — mechanize > assert).
+    // --- assemble by NAMED block: the layout SSOT (audit R6 / ADR-0012 P7) owns the order + offsets; the
+    // ctor resolved them once into off_ (no positional `o += N` ladder re-encoding the layout here, and no
+    // per-build string_view->offset hash lookup). `available` and `sum_unc` are the only belief×collected
+    // couplings, computed in this step. Slots are independent, so the WRITE order is irrelevant; the
+    // float-op order (the sum_unc accumulation, the per-i unc/available) is UNCHANGED from the former
+    // ladder — bit-exact (P6). The per-build layout-mismatch assert is GONE: the ctor's load (Σwidth==dim
+    // ==env-derived dim, no dup/neg widths ⇒ a contiguous partition) + its key-set check make the desync
+    // that assert guarded structurally unauthorable (dossier §3 — mechanize > assert).
     std::vector<double> out(dim_, 0.0);
-    { const int s = layout_.start("marg");        for (int i = 0; i < N; ++i) out[s + i] = bf.marg[i]; }
-    { const int s = layout_.start("collected");   for (int i = 0; i < N; ++i) out[s + i] = cf.coll[i]; }
-    { const int s = layout_.start("available");   for (int i = 0; i < N; ++i)
+    { const int s = off_.marg;        for (int i = 0; i < N; ++i) out[s + i] = bf.marg[i]; }
+    { const int s = off_.collected;   for (int i = 0; i < N; ++i) out[s + i] = cf.coll[i]; }
+    { const int s = off_.available;   for (int i = 0; i < N; ++i)
           out[s + i] = ((bf.marg[i] > 0.0) && (cf.coll[i] == 0.0)) ? 1.0 : 0.0; }
-    { const int s = layout_.start("dist_t");      for (int i = 0; i < N; ++i) out[s + i] = gf.dist_t[i]; }
+    { const int s = off_.dist_t;      for (int i = 0; i < N; ++i) out[s + i] = gf.dist_t[i]; }
     double sum_unc = 0.0;
-    { const int s = layout_.start("unc");
+    { const int s = off_.unc;
       for (int i = 0; i < N; ++i) {
           double u = bf.marg[i] * (1.0 - bf.marg[i]);                     // unc
           out[s + i] = u;
           if (cf.coll[i] == 0.0) sum_unc += u;       // Σ over UNCOLLECTED treasures (order preserved)
       } }
-    { const int s = layout_.start("informative"); for (int j = 0; j < nD; ++j) out[s + j] = bf.informative[j]; }
-    { const int s = layout_.start("p_pos");       for (int j = 0; j < nD; ++j) out[s + j] = bf.p_pos[j]; }
-    { const int s = layout_.start("dist_d");      for (int j = 0; j < nD; ++j) out[s + j] = gf.dist_d[j]; }
-    out[layout_.start("sharpness")]   = bf.sharpness;                     // log|bw|/log Nworlds
-    out[layout_.start("n_collected")] = cf.n_collected / static_cast<double>(env_.K());  // n_collected/K
-    out[layout_.start("marg_sum")]    = bf.marg_sum / static_cast<double>(env_.K());     // Σmarg/K
-    out[layout_.start("exit_norm")]   = gf.exit_norm;                     // exit geometry
-    out[layout_.start("nonempty")]    = bf.nonempty;                      // non-empty belief flag
-    out[layout_.start("sum_unc")]     = sum_unc;                          // Σ_uncollected unc
-    { const int s = layout_.start("dist_w");      for (int k = 0; k < n_tel; ++k) out[s + k] = gf.dist_w[k]; }
+    { const int s = off_.informative; for (int j = 0; j < nD; ++j) out[s + j] = bf.informative[j]; }
+    { const int s = off_.p_pos;       for (int j = 0; j < nD; ++j) out[s + j] = bf.p_pos[j]; }
+    { const int s = off_.dist_d;      for (int j = 0; j < nD; ++j) out[s + j] = gf.dist_d[j]; }
+    out[off_.sharpness]   = bf.sharpness;                                 // log|bw|/log Nworlds
+    out[off_.n_collected] = cf.n_collected / static_cast<double>(env_.K());  // n_collected/K
+    out[off_.marg_sum]    = bf.marg_sum / static_cast<double>(env_.K());     // Σmarg/K
+    out[off_.exit_norm]   = gf.exit_norm;                                 // exit geometry
+    out[off_.nonempty]    = bf.nonempty;                                  // non-empty belief flag
+    out[off_.sum_unc]     = sum_unc;                                      // Σ_uncollected unc
+    { const int s = off_.dist_w;      for (int k = 0; k < n_tel; ++k) out[s + k] = gf.dist_w[k]; }
     return out;
 }
 
@@ -293,8 +309,8 @@ std::vector<float> FeatureBuilder::legal_mask_from_features(std::span<const floa
     // always legal. No belief recompute — these blocks were just written by build() from the ONE marg
     // sweep (ADR-0012 P1). Offsets via the layout SSOT (named, not magic literals).
     std::vector<float> m(static_cast<size_t>(N_ + nD_ + 1), 0.0f);
-    const int avail = layout_.start("available");
-    const int info = layout_.start("informative");
+    const int avail = off_.available;
+    const int info = off_.informative;
     for (int i = 0; i < N_; ++i)
         m[static_cast<size_t>(i)] = (feat[static_cast<size_t>(avail + i)] > 0.0f) ? 1.0f : 0.0f;
     for (int j = 0; j < nD_; ++j)

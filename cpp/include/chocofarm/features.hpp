@@ -136,6 +136,18 @@ class FeatureBuilder {
     double log_nworlds_;   // log(|worlds|)
     FeatureLayoutSpec layout_;  // the §2.2 block table, runtime-read from the Python-emitted SSOT
 
+    // The §2.2 block start offsets, resolved ONCE from layout_ in the ctor (derived data, like dim_ /
+    // diag_): build() and legal_mask_from_features read these ints directly instead of re-doing a
+    // string_view -> offset hash lookup (with a std::string construction) per named block per call —
+    // FeatureLayoutSpec::start was 2.3% self-time in the K=32 profile. The layout SSOT still OWNS the
+    // offsets (ADR-0012 P1); this caches the resolved values, bit-identical to the lookups. Fields are
+    // the written-key set, in declaration order.
+    struct BlockOffsets {
+        int marg, collected, available, dist_t, unc, informative, p_pos, dist_d,
+            sharpness, n_collected, marg_sum, exit_norm, nonempty, sum_unc, dist_w;
+    };
+    BlockOffsets off_{};
+
     // ---- behaviour-preserving memos (derived data; a hit is bit-identical to a recompute, P6). `mutable`
     // so build() stays `const` (logical-const: the observable value-for-input is invariant). SINGLE-
     // THREAD-OWNED: every consumer holds its OWN FeatureBuilder (a fresh one per task in the runtimes; the
