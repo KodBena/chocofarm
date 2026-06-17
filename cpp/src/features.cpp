@@ -260,11 +260,14 @@ BeliefFeatures belief_features(const Environment& env, const Belief& bw) {
                        ? belief_features_empty(N, nD)
                        : belief_features_nonempty(std::span<const uint32_t>(a.worlds), env.face_masks(),
                                                   N, nD, log_nworlds);
-        } else {
+        } else if constexpr (std::is_same_v<T, BitsetBelief>) {
             return a.count_ == 0
                        ? belief_features_empty(N, nD)
                        : belief_features_bitset(env, a, N, nD, log_nworlds);
         }
+        // ZDD arm (opt-in): the whole BeliefFeatures off the maintained diagram (all_marginals +
+        // all_detector_counts + the IDENTICAL Phase-2 * inv) — byte-identical to the flat/bitset arms.
+        CHOCO_ZDD_ELSE(return zdd::belief_features(env, a);)
     }, bw);
 }
 

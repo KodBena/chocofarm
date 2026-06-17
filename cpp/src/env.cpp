@@ -111,6 +111,16 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
     const bool fits_inline = kW64_ <= kBitsetMaxWords;
     use_bitset_ = worlds_enumerable && (mask_bytes <= kTargetMaskCacheBudgetBytes) && fits_inline;
 
+#ifdef CHOCO_BELIEF_ZDD
+    // The §B.4(b) gate (OPT-IN build only): SELECT the maintained ZDD arm over bitset/flat whenever the
+    // worlds are enumerable (the diagram builds from worlds()). This is the WHOLE selection surface — the
+    // search's full_belief() then returns a ZddBelief and every seam op routes to the ZDD bodies. The
+    // default build never compiles this (use_zdd_ does not exist there), so the gate is byte-for-byte the
+    // current bitset/flat decision OFF. The bitset masks are still built below (use_bitset_ unchanged) so
+    // the flat-vs-ZDD A/B can build a bitset arm for the same belief; full_belief prefers ZDD when on.
+    use_zdd_ = worlds_enumerable;
+#endif
+
     if (use_bitset_) {
         // treasure_mask_[t] = worlds (by rank) with bit t set; detector_mask_[j] = worlds where
         // (w & face_masks()[j]) != 0 — the SAME enumeration + face masks the env owns, so the masks
@@ -133,6 +143,13 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
 // ---- belief construction + introspection (the seam ops; COARSE visit per op, §3) ----
 
 Belief Environment::full_belief() const {
+#ifdef CHOCO_BELIEF_ZDD
+    // The §B.4(b) gate selected the ZDD arm: build the diagram over EVERY world (the C(N,K) prior). The
+    // search then maintains it through filtering as a ZDD restrict op (no rebuild). Checked FIRST so the
+    // ON build runs the head-to-head ZDD profile; the bitset/flat arms below are untouched (the A/B still
+    // builds them directly for the same belief).
+    if (use_zdd_) return zdd::full_belief(*this);
+#endif
     if (use_bitset_) {
         // all-ones over the nb worlds: the first kw64_ words = ~0, the last (partial) word masked to the live
         // bit-tail so trailing bits past |worlds| stay 0 (a popcount over them must NOT count phantom worlds).
@@ -155,7 +172,8 @@ uint32_t Environment::world_at_rank(const Belief& b, int r) const {
     return std::visit([&](const auto& a) -> uint32_t {
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, FlatBelief>) return a.worlds[static_cast<size_t>(r)];
-        else return worlds_[static_cast<size_t>(rank_or_abort(a.live(), r))];  // r-th set bit -> world
+        else if constexpr (std::is_same_v<T, BitsetBelief>) return worlds_[static_cast<size_t>(rank_or_abort(a.live(), r))];  // r-th set bit -> world
+        CHOCO_ZDD_ELSE(return zdd::world_at_rank(a, r);)  // ZDD arm: r-th member in CANONICAL order (the re-baseline)
     }, b);
 }
 
@@ -177,9 +195,13 @@ BeliefKey Environment::belief_key(const Belief& b) const {
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, FlatBelief>)
             return BeliefKey{n, a.worlds.front(), a.worlds.back()};
-        else
+        else if constexpr (std::is_same_v<T, BitsetBelief>)
             return BeliefKey{n, worlds_[static_cast<size_t>(rank_or_abort(a.live(), 0))],
                                 worlds_[static_cast<size_t>(rank_or_abort(a.live(), n - 1))]};
+        // ZDD arm: (count, first, last) in the ZDD's CANONICAL member order — a valid, deterministic
+        // fingerprint (the cache verifies hits by full ZddBelief::operator== regardless), but NOT the flat
+        // rank-order triple (the re-baseline: the same belief fingerprints differently under the ZDD arm).
+        CHOCO_ZDD_ELSE(return BeliefKey{n, zdd::world_at_rank(a, 0), zdd::world_at_rank(a, n - 1)};)
     }, b);
 }
 
@@ -211,13 +233,14 @@ std::vector<double> Environment::marginals(const Belief& bw) const {
             const double inv = 1.0 / static_cast<double>(a.worlds.size());
             for (double& v : m) v *= inv;  // mean over the world-set (mirrors env.marginals)
             return m;
-        } else {
+        } else if constexpr (std::is_same_v<T, BitsetBelief>) {
             if (a.count_ == 0) return m;
             const double inv = 1.0 / static_cast<double>(a.count_);
             for (int t = 0; t < inst_.N; ++t)
                 m[static_cast<size_t>(t)] = static_cast<double>(popcount_and(a.live(), treasure_mask(t))) * inv;
             return m;
         }
+        CHOCO_ZDD_ELSE(return zdd::marginals(*this, a);)  // ZDD arm: all_marginals * inv — byte-identical
     }, bw);
 }
 
@@ -235,10 +258,11 @@ bool Environment::informative(int face_id, const Belief& bw) const {
                 if (any_hit && any_miss) return true;  // both polarities live
             }
             return false;  // mirrors SenseAction.informative: hit.any() and (~hit).any()
-        } else {
+        } else if constexpr (std::is_same_v<T, BitsetBelief>) {
             const int cnt = popcount_and(a.live(), detector_mask(face_id));
             return cnt > 0 && cnt < a.count_;
         }
+        CHOCO_ZDD_ELSE(return zdd::informative(*this, face_id, a);)  // ZDD arm: 0 < det_cnt < nb — byte-identical
     }, bw);
 }
 
@@ -284,7 +308,8 @@ void Environment::filter_treasure(Belief& bw, int i, bool present) const {
     std::visit([&](auto& a) {
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, FlatBelief>) filter_inplace(a.worlds, uint32_t{1} << i, present);
-        else filter_bits(a, treasure_mask(i), present);
+        else if constexpr (std::is_same_v<T, BitsetBelief>) filter_bits(a, treasure_mask(i), present);
+        CHOCO_ZDD_ELSE(zdd::filter_treasure(a, i, present);)  // ZDD arm: restrict_var in place (no rebuild)
     }, bw);
 }
 
@@ -294,7 +319,8 @@ void Environment::filter_detector(Belief& bw, int i, bool positive) const {
     std::visit([&](auto& a) {
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, FlatBelief>) filter_inplace(a.worlds, inst_.faces[static_cast<size_t>(i)].bitmask, positive);
-        else filter_bits(a, detector_mask(i), positive);
+        else if constexpr (std::is_same_v<T, BitsetBelief>) filter_bits(a, detector_mask(i), positive);
+        CHOCO_ZDD_ELSE(zdd::filter_detector(*this, a, i, positive);)  // ZDD arm: restrict_cover in place
     }, bw);
 }
 

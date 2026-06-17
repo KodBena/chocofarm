@@ -25,6 +25,14 @@
 #include "chocofarm/belief_key.hpp"
 #include "chocofarm/instance.hpp"
 
+// The OPT-IN ZDD belief engine — included at GLOBAL scope (NOT inside namespace chocofarm: a standard-
+// header include inside a namespace mis-nests std as chocofarm::std). Present only under the flag; the
+// ZddBelief value type + the zdd:: op declarations live in this header (env.hpp) alongside the variant,
+// under the same #ifdef — the whole ZDD-arm flag surface is here + env.cpp + features.cpp's one visit.
+#ifdef CHOCO_BELIEF_ZDD
+#include "chocofarm/belief_zdd_engine.hpp"
+#endif
+
 namespace chocofarm {
 
 // The belief value type — the world-set the search reasons over (ADR-0012 P2: the belief seam). STEP 1
@@ -105,7 +113,69 @@ struct BitsetBelief {
     }
 };
 
+#ifdef CHOCO_BELIEF_ZDD
+// The OPT-IN belief-as-diagram (ZDD) arm — the §B.4(b) graduation (belief_features_and_decision_diagram
+// _note.md Part B; docs/design/cpp-belief-zdd-onramp.md). A thin value wrapper over the maintained
+// BeliefDiagram (the engine owns the per-belief arena; this is the seam's opaque value — copyable,
+// value-semantics, == by the diagram's member SET). The diagram is maintained THROUGH the search:
+// filter_treasure/detector are RESTRICT ops on `z` in place, not a rebuild. cached_count_ mirrors
+// z.count() so nb() is O(1) (the same O(1)-nb obligation the bitset arm's count_ serves); it is
+// recomputed in EVERY filter. The EQUIVALENCE ASYMMETRY (design §4 of the B.4(b) task): the ZDD arm is
+// BIT-EXACT on filters/counts/features (restrict gives members set-equal to the flat filter;
+// all_marginals/all_detector_counts + the IDENTICAL Phase-2 * inv give byte-identical features), BUT the
+// sampling/fingerprint trio (sample_world / world_at_rank / belief_key) RE-BASELINES — the ZDD's
+// canonical member order != worlds()-rank order, so the r-th ZDD member != the flat bw[r] (an O(nb) rank
+// map would defeat |Z|≪nb). The scripted gumbel/ismcts parity diverges on the ZDD arm (a different world
+// index), the JAX-reorder behavioral bucket — EXPECTED, not a bug.
+struct ZddBelief {
+    beliefzdd::BeliefDiagram z;
+    int64_t cached_count_ = 0;  // = z.count(); the O(1) nb; recomputed after each filter
+    // Value-equality by the MEMBER SET (not the arena's node ids — two diagrams reduced from the same
+    // world-set are canonical-equal in member set even if their arenas differ by dead nodes). The belief
+    // cache's full-equality verify (the belief_key fingerprint pre-filter, then this net).
+    bool operator==(const ZddBelief& o) const { return z.members() == o.z.members(); }
+};
+
+// The Belief variant — THREE arms under the flag (flat + bitset + ZDD), TWO in the default build.
+using Belief = std::variant<FlatBelief, BitsetBelief, ZddBelief>;
+
+// The per-op ZDD `else` arm injector — the WHOLE visit-side flag surface is this one macro (+ the variant
+// alias above). A seam-op std::visit reads:
+//     if constexpr (FlatBelief) {..} else if constexpr (BitsetBelief) {..} CHOCO_ZDD_ELSE(return zdd::OP;)
+// ON  -> `else { return zdd::OP; }` (the third arm). OFF (the #else) -> empty (the variant has only two
+// alternatives, so std::visit instantiates only flat+bitset and the macro vanishes — the default build's
+// visit is byte-for-byte the current one). Defined in BOTH branches so env.cpp/features.cpp always have it.
+#define CHOCO_ZDD_ELSE(...) else { __VA_ARGS__ }
+#else
+// The DEFAULT build: the live flat + bitset arms ONLY, byte-for-byte unchanged.
 using Belief = std::variant<FlatBelief, BitsetBelief>;
+#define CHOCO_ZDD_ELSE(...)  // the third arm vanishes in the default build (no ZddBelief alternative)
+#endif
+
+#ifdef CHOCO_BELIEF_ZDD
+// The ZDD-arm seam-op bodies (the §B.4(b) arm) — free functions the env-op visits' CHOCO_ZDD_ELSE branch
+// calls, DEFINED in env_zdd.cpp (which has the full Environment + features.hpp). Declared HERE (after the
+// variant + the ZddBelief value type, before the inline nb() and the Environment class that use them) so
+// the call sites see the declarations. Environment / BeliefFeatures are forward-declared — the op
+// DECLARATIONS need only that (env_zdd.cpp has the full types). Each op MIRRORS its flat/bitset twin
+// BYTE-IDENTICALLY on counts/marginals/det-counts/features and gives members set-equal to the flat filter;
+// only world_at_rank (the sampling unrank) re-baselines (the canonical-order note on ZddBelief). NB: no
+// zdd::legal_actions / zdd::sample_world — Environment::legal_actions composes marginals()+informative()
+// and Environment::sample_world composes nb()+world_at_rank(), both already visit-dispatching to the ZDD
+// arm (one home, P1) — only the leaf ops need a ZDD body.
+class Environment;       // full class body below (the op declarations need only the forward decl)
+struct BeliefFeatures;   // full definition in features.hpp (env_zdd.cpp / the A/B include it)
+namespace zdd {
+[[nodiscard]] ZddBelief full_belief(const Environment& env);                       // Z over every world (C(N,K))
+[[nodiscard]] inline int nb(const ZddBelief& b) { return static_cast<int>(b.cached_count_); }  // O(1)
+void filter_treasure(ZddBelief& b, int i, bool present);                           // restrict_var in place
+void filter_detector(const Environment& env, ZddBelief& b, int i, bool positive);  // restrict_cover
+[[nodiscard]] uint32_t world_at_rank(const ZddBelief& b, int r);                   // r-th CANONICAL member (re-baseline)
+[[nodiscard]] std::vector<double> marginals(const Environment& env, const ZddBelief& b);
+[[nodiscard]] bool informative(const Environment& env, int face_id, const ZddBelief& b);
+[[nodiscard]] BeliefFeatures belief_features(const Environment& env, const ZddBelief& b);
+}  // namespace zdd
+#endif
 
 // The machine-cache budget the derived mask set must fit (the gate's second input, §4). NAMED here as
 // what it is — a target-cache fact, not a derived quantity: half of the i5-6600 (Skylake) 256 KiB
@@ -180,7 +250,8 @@ class Environment {
         return std::visit([](const auto& a) -> int {
             using T = std::decay_t<decltype(a)>;
             if constexpr (std::is_same_v<T, FlatBelief>) return static_cast<int>(a.worlds.size());
-            else return a.count_;  // BitsetBelief: the cached popcount, never a kW64-word recount
+            else if constexpr (std::is_same_v<T, BitsetBelief>) return a.count_;  // cached popcount, never a recount
+            CHOCO_ZDD_ELSE(return zdd::nb(a);)  // ZDD arm (opt-in): the cached_count_, O(1) (empty in the default build)
         }, b);
     }
     bool empty(const Belief& b) const { return nb(b) == 0; }  // derives from nb (one home; O(1) both arms)
@@ -242,6 +313,13 @@ class Environment {
     // Whether the bitset arm is active for THIS env (the gate decision, computed ONCE in the ctor and
     // invariant for the env's life). The full_belief() the search starts from takes the chosen arm.
     bool use_bitset() const { return use_bitset_; }
+#ifdef CHOCO_BELIEF_ZDD
+    // Whether the OPT-IN ZDD arm is active (the §B.4(b) gate, ON build only). When true the gate SELECTS
+    // ZDD over bitset/flat — full_belief() returns a ZddBelief and the whole search runs on the maintained
+    // diagram (the head-to-head profile vs the bitset). Gated on worlds enumerable (the diagram is built
+    // from worlds()); this is the WHOLE selection surface — no call site decides (the gate does, §4).
+    bool use_zdd() const { return use_zdd_; }
+#endif
     int kW64() const { return kW64_; }  // ceil(|worlds|/64) — the bitset word count (0 when not enumerable)
     // The env-static masks the bitset bodies AND-against, homed in the ctor like face_masks_ (P1):
     // treasure_mask_[t] = bitvector of worlds (by rank) with bit t set; detector_mask_[j] = bitvector of
@@ -264,6 +342,9 @@ class Environment {
 
     // ---- bitset arm gate + env-static masks (built in the ctor, P1) ----
     bool use_bitset_ = false;   // the gate decision (§4): worlds enumerable AND mask_bytes <= budget
+#ifdef CHOCO_BELIEF_ZDD
+    bool use_zdd_ = false;      // the §B.4(b) gate (ON build only): worlds enumerable -> select the ZDD arm
+#endif
     int kW64_ = 0;              // ceil(|worlds|/64) — derived, never the literal 243
     // Flattened kW64-word mask tables (row t/j is masks[row*kW64_ .. row*kW64_+kW64_]). std::vector (not
     // std::array): kW64_ is runtime-derived (see BitsetBelief). treasure: N rows; detector: nD rows.

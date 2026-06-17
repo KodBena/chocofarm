@@ -33,6 +33,21 @@ if(CHOCO_MARCH_NATIVE)
   add_compile_options(-march=native)
 endif()
 
+# The OPT-IN belief-as-diagram (ZDD) arm — the §B.4(b) graduation
+# (belief_features_and_decision_diagram_note.md Part B; docs/design/cpp-belief-zdd-onramp.md;
+# docs/design/cpp-belief-rep-scoping.md). DEFAULT OFF: the default build's belief surface is
+# flat+bitset ONLY (the live two arms), byte-for-byte unchanged — the ZDD engine TU + the env-op ZDD
+# bodies are NOT compiled, the Belief variant has two alternatives, and the env-op visits' third arm
+# vanishes (the empty CHOCO_ZDD_ELSE macro). ON: -DCHOCO_BELIEF_ZDD=ON adds ZddBelief as a THIRD
+# Belief variant arm, compiles the engine (belief_zdd_engine.cpp) + the ZDD seam bodies (env_zdd.cpp)
+# into chocofarm_core, and the gate SELECTS the ZDD arm (full_belief returns a ZddBelief) so the whole
+# search runs on the maintained diagram — for the head-to-head profile vs the bitset (and the large-N
+# hedge). The flag is propagated as a PUBLIC compile-definition so every consumer of chocofarm_core
+# (the runner, the benches, the A/B oracle, the tests' tools) sees the SAME Belief variant shape (else
+# the variant size/alternatives desync across TUs — an ODR hazard). Pass -DCHOCO_BELIEF_ZDD=ON to a
+# SEPARATE build dir (e.g. cpp/build-zdd) so the default build dir stays the live flat+bitset.
+option(CHOCO_BELIEF_ZDD "Opt-in: add the maintained ZDD belief arm (§B.4(b)) as a third Belief variant arm" OFF)
+
 # Threads (pthread): the SearchRuntime's PoolRuntime spawns std::thread workers (src/search_runtime.cpp
 # is in chocofarm_core), so the core links Threads::Threads PUBLIC and every consumer gets it.
 find_package(Threads REQUIRED)
@@ -131,6 +146,17 @@ add_library(chocofarm_core
 target_include_directories(chocofarm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(chocofarm_core PUBLIC nlohmann_json::nlohmann_json ${HIREDIS_LINK} ${ZMQ_LINK} Threads::Threads)
 target_compile_options(chocofarm_core PRIVATE -Wall -Wextra)
+
+# The OPT-IN ZDD belief arm (§B.4(b)): when CHOCO_BELIEF_ZDD=ON, compile the engine + the env-op ZDD
+# bodies INTO chocofarm_core and define CHOCO_BELIEF_ZDD PUBLICly (so every consumer's Belief variant has
+# the same three-arm shape — an ODR consistency requirement). When OFF neither TU is compiled and the
+# definition is absent, so the default build is byte-for-byte the live flat+bitset (the two arms + the
+# two-alternative variant). The TUs are added here (not as a separate library) so the runner + the benches
+# + the A/B oracle all link the SAME core with the SAME variant shape.
+if(CHOCO_BELIEF_ZDD)
+  target_sources(chocofarm_core PRIVATE src/belief_zdd_engine.cpp src/env_zdd.cpp)
+  target_compile_definitions(chocofarm_core PUBLIC CHOCO_BELIEF_ZDD)
+endif()
 
 add_executable(chocofarm-cpp-runner src/main.cpp)
 target_link_libraries(chocofarm-cpp-runner PRIVATE chocofarm_core)

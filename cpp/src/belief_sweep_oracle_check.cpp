@@ -192,6 +192,106 @@ namespace {
     }
     return true;
 }
+
+#ifdef CHOCO_BELIEF_ZDD
+// ---- the OPT-IN flat-vs-ZDD FEATURE A/B (the §B.4(b) net) ----
+// The ASYMMETRY vs the flat-vs-bitset A/B: the ZDD arm is BIT-EXACT on counts/marginals/det-counts/
+// features + members set-equal, but the SAMPLING trio (sample_world / world_at_rank / belief_key) RE-
+// BASELINES (the ZDD's canonical member order != worlds()-rank order). So zdd_ops_identical asserts the
+// FEATURE ops byte-identical + members(Z) SET-EQUAL the flat belief, and DOES NOT assert sampling equal.
+
+// Build a ZddBelief DIRECTLY from a flat world-set (bypassing the gate, so the A/B can run flat-vs-ZDD
+// for the same belief regardless of use_zdd_). The diagram is the family of exactly `flat`'s worlds.
+[[nodiscard]] chocofarm::ZddBelief to_zdd(const chocofarm::Environment& env,
+                                          const std::vector<uint32_t>& flat) {
+    chocofarm::ZddBelief b;
+    b.z = chocofarm::beliefzdd::BeliefDiagram(std::span<const uint32_t>(flat), env.N());
+    b.cached_count_ = b.z.count();
+    return b;
+}
+
+// Assert every FEATURE op is byte-identical flat-vs-ZDD, AND members(Z) is set-equal to the flat belief.
+// Sampling (sample_world / world_at_rank / belief_key) is NOT compared — it re-baselines (by design).
+[[nodiscard]] bool zdd_ops_identical(const chocofarm::Environment& env, const chocofarm::Belief& fb,
+                                     const chocofarm::Belief& zb, const std::string& tag, std::string& why) {
+    const int nb = env.nb(fb);
+    auto note = [&](const std::string& f) { why = tag + f + " (nb=" + std::to_string(nb) + ")"; return false; };
+    if (env.nb(fb) != env.nb(zb)) return note("nb");
+    if (env.empty(fb) != env.empty(zb)) return note("empty");
+    if (env.marginals(fb) != env.marginals(zb)) return note("marginals");
+    for (int j = 0; j < env.n_detectors(); ++j)
+        if (env.informative(j, fb) != env.informative(j, zb))
+            return note("informative[" + std::to_string(j) + "]");
+    for (const std::set<int>& coll : {std::set<int>{}, std::set<int>{0}, std::set<int>{0, 3, 7}})
+        if (env.legal_actions(fb, coll) != env.legal_actions(zb, coll)) return note("legal_actions");
+    {
+        const chocofarm::BeliefFeatures ff = chocofarm::belief_features(env, fb);
+        const chocofarm::BeliefFeatures zf = chocofarm::belief_features(env, zb);
+        std::string fwhy;
+        if (!equal_features(ff, zf, static_cast<size_t>(nb), fwhy)) return note("belief_features." + fwhy);
+    }
+    // members(Z) SET-EQUAL the flat belief (the restrict-op faithful-rep witness): sort both and compare.
+    {
+        std::vector<uint32_t> zm = std::get<chocofarm::ZddBelief>(zb).z.members();
+        std::vector<uint32_t> fm = std::get<chocofarm::FlatBelief>(fb).worlds;
+        std::sort(zm.begin(), zm.end());
+        std::sort(fm.begin(), fm.end());
+        if (zm != fm) return note("members(Z) != set(flat belief)");
+    }
+    return true;
+}
+
+// The flat-vs-ZDD A/B for ONE belief: static feature ops byte-identical + members set-equal, THEN a filter
+// SEQUENCE (the restrict ops — the B.4(b) maintenance) applied to BOTH arms in lockstep, re-asserting
+// every feature op + the members set-equality after each step.
+[[nodiscard]] bool zdd_ab_identical(const chocofarm::Environment& env,
+                                    const std::vector<uint32_t>& flat, std::string& why) {
+    chocofarm::Belief fb = chocofarm::FlatBelief{flat};
+    chocofarm::Belief zb = to_zdd(env, flat);
+    if (!zdd_ops_identical(env, fb, zb, "", why)) return false;
+    if (flat.empty()) return true;  // no filter sequence on the empty belief
+    const uint32_t wstar = flat.front();  // the true world for this scripted trajectory
+    for (int j = 0; j < env.n_detectors(); ++j) {
+        const bool pos = env.observe(j, wstar);
+        env.filter_detector(fb, j, pos);  // flat erase_if
+        env.filter_detector(zb, j, pos);  // ZDD restrict_cover
+        if (!zdd_ops_identical(env, fb, zb, "after filter_detector[" + std::to_string(j) + "] ", why)) return false;
+    }
+    for (int t = 0; t < env.N(); ++t) {
+        const bool present = ((wstar >> t) & 1u) != 0;
+        env.filter_treasure(fb, t, present);  // flat erase_if
+        env.filter_treasure(zb, t, present);  // ZDD restrict_var
+        if (!zdd_ops_identical(env, fb, zb, "after filter_treasure[" + std::to_string(t) + "] ", why)) return false;
+    }
+    // (c) drive the belief to EMPTY (a restrict -> BOT transition the wstar-consistent trajectory never
+    // reaches): contradict a still-live treasure. After the full trajectory the belief is {wstar} (single
+    // world); restrict_var on a treasure to the OPPOSITE of wstar's bit empties BOTH arms. Re-assert: both
+    // empty (the restrict->BOT / erase_if->{} path — nb=0, members empty). Nets the empty-result restrict.
+    if (env.nb(fb) > 0) {
+        const uint32_t w = env.world_at_rank(fb, 0);          // a still-live world (flat rank 0)
+        const int t0 = 0;
+        const bool opposite = ((w >> t0) & 1u) == 0;          // the polarity that w does NOT satisfy
+        env.filter_treasure(fb, t0, opposite);                // flat -> {} (w dropped, and it was the only one if single)
+        env.filter_treasure(zb, t0, opposite);               // ZDD -> BOT (restrict_var to empty)
+        if (!zdd_ops_identical(env, fb, zb, "after filter-to-empty ", why)) return false;
+    }
+    return true;
+}
+
+// Apply ONE filter (detector or treasure, given polarity) to a freshly-built flat+ZDD pair over `flat`,
+// and assert flat==ZDD afterward. Used to drive the restrict ops to EMPTY through paths the wstar-
+// consistent trajectory never reaches (cover_hold->BOT / cover_fail->BOT / with_var->BOT / without_var->
+// BOT — finding from the out-of-frame review). `tag` names the case.
+[[nodiscard]] bool zdd_one_filter_ok(const chocofarm::Environment& env, const std::vector<uint32_t>& flat,
+                                     bool is_detector, int idx, bool polarity,
+                                     const std::string& tag, std::string& why) {
+    chocofarm::Belief fb = chocofarm::FlatBelief{flat};
+    chocofarm::Belief zb = to_zdd(env, flat);
+    if (is_detector) { env.filter_detector(fb, idx, polarity); env.filter_detector(zb, idx, polarity); }
+    else             { env.filter_treasure(fb, idx, polarity); env.filter_treasure(zb, idx, polarity); }
+    return zdd_ops_identical(env, fb, zb, tag, why);
+}
+#endif  // CHOCO_BELIEF_ZDD
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -288,5 +388,60 @@ int main(int argc, char** argv) {
               << "legal_actions, belief_features, world_at_rank(all r), sample_world(256 draws)} static + a "
               << "full filter SEQUENCE (all " << env.n_detectors() << " detectors + " << env.N()
               << " treasures, re-asserted after each) — flat == bitset for every op)\n";
+
+#ifdef CHOCO_BELIEF_ZDD
+    // ---- Part 3 (OPT-IN): the flat-vs-ZDD FEATURE A/B (the §B.4(b) net) ----
+    // The ZDD arm is BIT-EXACT on counts/marginals/det-counts/features + members set-equal; the SAMPLING
+    // trio re-baselines, so it is NOT asserted equal here (the gumbel/ismcts-dump parity will diverge on
+    // the ZDD arm — EXPECTED). The restrict ops (filter_treasure -> restrict_var, filter_detector ->
+    // restrict_cover) are exercised by the filter SEQUENCE; members(Z) is set-equal to the flat belief
+    // after each step (the restrict-op faithful-rep witness, the design-§4 requirement).
+    std::cout << "GATE-ZDD: use_zdd=" << (env.use_zdd() ? "true" : "false")
+              << " (the opt-in §B.4(b) arm; full_belief returns a ZddBelief when on)\n";
+    size_t zdd_checked = 0;
+    for (const std::vector<uint32_t>& bw : beliefs) {
+        std::string zab_why;
+        if (!zdd_ab_identical(env, bw, zab_why)) {
+            (void)fail("flat-vs-ZDD FEATURE A/B DIVERGES at op " + zab_why + " — the ZDD arm is the bug "
+                       "(flat is the reference, ADR-0002)");
+            return 1;
+        }
+        ++zdd_checked;
+    }
+
+    // Targeted empty-RESULT restrict nets (the out-of-frame review's coverage finding): force EACH restrict
+    // op to BOT through a path the wstar-consistent trajectory cannot reach. Build beliefs from worlds()
+    // partitioned by a chosen detector's cover / a chosen treasure's bit, then filter to the empty subfamily.
+    {
+        const int j = 0;  // a detector whose cover is non-trivial (face 0)
+        std::vector<uint32_t> hitters, missers;  // cover holds / fails
+        for (uint32_t w : all) (env.observe(j, w) ? hitters : missers).push_back(w);
+        const int t = 0;  // a treasure
+        std::vector<uint32_t> with_t, without_t;
+        for (uint32_t w : all) (((w >> t) & 1u) ? with_t : without_t).push_back(w);
+        struct Case { bool is_det; int idx; bool pol; const std::vector<uint32_t>* bw; const char* tag; };
+        const Case cases[] = {
+            {true,  j, true,  &missers,   "cover_hold->BOT (all-miss belief, filter_detector +)"},
+            {true,  j, false, &hitters,   "cover_fail->BOT (all-hit belief, filter_detector -)"},
+            {false, t, true,  &without_t, "with_var->BOT (no-treasure-t belief, filter_treasure +)"},
+            {false, t, false, &with_t,    "without_var->BOT (all-treasure-t belief, filter_treasure -)"},
+        };
+        for (const Case& c : cases) {
+            if (c.bw->empty()) continue;  // (cannot construct this empty-path case on this instance — skip)
+            std::string ewhy;
+            if (!zdd_one_filter_ok(env, *c.bw, c.is_det, c.idx, c.pol, std::string("empty-path ") + c.tag + " ", ewhy)) {
+                (void)fail("flat-vs-ZDD empty-RESULT restrict DIVERGES: " + ewhy);
+                return 1;
+            }
+        }
+    }
+    std::cout << "RESULT: PASS flat-vs-ZDD FEATURE A/B byte-identical (" << zdd_checked
+              << " beliefs x {nb, empty, marginals, informative(per-det), legal_actions, belief_features} "
+              << "+ members(Z) set-equal the flat belief, static + a full filter SEQUENCE (all "
+              << env.n_detectors() << " detectors + " << env.N() << " treasures via restrict_cover/restrict_var, "
+              << "re-asserted after each) + the empty-RESULT restrict nets (cover_hold/cover_fail/with_var/"
+              << "without_var each driven to BOT) — flat == ZDD on every FEATURE op; SAMPLING (sample_world/"
+              << "world_at_rank/belief_key) RE-BASELINES and is NOT asserted equal — the design-§4 asymmetry)\n";
+#endif
     return 0;
 }
