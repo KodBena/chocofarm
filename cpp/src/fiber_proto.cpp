@@ -27,7 +27,6 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -116,7 +115,7 @@ int main(int argc, char** argv) {
 
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
-    std::set<int> collected;
+    chocofarm::CollectedSet collected;
     // a fixed, varied gumbel script (cycled to fill the n_slots draw) — identical for both runs.
     std::vector<double> gtable{0.40, -0.65, 1.10, 0.05, -0.30, 0.85, -1.20, 0.55,
                                0.20, -0.45, 0.95, -0.10, 0.70};

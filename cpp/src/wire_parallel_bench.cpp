@@ -34,7 +34,6 @@
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -118,7 +117,7 @@ int main(int argc, char** argv) {
     chocofarm::Environment env(*inst);
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
-    std::set<int> coll;
+    chocofarm::CollectedSet coll;
     std::vector<double> gtable{0.40, -0.65, 1.10, 0.05, -0.30, 0.85, -1.20, 0.55,
                                0.20, -0.45, 0.95, -0.10, 0.70};
 

@@ -22,7 +22,7 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
     // Live episode state (mirrors generate_episode's loc/bw/collected init: start at the entry).
     Loc loc{env.entry_point()};
     Belief bw = env.full_belief();   // belief = full world-set (the seam's construction entry)
-    std::set<int> collected;
+    CollectedSet collected;
 
     const int bw0 = env.nb(bw);  // initial belief size (for belief-shrinkage stat) — via the seam (L6)
 

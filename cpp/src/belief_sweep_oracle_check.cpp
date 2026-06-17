@@ -137,7 +137,9 @@ namespace {
     if (env.marginals(fb) != env.marginals(bb)) return note("marginals");
     for (int j = 0; j < env.n_detectors(); ++j)
         if (env.informative(j, fb) != env.informative(j, bb)) return note("informative[" + std::to_string(j) + "]");
-    for (const std::set<int>& coll : {std::set<int>{}, std::set<int>{0}, std::set<int>{0, 3, 7}}) {
+    for (const chocofarm::CollectedSet& coll :
+         {chocofarm::CollectedSet{}, chocofarm::CollectedSet{}.with(0),
+          chocofarm::CollectedSet{}.with(0).with(3).with(7)}) {
         if (env.legal_actions(fb, coll) != env.legal_actions(bb, coll)) return note("legal_actions");
     }
     {
@@ -222,7 +224,9 @@ namespace {
     for (int j = 0; j < env.n_detectors(); ++j)
         if (env.informative(j, fb) != env.informative(j, zb))
             return note("informative[" + std::to_string(j) + "]");
-    for (const std::set<int>& coll : {std::set<int>{}, std::set<int>{0}, std::set<int>{0, 3, 7}})
+    for (const chocofarm::CollectedSet& coll :
+         {chocofarm::CollectedSet{}, chocofarm::CollectedSet{}.with(0),
+          chocofarm::CollectedSet{}.with(0).with(3).with(7)})
         if (env.legal_actions(fb, coll) != env.legal_actions(zb, coll)) return note("legal_actions");
     {
         const chocofarm::BeliefFeatures ff = chocofarm::belief_features(env, fb);

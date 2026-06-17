@@ -43,7 +43,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -104,7 +103,7 @@ class ScriptedISMCTSSource final : public chocofarm::ISMCTSSource {
         return m;
     }
 
-    double leaf_value(const chocofarm::Loc&, const chocofarm::Belief&, const std::set<int>&,
+    double leaf_value(const chocofarm::Loc&, const chocofarm::Belief&, const chocofarm::CollectedSet&,
                       uint32_t, double) override {
         assert(!leaves_.empty() && "ismcts_dump: empty scripted leaf table");
         return leaves_[(lidx_++) % leaves_.size()];
@@ -145,7 +144,7 @@ int main(int argc, char** argv) {
 
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
-    std::set<int> collected;
+    chocofarm::CollectedSet collected;
 
     // optionally advance the real (loc, bw, collected) by a prefix slot sequence against the true
     // world bw[0] (the same deterministic world both languages advance by), so the fixed search input

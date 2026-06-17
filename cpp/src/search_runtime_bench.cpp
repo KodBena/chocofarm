@@ -27,7 +27,6 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -110,7 +109,7 @@ int main(int argc, char** argv) {
     // a batch of independent root-state tasks, one RNG seed each.
     chocofarm::Loc root_loc{env.entry_point()};
     chocofarm::Belief root_bw = env.full_belief();   // the seam's belief construction entry
-    std::set<int> root_collected;
+    chocofarm::CollectedSet root_collected;
     std::vector<chocofarm::SearchTask> tasks;
     tasks.reserve(static_cast<size_t>(n_tasks));
     for (int i = 0; i < n_tasks; ++i) {

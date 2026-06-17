@@ -37,10 +37,10 @@
 
 #include <cstdint>
 #include <random>
-#include <set>
 #include <utility>
 #include <vector>
 
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/policy.hpp"
 
@@ -65,7 +65,7 @@ struct NMCSConfig {
 // returns a scripted value, so both languages run identical nesting on identical leaf returns.
 struct NMCSWorldSource : public WorldSource {
     virtual double playout_value(const Loc& loc, const Belief& bw,
-                                 const std::set<int>& collected, double lam) = 0;
+                                 const CollectedSet& collected, double lam) = 0;
 };
 
 // Nested Monte-Carlo Search as a pluggable Policy. Construction takes the scalar config (level etc.)
@@ -78,18 +78,18 @@ class NMCSPolicy final : public Policy {
     // search from the current observed state, returning the FIRST action of the best line (mirrors
     // nmcs.py's decide). λ is the live Dinkelbach penalty threaded through every score (P4).
     Action decide(const Environment& env, const Loc& loc, const Belief& bw,
-                  const std::set<int>& collected, double lam, std::mt19937_64& rng) const override;
+                  const CollectedSet& collected, double lam, std::mt19937_64& rng) const override;
 
     // The pure search core, parameterized by an injected NMCSWorldSource (the seam the logic check
     // exploits). Returns (score_of_best_line, first_action). Mirrors nmcs.py's _search exactly.
     std::pair<double, Action> search(const Environment& env, const Loc& loc,
-                                     const Belief& bw, const std::set<int>& collected,
+                                     const Belief& bw, const CollectedSet& collected,
                                      double lam, int level, NMCSWorldSource& src) const;
 
     // The level-0 determinized base playout averaged over `playout_samples` sampled worlds (mirrors
     // nmcs.py's _playout): mean GreedyPolicy base_value, or −λ·exit_cost when the belief is empty.
     double playout(const Environment& env, const Loc& loc, const Belief& bw,
-                   const std::set<int>& collected, double lam, NMCSWorldSource& src) const;
+                   const CollectedSet& collected, double lam, NMCSWorldSource& src) const;
 
     const NMCSConfig& config() const { return cfg_; }
 
@@ -98,7 +98,7 @@ class NMCSPolicy final : public Policy {
     // level-(level-1) continuation). At level<=1 the continuation is a base playout (mirrors
     // nmcs.py's _eval_move).
     double eval_move(const Environment& env, const Loc& loc, const Belief& bw,
-                     const std::set<int>& collected, const Action& a, double lam, int level,
+                     const CollectedSet& collected, const Action& a, double lam, int level,
                      NMCSWorldSource& src) const;
 
     NMCSConfig cfg_;

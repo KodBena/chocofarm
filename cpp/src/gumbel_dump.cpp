@@ -57,7 +57,6 @@
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -204,7 +203,7 @@ int main(int argc, char** argv) {
 
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
-    std::set<int> collected;
+    chocofarm::CollectedSet collected;
 
     // optionally advance the real (loc, bw, collected) by a prefix slot sequence against the true world
     // bw[0] (the same deterministic world both languages advance by), so the fixed search input can be

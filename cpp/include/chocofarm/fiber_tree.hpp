@@ -25,10 +25,10 @@
 
 #include <boost/context/fiber.hpp>
 
-#include <set>
 #include <utility>
 #include <vector>
 
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/cyclic_gumbel.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/fiber_leaf.hpp"
@@ -62,7 +62,7 @@ struct TreeState {
     // LIFETIME: loc/bw/coll are captured BY REFERENCE into the fiber and re-read on every leaf across ALL
     // later resume_with() calls — keep them alive until `running` is false; pass named lvalues, never
     // temporaries (e.g. NOT start(loc, env.full_belief(), {}, lam) — that belief dies at the `;`).
-    void start(const Loc& loc, const Belief& bw, const std::set<int>& coll, double lam) {
+    void start(const Loc& loc, const Belief& bw, const CollectedSet& coll, double lam) {
         fib = boost::context::fiber{
             std::allocator_arg, boost::context::fixedsize_stack(512 * 1024),
             [this, &loc, &bw, &coll, lam](boost::context::fiber&& caller) {

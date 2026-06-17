@@ -25,7 +25,7 @@ constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
 
 // ---- level-0: determinized base playout (mirrors nmcs.py's _playout) -----------------------------
 double NMCSPolicy::playout(const Environment& env, const Loc& loc, const Belief& bw,
-                           const std::set<int>& collected, double lam, NMCSWorldSource& src) const {
+                           const CollectedSet& collected, double lam, NMCSWorldSource& src) const {
     (void)env;  // the level-0 leaf value is owned by the NMCSWorldSource (production: real GreedyPolicy
                 // playout; scripted: the FIFO) — env stays in the signature to mirror _playout(env,…)
     return src.playout_value(loc, bw, collected, lam);
@@ -33,7 +33,7 @@ double NMCSPolicy::playout(const Environment& env, const Loc& loc, const Belief&
 
 // ---- per-move evaluation (mirrors nmcs.py's _eval_move) -------------------------------------------
 double NMCSPolicy::eval_move(const Environment& env, const Loc& loc, const Belief& bw,
-                             const std::set<int>& collected, const Action& a, double lam, int level,
+                             const CollectedSet& collected, const Action& a, double lam, int level,
                              NMCSWorldSource& src) const {
     double tot = 0.0;
     for (int s = 0; s < cfg_.step_samples; ++s) {
@@ -44,7 +44,7 @@ double NMCSPolicy::eval_move(const Environment& env, const Loc& loc, const Belie
         uint32_t w = src.sample_world(bw);
         Loc nloc = loc;
         Belief nbw = bw;
-        std::set<int> nc = collected;
+        CollectedSet nc = collected;
         StepResult sr = env.apply(nloc, nbw, nc, a, w);
         double step = sr.reward - lam * sr.dt;
         double cont;
@@ -60,11 +60,11 @@ double NMCSPolicy::eval_move(const Environment& env, const Loc& loc, const Belie
 // ---- level-n search from a state (mirrors nmcs.py's _search) --------------------------------------
 std::pair<double, Action> NMCSPolicy::search(const Environment& env, const Loc& loc,
                                              const Belief& bw,
-                                             const std::set<int>& collected, double lam, int level,
+                                             const CollectedSet& collected, double lam, int level,
                                              NMCSWorldSource& src) const {
     Loc cur_loc = loc;
     Belief cur_bw = bw;
-    std::set<int> cur_coll = collected;
+    CollectedSet cur_coll = collected;
     double acc = 0.0;                  // λ-penalized reward accumulated along this line
     bool have_first = false;
     Action first_action = terminate_action();
@@ -157,7 +157,7 @@ class RngNMCSSource final : public NMCSWorldSource {
     uint32_t sample_world(const Belief& bw) override { return draw_.sample_world(bw); }
 
     double playout_value(const Loc& loc, const Belief& bw,
-                         const std::set<int>& collected, double lam) override {
+                         const CollectedSet& collected, double lam) override {
         if (env_.empty(bw)) return -lam * env_.exit_cost(loc.pt);  // matches nmcs.py len(bw)==0 branch
         double tot = 0.0;
         for (int s = 0; s < ps_; ++s) {
@@ -176,7 +176,7 @@ class RngNMCSSource final : public NMCSWorldSource {
 }  // namespace
 
 Action NMCSPolicy::decide(const Environment& env, const Loc& loc, const Belief& bw,
-                          const std::set<int>& collected, double lam, std::mt19937_64& rng) const {
+                          const CollectedSet& collected, double lam, std::mt19937_64& rng) const {
     std::vector<Action> cands =
         candidate_actions(env, loc, bw, collected, cfg_.cand_det, cfg_.cand_tre, true);
     if (cands.size() == 1 && cands[0].kind == ActionKind::Terminate) return terminate_action();

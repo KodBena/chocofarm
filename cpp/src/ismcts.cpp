@@ -97,7 +97,7 @@ int ISMCTSPolicy::ucb_select(const ISMCTSNode& node) const {
 // ---- one determinized iteration (mirrors _iterate) ------------------------------------------------
 double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& nodes, int node,
                              const Loc& loc, const Belief& bw,
-                             const std::set<int>& collected, uint32_t world, double lam,
+                             const CollectedSet& collected, uint32_t world, double lam,
                              ISMCTSSource& src, int depth) const {
     if (depth >= cfg_.max_depth) return -lam * env.exit_cost(loc.pt);
 
@@ -134,7 +134,7 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
         } else {
             Loc nloc = loc;
             Belief nbw = bw;
-            std::set<int> nc = collected;
+            CollectedSet nc = collected;
             StepResult sr = env.apply(nloc, nbw, nc, act, world);
             double step = sr.reward - lam * sr.dt;
             // register the successor child (still part of this edge's statistics), then the leaf.
@@ -159,7 +159,7 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
     } else {
         Loc nloc = loc;
         Belief nbw = bw;
-        std::set<int> nc = collected;
+        CollectedSet nc = collected;
         StepResult sr = env.apply(nloc, nbw, nc, act, world);
         double step = sr.reward - lam * sr.dt;
         std::tuple<int, BeliefKey> ckey{a, env.belief_key(nbw)};
@@ -183,14 +183,14 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
 
 // ---- the pure search core (mirrors decide's loop + final) -----------------------------------------
 Action ISMCTSPolicy::run_search(const Environment& env, const Loc& loc,
-                                const Belief& bw, const std::set<int>& collected,
+                                const Belief& bw, const CollectedSet& collected,
                                 double lam, ISMCTSSource& src) const {
     if (env.empty(bw)) return terminate_action();  // mirrors decide's len(bw)==0 -> TERMINATE
     std::vector<ISMCTSNode> nodes;
     nodes.emplace_back(n_action_slots(env));  // the root (index 0); dense stats sized to the slot space
     for (int i = 0; i < cfg_.iterations; ++i) {
         uint32_t w = src.sample_world(bw);  // (1) determinize: one world ~ belief
-        std::set<int> coll = collected;     // _iterate mutates a fresh collected-set per iteration
+        CollectedSet coll = collected;      // _iterate mutates a fresh collected-set per iteration
         iterate(env, nodes, 0, loc, bw, coll, w, lam, src, 0);
     }
     // (final) most-visited root action; TERMINATE if nothing was tried. First-wins tie over INSERTION
@@ -230,7 +230,7 @@ class RngISMCTSSource final : public ISMCTSSource {
     }
 
     double leaf_value(const Loc& loc, const Belief& bw,
-                      const std::set<int>& collected, uint32_t world, double lam) override {
+                      const CollectedSet& collected, uint32_t world, double lam) override {
         return base_value(env_, base_, loc, bw, collected, world, lam);  // shared leaf utility (P1)
     }
 
@@ -243,7 +243,7 @@ class RngISMCTSSource final : public ISMCTSSource {
 }  // namespace
 
 Action ISMCTSPolicy::decide(const Environment& env, const Loc& loc, const Belief& bw,
-                            const std::set<int>& collected, double lam,
+                            const CollectedSet& collected, double lam,
                             std::mt19937_64& rng) const {
     RngISMCTSSource src(env, *base_, rng);
     return run_search(env, loc, bw, collected, lam, src);

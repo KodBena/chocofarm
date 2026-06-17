@@ -21,7 +21,7 @@ namespace chocofarm {
 // same uniform target the runner built inline for RandomPolicy). A search policy (GumbelAZPolicy)
 // overrides this with its real σ-transformed improved-π.
 ActionAndPi Policy::decide_target(const Environment& env, const Loc& loc, const Belief& bw,
-                                  const std::set<int>& collected, double lam,
+                                  const CollectedSet& collected, double lam,
                                   std::mt19937_64& rng) const {
     Action action = decide(env, loc, bw, collected, lam, rng);
     std::vector<float> pi(static_cast<size_t>(n_action_slots(env)), 0.0f);
@@ -34,13 +34,13 @@ ActionAndPi Policy::decide_target(const Environment& env, const Loc& loc, const 
 
 // ---- GreedyBase: the λ-rational myopic leaf base (mirrors solvers.base.GreedyPolicy) -------------
 Action GreedyBase::decide(const Environment& env, const Loc& loc, const Belief& bw,
-                          const std::set<int>& collected, double lam, std::mt19937_64& rng) const {
+                          const CollectedSet& collected, double lam, std::mt19937_64& rng) const {
     (void)rng;  // GreedyPolicy is deterministic (Python calls it with rng=None)
     std::vector<double> marg = env.marginals(bw);
     double best = 0.0;
     Action act = terminate_action();
     for (int i = 0; i < env.N(); ++i) {
-        if (collected.count(i) != 0 || marg[i] <= 0.0) continue;
+        if (collected.contains(i) || marg[i] <= 0.0) continue;
         double s = marg[i] * env.value(i) - lam * env.dist(loc.pt, env.treasure_pt(i));
         if (s > best) {  // strict >: first treasure wins a tie (matches Python's `if s > best`)
             best = s;
@@ -55,7 +55,7 @@ Action GreedyBase::decide(const Environment& env, const Loc& loc, const Belief& 
 // marg·value − λ·(go_there + exit(there) − exit(here)) > 0, else TERMINATE. Same init (best=0.0,
 // act=TERMINATE) and strict `>` first-wins tie as GreedyPolicy. The default ISMCTS playout base.
 Action GreedyStopBase::decide(const Environment& env, const Loc& loc,
-                              const Belief& bw, const std::set<int>& collected,
+                              const Belief& bw, const CollectedSet& collected,
                               double lam, std::mt19937_64& rng) const {
     (void)rng;  // deterministic (Python calls it with rng=None, mirrors _base_value)
     std::vector<double> marg = env.marginals(bw);
@@ -63,7 +63,7 @@ Action GreedyStopBase::decide(const Environment& env, const Loc& loc,
     double best = 0.0;
     Action act = terminate_action();
     for (int i = 0; i < env.N(); ++i) {
-        if (collected.count(i) != 0 || marg[i] <= 0.0) continue;
+        if (collected.contains(i) || marg[i] <= 0.0) continue;
         double go = env.dist(loc.pt, env.treasure_pt(i));            // go_there = d(loc, ("t", i))
         // exit(there) = exit_cost(("t", i)) = exit_cost from the treasure's coordinate.
         double net = marg[i] * env.value(i) - lam * (go + env.exit_cost(env.treasure_pt(i)) - cur_exit);
@@ -78,7 +78,7 @@ Action GreedyStopBase::decide(const Environment& env, const Loc& loc,
 // ---- candidate_actions (mirrors solvers.base.candidate_actions) -----------------------------------
 std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
                                       const Belief& bw,
-                                      const std::set<int>& collected, int n_det, int n_tre,
+                                      const CollectedSet& collected, int n_det, int n_tre,
                                       bool include_terminate) {
     std::vector<double> marg = env.marginals(bw);
 
@@ -95,7 +95,7 @@ std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
     // nearest `n_tre` uncollected, marg>0 treasures by env.dist(loc, ("t", i)); stable on treasure id.
     std::vector<int> tres;
     for (int i = 0; i < env.N(); ++i)
-        if (collected.count(i) == 0 && marg[i] > 0.0) tres.push_back(i);
+        if (!collected.contains(i) && marg[i] > 0.0) tres.push_back(i);
     std::stable_sort(tres.begin(), tres.end(), [&](int a, int b) {
         return env.dist(loc.pt, env.treasure_pt(a)) < env.dist(loc.pt, env.treasure_pt(b));
     });
@@ -112,7 +112,7 @@ std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
 
 // ---- base_value: play the base to the end in a fixed world (mirrors solvers.base._base_value) -----
 double base_value(const Environment& env, const Policy& base, Loc loc, Belief bw,
-                  std::set<int> collected, uint32_t world, double lam) {
+                  CollectedSet collected, uint32_t world, double lam) {
     double R = 0.0, T = 0.0;
     // env.max_steps() is the single episode-horizon home (mirrors _base_value's range(env.max_steps)),
     // read from the env so a playout's horizon cannot silently desync from the Python env's.

@@ -267,12 +267,12 @@ bool Environment::informative(int face_id, const Belief& bw) const {
 }
 
 std::vector<Action> Environment::legal_actions(const Belief& bw,
-                                               const std::set<int>& collected) const {
+                                               const CollectedSet& collected) const {
     std::vector<Action> acts;
     std::vector<double> marg = marginals(bw);
     // collects: marg>0 and not collected, in treasure-id order (env iterates _treasure_ids = range(N))
     for (int i = 0; i < inst_.N; ++i) {
-        if (collected.count(i) == 0 && marg[i] > 0.0) acts.push_back(Action{ActionKind::Treasure, i});
+        if (!collected.contains(i) && marg[i] > 0.0) acts.push_back(Action{ActionKind::Treasure, i});
     }
     // senses: each informative face, in face-id order (env iterates self.detectors = range(nD))
     for (int j = 0; j < n_detectors(); ++j) {
@@ -324,7 +324,7 @@ void Environment::filter_detector(Belief& bw, int i, bool positive) const {
     }, bw);
 }
 
-StepResult Environment::apply(Loc& loc, Belief& bw, std::set<int>& collected,
+StepResult Environment::apply(Loc& loc, Belief& bw, CollectedSet& collected,
                               const Action& action, uint32_t world) const {
     StepResult res;
     Point target;
@@ -345,7 +345,7 @@ StepResult Environment::apply(Loc& loc, Belief& bw, std::set<int>& collected,
     if (action.kind == ActionKind::Treasure) {
         bool pres = ((world >> action.i) & 1u) != 0;
         // reward = value[i] (all unit values on this instance) iff present and not yet collected
-        bool fresh = pres && collected.count(action.i) == 0;
+        bool fresh = pres && !collected.contains(action.i);
         res.reward = fresh ? 1.0 : 0.0;  // env.value[i] = 1.0 on the live instance (unit values)
         if (pres) collected.insert(action.i);
         filter_treasure(bw, action.i, pres);

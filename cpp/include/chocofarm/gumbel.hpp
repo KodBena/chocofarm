@@ -55,12 +55,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <random>
-#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include "chocofarm/belief_key.hpp"
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/net_evaluator.hpp"
@@ -184,7 +184,7 @@ class GumbelAZPolicy final : public Policy {
     // runs the search from the current observed state, returning the executed action (the SH survivor,
     // temperature 0). λ is the live Dinkelbach penalty threaded through every score (P4).
     [[nodiscard]] Action decide(const Environment& env, const Loc& loc,
-                                const Belief& bw, const std::set<int>& collected,
+                                const Belief& bw, const CollectedSet& collected,
                                 double lam, std::mt19937_64& rng) const override;
 
     // The pure search core, parameterized by an injected GumbelSource (the seam the logic check
@@ -198,7 +198,7 @@ class GumbelAZPolicy final : public Policy {
         int survivor_slot = -1;        // the SH survivor slot (the executed action's slot)
     };
     [[nodiscard]] Decision run_search(const Loc& loc, const Belief& bw,
-                                      const std::set<int>& collected, double lam,
+                                      const CollectedSet& collected, double lam,
                                       GumbelSource& src) const;
 
     // Like decide(), but returns the FULL Decision (the executed action + the improved-π target +
@@ -208,7 +208,7 @@ class GumbelAZPolicy final : public Policy {
     // improved-π PI target the trainer consumes.
     [[nodiscard]] Decision decide_with_target(const Environment& env, const Loc& loc,
                                               const Belief& bw,
-                                              const std::set<int>& collected, double lam,
+                                              const CollectedSet& collected, double lam,
                                               std::mt19937_64& rng) const;
 
     // The Policy::decide_target override (the AZ runner's PI source): the executed action + the Gumbel
@@ -216,7 +216,7 @@ class GumbelAZPolicy final : public Policy {
     // via decide_with_target. This is what makes the C++ Gumbel actor emit a correct AZ PI target.
     [[nodiscard]] ActionAndPi decide_target(const Environment& env, const Loc& loc,
                                             const Belief& bw,
-                                            const std::set<int>& collected, double lam,
+                                            const CollectedSet& collected, double lam,
                                             std::mt19937_64& rng) const override;
 
     [[nodiscard]] const GumbelConfig& config() const { return cfg_; }
@@ -228,20 +228,20 @@ class GumbelAZPolicy final : public Policy {
     // (mlp._masked_softmax), then the STORED prior is narrowed to float32 — the precision the Python
     // search side-reads (root.prior). `kUniform` widens it back at every read site (discrimination ctl).
     double evaluate(GumbelNode& node, const Loc& loc, const Belief& bw,
-                    const std::set<int>& collected) const;
+                    const CollectedSet& collected) const;
 
     // Sequential Halving over n_sims (Danihelka §2): n_phases = ceil(log2 m), per-phase equal-share
     // budget, drop the worst half each phase by g+logit+σ·q̂, then a remainder loop spends the FULL
     // budget. Returns the surviving slot (the executed action). Mirrors _sequential_halving.
     [[nodiscard]] int sequential_halving(std::vector<GumbelNode>& nodes, const Loc& loc,
-                                         const Belief& bw, const std::set<int>& collected,
+                                         const Belief& bw, const CollectedSet& collected,
                                          double lam, GumbelSource& src, std::vector<int> considered,
                                          const std::vector<double>& g, const std::vector<double>& logits,
                                          int& n_spent) const;
 
     // Run `count` sims of root action `slot`, accumulating W/N (mirrors _visit).
     void visit(std::vector<GumbelNode>& nodes, const Loc& loc, const Belief& bw,
-               const std::set<int>& collected, int slot, double lam, GumbelSource& src,
+               const CollectedSet& collected, int slot, double lam, GumbelSource& src,
                int count) const;
 
     // One sim of a root action: realize it, average the leaf over c_outcome immediate determinizations,
@@ -249,12 +249,12 @@ class GumbelAZPolicy final : public Policy {
     // the λ-penalized return.
     [[nodiscard]] double simulate_root_action(std::vector<GumbelNode>& nodes, const Loc& loc,
                                               const Belief& bw,
-                                              const std::set<int>& collected, int slot, uint32_t world,
+                                              const CollectedSet& collected, int slot, uint32_t world,
                                               double lam, GumbelSource& src) const;
 
     // Interior PUCT descent; net value at the leaf (mirrors _descend). `node` is an arena index.
     [[nodiscard]] double descend(std::vector<GumbelNode>& nodes, int node, const Loc& loc,
-                                 const Belief& bw, const std::set<int>& collected,
+                                 const Belief& bw, const CollectedSet& collected,
                                  uint32_t world, double lam, GumbelSource& src, int depth) const;
 
     // AlphaZero PUCT select: argmax q + c_puct·p·√(ΣN)/(1+n) over node.legal_slots, strict-`>`

@@ -37,12 +37,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <random>
-#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include "chocofarm/belief_key.hpp"
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/policy.hpp"
 
@@ -75,7 +75,7 @@ struct ISMCTSSource : public WorldSource {
     // The leaf value at a freshly expanded post-action (loc, bw, collected) in the fixed `world`
     // (mirrors _base_value(env, base, nloc, nbw, ncoll, world, lam)).
     virtual double leaf_value(const Loc& loc, const Belief& bw,
-                              const std::set<int>& collected, uint32_t world, double lam) = 0;
+                              const CollectedSet& collected, uint32_t world, double lam) = 0;
 };
 
 // Hash for the children transposition key (action-slot, belief_key) = tuple<int, tuple<int,u32,u32>>.
@@ -141,7 +141,7 @@ class ISMCTSPolicy final : public Policy {
     // returning the most-visited root action (mirrors ismcts.py's decide). λ is the live Dinkelbach
     // penalty threaded through every score (P4).
     Action decide(const Environment& env, const Loc& loc, const Belief& bw,
-                  const std::set<int>& collected, double lam, std::mt19937_64& rng) const override;
+                  const CollectedSet& collected, double lam, std::mt19937_64& rng) const override;
 
     // The pure search core, parameterized by an injected ISMCTSSource (the seam the logic check
     // exploits). Runs the `iterations` determinized walks and returns the selected root action
@@ -149,7 +149,7 @@ class ISMCTSPolicy final : public Policy {
     // loop + final, exposed for the logic-check fixture so the selection logic is validated
     // independent of RNG.
     [[nodiscard]] Action run_search(const Environment& env, const Loc& loc,
-                                    const Belief& bw, const std::set<int>& collected,
+                                    const Belief& bw, const CollectedSet& collected,
                                     double lam, ISMCTSSource& src) const;
 
     const ISMCTSConfig& config() const { return cfg_; }
@@ -160,7 +160,7 @@ class ISMCTSPolicy final : public Policy {
     // `nodes` is the node arena (a flat vector so child nodes are stable across reallocation; the
     // Python dict-of-_Node is here an index into this arena).
     double iterate(const Environment& env, std::vector<ISMCTSNode>& nodes, int node, const Loc& loc,
-                   const Belief& bw, const std::set<int>& collected, uint32_t world,
+                   const Belief& bw, const CollectedSet& collected, uint32_t world,
                    double lam, ISMCTSSource& src, int depth) const;
 
     // Subset-armed UCB1 selection (eq. 7): exploit = reward[a]/n_j; explore =

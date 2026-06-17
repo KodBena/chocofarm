@@ -19,7 +19,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -76,7 +75,7 @@ int main(int argc, char** argv) {
 
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
-    std::set<int> collected;
+    chocofarm::CollectedSet collected;
 
     std::cout.precision(17);
     auto print_mask = [&]() {

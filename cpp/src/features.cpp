@@ -59,7 +59,7 @@ int action_to_slot(const Environment& env, const Action& a) {
 }
 
 std::vector<float> legal_mask(const Environment& env, const Belief& bw,
-                              const std::set<int>& collected) {
+                              const CollectedSet& collected) {
     // The authoritative legality source is env.legal_actions (mirrors actions.legal_mask): map its
     // output onto slots + the always-legal TERMINATE. Logic-exact -> bit-identical to Python's M.
     std::vector<float> m(n_action_slots(env), 0.0f);
@@ -298,10 +298,12 @@ struct CollectedFeatures {
     double n_collected = 0.0;     // |collected|
 };
 
-[[nodiscard]] CollectedFeatures collected_features(const std::set<int>& collected, int N) {
+[[nodiscard]] CollectedFeatures collected_features(const CollectedSet& collected, int N) {
     CollectedFeatures cf;
     cf.coll.assign(N, 0.0);
-    for (int i : collected) cf.coll[i] = 1.0;
+    // Ascending iteration (low bit -> high bit == the former std::set<int> sorted order); the indicator
+    // write is position-independent regardless, but ascending keeps the bit-exactness basis explicit.
+    collected.for_each_ascending([&](int i) { cf.coll[i] = 1.0; });
     cf.n_collected = static_cast<double>(collected.size());
     return cf;
 }
@@ -309,7 +311,7 @@ struct CollectedFeatures {
 }  // namespace
 
 std::vector<double> FeatureBuilder::build(const Point& loc, const Belief& bw,
-                                          const std::set<int>& collected) const {
+                                          const CollectedSet& collected) const {
     const int N = N_, nD = nD_, n_tel = n_tel_;
 
     // Three input groups that do not interact until assembly (the dossier's DAG): belief math (the

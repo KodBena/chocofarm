@@ -34,7 +34,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -69,7 +68,7 @@ class ScriptedSource final : public chocofarm::NMCSWorldSource {
         : env_(env), vals_(std::move(vals)) {}
     uint32_t sample_world(const chocofarm::Belief& bw) override { return env_.world_at_rank(bw, 0); }
     double playout_value(const chocofarm::Loc&, const chocofarm::Belief&,
-                         const std::set<int>&, double) override {
+                         const chocofarm::CollectedSet&, double) override {
         // The fixture guarantees a non-empty table (checked in main before constructing the source);
         // an empty table here would be a programmer bug (ADR-0012 P9: an invariant, an assert).
         assert(!vals_.empty() && "nmcs_dump: empty scripted playout table");
@@ -110,7 +109,7 @@ int main(int argc, char** argv) {
 
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
-    std::set<int> collected;
+    chocofarm::CollectedSet collected;
 
     // optionally advance the real (loc, bw, collected) by a prefix slot sequence against the
     // true world bw[0] (the same deterministic world both languages advance by), so the fixed

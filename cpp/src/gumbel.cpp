@@ -226,7 +226,7 @@ GumbelAZPolicy::GumbelAZPolicy(const GumbelConfig& cfg, const NetEvaluator& net,
 
 // ---- net evaluation (one forward, cached on the node) (mirrors _evaluate) --------------------------
 double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& bw,
-                                const std::set<int>& collected) const {
+                                const CollectedSet& collected) const {
     // build the feature vector + the legal mask, run one forward through the net port (the leaf seam).
     std::vector<double> feat64 = fb_.build(loc.pt, bw, collected);
     std::vector<float> feat(feat64.begin(), feat64.end());  // the wire dtype the port consumes (float32)
@@ -328,7 +328,7 @@ int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
 
 // ---- interior PUCT descent; net value at the leaf (mirrors _descend) ------------------------------
 double GumbelAZPolicy::descend(std::vector<GumbelNode>& nodes, int node, const Loc& loc,
-                               const Belief& bw, const std::set<int>& collected,
+                               const Belief& bw, const CollectedSet& collected,
                                uint32_t world, double lam, GumbelSource& src, int depth) const {
     if (depth >= cfg_.max_depth || env_.empty(bw)) {
         if (!nodes[static_cast<size_t>(node)].evaluated) {
@@ -350,7 +350,7 @@ double GumbelAZPolicy::descend(std::vector<GumbelNode>& nodes, int node, const L
     } else {
         Loc nloc = loc;  // COPY: apply computes dt = dist(OLD loc, target) then moves nloc to target
         Belief nbw = bw;
-        std::set<int> nc = collected;
+        CollectedSet nc = collected;
         StepResult sr = env_.apply(nloc, nbw, nc, act, world);
         double step = sr.reward - lam * sr.dt;
         std::tuple<int, GBeliefKey> ckey{a, gumbel_belief_key(env_, nbw)};
@@ -376,7 +376,7 @@ double GumbelAZPolicy::descend(std::vector<GumbelNode>& nodes, int node, const L
 // ---- one sim of a root action (mirrors _simulate_root_action) -------------------------------------
 double GumbelAZPolicy::simulate_root_action(std::vector<GumbelNode>& nodes, const Loc& loc,
                                             const Belief& bw,
-                                            const std::set<int>& collected, int slot, uint32_t world,
+                                            const CollectedSet& collected, int slot, uint32_t world,
                                             double lam, GumbelSource& src) const {
     Action a = action_of_slot(env_, slot);
     if (a.kind == ActionKind::Terminate) return -lam * env_.exit_cost(loc.pt);
@@ -387,7 +387,7 @@ double GumbelAZPolicy::simulate_root_action(std::vector<GumbelNode>& nodes, cons
         uint32_t w = (k == 0) ? world : src.sample_world(bw);
         Loc nloc = loc;  // COPY: apply computes dt = dist(OLD loc, target) then moves nloc to target
         Belief nbw = bw;
-        std::set<int> nc = collected;
+        CollectedSet nc = collected;
         StepResult sr = env_.apply(nloc, nbw, nc, a, w);
         double step = sr.reward - lam * sr.dt;
         std::tuple<int, GBeliefKey> ckey{slot, gumbel_belief_key(env_, nbw)};
@@ -408,7 +408,7 @@ double GumbelAZPolicy::simulate_root_action(std::vector<GumbelNode>& nodes, cons
 
 // ---- run `count` sims of root action `slot` (mirrors _visit) --------------------------------------
 void GumbelAZPolicy::visit(std::vector<GumbelNode>& nodes, const Loc& loc,
-                           const Belief& bw, const std::set<int>& collected, int slot,
+                           const Belief& bw, const CollectedSet& collected, int slot,
                            double lam, GumbelSource& src, int count) const {
     for (int i = 0; i < count; ++i) {
         uint32_t w = src.sample_world(bw);
@@ -421,7 +421,7 @@ void GumbelAZPolicy::visit(std::vector<GumbelNode>& nodes, const Loc& loc,
 // ---- Sequential Halving (Danihelka §2) (mirrors _sequential_halving) ------------------------------
 int GumbelAZPolicy::sequential_halving(std::vector<GumbelNode>& nodes, const Loc& loc,
                                        const Belief& bw,
-                                       const std::set<int>& collected, double lam, GumbelSource& src,
+                                       const CollectedSet& collected, double lam, GumbelSource& src,
                                        std::vector<int> considered, const std::vector<double>& g,
                                        const std::vector<double>& logits, int& n_spent) const {
     n_spent = 0;
@@ -520,7 +520,7 @@ std::vector<double> GumbelAZPolicy::improved_policy(const GumbelNode& root,
 
 // ---- the pure search core (mirrors _decide_root, temperature 0) -----------------------------------
 GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief& bw,
-                                                    const std::set<int>& collected, double lam,
+                                                    const CollectedSet& collected, double lam,
                                                     GumbelSource& src) const {
     // Scope the FeatureBuilder belief memo to ONE decision/tree: the node cache already folds same-node
     // rebuilds, so the memo's increment is same-belief-different-slot reuse WITHIN the tree; beliefs
@@ -624,14 +624,14 @@ class RngGumbelSource final : public GumbelSource {
 
 GumbelAZPolicy::Decision GumbelAZPolicy::decide_with_target(
     const Environment& env, const Loc& loc, const Belief& bw,
-    const std::set<int>& collected, double lam, std::mt19937_64& rng) const {
+    const CollectedSet& collected, double lam, std::mt19937_64& rng) const {
     (void)env;  // the policy holds its own env_ ref (the seam passes env for the contract; same object)
     RngGumbelSource src(env_, rng);  // the env homes the uniform world draw (L1)
     return run_search(loc, bw, collected, lam, src);
 }
 
 ActionAndPi GumbelAZPolicy::decide_target(const Environment& env, const Loc& loc,
-                                          const Belief& bw, const std::set<int>& collected,
+                                          const Belief& bw, const CollectedSet& collected,
                                           double lam, std::mt19937_64& rng) const {
     // The AZ runner's PI source: one search, the executed action + the REAL improved-π (float32).
     Decision dec = decide_with_target(env, loc, bw, collected, lam, rng);
@@ -639,7 +639,7 @@ ActionAndPi GumbelAZPolicy::decide_target(const Environment& env, const Loc& loc
 }
 
 Action GumbelAZPolicy::decide(const Environment& env, const Loc& loc, const Belief& bw,
-                              const std::set<int>& collected, double lam,
+                              const CollectedSet& collected, double lam,
                               std::mt19937_64& rng) const {
     // decide() is decide_with_target() composed with `.action` (DRY — one search entry point).
     return decide_with_target(env, loc, bw, collected, lam, rng).action;

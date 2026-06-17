@@ -32,9 +32,9 @@
 
 #include <cstdint>
 #include <random>
-#include <set>
 #include <vector>
 
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/env.hpp"
 
 namespace chocofarm {
@@ -58,7 +58,7 @@ class Policy {
   public:
     virtual ~Policy() = default;
     virtual Action decide(const Environment& env, const Loc& loc,
-                          const Belief& bw, const std::set<int>& collected,
+                          const Belief& bw, const CollectedSet& collected,
                           double lam, std::mt19937_64& rng) const = 0;
 
     // Decide AND return the improved-policy target (the PI block the AZ learner trains on). The DEFAULT
@@ -69,7 +69,7 @@ class Policy {
     // generate_episode using the search's improved_pi). Not pure — the default is defined in policy.cpp.
     [[nodiscard]] virtual ActionAndPi decide_target(const Environment& env, const Loc& loc,
                                                     const Belief& bw,
-                                                    const std::set<int>& collected, double lam,
+                                                    const CollectedSet& collected, double lam,
                                                     std::mt19937_64& rng) const;
 };
 
@@ -80,7 +80,7 @@ class Policy {
 class RandomPolicy final : public Policy {
   public:
     Action decide(const Environment& env, const Loc& loc, const Belief& bw,
-                  const std::set<int>& collected, double lam, std::mt19937_64& rng) const override {
+                  const CollectedSet& collected, double lam, std::mt19937_64& rng) const override {
         (void)loc;  // RandomPolicy is position-blind; loc stays in the seam signature (P2 contract)
         (void)lam;  // P4: threaded through the seam, ignored by this dumb-random policy
         std::vector<Action> acts = env.legal_actions(bw, collected);
@@ -97,7 +97,7 @@ class RandomPolicy final : public Policy {
 class GreedyBase final : public Policy {
   public:
     Action decide(const Environment& env, const Loc& loc, const Belief& bw,
-                  const std::set<int>& collected, double lam, std::mt19937_64& rng) const override;
+                  const CollectedSet& collected, double lam, std::mt19937_64& rng) const override;
 };
 
 // GreedyStopBase: the default ISMCTS/UCT playout base (mirrors solvers.base.GreedyStopBase). Plain
@@ -108,7 +108,7 @@ class GreedyBase final : public Policy {
 class GreedyStopBase final : public Policy {
   public:
     Action decide(const Environment& env, const Loc& loc, const Belief& bw,
-                  const std::set<int>& collected, double lam, std::mt19937_64& rng) const override;
+                  const CollectedSet& collected, double lam, std::mt19937_64& rng) const override;
 };
 
 // The shared bounded-branching candidate set (mirrors solvers.base.candidate_actions): nearest
@@ -119,7 +119,7 @@ class GreedyStopBase final : public Policy {
 // so every consumer derives the SAME pruning, not a per-search member (ADR-0012 P1).
 [[nodiscard]] std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
                                                     const Belief& bw,
-                                                    const std::set<int>& collected, int n_det,
+                                                    const CollectedSet& collected, int n_det,
                                                     int n_tre, bool include_terminate);
 
 // Play a deterministic base policy to the end in a fixed `world`; return its λ-value
@@ -128,7 +128,7 @@ class GreedyStopBase final : public Policy {
 // taken BY VALUE — _base_value mutates a playout COPY of the belief in place (the seam's apply filters
 // it through the run), so the copy is deliberate (a Belief value, not a borrowed ref).
 [[nodiscard]] double base_value(const Environment& env, const Policy& base, Loc loc,
-                                Belief bw, std::set<int> collected, uint32_t world,
+                                Belief bw, CollectedSet collected, uint32_t world,
                                 double lam);
 
 // The GENERIC world-sampling seam: the part of a search's RNG use that is NOT search-specific.

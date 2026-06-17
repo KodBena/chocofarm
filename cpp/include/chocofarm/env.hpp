@@ -17,12 +17,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <random>
-#include <set>
 #include <span>
 #include <variant>
 #include <vector>
 
 #include "chocofarm/belief_key.hpp"
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/instance.hpp"
 
 // The OPT-IN ZDD belief engine — included at GLOBAL scope (NOT inside namespace chocofarm: a standard-
@@ -291,11 +291,11 @@ class Environment {
     // included here (it is the always-legal extra slot, appended by the Policy / the mask builder),
     // matching env.legal_actions + actions.term_slot exactly.
     std::vector<Action> legal_actions(const Belief& bw,
-                                      const std::set<int>& collected) const;
+                                      const CollectedSet& collected) const;
 
     // Realise `action` against the true `world`. Filters `bw` IN PLACE (move/observe/collect), and
     // returns (reward, dt). The belief filter is the same disjunction/treasure-bit logic as env.py.
-    StepResult apply(Loc& loc, Belief& bw, std::set<int>& collected,
+    StepResult apply(Loc& loc, Belief& bw, CollectedSet& collected,
                      const Action& action, uint32_t world) const;
 
     // ---- belief filters (mirror filter_treasure / SenseAction.filter) ----

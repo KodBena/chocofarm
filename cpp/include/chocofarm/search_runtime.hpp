@@ -30,10 +30,10 @@
 
 #include <cstdint>
 #include <expected>
-#include <set>
 #include <span>
 #include <vector>
 
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/error.hpp"
 #include "chocofarm/gumbel.hpp"
@@ -51,7 +51,7 @@ namespace chocofarm {
 struct SearchTask {
     Loc loc;                       // observed agent location
     Belief bw;                     // observed belief (the seam value type; flat world-set today)
-    std::set<int> collected;       // treasures already collected
+    CollectedSet collected;        // treasures already collected (fixed-width bitmask, alloc-free)
     double lam = 0.0;              // the live Dinkelbach penalty (per-decision, not frozen)
     std::uint64_t seed = 0;        // the per-tree RNG seed (seeds the std::mt19937_64 the source draws off)
     GumbelConfig cfg{};            // the frozen budget for this decision (m, n_sims, c_puct, ...)

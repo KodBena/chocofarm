@@ -21,13 +21,13 @@
 #include <cstdint>
 #include <functional>
 #include <map>
-#include <set>
 #include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "chocofarm/belief_key.hpp"
+#include "chocofarm/collected_set.hpp"
 #include "chocofarm/env.hpp"
 #include "chocofarm/feature_layout.hpp"
 
@@ -48,7 +48,7 @@ int action_to_slot(const Environment& env, const Action& a);
 // non-hot ORACLE: the per-step training-mask emission (runner.cpp) + the parity tool use it; the hot
 // search path uses FeatureBuilder::legal_mask_from_features, which the parity harness nets against THIS.
 std::vector<float> legal_mask(const Environment& env, const Belief& bw,
-                              const std::set<int>& collected);
+                              const CollectedSet& collected);
 
 // --- the featurizer's internal value types (the memo's stored shapes; the pure compute functions in
 // features.cpp return them, the FeatureBuilder caches below hold them) ---
@@ -105,7 +105,7 @@ class FeatureBuilder {
     // `loc` is the current standing point (resolved Point, as in env.coord). `bw`/`collected` are
     // the live belief + collected set. Returns a length-`dim()` float64 vector.
     std::vector<double> build(const Point& loc, const Belief& bw,
-                              const std::set<int>& collected) const;
+                              const CollectedSet& collected) const;
 
     // The legal-action mask sliced from an ALREADY-BUILT feature vector (mirrors
     // actions.legal_mask_from_features): the per-treasure `available` block IS the collect-legal mask,

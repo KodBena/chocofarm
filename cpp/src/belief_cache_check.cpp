@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,7 +45,7 @@ int main(int argc, char** argv) {
     chocofarm::Environment env(*inst);
     chocofarm::FeatureBuilder fb(env);
     const chocofarm::Point loc = env.entry_point();
-    const std::set<int> coll;
+    const chocofarm::CollectedSet coll;
 
     // Two DISTINCT beliefs that SHARE a (count, first, last) fingerprint (different MIDDLE world) — the
     // exact collision the full-equality guard must distinguish. front()=1, back()=5, size=3 for both.
