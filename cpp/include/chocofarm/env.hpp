@@ -117,7 +117,8 @@ struct BitsetBelief {
 // The OPT-IN belief-as-diagram (ZDD) arm — the §B.4(b) graduation (belief_features_and_decision_diagram
 // _note.md Part B; docs/design/cpp-belief-zdd-onramp.md). A thin value wrapper over the maintained
 // BeliefDiagram (the engine owns the per-belief arena; this is the seam's opaque value — copyable,
-// value-semantics, == by the diagram's member SET). The diagram is maintained THROUGH the search:
+// value-semantics, == by the diagram's CANONICAL STRUCTURE, O(|Z|): see BeliefDiagram::operator==). The
+// diagram is maintained THROUGH the search:
 // filter_treasure/detector are RESTRICT ops on `z` in place, not a rebuild. cached_count_ mirrors
 // z.count() so nb() is O(1) (the same O(1)-nb obligation the bitset arm's count_ serves); it is
 // recomputed in EVERY filter. The EQUIVALENCE ASYMMETRY (design §4 of the B.4(b) task): the ZDD arm is
@@ -130,10 +131,16 @@ struct BitsetBelief {
 struct ZddBelief {
     beliefzdd::BeliefDiagram z;
     int64_t cached_count_ = 0;  // = z.count(); the O(1) nb; recomputed after each filter
-    // Value-equality by the MEMBER SET (not the arena's node ids — two diagrams reduced from the same
-    // world-set are canonical-equal in member set even if their arenas differ by dead nodes). The belief
-    // cache's full-equality verify (the belief_key fingerprint pre-filter, then this net).
-    bool operator==(const ZddBelief& o) const { return z.members() == o.z.members(); }
+    // Value-equality by the diagram's CANONICAL STRUCTURE — z == o.z compares the canonical layout
+    // (n_, root_, the byte-identical nodes_ array) in O(|Z|), with NO enumeration and NO allocation. This
+    // replaces the former z.members() == o.z.members(), which fully enumerated BOTH world-sets (O(nb) + two
+    // heap vectors) on every belief-cache full-equality verify (the belief_key fingerprint pre-filter, then
+    // this net — ~40% of the ZDD client self-time post the value-copy fix). compact() canonicalizes the
+    // layout at every mutation exit, so two diagrams of the SAME family (reached via any restrict sequence)
+    // are byte-identical and structural == is EXACT (a canonical reduced ZDD is its family's unique
+    // representation: structural-equal ⟺ family-equal — no false positives, never a wrong cache value; the
+    // only conceivable failure is a harmless false-negative cache miss). See BeliefDiagram::operator==.
+    bool operator==(const ZddBelief& o) const { return z == o.z; }
 };
 
 // The Belief variant — THREE arms under the flag (flat + bitset + ZDD), TWO in the default build.

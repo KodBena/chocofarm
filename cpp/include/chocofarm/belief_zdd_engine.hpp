@@ -73,6 +73,9 @@ struct ZNode {
     int32_t var;
     uint32_t lo;
     uint32_t hi;
+    // Field-exact equality — the per-element comparator the structural BeliefDiagram::operator== uses
+    // (the std::vector<ZNode> compare below calls this). Defaulted: var/lo/hi are the whole node.
+    bool operator==(const ZNode&) const = default;
 };
 
 // The LOSSLESS hash-cons key (design §13 trap 4): an exact struct, NEVER an XOR-folded packed integer
@@ -116,6 +119,25 @@ class BeliefDiagram {
     BeliefDiagram(BeliefDiagram&&) = default;
     BeliefDiagram& operator=(const BeliefDiagram&) = default;
     BeliefDiagram& operator=(BeliefDiagram&&) = default;
+
+    // STRUCTURAL canonical equality — O(|Z|), NO enumeration, NO allocation (the cheap replacement for the
+    // former enumerate-both-sides members()==members() the belief cache's full-equality verify called on
+    // every collision-guard, ~40% of the ZDD client self-time). It compares the CANONICAL LAYOUT directly:
+    // the variable universe (n_), the root id, and the byte-identical nodes_ array (std::vector<ZNode>
+    // compare → ZNode::operator==). Lives ON BeliefDiagram (not a free function) because it reads the
+    // private arena. CORRECTNESS: compact() (run at every mutation exit) renumbers nodes_ in a deterministic
+    // POST-ORDER DFS from root_; for a reduced, ordered, hash-consed ZDD that numbering is CANONICAL —
+    // determined purely by the DAG structure, independent of construction history. So two diagrams that
+    // represent the SAME family (even reached via different restrict sequences) have byte-identical
+    // (n_, root_, nodes_), and structural == is EXACT. A canonical reduced ZDD is the unique representation
+    // of its family ⇒ structural-equal ⟺ family-equal: NO false positives (two distinct families can never
+    // share a canonical layout, so the cache can never return a wrong value). The only conceivable failure
+    // is a false NEGATIVE (equal families, different layout) were compact()'s numbering ever non-canonical
+    // — and that degrades to a harmless cache MISS (recompute), never incorrectness. The construction-order
+    // invariance is NET in belief_sweep_oracle_check.cpp's flat-vs-ZDD harness (build-two-ways → assert ==).
+    [[nodiscard]] bool operator==(const BeliefDiagram& o) const {
+        return n_ == o.n_ && root_ == o.root_ && nodes_ == o.nodes_;
+    }
 
     // ---- the maintained-belief queries (the seam's reads) ----
     [[nodiscard]] int64_t count() const;                  // cardinality == nb (§5.1)

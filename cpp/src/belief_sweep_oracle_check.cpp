@@ -291,6 +291,144 @@ namespace {
     else             { env.filter_treasure(fb, idx, polarity); env.filter_treasure(zb, idx, polarity); }
     return zdd_ops_identical(env, fb, zb, tag, why);
 }
+
+// ---- the CONSTRUCTION-ORDER-INVARIANCE net for ZddBelief::operator== (the canonical-layout crux) ----
+// The structural == (z == o.z compares n_/root_/nodes_) is EXACT only because compact()'s post-order DFS
+// renumber is CANONICAL — a reduced/ordered/hash-consed ZDD's node layout is determined by the DAG, NOT by
+// construction history. This net FALSIFIES that claim directly (ADR-0011 — net the guard, do not trust it):
+// for a target world-set, build a ZddBelief TWO ways that reach the SAME family but via different
+// construction orders, and assert structural == is TRUE. If it ever fails, the canonical-layout assumption
+// is false — make it RESULT: FAIL loud (ADR-0002). Also assert two DIFFERENT families compare FALSE.
+//
+//   way (i)  build-from-worlds DIRECTLY (the bw ctor over `target`'s worlds).
+//   way (ii) full_belief() (the family of EVERY world over N vars) then restrict_* DOWN to the same
+//            world-set, by intersecting with each treasure's present/absent constraint that `target` shares
+//            (a sequence of restrict_var ops — a wholly different construction path: zunion-fold from chains
+//            vs restrict-applies on the full diagram, both ending in compact()). The two reach the same
+//            family iff `target` is exactly the set of worlds satisfying that conjunction of bit-constraints.
+//
+// To make way (ii) reach a clean family we drive it on the worlds that AGREE with a fixed reference world on
+// a chosen treasure bit (the subfamily "treasure t present" or "absent"): full_belief() then restrict_var(t,
+// present) is exactly the set of K-subsets that (do/don't) contain t — and the same family built directly
+// from those worlds is way (i). For a few t we assert way(i) == way(ii) (same family, different order) AND
+// way(i) for "present" != way(i) for "absent" (disjoint families → structural !=).
+[[nodiscard]] bool zdd_ctor_order_invariant(const chocofarm::Environment& env, std::string& why) {
+    const std::vector<uint32_t>& all = env.worlds();
+    const int N = env.N();
+    // A handful of treasures spread across the universe (each partitions worlds into present/absent).
+    for (int t : {0, 1, N / 2, N - 1}) {
+        if (t < 0 || t >= N) continue;
+        // The two target families: worlds WITH treasure t, worlds WITHOUT it (a clean bit-constraint family).
+        std::vector<uint32_t> with_t, without_t;
+        for (uint32_t w : all) (((w >> t) & 1u) ? with_t : without_t).push_back(w);
+
+        for (bool present : {true, false}) {
+            const std::vector<uint32_t>& target = present ? with_t : without_t;
+            if (target.empty()) continue;  // (no such family on this instance — skip)
+
+            // way (i): build the family DIRECTLY from its worlds (the bw ctor / zunion-fold).
+            chocofarm::beliefzdd::BeliefDiagram zi(std::span<const uint32_t>(target), N);
+            // way (ii): full_belief() then restrict DOWN to the same family (a different construction path).
+            chocofarm::beliefzdd::BeliefDiagram zii(std::span<const uint32_t>(all), N);
+            zii.restrict_var(t, present);
+
+            // FAMILY pre-check (members set-equal): both ways must represent `target` exactly (else the test
+            // itself is malformed — a loud failure, not a silent skip).
+            {
+                std::vector<uint32_t> mi = zi.members(), mii = zii.members(), tg = target;
+                std::sort(mi.begin(), mi.end());
+                std::sort(mii.begin(), mii.end());
+                std::sort(tg.begin(), tg.end());
+                if (mi != tg || mii != tg) {
+                    why = "construction-order net malformed: members(way i/ii) != target family (t=" +
+                          std::to_string(t) + " present=" + (present ? "1" : "0") + ")";
+                    return false;
+                }
+            }
+
+            // THE CRUX: same family, two construction orders → structural == MUST be TRUE (canonical layout).
+            if (!(zi == zii)) {
+                why = "CANONICAL-LAYOUT FALSIFIED: same family via different construction orders compared "
+                      "NOT-EQUAL under structural == (t=" + std::to_string(t) + " present=" +
+                      (present ? "1" : "0") + " |target|=" + std::to_string(target.size()) +
+                      ") — compact()'s post-order renumber is non-canonical; the ZDD operator== fix is unsound";
+                return false;
+            }
+        }
+
+        // DIFFERENT families → structural == MUST be FALSE (no false positives). worlds-with-t vs
+        // worlds-without-t are disjoint non-empty families (when both exist); their canonical layouts differ.
+        if (!with_t.empty() && !without_t.empty()) {
+            chocofarm::beliefzdd::BeliefDiagram za(std::span<const uint32_t>(with_t), N);
+            chocofarm::beliefzdd::BeliefDiagram zb(std::span<const uint32_t>(without_t), N);
+            if (za == zb) {
+                why = "FALSE POSITIVE: two DIFFERENT families (with/without treasure " + std::to_string(t) +
+                      ") compared EQUAL under structural == — the canonical layout is not injective";
+                return false;
+            }
+        }
+    }
+
+    // ALSO net the restrict_COVER construction path (the PRODUCTION filter_detector path: env_zdd.cpp routes
+    // filter_detector -> restrict_cover -> cover_hold/cover_fail — the diagrams the belief cache actually
+    // compares are mutated by BOTH restrict ops, not just restrict_var). The restrict_var loop above leaves
+    // the cover path un-netted; this exercises it the same two-ways: a face's COVER-defined subfamily built
+    // (i) directly from its worlds vs (ii) full_belief() then restrict_cover(mask, positive). The cover ops
+    // create nodes only via mk + end in compact() exactly like restrict_var, so the canonical-layout claim
+    // covers them — and now the net falsifies it on the cover path too (a future cover edit that stranded a
+    // non-canonical arena would make the same-family case fail loud here, ADR-0002).
+    const std::span<const uint32_t> masks = env.face_masks();
+    for (int j : {0, env.n_detectors() / 2, env.n_detectors() - 1}) {
+        if (j < 0 || j >= env.n_detectors()) continue;
+        const uint32_t mask = masks[static_cast<size_t>(j)];
+        std::vector<uint32_t> hold, fail;  // cover-disjunction holds (>=1 mask bit) / fails (none)
+        for (uint32_t w : all) ((w & mask) != 0 ? hold : fail).push_back(w);
+
+        for (bool positive : {true, false}) {
+            const std::vector<uint32_t>& target = positive ? hold : fail;
+            if (target.empty()) continue;  // (no such cover subfamily on this instance — skip)
+
+            // way (i): build the cover subfamily DIRECTLY from its worlds (the bw ctor / zunion-fold).
+            chocofarm::beliefzdd::BeliefDiagram zi(std::span<const uint32_t>(target), N);
+            // way (ii): full_belief() then restrict_cover DOWN to the same family (the production cover path).
+            chocofarm::beliefzdd::BeliefDiagram zii(std::span<const uint32_t>(all), N);
+            zii.restrict_cover(mask, positive);
+
+            {
+                std::vector<uint32_t> mi = zi.members(), mii = zii.members(), tg = target;
+                std::sort(mi.begin(), mi.end());
+                std::sort(mii.begin(), mii.end());
+                std::sort(tg.begin(), tg.end());
+                if (mi != tg || mii != tg) {
+                    why = "construction-order net malformed (cover): members(way i/ii) != target family (face=" +
+                          std::to_string(j) + " positive=" + (positive ? "1" : "0") + ")";
+                    return false;
+                }
+            }
+
+            // THE CRUX (cover path): same family, two construction orders -> structural == MUST be TRUE.
+            if (!(zi == zii)) {
+                why = "CANONICAL-LAYOUT FALSIFIED (cover): same family via build-from-worlds vs full_belief()+"
+                      "restrict_cover compared NOT-EQUAL under structural == (face=" + std::to_string(j) +
+                      " positive=" + (positive ? "1" : "0") + " |target|=" + std::to_string(target.size()) +
+                      ") — compact()'s post-order renumber is non-canonical on the cover path; the fix is unsound";
+                return false;
+            }
+        }
+
+        // DIFFERENT cover families (hold vs fail are a disjoint partition) -> structural == MUST be FALSE.
+        if (!hold.empty() && !fail.empty()) {
+            chocofarm::beliefzdd::BeliefDiagram za(std::span<const uint32_t>(hold), N);
+            chocofarm::beliefzdd::BeliefDiagram zb(std::span<const uint32_t>(fail), N);
+            if (za == zb) {
+                why = "FALSE POSITIVE (cover): the cover-hold and cover-fail families of face " +
+                      std::to_string(j) + " compared EQUAL under structural == — layout not injective";
+                return false;
+            }
+        }
+    }
+    return true;
+}
 #endif  // CHOCO_BELIEF_ZDD
 }  // namespace
 
@@ -442,6 +580,25 @@ int main(int argc, char** argv) {
               << "re-asserted after each) + the empty-RESULT restrict nets (cover_hold/cover_fail/with_var/"
               << "without_var each driven to BOT) — flat == ZDD on every FEATURE op; SAMPLING (sample_world/"
               << "world_at_rank/belief_key) RE-BASELINES and is NOT asserted equal — the design-§4 asymmetry)\n";
+
+    // ---- Part 4 (OPT-IN): the construction-order-invariance net for the structural ZddBelief::operator== ----
+    // The structural == (z == o.z: canonical n_/root_/nodes_ compare) replaces the O(nb) members()==members()
+    // enumerate-both-sides equality. It is EXACT iff compact()'s post-order renumber is CANONICAL. This nets
+    // that crux directly (ADR-0011): same family via DIFFERENT construction orders → == TRUE; different
+    // families → == FALSE. A false on the same-family case falsifies the canonical-layout claim (RESULT: FAIL,
+    // ADR-0002 — do not paper over).
+    {
+        std::string cwhy;
+        if (!zdd_ctor_order_invariant(env, cwhy)) {
+            (void)fail("ZDD operator== construction-order-invariance net: " + cwhy);
+            return 1;
+        }
+    }
+    std::cout << "RESULT: PASS ZDD operator== construction-order invariance (same family via build-from-worlds "
+              << "vs full_belief()+restrict_var AND vs full_belief()+restrict_cover → structural == TRUE; "
+              << "disjoint families (treasure present/absent + cover hold/fail) → structural == FALSE; the "
+              << "canonical-layout assumption behind the O(|Z|) structural == is netted on BOTH restrict paths, "
+              << "not trusted)\n";
 #endif
     return 0;
 }
