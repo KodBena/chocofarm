@@ -46,20 +46,16 @@ namespace {
 
 // _update(node, a, ret) (mirrors ISMCTSPolicy._update): bump visits + reward for action-slot `a`.
 // The FIRST insertion of `a` into visits records its INSERTION ORDER in visit_order — the order both
-// the UCB select and the most-visited final iterate (the parity-critical first-wins tie source).
+// the UCB select and the most-visited final iterate (the parity-critical first-wins tie source). DENSE:
+// visits[a]==0 <=> `a` not yet inserted (visits only increments from the zero-init), so the former
+// `visits.find(a)==end()` first-insertion test is exactly `visits[a]==0`; reward is written in lockstep
+// with visits (this is their only writer), so `+= ret` from the zero-init is the former
+// `reward[a]=ret` (new) / `+= ret` (seen) — bit-identical.
 void update_node(ISMCTSNode& nd, int a, double ret) {
-    auto vit = nd.visits.find(a);
-    if (vit == nd.visits.end()) {
-        nd.visits[a] = 1;
-        nd.visit_order.push_back(a);  // first visits-insertion -> insertion order
-    } else {
-        vit->second += 1;
-    }
-    auto rit = nd.reward.find(a);
-    if (rit == nd.reward.end())
-        nd.reward[a] = ret;
-    else
-        rit->second += ret;
+    const size_t s = static_cast<size_t>(a);
+    if (nd.visits[s] == 0) nd.visit_order.push_back(a);  // first visits-insertion -> insertion order
+    nd.visits[s] += 1;
+    nd.reward[s] += ret;  // dense, zero-init: += is the former (new ? ret : reward[a]+ret)
 }
 }  // namespace
 
@@ -74,11 +70,14 @@ int ISMCTSPolicy::ucb_select(const ISMCTSNode& node) const {
     // iterate in INSERTION order (visit_order), not the map's sorted-key order — the parity-critical
     // first-wins tie is over insertion order (mirrors Python dict iteration in _ucb_select).
     for (int a : node.visit_order) {
-        int n_j = node.visits.at(a);
+        const size_t s = static_cast<size_t>(a);
+        int n_j = node.visits[s];
         if (n_j == 0) return a;  // an unselected-but-present arm: pick it immediately (mirrors Python)
-        double exploit = node.reward.at(a) / static_cast<double>(n_j);
-        auto it = node.avail.find(a);
-        int navail = (it != node.avail.end()) ? it->second : n_j;  // avail.get(a, n_j)
+        double exploit = node.reward[s] / static_cast<double>(n_j);
+        // avail.get(a, n_j): dense avail[a]==0 <=> the key was absent in the map (avail only increments
+        // from the zero-init), so `avail[a] ? avail[a] : n_j` reproduces the map's present?value:default
+        // exactly (here a slot in visit_order always had its avail bumped in the same iterate, so >0).
+        int navail = (node.avail[s] != 0) ? node.avail[s] : n_j;
         double explore = (navail > 1)
                              ? c * std::sqrt(std::log(static_cast<double>(navail)) /
                                              static_cast<double>(n_j))
@@ -113,15 +112,18 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
     for (const Action& a : actions) slots.push_back(slot_of(env, a));
 
     // Bump availability for every action legal on this visit (subset-armed bandit, §IV-B). This
-    // touches ONLY the avail dict; the parity-critical insertion order is the VISITS-insertion order
+    // touches ONLY the avail counts; the parity-critical insertion order is the VISITS-insertion order
     // (the order _update first inserts an action into `visits`), which both _ucb_select and the
     // most-visited final iterate — so visit_order is appended at the _update site below, NOT here.
-    for (int a : slots) nodes[node].avail[a] = nodes[node].avail.count(a) ? nodes[node].avail[a] + 1 : 1;
+    // DENSE, zero-init: `avail[a]++` is the former `avail[a] = avail.count(a) ? avail[a]+1 : 1`
+    // (avail[a]==0 <=> absent, so 0->1 on first bump, then increments — bit-identical).
+    for (int a : slots) nodes[node].avail[static_cast<size_t>(a)] += 1;
 
-    // (3) Expansion: if any compatible action is untried here, expand one uniformly.
+    // (3) Expansion: if any compatible action is untried here, expand one uniformly. DENSE:
+    // visits[a]==0 <=> untried (the former `visits.find(a)==end()`).
     std::vector<int> untried;
     for (int a : slots)
-        if (nodes[node].visits.find(a) == nodes[node].visits.end()) untried.push_back(a);
+        if (nodes[node].visits[static_cast<size_t>(a)] == 0) untried.push_back(a);
     if (!untried.empty()) {
         int pick = src.expand_index(static_cast<int>(untried.size()));
         int a = untried[static_cast<size_t>(pick)];
@@ -138,7 +140,7 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
             // register the successor child (still part of this edge's statistics), then the leaf.
             std::tuple<int, BeliefKey> ckey{a, env.belief_key(nbw)};
             if (nodes[node].children.find(ckey) == nodes[node].children.end()) {
-                nodes.emplace_back();
+                nodes.emplace_back(n_action_slots(env));  // dense stats sized to the slot space
                 nodes[node].children[ckey] = static_cast<int>(nodes.size()) - 1;
             }
             double cont = src.leaf_value(nloc, nbw, nc, world, lam);
@@ -166,7 +168,7 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
         if (cit == nodes[node].children.end()) {
             // the action edge exists, but this determinization routes to a successor belief not yet
             // seen — create that child node (still part of the same edge's statistics).
-            nodes.emplace_back();
+            nodes.emplace_back(n_action_slots(env));  // dense stats sized to the slot space
             child = static_cast<int>(nodes.size()) - 1;
             nodes[node].children[ckey] = child;
         } else {
@@ -185,23 +187,24 @@ Action ISMCTSPolicy::run_search(const Environment& env, const Loc& loc,
                                 double lam, ISMCTSSource& src) const {
     if (env.empty(bw)) return terminate_action();  // mirrors decide's len(bw)==0 -> TERMINATE
     std::vector<ISMCTSNode> nodes;
-    nodes.emplace_back();  // the root (index 0)
+    nodes.emplace_back(n_action_slots(env));  // the root (index 0); dense stats sized to the slot space
     for (int i = 0; i < cfg_.iterations; ++i) {
         uint32_t w = src.sample_world(bw);  // (1) determinize: one world ~ belief
         std::set<int> coll = collected;     // _iterate mutates a fresh collected-set per iteration
         iterate(env, nodes, 0, loc, bw, coll, w, lam, src, 0);
     }
-    // (final) most-visited root action; TERMINATE if nothing was tried (visits empty). First-wins tie
-    // over INSERTION order (mirrors max(root.visits, key=...) which keeps the first max).
+    // (final) most-visited root action; TERMINATE if nothing was tried. First-wins tie over INSERTION
+    // order (mirrors max(root.visits, key=...) which keeps the first max). DENSE: "nothing was tried" is
+    // `visit_order.empty()` (the dense visits vector is always size n_slots; the former `visits.empty()`
+    // meant the MAP had no key, i.e. no slot was ever inserted — exactly visit_order being empty).
     const ISMCTSNode& root = nodes[0];
-    if (root.visits.empty()) return terminate_action();
+    if (root.visit_order.empty()) return terminate_action();
     int best_slot = -1;
     int best_visits = -1;
     for (int a : root.visit_order) {
-        auto it = root.visits.find(a);
-        if (it == root.visits.end()) continue;  // an avail-only arm never selected: skip
-        if (it->second > best_visits) {  // strict >: first arm (insertion order) wins a tie
-            best_visits = it->second;
+        if (root.visits[static_cast<size_t>(a)] == 0) continue;  // an avail-only arm never selected: skip
+        if (root.visits[static_cast<size_t>(a)] > best_visits) {  // strict >: first arm wins a tie
+            best_visits = root.visits[static_cast<size_t>(a)];
             best_slot = a;
         }
     }

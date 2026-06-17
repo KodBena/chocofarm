@@ -130,8 +130,8 @@ namespace {
 [[nodiscard]] double sigma_scale_1a(const GumbelNode& node, double c_visit, double c_scale) {
     int max_n = 0;
     for (int s : node.legal_slots) {
-        auto it = node.N.find(s);
-        if (it != node.N.end() && it->second > max_n) max_n = it->second;
+        const int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (the former N.find==end branch)
+        if (n > max_n) max_n = n;
     }
     return (c_visit + static_cast<double>(max_n)) * c_scale;
 }
@@ -155,8 +155,7 @@ namespace {
         // arithmetic throughout (the discrimination control — diverges from Python on fine near-ties).
         double pw_num = 0.0, pw_den = 0.0;
         for (int s : node.legal_slots) {
-            auto nit = node.N.find(s);
-            int n = (nit != node.N.end()) ? nit->second : 0;
+            int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
             if (n > 0) {
                 sum_n += n;
                 double p = prior_read(node, s);  // full-float64 prior (kUniform)
@@ -174,8 +173,7 @@ namespace {
     // mixed precision (default): float32 prior-weighted blend, byte-faithful to numpy's weak promotion.
     float pw_num = 0.0f, pw_den = 0.0f;
     for (int s : node.legal_slots) {
-        auto nit = node.N.find(s);
-        int n = (nit != node.N.end()) ? nit->second : 0;
+        int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
         if (n > 0) {
             sum_n += n;
             float p = node.prior[static_cast<size_t>(s)];               // the stored float32 prior
@@ -282,8 +280,11 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
 
 // ---- AlphaZero PUCT select (mirrors _puct_select) -------------------------------------------------
 int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
+    // total_n = ΣN over the slot space. The former std::map held ONLY visited slots; the dense vector holds
+    // ALL slots with unvisited == 0, so summing the whole vector gives the IDENTICAL total (the 0 entries
+    // add nothing). Order-independent either way (a sum).
     int total_n = 0;
-    for (const auto& kv : node.N) total_n += kv.second;
+    for (int n : node.N) total_n += n;
     double sqrt_total = (total_n > 0) ? std::sqrt(static_cast<double>(total_n)) : 1.0;
     double base_v = node.value;  // unvisited Q completed by the node's own net value
     int best_a = -1;
@@ -291,9 +292,8 @@ int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
     // iterate node.legal_slots (the env-order list), strict `>` first-wins — mirrors Python's loop over
     // node.legal with `if v > best_v`, never the std::map's sorted-key order.
     for (int s : node.legal_slots) {
-        auto nit = node.N.find(s);
-        int n = (nit != node.N.end()) ? nit->second : 0;
-        double q = (n > 0) ? (node.W.at(s) / static_cast<double>(n)) : base_v;
+        int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
+        double q = (n > 0) ? (node.W[static_cast<size_t>(s)] / static_cast<double>(n)) : base_v;
         // 1b SEAM (seam 4): Python computes `q + c_puct·p·√ΣN/(1+n)` with `p` the float32 prior scalar,
         // which numpy weak-promotes through the WHOLE U-term and the `q +` to float32 — so the interior
         // near-tie argmax is decided in FLOAT32 (gumbel_search.py:397-426). Mirror it: cast the Python-
@@ -358,7 +358,7 @@ double GumbelAZPolicy::descend(std::vector<GumbelNode>& nodes, int node, const L
         int child;
         auto cit = cur.children.find(ckey);
         if (cit == cur.children.end()) {
-            nodes.emplace_back();
+            nodes.emplace_back(n_slots_);  // dense W/N sized to the slot space, zero-initialized
             child = static_cast<int>(nodes.size()) - 1;
             nodes[static_cast<size_t>(node)].children[ckey] = child;  // re-index after possible realloc
         } else {
@@ -368,8 +368,8 @@ double GumbelAZPolicy::descend(std::vector<GumbelNode>& nodes, int node, const L
         ret = step + cont;
     }
     auto& cur = nodes[static_cast<size_t>(node)];
-    cur.W[a] = (cur.W.count(a) ? cur.W[a] : 0.0) + ret;
-    cur.N[a] = (cur.N.count(a) ? cur.N[a] : 0) + 1;
+    cur.W[static_cast<size_t>(a)] += ret;  // dense, zero-init: += is the former (count?W[a]:0)+ret
+    cur.N[static_cast<size_t>(a)] += 1;    // dense, zero-init: += is the former (count?N[a]:0)+1
     return ret;
 }
 
@@ -394,7 +394,7 @@ double GumbelAZPolicy::simulate_root_action(std::vector<GumbelNode>& nodes, cons
         int child;
         auto cit = nodes[0].children.find(ckey);
         if (cit == nodes[0].children.end()) {
-            nodes.emplace_back();
+            nodes.emplace_back(n_slots_);  // dense W/N sized to the slot space, zero-initialized
             child = static_cast<int>(nodes.size()) - 1;
             nodes[0].children[ckey] = child;
         } else {
@@ -413,8 +413,8 @@ void GumbelAZPolicy::visit(std::vector<GumbelNode>& nodes, const Loc& loc,
     for (int i = 0; i < count; ++i) {
         uint32_t w = src.sample_world(bw);
         double ret = simulate_root_action(nodes, loc, bw, collected, slot, w, lam, src);
-        nodes[0].W[slot] = (nodes[0].W.count(slot) ? nodes[0].W[slot] : 0.0) + ret;
-        nodes[0].N[slot] = (nodes[0].N.count(slot) ? nodes[0].N[slot] : 0) + 1;
+        nodes[0].W[static_cast<size_t>(slot)] += ret;  // dense, zero-init: += is the former (count?W:0)+ret
+        nodes[0].N[static_cast<size_t>(slot)] += 1;    // dense, zero-init: += is the former (count?N:0)+1
     }
 }
 
@@ -497,8 +497,7 @@ std::vector<double> GumbelAZPolicy::improved_policy(const GumbelNode& root,
     double vm = v_mix_mixed(root, root.value);   // float32-faithful v_mix (returned widened to double)
     std::vector<double> completed(static_cast<size_t>(n_slots_), -1e30);
     for (int s : root.legal_slots) {
-        auto nit = root.N.find(s);
-        int n = (nit != root.N.end()) ? nit->second : 0;
+        int n = root.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
         // 1b SEAM (seam 3): `completed[s] = logits[s] + σ·q`, where `logits[s]` is a float64 root logit
         // (an element of the float64 `logits` array) and σ is a Python float. For VISITED slots q is a
         // Python float (root.q), so `σ·q` is float64 → the whole term is float64. For UNVISITED slots q
@@ -540,7 +539,7 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     }
 
     std::vector<GumbelNode> nodes;
-    nodes.emplace_back();  // the root (arena index 0)
+    nodes.emplace_back(n_slots_);  // the root (arena index 0); dense W/N sized to the slot space
     evaluate(nodes[0], loc, bw, collected);
 
     // root logits = log(prior) over legal slots (the masked-softmax prior is the reference; its log is

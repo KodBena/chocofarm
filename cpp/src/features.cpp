@@ -226,13 +226,14 @@ namespace {
     bf.informative.assign(nD, 0.0);
 
     const double inv = 1.0 / static_cast<double>(nb);
+    const std::span<const uint64_t> live = b.live();  // the live words [0,kw64_), NOT the inline-array cap
     for (int t = 0; t < N; ++t) {
-        const int64_t bit_cnt = popcount_and(b.bits, env.treasure_mask(t));  // Σ_w bit_t(w)
+        const int64_t bit_cnt = popcount_and(live, env.treasure_mask(t));  // Σ_w bit_t(w)
         bf.marg[static_cast<size_t>(t)]  = static_cast<double>(bit_cnt) * inv;
         bf.marg_sum += bf.marg[static_cast<size_t>(t)];                       // treasure-id order (P6)
     }
     for (int j = 0; j < nD; ++j) {
-        const int64_t det_cnt = popcount_and(b.bits, env.detector_mask(j));   // Σ_w [(w & mask_j)!=0]
+        const int64_t det_cnt = popcount_and(live, env.detector_mask(j));   // Σ_w [(w & mask_j)!=0]
         bf.p_pos[static_cast<size_t>(j)]       = static_cast<double>(det_cnt) * inv;
         bf.informative[static_cast<size_t>(j)] = (det_cnt > 0 && det_cnt < static_cast<int64_t>(nb)) ? 1.0 : 0.0;
     }

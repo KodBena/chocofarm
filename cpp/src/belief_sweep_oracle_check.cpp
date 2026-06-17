@@ -110,13 +110,13 @@ namespace {
 [[nodiscard]] chocofarm::BitsetBelief to_bitset(const chocofarm::Environment& env,
                                                 const std::map<uint32_t, size_t>& rank,
                                                 const std::vector<uint32_t>& flat) {
-    chocofarm::BitsetBelief b;
-    b.bits.assign(static_cast<size_t>(env.kW64()), 0ull);
+    chocofarm::BitsetBelief b;  // bits{} zero-initialized inline (the fixed-capacity array); tail stays 0
+    b.kw64_ = env.kW64();       // the runtime word count (the env gates ON so kW64 <= kBitsetMaxWords)
     for (uint32_t w : flat) {
         const auto it = rank.find(w);
         // every belief here is a subset of env.worlds(), so the world is always found (invariant).
         const size_t r = it->second;
-        b.bits[r >> 6] |= (uint64_t{1} << (r & 63u));
+        b.bits[r >> 6] |= (uint64_t{1} << (r & 63u));  // only live words [0,kw64_) are ever written here
     }
     b.count_ = static_cast<int>(flat.size());
     return b;
@@ -251,10 +251,16 @@ int main(int argc, char** argv) {
     // (the test asserts PASS, not SKIP) are the regression surface (ADR-0011 measure-first / Rule 1).
     const std::size_t mask_bytes =
         static_cast<std::size_t>(N + nD) * static_cast<std::size_t>(env.kW64()) * sizeof(uint64_t);
+    // The GATE: line now also prints the inline-buffer fit (the THIRD conjunct, env.cpp): kW64 must be
+    // <= kBitsetMaxWords (the BitsetBelief's fixed inline-array capacity) or the bitset arm cannot hold the
+    // belief and the env falls to flat. A dim change that pushes kW64 past the cap (or mask_bytes past the
+    // budget) silently drops to flat, which this line + the A/B PASS/SKIP gate below make DIAGNOSABLE.
     std::cout << "GATE: kW64=" << env.kW64() << " mask_bytes=" << mask_bytes << " ("
               << (static_cast<double>(mask_bytes) / 1024.0) << " KiB) budget="
               << chocofarm::kTargetMaskCacheBudgetBytes << " ("
-              << (static_cast<double>(chocofarm::kTargetMaskCacheBudgetBytes) / 1024.0) << " KiB) => use_bitset="
+              << (static_cast<double>(chocofarm::kTargetMaskCacheBudgetBytes) / 1024.0) << " KiB) inline_cap="
+              << chocofarm::kBitsetMaxWords << " words (kW64<=cap: "
+              << ((env.kW64() <= chocofarm::kBitsetMaxWords) ? "yes" : "no") << ") => use_bitset="
               << (env.use_bitset() ? "true" : "false") << "\n";
 
     // ---- Part 2: the flat-vs-bitset A/B (every env seam op byte-identical across the two reps) ----

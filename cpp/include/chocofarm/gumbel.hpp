@@ -52,11 +52,12 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
-#include <map>
 #include <random>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "chocofarm/belief_key.hpp"
@@ -93,13 +94,42 @@ using GBeliefKey = BeliefKey;  // the ONE fingerprint (belief_key.hpp), now shar
     return env.belief_key(bw);
 }
 
+// Hash for the children transposition key (action-slot, belief_key) = tuple<int, tuple<int,u32,u32>>.
+// `children` is a find/insert-only TRANSPOSITION TABLE (never iterated in key order — descend /
+// simulate_root_action only `find` then insert), so swapping std::map -> std::unordered_map is bit-exact:
+// the node graph is unchanged, only the lookup container differs (no ordered traversal anywhere). The mix
+// is the boost hash_combine recurrence (h ^= v*0x9e3779b9 + (h<<6) + (h>>2)) folded over the FOUR scalar
+// fields (the outer slot + the inner count/first/last) — NOT a bare XOR-fold (which would let (a,b) and
+// (b,a) cancel); the shift+golden-ratio mixing breaks that symmetry, so distinct keys hash distinctly with
+// the usual avalanche. Correctness rests on operator== of the tuple (the table compares keys exactly on a
+// bucket collision), not on the hash being injective.
+struct GBeliefChildKeyHash {
+    [[nodiscard]] std::size_t operator()(const std::tuple<int, GBeliefKey>& k) const noexcept {
+        auto mix = [](std::size_t& h, std::size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        std::size_t h = 0;
+        const GBeliefKey& bk = std::get<1>(k);
+        mix(h, static_cast<std::size_t>(static_cast<uint32_t>(std::get<0>(k))));   // action slot
+        mix(h, static_cast<std::size_t>(static_cast<uint32_t>(std::get<0>(bk))));  // belief count
+        mix(h, static_cast<std::size_t>(std::get<1>(bk)));                         // first world id
+        mix(h, static_cast<std::size_t>(std::get<2>(bk)));                         // last world id
+        return h;
+    }
+};
+
 // One information-set node (a belief). Per-action aggregate W (summed λ-penalized return) / N
 // (selection count) over the info set (the ISMCTS/F7 contract), children keyed by (action-slot,
 // belief_key). prior/value/legal are the net's cached evaluation at this belief (one forward, reused
-// across the node's action loop), populated lazily by `evaluate` (mirrors _Node + _evaluate). The
-// maps are keyed by action SLOT (a faithful stand-in for the Python Action-tuple keys; the mapping is
-// a bijection); the legal-slot order is tracked in `legal_slots` so the PUCT scan + the improved-π are
-// over the SAME deterministic order the Python `node.legal` list carries (insertion / id order).
+// across the node's action loop), populated lazily by `evaluate` (mirrors _Node + _evaluate). W/N are
+// DENSE per-slot vectors (sized n_slots, zero-initialized at node creation), indexed by action SLOT — a
+// faithful stand-in for the Python Action-tuple keys (the mapping is a bijection). They REPLACE the former
+// std::map<int,.> (the per-action maps whose std::_Rb_tree_increment dominated the K=128 profile at ~10%):
+// the search only ever LOOKS UP W/N by slot (over node.legal_slots, in env order) and SUMS N (order-
+// independent), never iterates them in key order, so a dense vector is byte-identical (unvisited slot ->
+// N[slot]==0 -> q==0.0, the SAME unvisited-completion the map's `find==end` gave; total_n sums all slots,
+// and unvisited entries are 0 so the sum equals the map's visited-only sum). `legal_slots` tracks the env
+// order the PUCT scan + the improved-π iterate (the Python `node.legal` list order).
 struct GumbelNode {
     bool evaluated = false;                 // has `evaluate` populated this node?
     double value = 0.0;                     // scalar net value V at this belief
@@ -112,15 +142,23 @@ struct GumbelNode {
                                             //   the genuine 1a all-float64 port; the mixed (default) arm
                                             //   reads the float32 `prior`. See gumbel.cpp seam map.
     std::vector<int> legal_slots;           // legal action slots, in env.legal_actions + TERMINATE order
-    std::map<int, double> W;                // action-slot -> summed λ-penalized return
-    std::map<int, int> N;                   // action-slot -> selection count
-    std::map<std::tuple<int, GBeliefKey>, int> children;  // (action-slot, belief_key) -> child arena idx
+    std::vector<double> W;                  // (n_slots,) action-slot -> summed λ-penalized return (0 unvisited)
+    std::vector<int> N;                     // (n_slots,) action-slot -> selection count (0 unvisited)
+    // (action-slot, belief_key) -> child arena idx. A find/insert-only transposition table (never iterated
+    // in key order), so an unordered_map is bit-exact with the former std::map — see GBeliefChildKeyHash.
+    std::unordered_map<std::tuple<int, GBeliefKey>, int, GBeliefChildKeyHash> children;
 
-    // Q(slot) = W/N, or 0.0 unvisited (mirrors _Node.q).
+    // Construct with W/N sized to the slot space, zero-initialized (the unvisited semantics: N[slot]==0).
+    GumbelNode() = default;
+    explicit GumbelNode(int n_slots)
+        : W(static_cast<size_t>(n_slots), 0.0), N(static_cast<size_t>(n_slots), 0) {}
+
+    // Q(slot) = W/N, or 0.0 unvisited (mirrors _Node.q). Dense: N[slot]==0 <=> unvisited (the former
+    // `N.find==end` branch), so the unvisited->0.0 semantics is preserved exactly.
     [[nodiscard]] double q(int slot) const {
-        auto it = N.find(slot);
-        if (it == N.end() || it->second == 0) return 0.0;
-        return W.at(slot) / static_cast<double>(it->second);
+        const int n = N[static_cast<size_t>(slot)];
+        if (n == 0) return 0.0;
+        return W[static_cast<size_t>(slot)] / static_cast<double>(n);
     }
 };
 

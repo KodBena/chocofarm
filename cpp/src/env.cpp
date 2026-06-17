@@ -19,12 +19,30 @@ namespace chocofarm {
 
 namespace {
 
+// DEBUG-only guard on the tail-zero invariant operator== relies on (the unused words [kw64_, kBitsetMaxWords)
+// must always be 0, so the whole-array `= default` compare equals comparing the first kw64_ words). Called
+// after each production write of a BitsetBelief; compiles to nothing under NDEBUG (the Release build), so it
+// is OFF the hot read path entirely. It is the cheap net for a FUTURE writer that sets a tail word (the one
+// way the inline-array operator== could silently diverge — the out-of-frame audit's named residual risk).
+inline void assert_tail_zero([[maybe_unused]] const BitsetBelief& b) {
+#ifndef NDEBUG
+    for (int w = b.kw64_; w < kBitsetMaxWords; ++w)
+        assert(b.bits[static_cast<size_t>(w)] == 0ull &&
+               "BitsetBelief tail word nonzero — operator== invariant broken by a writer past kw64_");
+#endif
+}
+
 // In-place filter: keep where the mask reads `want` (bits &= want ? mask : ~mask), then recompute count_.
-// The one place count_ is written (§6 risk 8). O(kW64) — the same cost as the AND.
+// The one place count_ is written (§6 risk 8). O(kw64_) — the same cost as the AND. Iterates the LIVE words
+// [0, kw64_) (b.live()), NOT b.bits.size() (now the inline CAPACITY kBitsetMaxWords): the mask span is
+// exactly kw64_ words (env.treasure_mask/detector_mask), so an AND only ever clears bits in the live words —
+// it never touches the always-zero tail, preserving the tail-zero invariant operator== relies on.
 void filter_bits(BitsetBelief& b, std::span<const uint64_t> mask, bool want) {
-    if (want) for (int w = 0; w < static_cast<int>(b.bits.size()); ++w) b.bits[static_cast<size_t>(w)] &=  mask[static_cast<size_t>(w)];
-    else      for (int w = 0; w < static_cast<int>(b.bits.size()); ++w) b.bits[static_cast<size_t>(w)] &= ~mask[static_cast<size_t>(w)];
-    b.count_ = popcount_all(b.bits);
+    std::span<uint64_t> bits = b.live();
+    if (want) for (int w = 0; w < b.kw64_; ++w) bits[static_cast<size_t>(w)] &=  mask[static_cast<size_t>(w)];
+    else      for (int w = 0; w < b.kw64_; ++w) bits[static_cast<size_t>(w)] &= ~mask[static_cast<size_t>(w)];
+    b.count_ = popcount_all(b.live());
+    assert_tail_zero(b);  // debug-only: an AND never sets a tail word, but net the invariant explicitly
 }
 
 // The r-th set bit -> world rank, with the loud-abort invariant arm the seam owns (the kernel returns -1 on
@@ -85,7 +103,13 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
     kW64_ = static_cast<int>((nworlds + 63) / 64);
     const std::size_t mask_bytes =
         static_cast<std::size_t>(inst_.N + n_detectors()) * static_cast<std::size_t>(kW64_) * sizeof(uint64_t);
-    use_bitset_ = worlds_enumerable && (mask_bytes <= kTargetMaskCacheBudgetBytes);
+    // The gate's THIRD conjunct (the inline-buffer fit): the BitsetBelief now holds its words in a
+    // FIXED-CAPACITY inline std::array<.., kBitsetMaxWords> (env.hpp — the per-copy heap alloc this kills),
+    // so a belief with kW64 > kBitsetMaxWords CANNOT be represented in the bitset arm and MUST fall to the
+    // flat arm. Conjoin it here (and print it in the GATE: line) so the inline cap is an EXPLICIT gate
+    // input, not a silent overflow (ADR-0002).
+    const bool fits_inline = kW64_ <= kBitsetMaxWords;
+    use_bitset_ = worlds_enumerable && (mask_bytes <= kTargetMaskCacheBudgetBytes) && fits_inline;
 
     if (use_bitset_) {
         // treasure_mask_[t] = worlds (by rank) with bit t set; detector_mask_[j] = worlds where
@@ -110,14 +134,18 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
 
 Belief Environment::full_belief() const {
     if (use_bitset_) {
-        // all-ones over the nb worlds: every full word = ~0, the last (partial) word masked to the live
+        // all-ones over the nb worlds: the first kw64_ words = ~0, the last (partial) word masked to the live
         // bit-tail so trailing bits past |worlds| stay 0 (a popcount over them must NOT count phantom worlds).
-        BitsetBelief b;
-        b.bits.assign(static_cast<size_t>(kW64_), ~uint64_t{0});
+        // The inline array is zero-initialized ({}), so the unused tail words [kw64_, kBitsetMaxWords) STAY 0
+        // (the tail-zero invariant operator== relies on); we write ONLY the live words [0, kw64_).
+        BitsetBelief b;  // bits{} zero-initialized; tail words past kw64_ stay 0
+        b.kw64_ = kW64_;
+        for (int w = 0; w < kW64_; ++w) b.bits[static_cast<size_t>(w)] = ~uint64_t{0};
         const size_t nworlds = worlds_.size();
         const int tail = static_cast<int>(nworlds & 63u);  // live bits in the final word (0 => the word is full)
-        if (tail != 0) b.bits.back() = (uint64_t{1} << tail) - 1;
+        if (tail != 0) b.bits[static_cast<size_t>(kW64_ - 1)] = (uint64_t{1} << tail) - 1;
         b.count_ = static_cast<int>(nworlds);  // = popcount(all-ones over nworlds bits), the C(N,K) prior
+        assert_tail_zero(b);  // debug-only: full_belief writes only [0,kW64_); the tail stays zero-init
         return b;
     }
     return FlatBelief{worlds_};  // the flat arm copies worlds_ (rank order = combinations order)
@@ -127,7 +155,7 @@ uint32_t Environment::world_at_rank(const Belief& b, int r) const {
     return std::visit([&](const auto& a) -> uint32_t {
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, FlatBelief>) return a.worlds[static_cast<size_t>(r)];
-        else return worlds_[static_cast<size_t>(rank_or_abort(a.bits, r))];  // r-th set bit -> world
+        else return worlds_[static_cast<size_t>(rank_or_abort(a.live(), r))];  // r-th set bit -> world
     }, b);
 }
 
@@ -150,8 +178,8 @@ BeliefKey Environment::belief_key(const Belief& b) const {
         if constexpr (std::is_same_v<T, FlatBelief>)
             return BeliefKey{n, a.worlds.front(), a.worlds.back()};
         else
-            return BeliefKey{n, worlds_[static_cast<size_t>(rank_or_abort(a.bits, 0))],
-                                worlds_[static_cast<size_t>(rank_or_abort(a.bits, n - 1))]};
+            return BeliefKey{n, worlds_[static_cast<size_t>(rank_or_abort(a.live(), 0))],
+                                worlds_[static_cast<size_t>(rank_or_abort(a.live(), n - 1))]};
     }, b);
 }
 
@@ -187,7 +215,7 @@ std::vector<double> Environment::marginals(const Belief& bw) const {
             if (a.count_ == 0) return m;
             const double inv = 1.0 / static_cast<double>(a.count_);
             for (int t = 0; t < inst_.N; ++t)
-                m[static_cast<size_t>(t)] = static_cast<double>(popcount_and(a.bits, treasure_mask(t))) * inv;
+                m[static_cast<size_t>(t)] = static_cast<double>(popcount_and(a.live(), treasure_mask(t))) * inv;
             return m;
         }
     }, bw);
@@ -208,7 +236,7 @@ bool Environment::informative(int face_id, const Belief& bw) const {
             }
             return false;  // mirrors SenseAction.informative: hit.any() and (~hit).any()
         } else {
-            const int cnt = popcount_and(a.bits, detector_mask(face_id));
+            const int cnt = popcount_and(a.live(), detector_mask(face_id));
             return cnt > 0 && cnt < a.count_;
         }
     }, bw);

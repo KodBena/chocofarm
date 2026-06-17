@@ -34,11 +34,12 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
-#include <map>
 #include <random>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "chocofarm/belief_key.hpp"
@@ -77,17 +78,55 @@ struct ISMCTSSource : public WorldSource {
                               const std::set<int>& collected, uint32_t world, double lam) = 0;
 };
 
+// Hash for the children transposition key (action-slot, belief_key) = tuple<int, tuple<int,u32,u32>>.
+// `children` is a find/insert-only TRANSPOSITION TABLE (never iterated in key order — iterate only `find`s
+// then inserts), so std::map -> std::unordered_map is bit-exact (the selection iterates visit_order, NOT
+// the children map). Same boost hash_combine mix as Gumbel's GBeliefChildKeyHash (shift+golden-ratio, no
+// XOR-fold cancellation); correctness rests on the tuple's operator== on a bucket collision, not on the
+// hash being injective.
+struct ISMCTSChildKeyHash {
+    [[nodiscard]] std::size_t operator()(const std::tuple<int, BeliefKey>& k) const noexcept {
+        auto mix = [](std::size_t& h, std::size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        std::size_t h = 0;
+        const BeliefKey& bk = std::get<1>(k);
+        mix(h, static_cast<std::size_t>(static_cast<uint32_t>(std::get<0>(k))));   // action slot
+        mix(h, static_cast<std::size_t>(static_cast<uint32_t>(std::get<0>(bk))));  // belief count
+        mix(h, static_cast<std::size_t>(std::get<1>(bk)));                         // first world id
+        mix(h, static_cast<std::size_t>(std::get<2>(bk)));                         // last world id
+        return h;
+    }
+};
+
 // One information-set node. Per-action statistics (reward sum, selection count n_j, availability
-// count n'_j) aggregated over the whole information set — the ISMCTS contract. Children are keyed by
-// (action, belief_key): an action's observation outcome under the active determinization routes
-// WHICH successor-belief child the simulation continues from, but does NOT split the action's bandit
-// statistics (mirrors ismcts.py's _Node).
+// count n'_j) aggregated over the whole information set — the ISMCTS contract. reward/visits/avail are
+// DENSE per-slot vectors (sized n_slots, zero-initialized at node creation), indexed by action SLOT —
+// REPLACING the former std::map<int,.> (the same dense conversion as GumbelNode's W/N; the std::map's
+// per-action _Rb_tree_increment is the cost). The conversion is BYTE-IDENTICAL because the selection
+// (ucb_select) and the most-visited final iterate `visit_order` (insertion order), NEVER the maps in
+// key order; a slot's "presence" in a map is exactly "its dense count > 0" (visits/avail only increment
+// from the zero-init, so 0 <=> absent — preserving avail.get(a, n_j)'s present?value:default and the
+// first-insertion-into-visits test that appends to visit_order). Children are keyed by (action,
+// belief_key): an action's observation outcome under the active determinization routes WHICH
+// successor-belief child the simulation continues from, but does NOT split the action's bandit statistics
+// (mirrors ismcts.py's _Node).
 struct ISMCTSNode {
-    std::map<int, double> reward;            // action-slot -> summed playout return over selections
-    std::map<int, int> visits;               // action-slot -> times selected            (n_j)
-    std::map<int, int> avail;                // action-slot -> times available            (n'_j)
+    std::vector<double> reward;              // (n_slots,) action-slot -> summed playout return (0 absent)
+    std::vector<int> visits;                 // (n_slots,) action-slot -> times selected n_j (0 absent)
+    std::vector<int> avail;                  // (n_slots,) action-slot -> times available n'_j (0 absent)
     std::vector<int> visit_order;            // action-slots in INSERTION order (first-wins tie source)
-    std::map<std::tuple<int, BeliefKey>, int> children;  // (action-slot, belief_key) -> child index
+    // (action-slot, belief_key) -> child index. A find/insert-only transposition table (never iterated in
+    // key order), so an unordered_map is bit-exact with the former std::map — see ISMCTSChildKeyHash.
+    std::unordered_map<std::tuple<int, BeliefKey>, int, ISMCTSChildKeyHash> children;
+
+    // Construct with reward/visits/avail sized to the slot space, zero-initialized (the absent semantics:
+    // dense count == 0 <=> the slot has not been touched).
+    ISMCTSNode() = default;
+    explicit ISMCTSNode(int n_slots)
+        : reward(static_cast<size_t>(n_slots), 0.0),
+          visits(static_cast<size_t>(n_slots), 0),
+          avail(static_cast<size_t>(n_slots), 0) {}
 };
 
 // Single-Observer ISMCTS as a pluggable Policy. Construction takes the scalar config (iterations,

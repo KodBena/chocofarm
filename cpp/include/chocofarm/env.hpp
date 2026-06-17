@@ -13,6 +13,7 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -51,23 +52,57 @@ struct FlatBelief {
     bool operator==(const FlatBelief&) const = default;
 };
 
+// The inline belief-word CAPACITY (NOT the live kW64). The bitset arm's `bits` is a FIXED-CAPACITY inline
+// std::array of this many words so a per-node belief copy is an inline value-copy, NOT a ~2 KiB heap
+// alloc+free (the profiled per-copy malloc/free cost the inline storage kills). This is a CAPACITY, like a
+// fixed buffer's size — NOT the live 243: the gate (env ctor) ADDITIONALLY requires kW64 <= kBitsetMaxWords
+// (else the inline buffer cannot hold the belief and the env falls to the flat arm). 256 comfortably covers
+// the live kW64=243 (243 worlds-words for |worlds|=15504) with headroom; raise it (and re-measure the
+// inline footprint) before an instance whose ceil(|worlds|/64) exceeds 256 can use the bitset arm. The
+// runtime word count is `kw64_` below (= env's kW64_, <= kBitsetMaxWords); the ops iterate the first kw64_
+// words via a span, NEVER the full array.
+inline constexpr int kBitsetMaxWords = 256;
+
 // The BITSET arm (gated fast path): a dense bitvector over the env's enumerated worlds (bit r set <=>
-// world of rank r is live), packed into kW64 = ceil(|worlds|/64) words. `bits` is a std::vector<uint64_t>
-// (NOT a std::array<.., kW64>): kW64 is DERIVED from the env's world count at construction (ADR-0012 P1 /
-// CLAUDE.md "derived dimensions never hardcoded"), so it cannot be a compile-time template arg — a
-// std::array<.., 243> would hardcode the live instance's 243 into the TYPE. The bitset note (§88-91) and
-// the scoping report (§1) write `std::array<uint64_t, kW64>` assuming kW64 is a compile-time constant; the
-// codebase's standing derive-don't-hardcode discipline resolves that ambiguity in favour of the runtime
-// vector. (Per-belief footprint: ~1.9 KiB on the heap for the live 243 words + the 24-byte inline vector,
-// vs the report's 1.9 KiB-inline std::array — a smaller variant, so the §3 "1.9 KiB paid inline even in
-// flat fallback" concern only eases; correctness is identical.)
-// `count_` is the cached popcount (the O(1)-nb obligation, §6 risk 2): updated in EVERY filter, NEVER
-// recounted at a guard. Equality compares the bits (count_ is derived from them — but it is always kept in
-// sync, so `= default` over both fields is equivalent and clearer).
+// world of rank r is live), packed into kw64_ = ceil(|worlds|/64) words held in a FIXED-CAPACITY INLINE
+// std::array<uint64_t, kBitsetMaxWords>. The inline buffer replaces the former std::vector<uint64_t> (whose
+// per-copy heap alloc+free — ~2 KiB on every descent-local belief copy — the K=128 client profile flagged
+// as ~14.5% of the malloc/free family): the bitset variant now copies inline, no allocation. The scoping
+// report (§1/§3) ORIGINALLY chose `std::array<uint64_t, kW64>` for exactly this reason; the STEP-2 note
+// switched it to a vector to keep kW64 runtime-derived (derive-don't-hardcode). This refactor reconciles
+// both: the CAPACITY (kBitsetMaxWords) is a named compile-time buffer cap (NOT 243), while the ACTUAL word
+// count `kw64_` stays RUNTIME-derived from the env (= env's kW64_) — so no live dimension is hardcoded in
+// the TYPE, and the per-copy alloc is gone. The variant grows to ~2 KiB inline (the §3 cost, accepted: the
+// per-copy alloc this removes is the worse cost). Per-belief footprint: a fixed ~2 KiB inline, NO heap.
+//
+// `kw64_` is the runtime word count (= env.kW64() <= kBitsetMaxWords); the ops read ONLY the first kw64_
+// words (a std::span(bits.data(), kw64_)), never the full kBitsetMaxWords array. `count_` is the cached
+// popcount (the O(1)-nb obligation, §6 risk 2): updated in EVERY filter, NEVER recounted at a guard.
+//
+// `operator== = default` compares the WHOLE array (all kBitsetMaxWords words) + kw64_ + count_. That is
+// CORRECT precisely because the unused tail words [kw64_, kBitsetMaxWords) are ALWAYS zero: the array is
+// zero-initialized at construction (the `{}` member initializer), full_belief() writes only words [0,kw64_)
+// and the partial-tail mask leaves [kw64_,end) at 0, and the filters only AND existing words (an AND never
+// sets a previously-zero tail word). Two beliefs with the same first-kw64_ words therefore have identical
+// tails, so the whole-array `= default` compare is equivalent to comparing the first kw64_ words — and
+// clearer (no hand-written loop, no kw64_ to thread). The A/B oracle nets this (belief_key / operator== /
+// every derived value byte-identical to the flat arm).
 struct BitsetBelief {
-    std::vector<uint64_t> bits;          // kW64 words; bit r <=> world rank r live
-    int count_ = 0;                      // cached popcount(bits) — the O(1) nb (never recounted at a guard)
+    std::array<uint64_t, kBitsetMaxWords> bits{};  // first kw64_ words live; tail [kw64_,end) always 0
+    int kw64_ = 0;                                 // runtime word count (= env.kW64() <= kBitsetMaxWords)
+    int count_ = 0;                                // cached popcount(first kw64_ words) — the O(1) nb
     bool operator==(const BitsetBelief&) const = default;
+
+    // The LIVE words [0, kw64_) as a span — the ONE place the inline-array/runtime-count split is bridged
+    // (P1). Every bitset op (the masked-popcount kernels, the filter, world_at_rank/belief_key) reads THIS,
+    // never the full kBitsetMaxWords array (which would count the always-zero tail — harmless for popcount
+    // but wrong for any size-derived op). Const + mutable overloads so the filter can &= in place.
+    [[nodiscard]] std::span<const uint64_t> live() const {
+        return {bits.data(), static_cast<size_t>(kw64_)};
+    }
+    [[nodiscard]] std::span<uint64_t> live() {
+        return {bits.data(), static_cast<size_t>(kw64_)};
+    }
 };
 
 using Belief = std::variant<FlatBelief, BitsetBelief>;
