@@ -229,3 +229,21 @@ A K=128 client profile (gate ON, bitset live) showed the belief-math collapsed t
 1. **`BitsetBelief::bits` reverted from `std::vector<uint64_t>` to a FIXED-CAPACITY inline `std::array<uint64_t, kBitsetMaxWords>` — SUPERSEDES STEP-2 note point 2.** The STEP-2 note chose a runtime vector to keep `kW64` derived (the report's `std::array<.., kW64>` would hardcode 243 into the TYPE). This refactor reconciles the report's ORIGINAL §1/§3 inline-array intent with derive-don't-hardcode: the array CAPACITY is a NAMED `inline constexpr int kBitsetMaxWords = 256` (a fixed-buffer cap, NOT the live 243; 243 fits with headroom), while the ACTUAL word count `kw64_` stays a runtime field (= env's `kW64_`, ≤ cap). The gate gained a THIRD conjunct — `kW64 <= kBitsetMaxWords` (an inline-fit guard; else fall to the flat arm) — printed in the oracle's GATE: line (`inline_cap=256 words (kW64<=cap: yes)`). All bitset ops iterate the FIRST `kw64_` words via `BitsetBelief::live()` (a `std::span(bits.data(), kw64_)`), NEVER the full array. `operator== = default` over the whole array is correct because the unused tail words `[kw64_, kBitsetMaxWords)` are ALWAYS zero (zero-init at construction; `full_belief` writes only `[0,kw64_)` with the partial-tail word masked; the filters only `&=` existing words, never setting a zero tail) — so the whole-array compare equals comparing the first `kw64_` words. The per-copy heap alloc is gone (the variant is now ~2 KiB inline, the §3 cost, accepted — the per-copy alloc it removes is the worse cost).
 
 2. **`GumbelNode` / `ISMCTSNode` per-action `std::map<int,.>` stats → DENSE `std::vector` by slot; `children` `std::map` → `std::unordered_map` (a hashed transposition table).** The per-action maps (`GumbelNode::W`/`N`; `ISMCTSNode::reward`/`visits`/`avail`) are keyed by a DENSE int slot (0..n_slots-1) and the selection only ever LOOKS UP by slot (over `legal_slots` / `visit_order`, in env / insertion order) and SUMS them (order-independent) — it NEVER iterates them in key order. So a dense `std::vector` sized `n_slots` (= `env.N()+env.n_detectors()+1`), zero-initialized at node creation, is byte-identical: an unvisited slot's `N[slot]==0` reproduces the former `find==end` unvisited→0 (`q`), and `total_n` summing all slots equals the map's visited-only sum (the 0 entries add nothing). `children` is `find`/insert-only (a transposition table, never iterated), so the `std::map`→`std::unordered_map` swap is bit-exact (a small boost-`hash_combine` tuple hash mixes the (slot, count, first, last) fields; no XOR-fold cancellation; correctness rests on the tuple's `operator==` on a bucket collision). ISMCTS got the SAME conversion (a clean parallel — nothing in its selection iterates the maps in key order; `ucb_select` and the most-visited final both iterate `visit_order`). NMCS is untouched (it has no per-action node arena). This removes the `_Rb_tree_increment` cost.
+
+---
+
+## DYNAMIC-SELECTION FOLLOW-UP NOTE (2026-06-17 — amend-by-append, ADR-0005 Rule 8)
+
+§3/§4 commit this design to a **static, per-env, universe-keyed** gate: one arm of the `Belief` variant
+chosen once at construction from `mask_bytes`/`kW64` (a function of N/K/nD), invariant for the run. A
+follow-on hypothesis — recorded in **`docs/design/cpp-belief-dynamic-rep-selection.md`** — proposes
+*generalizing* that gate to a **per-belief, runtime, `nb`-keyed** choice: flat is O(nb), bitset is
+O(kW64) constant, so flat wins at small-`nb` leaves where bitset wastes its constant popcount, and the
+support `nb` shrinks monotonically down any root→leaf path. Two relevant facts this report already
+establishes carry directly into that hypothesis: (i) the `belief_key` triple is **rep-independent and
+bit-identical across arms** (§6 risk 5), so it is the natural representation-independent *identity* — the
+dynamic selector can set `arm = f(nb)` and the §5 cache collision guard (`entry.first == bw`) stays
+correct, because the same belief always maps to the same arm; (ii) the flat↔bitset A/B oracle (§5
+Steps 2–3) extends directly to a mixed-arm population. That note is a **hypothesis pending the head-to-head
+ZDD-vs-bitset profile + an nb-histogram**, not a committed design; this gate stands until that measurement
+fires.

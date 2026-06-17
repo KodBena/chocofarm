@@ -58,6 +58,36 @@ side is built in a gate:
   `template<class Tag> struct Idx { int v; };`) is more appropriate, so semantically-distinct ints
   can't be silently mixed. Postponed for token-saving; revisit when the cpp type surface is next open.
 
+## ZDD belief arm — close the per-leaf value-semantics gap (deferred 2026-06-17)
+
+The opt-in ZDD belief arm (§B.4(b), `CHOCO_BELIEF_ZDD`; `docs/design/cpp-belief-zdd-onramp.md`) is
+**landed and sound**: runtime-viable (no OOM), bit-exact (the flat-vs-ZDD FEATURE A/B + the
+construction-order-invariance net in `belief_sweep_oracle_check.cpp`), free of O(nb) value ops. Two
+value-semantics footguns the head-to-head exposed are already fixed — the per-descent full-arena
+copy/OOM (`compact()` + transient hash-cons, commit `5391c59`) and `operator==`'s O(nb) `members()`
+double-enumeration (canonical structural compare, commit `b826baa`). What remains is a **third layer**,
+deferred on purpose:
+
+- **Finding** (head-to-head vs bitset, K=512; profiles under `~/w/vdc/chocobo/profiles/h2h*`): ZDD costs
+  **~10× the client CPU per leaf** of bitset (perf-sample volume at matched ~128K leaves: ~11 MB vs
+  ~1.1 MB), and **~70% of it is allocation churn** (`_int_malloc`/`memset`/free) intrinsic to maintaining
+  the diagram as a *copyable value* — `compact()`'s fresh+remap vectors (+ memset-init), `seed_unique()`'s
+  per-restrict hashtable rebuild, the per-descent `nodes_` copy. The diagram *math* is cheap (~10%).
+  Bitset sidesteps all of it (a ~2 KB inline `memcpy`, zero per-op alloc). The gap is **structural (the
+  copyable-diagram machinery), not algorithmic**.
+- **Deferred work:** a workspace / copy-on-write-arena refactor — reuse the `compact()`/`seed_unique()`
+  scratch (the `remap` vector, the hash table) across mutations via a per-thread workspace, and avoid the
+  per-mutation/per-copy `nodes_` reallocation (e.g. a shared immutable arena with COW on restrict).
+- **Why deferred (low-ROI here):** on the live instance bitset wins decisively regardless (its
+  masked-popcount is cheap + SIMD); ZDD's role is the **large-N hedge** (a non-enumerable universe where
+  the bitset gate can't apply) — a regime this instance isn't in. The **alloc campaign** (the production
+  bitset path's #1 cost, ~30%) is the higher-value next step, and its workspace/buffer-reuse techniques
+  are exactly what this refactor would also need — so it lays the groundwork.
+- **Acceptance when resumed:** bit-exact (the A/B + construction-order net stay green); the per-leaf
+  client-CPU gap closes (the alloc-churn share collapses, the diagram math comes to dominate the ZDD
+  self-time); no OOM at the production search config (`n_sims=256 max_depth=24`). Feeds the per-nb
+  dispatch decision in `docs/design/cpp-belief-dynamic-rep-selection.md`.
+
 ## Retired
 
 - **NMCS parity tests** marked `skip` in `tests/test_cpp_runner.py` (2026-06-16): validated repeatedly,

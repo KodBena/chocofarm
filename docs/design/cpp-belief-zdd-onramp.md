@@ -571,3 +571,24 @@ The §B.4(a) probe (this document's contract) graduated to **§B.4(b) belief-as-
 
 **New files (absolute):** `/home/bork/w/vdc/1/chocofarm/cpp/include/chocofarm/belief_zdd_engine.hpp`, `/home/bork/w/vdc/1/chocofarm/cpp/src/belief_zdd_engine.cpp`, `/home/bork/w/vdc/1/chocofarm/cpp/src/env_zdd.cpp`.
 **Edited (absolute):** `cpp/include/chocofarm/env.hpp` (the `ZddBelief` value type + the gated 3-arm variant + the `CHOCO_ZDD_ELSE` macro + the `use_zdd_` gate + the zdd:: op decls), `cpp/src/env.cpp` (the gate selection + the per-op ZDD visit arms), `cpp/src/features.cpp` (the `belief_features` ZDD visit arm), `cpp/src/belief_sweep_oracle_check.cpp` (the flat-vs-ZDD FEATURE A/B, gated), `cpp/CMakeLists.txt` (the `CHOCO_BELIEF_ZDD` option + the conditional TUs + the PUBLIC compile-definition).
+
+---
+
+## REVISIT-WHEN: DYNAMIC SELECTION (2026-06-17 — amend-by-append, ADR-0005 Rule 8)
+
+§12 records the graduation trigger as "Part B graduates → the belief-surface replacement (b)"; the B.4(b)
+graduation note above records that firing. A *distinct*, nearer trigger is now recorded: the
+**head-to-head ZDD-vs-bitset profile** (planned now that the opt-in ZDD arm has landed — see the B.4(b)
+note above) feeds a follow-on design question — **dynamic, per-belief representation selection keyed on
+the support `nb`** — written up in **`docs/design/cpp-belief-dynamic-rep-selection.md`**. The `|Z|`-vs-`nb`
+table this probe already produces (§7, with its random-subset control) is exactly one of the three inputs
+that decision needs. Two framing notes for that decision:
+
+1. ZDD here is an **opt-in build flag** (an all-or-nothing alternative). If the dynamic measurement shows
+   a real win, the three reps are reconceived as a **standing portfolio** the runtime draws from per
+   belief — at which point ZddBelief becomes a *permanent* variant arm and the opt-in build-flag framing
+   is **superseded, not violated**. Until that measurement fires, the opt-in flag stands as specified here.
+2. The ZDD crossover is **not purely `nb`** — `|Z|` is a *structure* measure (the whole point of the §7
+   control arm), and `|Z|` is not cheaply knowable without building the diagram. So `nb` is a *proxy*;
+   the dynamic note's §5b must establish that `nb` (or depth) predicts the ZDD winner before any
+   `nb`-keyed ZDD selector is built.
