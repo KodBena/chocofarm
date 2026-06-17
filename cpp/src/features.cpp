@@ -15,6 +15,7 @@
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/features.hpp"
+#include "chocofarm/feature_compute.hpp"
 
 #include <algorithm>
 #include <array>
@@ -116,14 +117,15 @@ FeatureBuilder::FeatureBuilder(const Environment& env)
     }
 }
 
-namespace {
-
 // --- belief-derived intermediates: a PURE function of the world-set `bw` (the §2-decomposition unit;
 // the memoizable / hoistable core). marg[i] = mean over bw of bit i; per detector cnt = #worlds in the
 // disjunction's cover, p_pos = cnt/nb, informative = (0 < cnt < nb). Same ops + order as the former
-// inline block (bit-exact, ADR-0012 P6). The O(nb·(N+nD)) sweep here is the profile bottleneck.
-[[nodiscard]] BeliefFeatures belief_features(const Environment& env, std::span<const uint32_t> bw,
-                                             int N, int nD, double log_nworlds) {
+// inline block (bit-exact, ADR-0012 P6). The O(nb·(N+nD)) sweep here is the profile bottleneck (~81% of
+// the single-thread cost at the K=16 sweetspot), so it is EXPOSED via feature_compute.hpp (its single
+// home stays here) for the isolated belief_sweep_bench + tests to drive directly. Still the functional
+// core (P9): a pure value-function, no I/O, no state.
+BeliefFeatures belief_features(const Environment& env, std::span<const uint32_t> bw,
+                               int N, int nD, double log_nworlds) {
     BeliefFeatures bf;
     bf.marg.assign(N, 0.0);
     std::vector<int64_t> cnt(nD, 0);
@@ -149,6 +151,8 @@ namespace {
     bf.nonempty = nb ? 1.0 : 0.0;
     return bf;
 }
+
+namespace {
 
 // --- per-loc static distance block: geometry is FULLY separable (one outgoing edge in the DAG). Each
 // distance normalized by the bbox diagonal. `hypot` chains TODAY (a precomputed lookup is the deferred
