@@ -37,6 +37,8 @@
 #include <cassert>
 #include <cstdint>
 
+#include "chocofarm/world.hpp"
+
 namespace chocofarm {
 
 // The fixed-width bitmask of collected treasure ids. Value semantics: a copy is a register move (no heap),
@@ -49,7 +51,8 @@ struct CollectedSet {
     // future world-mask type ever outgrew the uint64_t storage; the per-id asserts below guard the actual
     // DOMAIN (kMaxId), not the storage width — an id in [kMaxId, 64) is an id the world-mask cannot carry,
     // a bug, and is caught loud rather than silently set in a tail bit.
-    using world_mask_t = std::uint32_t;  // the env's per-world bitmask type (env.hpp worlds())
+    using world_mask_t = World;  // IS the shared World SSOT (world.hpp) now, not a local re-declaration:
+                                 // the env's per-world bitmask type (env.hpp worlds()), single-sourced (P1)
     std::uint64_t bits = 0;
     static constexpr int kMaxId = static_cast<int>(sizeof(world_mask_t) * 8);  // = 32, the treasure-id domain
     static_assert(kMaxId <= static_cast<int>(sizeof(std::uint64_t) * 8),

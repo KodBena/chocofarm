@@ -24,6 +24,7 @@
 #include "chocofarm/belief_key.hpp"
 #include "chocofarm/collected_set.hpp"
 #include "chocofarm/instance.hpp"
+#include "chocofarm/world.hpp"
 
 // The OPT-IN ZDD belief engine — included at GLOBAL scope (NOT inside namespace chocofarm: a standard-
 // header include inside a namespace mis-nests std as chocofarm::std). Present only under the flag; the
@@ -56,7 +57,7 @@ namespace chocofarm {
 // the bit-exactness basis (front()/back() == rank-0/rank-(count-1) world for the same belief). The seam ops
 // below are the SOLE readers/mutators.
 struct FlatBelief {
-    std::vector<uint32_t> worlds;
+    std::vector<World> worlds;
     bool operator==(const FlatBelief&) const = default;
 };
 
@@ -222,7 +223,7 @@ class Environment {
     // ---- belief world-set ----
     // The full C(N,K) world-set as bitmasks over treasure ids (mirrors world_array): all K-subsets
     // of range(N), in itertools.combinations order, as (1<<t) sums. 20 bits fit a uint32.
-    const std::vector<uint32_t>& worlds() const { return worlds_; }
+    const std::vector<World>& worlds() const { return worlds_; }
     int N() const { return inst_.N; }
     int K() const { return inst_.K; }
     int n_detectors() const { return static_cast<int>(inst_.faces.size()); }
@@ -343,7 +344,7 @@ class Environment {
 
   private:
     Instance inst_;
-    std::vector<uint32_t> worlds_;
+    std::vector<World> worlds_;
     std::vector<uint32_t> face_masks_;  // contiguous per-detector cover bitmasks (face_masks(); built in ctor)
     int entry_idx_ = 0;
 
