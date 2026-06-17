@@ -21,6 +21,18 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# Build for the HOST CPU (-march=native): unlocks AVX2/FMA/BMI2 on this i5-6600 (Skylake) so the
+# branchless integer belief sweep (features.cpp belief_features, the §A.4 form) AUTO-VECTORIZES — ~1.94x
+# on the isolated sweep, ~1.29x end-to-end at the K=32 wire-pool sweetspot, with no code change. Pins the
+# binary to this host's ISA (it may SIGILL on an older CPU) — correct for this build-and-run-locally
+# scratch VM; pass -DCHOCO_MARCH_NATIVE=OFF for a portable build. FMA fusion shifts the FEATURE vector by
+# ~1 ULP (within the ADR-0012 P6 behavioral bar vs Python; the legal MASK stays bit-exact — it is sign /
+# integer tests), netted by the gumbel parity.
+option(CHOCO_MARCH_NATIVE "Compile for the host CPU (-march=native): AVX2/FMA auto-vectorization" ON)
+if(CHOCO_MARCH_NATIVE)
+  add_compile_options(-march=native)
+endif()
+
 # Threads (pthread): the SearchRuntime's PoolRuntime spawns std::thread workers (src/search_runtime.cpp
 # is in chocofarm_core), so the core links Threads::Threads PUBLIC and every consumer gets it.
 find_package(Threads REQUIRED)
