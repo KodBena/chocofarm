@@ -18,6 +18,7 @@
 #include <random>
 #include <set>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include "chocofarm/belief_key.hpp"
@@ -26,18 +27,57 @@
 namespace chocofarm {
 
 // The belief value type — the world-set the search reasons over (ADR-0012 P2: the belief seam). STEP 1
-// of the belief-rep cutover (docs/design/cpp-belief-rep-scoping.md §5) introduces this as the ONE belief
-// value the search names, replacing the bare `std::vector<uint32_t>` every caller used to poke directly.
-// It is a plain struct + alias today (the FLAT arm only): a pure refactor, byte-identical to the former
-// vector. The Step-2 swap (`using Belief = std::variant<FlatBelief, BitsetBelief>`) then touches ONLY
-// this alias + the env op bodies — every caller already speaks `const Belief&` / `Belief` / `Belief&`.
-// The worlds stay in ascending worlds()-order (the parity fixtures' documented basis); the seam ops
-// below are the SOLE readers/mutators of `.worlds`, so no caller pokes the representation.
+// of the belief-rep cutover (docs/design/cpp-belief-rep-scoping.md §5) introduced ONE belief value the
+// search names, replacing the bare `std::vector<uint32_t>` every caller used to poke directly. STEP 2
+// (this slice, §5 "Add the bitset arm + the gate") swaps the alias to a `std::variant<FlatBelief,
+// BitsetBelief>`: the search now names TWO representations behind one opaque value, chosen ONCE per env
+// (the gate, §4) and invariant for the env's life. Every caller already speaks `const Belief&` / `Belief`
+// / `Belief&`, so this slice touches ONLY this alias + the env op bodies + the few tools that build a
+// belief DIRECTLY (the A/B oracle, the benches). The seam ops dispatch COARSELY (one std::visit /
+// holds_alternative per env op, §3), then run a pure rep-specific body — NEVER a visit inside a per-world
+// loop. The bitset arm is BYTE-IDENTICAL to the flat arm (filters, counts, features, sampling,
+// fingerprint); the flat arm is the reference (any divergence is a bug, ADR-0002).
+
+// The FLAT arm: the world-set as an explicit vector of bitmasks, in worlds()-RANK order (the general base
+// + the non-enumerable fallback). RANK order is the combinations(range(N), K) emission order of
+// build_worlds (env.cpp) — NOT numerically ascending (the bitmask values are not monotone: e.g. world rank
+// 15 is the high-bit combination {0,1,2,3,19} = 524303, rank 16 is {0,1,2,4,5} = 55). The flat belief is
+// always a SUBSEQUENCE of worlds_ (it starts as worlds_ and erase_if preserves order), so it stays in rank
+// order; the bitset arm indexes the SAME worlds_ by rank. THAT shared rank order — not a numeric one — is
+// the bit-exactness basis (front()/back() == rank-0/rank-(count-1) world for the same belief). The seam ops
+// below are the SOLE readers/mutators.
 struct FlatBelief {
     std::vector<uint32_t> worlds;
     bool operator==(const FlatBelief&) const = default;
 };
-using Belief = FlatBelief;
+
+// The BITSET arm (gated fast path): a dense bitvector over the env's enumerated worlds (bit r set <=>
+// world of rank r is live), packed into kW64 = ceil(|worlds|/64) words. `bits` is a std::vector<uint64_t>
+// (NOT a std::array<.., kW64>): kW64 is DERIVED from the env's world count at construction (ADR-0012 P1 /
+// CLAUDE.md "derived dimensions never hardcoded"), so it cannot be a compile-time template arg — a
+// std::array<.., 243> would hardcode the live instance's 243 into the TYPE. The bitset note (§88-91) and
+// the scoping report (§1) write `std::array<uint64_t, kW64>` assuming kW64 is a compile-time constant; the
+// codebase's standing derive-don't-hardcode discipline resolves that ambiguity in favour of the runtime
+// vector. (Per-belief footprint: ~1.9 KiB on the heap for the live 243 words + the 24-byte inline vector,
+// vs the report's 1.9 KiB-inline std::array — a smaller variant, so the §3 "1.9 KiB paid inline even in
+// flat fallback" concern only eases; correctness is identical.)
+// `count_` is the cached popcount (the O(1)-nb obligation, §6 risk 2): updated in EVERY filter, NEVER
+// recounted at a guard. Equality compares the bits (count_ is derived from them — but it is always kept in
+// sync, so `= default` over both fields is equivalent and clearer).
+struct BitsetBelief {
+    std::vector<uint64_t> bits;          // kW64 words; bit r <=> world rank r live
+    int count_ = 0;                      // cached popcount(bits) — the O(1) nb (never recounted at a guard)
+    bool operator==(const BitsetBelief&) const = default;
+};
+
+using Belief = std::variant<FlatBelief, BitsetBelief>;
+
+// The machine-cache budget the derived mask set must fit (the gate's second input, §4). NAMED here as
+// what it is — a target-cache fact, not a derived quantity: half of the i5-6600 (Skylake) 256 KiB
+// per-core L2, leaving the other half for the live belief + the per-step working set. The live mask set
+// is (N + nD) * kW64 * 8 = 64 * 243 * 8 = 124416 B ≈ 121.5 KiB <= 131072 B, so the live instance lands on
+// the bitset side. A constexpr (ADR-0012 P9: a typed compile-time constant, not a #define).
+inline constexpr std::size_t kTargetMaskCacheBudgetBytes = 128 * 1024;
 
 // An action: a kind tag + an index. Mirrors the env's ("t", i) / ("d", i) / TERMINATE shape.
 enum class ActionKind { Treasure, Detector, Terminate };
@@ -94,30 +134,40 @@ class Environment {
     Point teleport_pt(int k) const { return inst_.teleports[k]; }
 
     // ---- belief construction (the seam's entry — replaces `bw = env.worlds()`) ----
-    // The full belief: every world (the C(N,K) prior). The flat arm copies `worlds_` (ascending).
-    Belief full_belief() const { return Belief{worlds_}; }
+    // The full belief: every world (the C(N,K) prior). When the gate is on (use_bitset_) the bitset arm:
+    // all-ones over the nb worlds (count_ = |worlds|); else the flat arm (copy `worlds_`, in rank order).
+    Belief full_belief() const;
 
-    // ---- belief introspection (the seam ops — NO caller pokes `.worlds` directly) ----
-    int nb(const Belief& b) const { return static_cast<int>(b.worlds.size()); }  // belief size
-    bool empty(const Belief& b) const { return b.worlds.empty(); }
-    // The r-th world by rank (the flat arm: ascending worlds()-order, so worlds[r]). The scripted
-    // parity sources resolve their `bw[idx]` poke through this (L4), preserving the exact index.
-    uint32_t world_at_rank(const Belief& b, int r) const { return b.worlds[static_cast<size_t>(r)]; }
+    // ---- belief introspection (the seam ops — COARSE visit per op, NEVER per-world; §3) ----
+    // belief size. Coarse visit: the flat arm reads .worlds.size(); the bitset arm returns the CACHED
+    // count_ (NOT a recount — the O(1)-nb obligation, §6 risk 2). One predicted branch per call.
+    int nb(const Belief& b) const {
+        return std::visit([](const auto& a) -> int {
+            using T = std::decay_t<decltype(a)>;
+            if constexpr (std::is_same_v<T, FlatBelief>) return static_cast<int>(a.worlds.size());
+            else return a.count_;  // BitsetBelief: the cached popcount, never a kW64-word recount
+        }, b);
+    }
+    bool empty(const Belief& b) const { return nb(b) == 0; }  // derives from nb (one home; O(1) both arms)
+    // The r-th world by RANK (worlds()-position = combinations order, NOT numeric — see FlatBelief). Flat:
+    // worlds[r] (the belief is a rank-ordered subsequence). Bitset: the r-th set bit, unranked through
+    // worlds_ (the SAME rank order, so byte-identical to the flat arm for the same r — the bit-exactness
+    // basis). The scripted parity sources resolve their `bw[idx]` poke through this (L4), preserving the
+    // exact index.
+    uint32_t world_at_rank(const Belief& b, int r) const;
     // Sample one concrete world uniformly from the belief (mirrors env.sample_world / rng.choice(bw)).
-    // MOVED here from RngWorldSource (L1) so no caller pokes the representation; the uniform draw is the
-    // IDENTICAL std::uniform_int_distribution<size_t>(0, nb-1)(rng) so the RNG stream is byte-identical.
-    uint32_t sample_world(const Belief& b, std::mt19937_64& rng) const {
-        std::uniform_int_distribution<size_t> pick(0, b.worlds.size() - 1);
-        return b.worlds[pick(rng)];
-    }
+    // MOVED here from RngWorldSource (L1) so no caller pokes the representation. The uniform draw is the
+    // IDENTICAL std::uniform_int_distribution<size_t>(0, nb-1)(rng) on BOTH arms, so the RNG stream is
+    // byte-identical; the drawn rank r then unranks via world_at_rank — byte-identical to the flat index.
+    uint32_t sample_world(const Belief& b, std::mt19937_64& rng) const;
     // The ONE belief-identity fingerprint (L2), MOVED off belief_key.hpp into the env so the seam owns
-    // the read of `.worlds`. (count, first, last); {0,0,0} on the empty belief — exactly the former
-    // free belief_key() logic. The `using BeliefKey` TYPE stays in belief_key.hpp (a leaf header
+    // the read of the representation. (count, first, last); {0,0,0} on the empty belief. Flat: (size,
+    // front, back). Bitset: (count_, world_at_rank(0), world_at_rank(count_-1)) — bit-identical to the
+    // flat triple (the RANK order is shared: flat front/back ARE the rank-0/rank-(count-1) worlds), so the
+    // cache hit-rate / gumbel transposition behaviour
+    // is preserved exactly (§6 risk 5). The `using BeliefKey` TYPE stays in belief_key.hpp (a leaf header
     // gumbel.hpp/features.hpp include — moving the TYPE would create an include cycle).
-    BeliefKey belief_key(const Belief& b) const {
-        if (b.worlds.empty()) return BeliefKey{0, 0u, 0u};
-        return BeliefKey{static_cast<int>(b.worlds.size()), b.worlds.front(), b.worlds.back()};
-    }
+    BeliefKey belief_key(const Belief& b) const;
 
     // ---- belief marginals (mirrors env.marginals) ----
     std::vector<double> marginals(const Belief& bw) const;
@@ -153,11 +203,37 @@ class Environment {
     // Outcome still uncertain over the belief — both polarities live (SenseAction.informative).
     bool informative(int face_id, const Belief& bw) const;
 
+    // ---- the bitset arm's env-static state + gate (§3/§4) ----
+    // Whether the bitset arm is active for THIS env (the gate decision, computed ONCE in the ctor and
+    // invariant for the env's life). The full_belief() the search starts from takes the chosen arm.
+    bool use_bitset() const { return use_bitset_; }
+    int kW64() const { return kW64_; }  // ceil(|worlds|/64) — the bitset word count (0 when not enumerable)
+    // The env-static masks the bitset bodies AND-against, homed in the ctor like face_masks_ (P1):
+    // treasure_mask_[t] = bitvector of worlds (by rank) with bit t set; detector_mask_[j] = bitvector of
+    // worlds where (w & face_masks()[j]) != 0 (the identity env.observe rests on). Each is kW64 words.
+    // Built only when use_bitset_; empty otherwise.
+    std::span<const uint64_t> treasure_mask(int t) const {
+        return {treasure_mask_.data() + static_cast<size_t>(t) * static_cast<size_t>(kW64_),
+                static_cast<size_t>(kW64_)};
+    }
+    std::span<const uint64_t> detector_mask(int j) const {
+        return {detector_mask_.data() + static_cast<size_t>(j) * static_cast<size_t>(kW64_),
+                static_cast<size_t>(kW64_)};
+    }
+
   private:
     Instance inst_;
     std::vector<uint32_t> worlds_;
     std::vector<uint32_t> face_masks_;  // contiguous per-detector cover bitmasks (face_masks(); built in ctor)
     int entry_idx_ = 0;
+
+    // ---- bitset arm gate + env-static masks (built in the ctor, P1) ----
+    bool use_bitset_ = false;   // the gate decision (§4): worlds enumerable AND mask_bytes <= budget
+    int kW64_ = 0;              // ceil(|worlds|/64) — derived, never the literal 243
+    // Flattened kW64-word mask tables (row t/j is masks[row*kW64_ .. row*kW64_+kW64_]). std::vector (not
+    // std::array): kW64_ is runtime-derived (see BitsetBelief). treasure: N rows; detector: nD rows.
+    std::vector<uint64_t> treasure_mask_;
+    std::vector<uint64_t> detector_mask_;
 };
 
 // One-owner in-place belief compaction (ADR-0012 P1/P3): keep the worlds where ((w & mask) != 0) == want,

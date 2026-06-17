@@ -11,15 +11,26 @@
 //   `* inv`), so the oracle is the home of "the *inv sweep IS the reference." Cross-language vs Python stays
 //   at the P6 behavioral bar (the gumbel parity); THIS is the in-language bit-exact bar.
 //
+//   STEP 2 (the bitset arm, docs/design/cpp-belief-rep-scoping.md §5 step 6) EXTENDS this into the
+//   FLAT-vs-BITSET A/B harness: for each sampled belief it builds BOTH a FlatBelief and a BitsetBelief
+//   DIRECTLY (bypassing the gate) and asserts they are BYTE-IDENTICAL across every env seam op — marginals,
+//   informative (per detector), legal_actions, belief_features, nb, belief_key, world_at_rank(r) for all r,
+//   and sample_world over a fixed RNG stream (the same draws ⇒ the same world). The flat arm is the
+//   REFERENCE; any divergence is a bitset bug (ADR-0002). This is the strongest P6 tier (exact integer
+//   counts) and pins flat↔bitset bit-exactness — the basis on which the end-to-end search (gate ON) matches
+//   Python exactly as the flat arm did.
+//
 //   Protocol:  belief-sweep-oracle-check --instance <p> --faces <p>
-//   A separate executable (ADR-0012 P3, one-owner): this tool owns the belief-sweep bit-exactness fixture.
-//   No redis, no net — pure compute. Public Domain (The Unlicense).
+//   A separate executable (ADR-0012 P3, one-owner): this tool owns the belief-sweep bit-exactness fixture
+//   AND the flat-vs-bitset A/B. No redis, no net — pure compute. Public Domain (The Unlicense).
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -81,6 +92,106 @@ namespace {
     if (a.nonempty != b.nonempty) return note("nonempty");
     return true;
 }
+
+// world value -> RANK (its position in env.worlds(), i.e. combinations order — NOT numeric order: the
+// world-set is built by combinations(range(N), K) which is NOT numerically ascending; see the §1B note
+// correction in the Step-2 report). Built once from env.worlds(); used to set the rank bit for each world.
+[[nodiscard]] std::map<uint32_t, size_t> rank_of(const chocofarm::Environment& env) {
+    std::map<uint32_t, size_t> m;
+    const std::vector<uint32_t>& worlds = env.worlds();
+    for (size_t r = 0; r < worlds.size(); ++r) m.emplace(worlds[r], r);
+    return m;
+}
+
+// Build a BitsetBelief over env.worlds()' RANK space from a flat world-set (a SUBSET of env.worlds(), in
+// any order). Each world's rank (its position in env.worlds(), via the rank map — combinations order, NOT
+// numeric) sets its bit. This bypasses the env's gate (it constructs the bitset directly regardless of
+// use_bitset_), so the A/B can run flat-vs-bitset for the SAME belief. count_ = the set-bit count.
+[[nodiscard]] chocofarm::BitsetBelief to_bitset(const chocofarm::Environment& env,
+                                                const std::map<uint32_t, size_t>& rank,
+                                                const std::vector<uint32_t>& flat) {
+    chocofarm::BitsetBelief b;
+    b.bits.assign(static_cast<size_t>(env.kW64()), 0ull);
+    for (uint32_t w : flat) {
+        const auto it = rank.find(w);
+        // every belief here is a subset of env.worlds(), so the world is always found (invariant).
+        const size_t r = it->second;
+        b.bits[r >> 6] |= (uint64_t{1} << (r & 63u));
+    }
+    b.count_ = static_cast<int>(flat.size());
+    return b;
+}
+
+// Compare a FLAT and a BITSET belief (the SAME world-set in two reps) across EVERY env seam read op and
+// assert byte-identity. `tag` prefixes the op name (so a filter-sequence step can be located). Returns true
+// on agreement; on a mismatch names the diverging op in `why`.
+[[nodiscard]] bool ops_identical(const chocofarm::Environment& env, const chocofarm::Belief& fb,
+                                 const chocofarm::Belief& bb, const std::string& tag, std::string& why) {
+    const int nb = env.nb(fb);
+    auto note = [&](const std::string& f) {
+        why = tag + f + " (nb=" + std::to_string(nb) + ")"; return false;
+    };
+    if (env.nb(fb) != env.nb(bb)) return note("nb");
+    if (env.empty(fb) != env.empty(bb)) return note("empty");
+    if (env.belief_key(fb) != env.belief_key(bb)) return note("belief_key");  // the fingerprint triple, §6 risk 5
+    if (env.marginals(fb) != env.marginals(bb)) return note("marginals");
+    for (int j = 0; j < env.n_detectors(); ++j)
+        if (env.informative(j, fb) != env.informative(j, bb)) return note("informative[" + std::to_string(j) + "]");
+    for (const std::set<int>& coll : {std::set<int>{}, std::set<int>{0}, std::set<int>{0, 3, 7}}) {
+        if (env.legal_actions(fb, coll) != env.legal_actions(bb, coll)) return note("legal_actions");
+    }
+    {
+        const chocofarm::BeliefFeatures ff = chocofarm::belief_features(env, fb);
+        const chocofarm::BeliefFeatures bf2 = chocofarm::belief_features(env, bb);
+        std::string fwhy;
+        if (!equal_features(ff, bf2, static_cast<size_t>(nb), fwhy)) return note("belief_features." + fwhy);
+    }
+    for (int r = 0; r < nb; ++r)
+        if (env.world_at_rank(fb, r) != env.world_at_rank(bb, r)) return note("world_at_rank[" + std::to_string(r) + "]");
+    if (nb > 0) {
+        // sample_world over a FIXED RNG stream: the SAME draws ⇒ the SAME world (the byte-identity basis).
+        std::mt19937_64 rf(0xA5A5A5A5ull), rb(0xA5A5A5A5ull);
+        for (int draw = 0; draw < 256; ++draw)
+            if (env.sample_world(fb, rf) != env.sample_world(bb, rb))
+                return note("sample_world[draw=" + std::to_string(draw) + "]");
+    }
+    return true;
+}
+
+// The flat-vs-bitset A/B for ONE belief: build BOTH arms over the same world-set, assert every read op is
+// byte-identical (ops_identical), THEN drive a SEQUENCE of in-place filters through BOTH arms (the mutation
+// seam, §6 risk 8 — the one place count_ is written) consistent with a fixed true world, re-asserting every
+// op after each filter. This exercises filter_treasure/filter_detector/the count_ recompute, which the
+// static (directly-built) beliefs do not. Returns true on agreement; names the diverging op in `why`.
+[[nodiscard]] bool ab_identical(const chocofarm::Environment& env,
+                                const std::map<uint32_t, size_t>& rank,
+                                const std::vector<uint32_t>& flat, std::string& why) {
+    chocofarm::Belief fb = chocofarm::FlatBelief{flat};
+    chocofarm::Belief bb = to_bitset(env, rank, flat);
+
+    // (a) the static belief: every read op byte-identical across the two reps.
+    if (!ops_identical(env, fb, bb, "", why)) return false;
+    if (flat.empty()) return true;  // no filter sequence to run on the empty belief
+
+    // (b) a filter SEQUENCE consistent with a fixed true world (the first live world), applied to BOTH arms
+    // in lockstep; re-assert every op after each step. Detector filters by the world's true reading; a
+    // treasure filter by the world's presence bit. The two arms must track byte-identically through the
+    // narrowing (the in-place mutation + count_ recompute).
+    const uint32_t wstar = flat.front();  // the true world for this scripted trajectory
+    for (int j = 0; j < env.n_detectors(); ++j) {
+        const bool pos = env.observe(j, wstar);
+        env.filter_detector(fb, j, pos);
+        env.filter_detector(bb, j, pos);
+        if (!ops_identical(env, fb, bb, "after filter_detector[" + std::to_string(j) + "] ", why)) return false;
+    }
+    for (int t = 0; t < env.N(); ++t) {
+        const bool present = ((wstar >> t) & 1u) != 0;
+        env.filter_treasure(fb, t, present);
+        env.filter_treasure(bb, t, present);
+        if (!ops_identical(env, fb, bb, "after filter_treasure[" + std::to_string(t) + "] ", why)) return false;
+    }
+    return true;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -96,7 +207,6 @@ int main(int argc, char** argv) {
     chocofarm::Environment env(*inst);
     const int N = env.N();
     const int nD = env.n_detectors();
-    const std::span<const uint32_t> masks = env.face_masks();
     const std::vector<uint32_t>& all = env.worlds();
     const size_t nworlds = all.size();
     const double log_nworlds = std::log(static_cast<double>(nworlds));
@@ -110,18 +220,19 @@ int main(int argc, char** argv) {
         const size_t k = std::min(n, nworlds);
         beliefs.emplace_back(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(k));
     }
-    { std::vector<uint32_t> strided; for (size_t i = 0; i < nworlds; i += 13) strided.push_back(all[i]);
-      beliefs.push_back(std::move(strided)); }
+    for (size_t step : {size_t{7}, size_t{13}}) {  // two strides => two cover mixes the prefixes do not produce
+        std::vector<uint32_t> strided; for (size_t i = 0; i < nworlds; i += step) strided.push_back(all[i]);
+        beliefs.push_back(std::move(strided));
+    }
 
+    // ---- Part 1: the belief-sweep bit-exact oracle (production §A.4 sweep == naive reference) ----
     bool ok = true;
     std::string why;
     size_t checked = 0;
     for (const std::vector<uint32_t>& bw : beliefs) {
-        // STEP 1 retypes belief_features to the seam value type; the harness builds beliefs as raw
-        // vectors, so wrap as FlatBelief{...} for the production call. The naive reference() keeps the
-        // raw vector — its math is identical (the bit-exact net is unchanged).
-        const chocofarm::BeliefFeatures prod =
-            chocofarm::belief_features(chocofarm::FlatBelief{bw}, masks, N, nD, log_nworlds);
+        // STEP 2 folds the masks/dims into the env argument; the production call now takes (env, belief).
+        // The naive reference() keeps the raw vector — its math is identical (the bit-exact net is unchanged).
+        const chocofarm::BeliefFeatures prod = chocofarm::belief_features(env, chocofarm::FlatBelief{bw});
         const chocofarm::BeliefFeatures ref = reference(env, bw, N, nD, log_nworlds);
         if (!equal_features(prod, ref, bw.size(), why)) {
             ok = fail("production belief_features != naive reference at field " + why);
@@ -129,10 +240,47 @@ int main(int argc, char** argv) {
         }
         ++checked;
     }
-
     if (!ok) return 1;
     std::cout << "RESULT: PASS belief-sweep bit-exact oracle (N=" << N << " nD=" << nD
               << " |worlds|=" << nworlds << "; " << checked << " beliefs, production == naive reference"
               << " byte-for-byte, *inv convention)\n";
+
+    // The gate decision, printed so a flip is DIAGNOSABLE (the §4 derived-quantity-vs-machine-constant): a
+    // dim change that pushes mask_bytes past the budget silently drops the live instance to flat, which the
+    // bare 'RESULT: PASS in stdout' grep would miss — the visible numbers + the A/B PASS/SKIP line below
+    // (the test asserts PASS, not SKIP) are the regression surface (ADR-0011 measure-first / Rule 1).
+    const std::size_t mask_bytes =
+        static_cast<std::size_t>(N + nD) * static_cast<std::size_t>(env.kW64()) * sizeof(uint64_t);
+    std::cout << "GATE: kW64=" << env.kW64() << " mask_bytes=" << mask_bytes << " ("
+              << (static_cast<double>(mask_bytes) / 1024.0) << " KiB) budget="
+              << chocofarm::kTargetMaskCacheBudgetBytes << " ("
+              << (static_cast<double>(chocofarm::kTargetMaskCacheBudgetBytes) / 1024.0) << " KiB) => use_bitset="
+              << (env.use_bitset() ? "true" : "false") << "\n";
+
+    // ---- Part 2: the flat-vs-bitset A/B (every env seam op byte-identical across the two reps) ----
+    // The A/B builds a BitsetBelief DIRECTLY (bypassing the gate), so it needs the env's bitset masks,
+    // which the ctor builds only when the gate is ON (use_bitset_). The live instance gates ON
+    // (mask_bytes ≈ 121.5 KiB <= 128 KiB); a gate-OFF env has no bitset arm to A/B, so report that and skip.
+    if (!env.use_bitset()) {
+        std::cout << "RESULT: SKIP flat-vs-bitset A/B (this env gates OFF the bitset arm — no masks built; "
+                  << "N=" << N << " nD=" << nD << " |worlds|=" << nworlds << ")\n";
+        return 0;
+    }
+    const std::map<uint32_t, size_t> rank = rank_of(env);  // world value -> rank (combinations order)
+    size_t ab_checked = 0;
+    for (const std::vector<uint32_t>& bw : beliefs) {
+        std::string ab_why;
+        if (!ab_identical(env, rank, bw, ab_why)) {
+            (void)fail("flat-vs-bitset A/B DIVERGES at op " + ab_why + " — the bitset arm is the bug (flat "
+                       "is the reference, ADR-0002)");  // (void): fail() is [[nodiscard]]; we return 1 next
+            return 1;
+        }
+        ++ab_checked;
+    }
+    std::cout << "RESULT: PASS flat-vs-bitset A/B byte-identical (kW64=" << env.kW64()
+              << "; " << ab_checked << " beliefs x {nb, empty, belief_key, marginals, informative(per-det), "
+              << "legal_actions, belief_features, world_at_rank(all r), sample_world(256 draws)} static + a "
+              << "full filter SEQUENCE (all " << env.n_detectors() << " detectors + " << env.N()
+              << " treasures, re-asserted after each) — flat == bitset for every op)\n";
     return 0;
 }

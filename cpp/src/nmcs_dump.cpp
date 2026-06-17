@@ -63,8 +63,8 @@ namespace {
 class ScriptedSource final : public chocofarm::NMCSWorldSource {
   public:
     // The scripted source threads `const Environment&` so it resolves its `bw[0]` poke through the seam
-    // (env.world_at_rank, L4) — the lowest-bitmask world (rank 0), byte-identical to the former direct
-    // `bw[0]` (the flat arm is ascending worlds()-order).
+    // (env.world_at_rank, L4) — the rank-0 world (the first in worlds() emission order), byte-identical to
+    // the former direct `bw[0]` (the flat belief is a worlds()-RANK-ordered subsequence, so bw[0] IS rank 0).
     ScriptedSource(const chocofarm::Environment& env, std::vector<double> vals)
         : env_(env), vals_(std::move(vals)) {}
     uint32_t sample_world(const chocofarm::Belief& bw) override { return env_.world_at_rank(bw, 0); }

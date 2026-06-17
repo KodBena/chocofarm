@@ -144,8 +144,8 @@ class ScriptedNet final : public chocofarm::NetEvaluator {
 class ScriptedGumbelSource final : public chocofarm::GumbelSource {
   public:
     // The scripted source threads `const Environment&` so it resolves its `bw[idx]` pokes through the
-    // seam (env.world_at_rank, L4) — byte-identical to the former direct `bw[idx]` (the flat arm is
-    // ascending worlds()-order, so the r-th element == the r-th rank).
+    // seam (env.world_at_rank, L4) — byte-identical to the former direct `bw[idx]` (the flat belief is a
+    // worlds()-RANK-ordered subsequence, so the r-th element == the r-th rank).
     ScriptedGumbelSource(const chocofarm::Environment& env, std::vector<double> gumbels,
                          std::vector<int> world_idxs)
         : env_(env), gumbels_(std::move(gumbels)), world_idxs_(std::move(world_idxs)) {}

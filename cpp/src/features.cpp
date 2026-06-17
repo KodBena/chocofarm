@@ -24,6 +24,7 @@
 // Public Domain (The Unlicense).
 #include "chocofarm/features.hpp"
 #include "chocofarm/feature_compute.hpp"
+#include "chocofarm/belief_bitset_ops.hpp"  // popcount_and (the ONE home, P1 — shared with env.cpp's seam)
 
 #include <algorithm>
 #include <array>
@@ -209,16 +210,61 @@ namespace {
     return bf;
 }
 
+// nb>=1, the BITSET arm (§5 step 5). Phase 1: the SAME two integer column-sums as the §A.4 flat sweep —
+// bit_cnt[t] = Σ_w bit_t(w) = popcount(belief & treasure_mask[t]); det_cnt[j] = Σ_w [(w & mask_j)!=0] =
+// popcount(belief & detector_mask[j]) — produced by masked-AND + popcount instead of a per-world loop.
+// Phase 2 is the IDENTICAL pointwise `* inv` (NEVER `/ nb`; §6 risk 6), and informative via
+// det_cnt>0 && det_cnt<(int64_t)nb — so the result is BYTE-IDENTICAL to belief_features_nonempty for the
+// same belief (exact integer counts, same inv). `count_` is the cached nb (>= 1 here, the dispatcher
+// guarantees it).
+[[nodiscard]] BeliefFeatures belief_features_bitset(const Environment& env, const BitsetBelief& b,
+                                                    int N, int nD, double log_nworlds) {
+    const size_t nb = static_cast<size_t>(b.count_);  // >= 1 (the dispatcher guarantees it)
+    BeliefFeatures bf;
+    bf.marg.assign(N, 0.0);
+    bf.p_pos.assign(nD, 0.0);
+    bf.informative.assign(nD, 0.0);
+
+    const double inv = 1.0 / static_cast<double>(nb);
+    for (int t = 0; t < N; ++t) {
+        const int64_t bit_cnt = popcount_and(b.bits, env.treasure_mask(t));  // Σ_w bit_t(w)
+        bf.marg[static_cast<size_t>(t)]  = static_cast<double>(bit_cnt) * inv;
+        bf.marg_sum += bf.marg[static_cast<size_t>(t)];                       // treasure-id order (P6)
+    }
+    for (int j = 0; j < nD; ++j) {
+        const int64_t det_cnt = popcount_and(b.bits, env.detector_mask(j));   // Σ_w [(w & mask_j)!=0]
+        bf.p_pos[static_cast<size_t>(j)]       = static_cast<double>(det_cnt) * inv;
+        bf.informative[static_cast<size_t>(j)] = (det_cnt > 0 && det_cnt < static_cast<int64_t>(nb)) ? 1.0 : 0.0;
+    }
+    bf.sharpness = std::log(static_cast<double>(nb)) / log_nworlds;
+    bf.nonempty  = 1.0;
+    return bf;
+}
+
 }  // namespace
 
-// The public sweep entry (feature_compute.hpp): dispatch on belief size to the empty / hot child. STEP 1
-// retypes the entry to `const Belief&` (the seam value type, L3); the flat arm reads `.worlds` and runs
-// the EXISTING §A.4 sweep UNCHANGED (the empty/nonempty children take the flat span, byte-identical).
-BeliefFeatures belief_features(const Belief& bw, std::span<const uint32_t> masks,
-                               int N, int nD, double log_nworlds) {
-    return bw.worlds.empty()
-               ? belief_features_empty(N, nD)
-               : belief_features_nonempty(std::span<const uint32_t>(bw.worlds), masks, N, nD, log_nworlds);
+// The public sweep entry (feature_compute.hpp): COARSE visit on the rep (§3), then dispatch on belief size
+// to the empty / hot child. The flat arm reads `.worlds` and runs the EXISTING §A.4 sweep UNCHANGED; the
+// bitset arm runs the masked-AND + popcount kernel (byte-identical, §6 risk 6). Dims + masks + log|worlds|
+// come from the env (the honest signature, P9): N/nD/log_nworlds are env-static; the empty child takes only
+// N/nD (both arms share belief_features_empty — the zero return).
+BeliefFeatures belief_features(const Environment& env, const Belief& bw) {
+    const int N = env.N();
+    const int nD = env.n_detectors();
+    const double log_nworlds = std::log(static_cast<double>(env.worlds().size()));
+    return std::visit([&](const auto& a) -> BeliefFeatures {
+        using T = std::decay_t<decltype(a)>;
+        if constexpr (std::is_same_v<T, FlatBelief>) {
+            return a.worlds.empty()
+                       ? belief_features_empty(N, nD)
+                       : belief_features_nonempty(std::span<const uint32_t>(a.worlds), env.face_masks(),
+                                                  N, nD, log_nworlds);
+        } else {
+            return a.count_ == 0
+                       ? belief_features_empty(N, nD)
+                       : belief_features_bitset(env, a, N, nD, log_nworlds);
+        }
+    }, bw);
 }
 
 namespace {
@@ -339,7 +385,7 @@ const BeliefFeatures& FeatureBuilder::belief_feats_(const Belief& bw) const {
     // miss: the cap is a memory backstop (mirrors _belief_cache_cap); compute, store an OWNED copy of bw
     // (a stored span would dangle), return the cached ref.
     if (belief_cache_n_ >= kBeliefCacheCap) { belief_cache_.clear(); belief_cache_n_ = 0; }
-    BeliefFeatures feats = belief_features(bw, env_.face_masks(), N_, nD_, log_nworlds_);
+    BeliefFeatures feats = belief_features(env_, bw);  // visits the rep (flat sweep / bitset popcount)
     auto& bucket = belief_cache_[key];
     bucket.emplace_back(bw, std::move(feats));
     ++belief_cache_n_;

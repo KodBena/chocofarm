@@ -71,8 +71,8 @@ namespace {
 class ScriptedISMCTSSource final : public chocofarm::ISMCTSSource {
   public:
     // The scripted source threads `const Environment&` so it resolves its `bw[idx]` pokes through the
-    // seam (env.world_at_rank, L4) — byte-identical to the former direct `bw[idx]` (the flat arm is
-    // ascending worlds()-order, so the r-th element == the r-th rank).
+    // seam (env.world_at_rank, L4) — byte-identical to the former direct `bw[idx]` (the flat belief is a
+    // worlds()-RANK-ordered subsequence, so the r-th element == the r-th rank).
     ScriptedISMCTSSource(const chocofarm::Environment& env, std::vector<int> idxs,
                          std::vector<double> leaves, std::vector<int> world_idxs = {})
         : env_(env), idxs_(std::move(idxs)), leaves_(std::move(leaves)),

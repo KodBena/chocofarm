@@ -121,13 +121,24 @@ def test_cpp_belief_sweep_oracle():
     naive env.observe count, same *inv spec) and asserts byte-equality over a sample of beliefs — the
     in-language bit-exact net for the rewrite and every later rung (SIMD, the Part B diagram). ADR-0011:
     net the rewrite, don't trust it. Pure compute (no FeatureBuilder, no layout file, no redis) so the
-    binary is cwd-independent; cwd=REPO / PYTHONPATH are kept only for parity with the other cpp gates."""
+    binary is cwd-independent; cwd=REPO / PYTHONPATH are kept only for parity with the other cpp gates.
+
+    STEP 2 (the bitset belief arm, docs/design/cpp-belief-rep-scoping.md §5) extended this binary with a
+    flat-vs-bitset A/B that builds BOTH reps and asserts byte-identity across every env seam op (marginals,
+    informative, legal_actions, belief_features, nb, belief_key, world_at_rank, sample_world) plus a full
+    in-place filter sequence. This test PINS the live instance to the bitset arm (ADR-0011 Rule 1: the gate
+    is enforced here, the strongest feasible surface): the A/B must print its OWN 'RESULT: PASS' line, NOT
+    'RESULT: SKIP' — a SKIP means the gate silently fell back to flat (e.g. a dim change pushed mask_bytes
+    past the cache budget), which the bare 'RESULT: PASS in stdout' check below would not catch."""
     out = subprocess.run([BELIEF_ORACLE_BIN, "--instance", DATA_INSTANCE, "--faces", DATA_FACES],
                          cwd=REPO, capture_output=True, text=True, timeout=60,
                          env={**os.environ, "PYTHONPATH": REPO})
     sys.stdout.write(out.stdout)
     sys.stderr.write(out.stderr)
     assert out.returncode == 0 and "RESULT: PASS" in out.stdout
+    # the live instance MUST gate ON: the flat-vs-bitset A/B ran (PASS) and did not silently fall back (SKIP)
+    assert "RESULT: PASS flat-vs-bitset A/B" in out.stdout, out.stdout
+    assert "RESULT: SKIP" not in out.stdout, out.stdout
 
 
 # ---------------------------------------------------------------------------

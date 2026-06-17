@@ -50,9 +50,11 @@ int main(int argc, char** argv) {
 
     // Two DISTINCT beliefs that SHARE a (count, first, last) fingerprint (different MIDDLE world) — the
     // exact collision the full-equality guard must distinguish. front()=1, back()=5, size=3 for both.
-    // STEP 1: the fingerprint + build take the seam value type, so wrap the raw world-sets as FlatBelief.
-    const chocofarm::Belief bw1{{1u, 3u, 5u}};
-    const chocofarm::Belief bw2{{1u, 4u, 5u}};
+    // STEP 2: Belief is now a std::variant, so construct the variant from an explicit FlatBelief. (These are
+    // synthetic world-sets {1,3,5}/{1,4,5}, not subsets of env.worlds(), so the FLAT arm is the right rep to
+    // exercise here — the bitset arm's rank-space requires worlds()-membership, which the A/B oracle covers.)
+    const chocofarm::Belief bw1{chocofarm::FlatBelief{{1u, 3u, 5u}}};
+    const chocofarm::Belief bw2{chocofarm::FlatBelief{{1u, 4u, 5u}}};
     bool ok = true;
     if (env.belief_key(bw1) != env.belief_key(bw2))
         ok = fail("test setup: bw1/bw2 do not share a fingerprint");

@@ -25,7 +25,8 @@ class CyclicGumbelSource final : public GumbelSource {
   public:
     // The scripted source threads `const Environment&` so it resolves its `bw[0]` poke through the seam
     // (env.world_at_rank, L4) — the rank-0 world, byte-identical to the former direct `bw[0]` (the flat
-    // arm is ascending worlds()-order). The empty-belief sentinel (0u) is preserved.
+    // belief is a worlds()-RANK-ordered subsequence, so bw[0] IS the rank-0 world). The empty-belief
+    // sentinel (0u) is preserved.
     CyclicGumbelSource(const Environment& env, std::vector<double> table)
         : env_(env), table_(std::move(table)) {}
     uint32_t sample_world(const Belief& bw) override {

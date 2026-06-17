@@ -12,23 +12,24 @@
 // Public Domain (The Unlicense).
 #pragma once
 
-#include <cstdint>
-#include <span>
-
+#include "chocofarm/env.hpp"        // Environment + Belief (the seam value type)
 #include "chocofarm/features.hpp"   // BeliefFeatures (the returned value type)
 
 namespace chocofarm {
 
 // The belief-derived intermediates for `bw`: mean-bit marg over treasures + per-detector cover counts ->
 // p_pos / informative, plus marg_sum / sharpness / nonempty. The signature names its TRUE inputs
-// (ADR-0012 P9 honest signature): the belief `bw` (the seam value type — STEP 1 retypes the former bare
-// world-set span to `const Belief&`, docs/design/cpp-belief-rep-scoping.md §5 L3; the flat arm reads
-// `.worlds` and runs the EXISTING §A.4 sweep UNCHANGED), the per-detector cover bitmasks `masks`
-// (= env.face_masks(), the only piece of env the sweep touches; observe(j,w) == (w&masks[j])!=0), and
-// the env-static dims N = env.N(), nD = env.n_detectors(), log_nworlds = log(|env.worlds()|). Pure; the
+// (ADR-0012 P9 honest signature): the env (which carries the per-detector cover bitmasks env.face_masks()
+// for the FLAT arm AND the env-static bitset masks env.treasure_mask/detector_mask for the BITSET arm, plus
+// the dims N/nD and log|worlds|) and the belief `bw` (the seam value type). STEP 2 (the bitset arm,
+// docs/design/cpp-belief-rep-scoping.md §5 L3) makes this VISIT the variant: the flat arm runs the EXISTING
+// §A.4 sweep over `.worlds` UNCHANGED; the bitset arm runs the masked-AND + popcount kernel (env-static
+// masks), producing the SAME integer bit_cnt/det_cnt then the IDENTICAL Phase-2 `* inv` — byte-identical
+// to the flat sweep (§6 risk 6). The signature took `(const Belief&, span<masks>, N, nD, log_nworlds)` in
+// Step 1; Step 2 folds those into `const Environment&` because the bitset arm needs the env's bitset masks
+// (the span-only signature could not reach them) — every caller already holds an Environment. Pure; the
 // single home is features.cpp. (geometry_features / collected_features stay file-local — only the sweep,
 // the K=16 profile's ~81%, is exposed for the bench + the bit-exact oracle.)
-[[nodiscard]] BeliefFeatures belief_features(const Belief& bw, std::span<const uint32_t> masks,
-                                             int N, int nD, double log_nworlds);
+[[nodiscard]] BeliefFeatures belief_features(const Environment& env, const Belief& bw);
 
 }  // namespace chocofarm

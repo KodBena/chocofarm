@@ -55,8 +55,8 @@ int main(int argc, char** argv) {
     const int nD = env.n_detectors();
     const std::vector<uint32_t> bw_full = env.worlds();
     const size_t nworlds = bw_full.size();
-    const double log_nworlds = std::log(static_cast<double>(nworlds));
-    const std::span<const uint32_t> masks = env.face_masks();   // contiguous per-detector cover masks (P1)
+    // log_nworlds + the per-detector masks are now derived inside belief_features from the env (STEP 2 folds
+    // them into the env argument); the bench no longer threads them.
 
     std::cout << "belief-sweep-bench: N=" << N << " nD=" << nD << " |worlds|=" << nworlds
               << " budget=" << budget << "s/point  (timing chocofarm::belief_features in isolation)\n";
@@ -70,11 +70,12 @@ int main(int argc, char** argv) {
     sizes.push_back(nworlds);
 
     for (size_t nb : sizes) {
-        // STEP 1: belief_features takes the seam value type. Build the FlatBelief for this size ONCE,
-        // outside the timing loop, from the leading nb worlds — the timed work (the §A.4 sweep over
-        // `.worlds`) is byte-identical to the former subspan.
-        const chocofarm::Belief bw{std::vector<uint32_t>(bw_full.begin(),
-                                                         bw_full.begin() + static_cast<std::ptrdiff_t>(nb))};
+        // Build the FlatBelief for this size ONCE, outside the timing loop, from the leading nb worlds.
+        // STEP 2 folds the masks/dims into the env argument; this bench times the FLAT sweep in isolation
+        // (an explicit FlatBelief, regardless of the env's gate), the K=16 profile's ~81%. The timed work
+        // (the §A.4 sweep over `.worlds`) is byte-identical to the former subspan call.
+        const chocofarm::Belief bw{chocofarm::FlatBelief{
+            std::vector<uint32_t>(bw_full.begin(), bw_full.begin() + static_cast<std::ptrdiff_t>(nb))}};
         using clk = std::chrono::steady_clock;
         long calls = 0;
         double sink = 0.0;
@@ -82,7 +83,7 @@ int main(int argc, char** argv) {
         double el = 0.0;
         do {
             for (int i = 0; i < 16; ++i) {
-                const chocofarm::BeliefFeatures bf = chocofarm::belief_features(bw, masks, N, nD, log_nworlds);
+                const chocofarm::BeliefFeatures bf = chocofarm::belief_features(env, bw);
                 sink += bf.marg_sum + bf.sharpness;
             }
             calls += 16;

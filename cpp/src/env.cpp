@@ -13,7 +13,33 @@
 #include <cstdlib>
 #include <iostream>
 
+#include "chocofarm/belief_bitset_ops.hpp"  // popcount_all / popcount_and / rth_set_bit_index (the ONE home, P1)
+
 namespace chocofarm {
+
+namespace {
+
+// In-place filter: keep where the mask reads `want` (bits &= want ? mask : ~mask), then recompute count_.
+// The one place count_ is written (§6 risk 8). O(kW64) — the same cost as the AND.
+void filter_bits(BitsetBelief& b, std::span<const uint64_t> mask, bool want) {
+    if (want) for (int w = 0; w < static_cast<int>(b.bits.size()); ++w) b.bits[static_cast<size_t>(w)] &=  mask[static_cast<size_t>(w)];
+    else      for (int w = 0; w < static_cast<int>(b.bits.size()); ++w) b.bits[static_cast<size_t>(w)] &= ~mask[static_cast<size_t>(w)];
+    b.count_ = popcount_all(b.bits);
+}
+
+// The r-th set bit -> world rank, with the loud-abort invariant arm the seam owns (the kernel returns -1 on
+// a count_/bits desync; here that becomes a FATAL abort — ADR-0002 / scoping §6 risk 7).
+[[nodiscard]] int rank_or_abort(std::span<const uint64_t> bits, int r) {
+    const int idx = rth_set_bit_index(bits, r);
+    if (idx < 0) {
+        assert(false && "rth_set_bit_index: r out of range (count_ desynced from bits?)");
+        std::cerr << "chocofarm: FATAL invariant: rth_set_bit_index: r out of range\n";
+        std::abort();
+    }
+    return idx;
+}
+
+}  // namespace
 
 // C(N,K) bitmask world-set in itertools.combinations order (mirrors instance.world_array). Bit t
 // set <=> treasure t present. The "next combination" walk reproduces combinations(range(N), K)
@@ -49,6 +75,84 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
     for (size_t k = 0; k < inst_.teleport_names.size(); ++k) {
         if (inst_.teleport_names[k] == inst_.entry) { entry_idx_ = static_cast<int>(k); break; }
     }
+
+    // ---- the bitset-arm gate + env-static masks (§4; built ONCE here, homed like face_masks_, P1) ----
+    // The gate has TWO inputs (§4): a DERIVED quantity (the mask-storage bytes, a pure function of N/nD/kW64)
+    // and a MACHINE CONSTANT (kTargetMaskCacheBudgetBytes — the L2-residency budget). kW64 is DERIVED from
+    // the world count, NEVER the literal 243.
+    const std::size_t nworlds = worlds_.size();
+    const bool worlds_enumerable = nworlds > 0;  // build_worlds returns the full C(N,K) set; empty only if K out of range
+    kW64_ = static_cast<int>((nworlds + 63) / 64);
+    const std::size_t mask_bytes =
+        static_cast<std::size_t>(inst_.N + n_detectors()) * static_cast<std::size_t>(kW64_) * sizeof(uint64_t);
+    use_bitset_ = worlds_enumerable && (mask_bytes <= kTargetMaskCacheBudgetBytes);
+
+    if (use_bitset_) {
+        // treasure_mask_[t] = worlds (by rank) with bit t set; detector_mask_[j] = worlds where
+        // (w & face_masks()[j]) != 0 — the SAME enumeration + face masks the env owns, so the masks
+        // derive from worlds_/face_masks_ (the identity env.observe rests on; the oracle pins it).
+        const size_t kw = static_cast<size_t>(kW64_);
+        treasure_mask_.assign(static_cast<size_t>(inst_.N) * kw, 0ull);
+        detector_mask_.assign(static_cast<size_t>(n_detectors()) * kw, 0ull);
+        for (size_t r = 0; r < nworlds; ++r) {
+            const uint32_t w = worlds_[r];
+            const size_t word = r >> 6;           // r / 64
+            const uint64_t bit = uint64_t{1} << (r & 63u);  // 1 << (r % 64)
+            for (int t = 0; t < inst_.N; ++t)
+                if ((w >> t) & 1u) treasure_mask_[static_cast<size_t>(t) * kw + word] |= bit;
+            for (int j = 0; j < n_detectors(); ++j)
+                if ((w & face_masks_[static_cast<size_t>(j)]) != 0) detector_mask_[static_cast<size_t>(j) * kw + word] |= bit;
+        }
+    }
+}
+
+// ---- belief construction + introspection (the seam ops; COARSE visit per op, §3) ----
+
+Belief Environment::full_belief() const {
+    if (use_bitset_) {
+        // all-ones over the nb worlds: every full word = ~0, the last (partial) word masked to the live
+        // bit-tail so trailing bits past |worlds| stay 0 (a popcount over them must NOT count phantom worlds).
+        BitsetBelief b;
+        b.bits.assign(static_cast<size_t>(kW64_), ~uint64_t{0});
+        const size_t nworlds = worlds_.size();
+        const int tail = static_cast<int>(nworlds & 63u);  // live bits in the final word (0 => the word is full)
+        if (tail != 0) b.bits.back() = (uint64_t{1} << tail) - 1;
+        b.count_ = static_cast<int>(nworlds);  // = popcount(all-ones over nworlds bits), the C(N,K) prior
+        return b;
+    }
+    return FlatBelief{worlds_};  // the flat arm copies worlds_ (rank order = combinations order)
+}
+
+uint32_t Environment::world_at_rank(const Belief& b, int r) const {
+    return std::visit([&](const auto& a) -> uint32_t {
+        using T = std::decay_t<decltype(a)>;
+        if constexpr (std::is_same_v<T, FlatBelief>) return a.worlds[static_cast<size_t>(r)];
+        else return worlds_[static_cast<size_t>(rank_or_abort(a.bits, r))];  // r-th set bit -> world
+    }, b);
+}
+
+uint32_t Environment::sample_world(const Belief& b, std::mt19937_64& rng) const {
+    // The IDENTICAL uniform draw on both arms (so the RNG stream is byte-identical): r in [0, nb-1], then
+    // unrank via world_at_rank. The flat arm's nb is .worlds.size(); the bitset arm's is count_.
+    const int n = nb(b);
+    std::uniform_int_distribution<size_t> pick(0, static_cast<size_t>(n) - 1);
+    const int r = static_cast<int>(pick(rng));
+    return world_at_rank(b, r);
+}
+
+BeliefKey Environment::belief_key(const Belief& b) const {
+    const int n = nb(b);
+    if (n == 0) return BeliefKey{0, 0u, 0u};
+    // (count, first, last) — bit-identical across arms (shared RANK order, NOT numeric: flat front/back are
+    // the rank-0/rank-(count-1) worlds). Flat reads front/back directly; bitset unranks rank 0 and count_-1.
+    return std::visit([&](const auto& a) -> BeliefKey {
+        using T = std::decay_t<decltype(a)>;
+        if constexpr (std::is_same_v<T, FlatBelief>)
+            return BeliefKey{n, a.worlds.front(), a.worlds.back()};
+        else
+            return BeliefKey{n, worlds_[static_cast<size_t>(rank_or_abort(a.bits, 0))],
+                                worlds_[static_cast<size_t>(rank_or_abort(a.bits, n - 1))]};
+    }, b);
 }
 
 double Environment::dist(const Point& a, const Point& b) const {
@@ -65,26 +169,49 @@ double Environment::exit_cost(const Point& loc) const {
 }
 
 std::vector<double> Environment::marginals(const Belief& bw) const {
-    std::vector<double> m(inst_.N, 0.0);
-    if (bw.worlds.empty()) return m;
-    for (uint32_t w : bw.worlds) {
-        for (int t = 0; t < inst_.N; ++t) {
-            if ((w >> t) & 1u) m[t] += 1.0;
+    // COARSE visit (§3): one dispatch, then a pure rep-specific body. Both produce byte-identical marg —
+    // exact integer counts (Σ_w bit_t / popcount_and) times the SAME `* inv` (1/nb), and (double)count is
+    // exact for count <= |worlds| (P6).
+    return std::visit([&](const auto& a) -> std::vector<double> {
+        using T = std::decay_t<decltype(a)>;
+        std::vector<double> m(inst_.N, 0.0);
+        if constexpr (std::is_same_v<T, FlatBelief>) {
+            if (a.worlds.empty()) return m;
+            for (uint32_t w : a.worlds)
+                for (int t = 0; t < inst_.N; ++t)
+                    if ((w >> t) & 1u) m[static_cast<size_t>(t)] += 1.0;
+            const double inv = 1.0 / static_cast<double>(a.worlds.size());
+            for (double& v : m) v *= inv;  // mean over the world-set (mirrors env.marginals)
+            return m;
+        } else {
+            if (a.count_ == 0) return m;
+            const double inv = 1.0 / static_cast<double>(a.count_);
+            for (int t = 0; t < inst_.N; ++t)
+                m[static_cast<size_t>(t)] = static_cast<double>(popcount_and(a.bits, treasure_mask(t))) * inv;
+            return m;
         }
-    }
-    double inv = 1.0 / static_cast<double>(bw.worlds.size());
-    for (double& v : m) v *= inv;  // mean over the world-set (mirrors env.marginals)
-    return m;
+    }, bw);
 }
 
 bool Environment::informative(int face_id, const Belief& bw) const {
-    uint32_t bm = inst_.faces[face_id].bitmask;
-    bool any_hit = false, any_miss = false;
-    for (uint32_t w : bw.worlds) {
-        if ((w & bm) != 0) any_hit = true; else any_miss = true;
-        if (any_hit && any_miss) return true;  // both polarities live
-    }
-    return false;  // mirrors SenseAction.informative: hit.any() and (~hit).any()
+    // Outcome still uncertain over the belief — both polarities live (SenseAction.informative). COARSE
+    // visit. Bitset: 0 < popcount_and(detector_mask[j]) < count_ (the cover count strictly between empty
+    // and full ⇔ a hit AND a miss both exist) — byte-identical to the flat two-polarity scan.
+    return std::visit([&](const auto& a) -> bool {
+        using T = std::decay_t<decltype(a)>;
+        if constexpr (std::is_same_v<T, FlatBelief>) {
+            const uint32_t bm = inst_.faces[static_cast<size_t>(face_id)].bitmask;
+            bool any_hit = false, any_miss = false;
+            for (uint32_t w : a.worlds) {
+                if ((w & bm) != 0) any_hit = true; else any_miss = true;
+                if (any_hit && any_miss) return true;  // both polarities live
+            }
+            return false;  // mirrors SenseAction.informative: hit.any() and (~hit).any()
+        } else {
+            const int cnt = popcount_and(a.bits, detector_mask(face_id));
+            return cnt > 0 && cnt < a.count_;
+        }
+    }, bw);
 }
 
 std::vector<Action> Environment::legal_actions(const Belief& bw,
@@ -123,11 +250,24 @@ std::size_t filter_inplace(std::vector<uint32_t>& bw, uint32_t mask, bool want) 
 }
 
 void Environment::filter_treasure(Belief& bw, int i, bool present) const {
-    filter_inplace(bw.worlds, uint32_t{1} << i, present);   // a treasure is the single-bit mask 1<<i
+    // In-place through the visited variant (§6 risk 8). Flat: erase_if on the single-bit mask 1<<i.
+    // Bitset: bits &= ±treasure_mask[i], recompute count_ (the one place count_ is written). Byte-identical
+    // kept set (same keep-predicate, same rank order — both filters keep worlds in their worlds_ rank).
+    std::visit([&](auto& a) {
+        using T = std::decay_t<decltype(a)>;
+        if constexpr (std::is_same_v<T, FlatBelief>) filter_inplace(a.worlds, uint32_t{1} << i, present);
+        else filter_bits(a, treasure_mask(i), present);
+    }, bw);
 }
 
 void Environment::filter_detector(Belief& bw, int i, bool positive) const {
-    filter_inplace(bw.worlds, inst_.faces[i].bitmask, positive);  // a detector is its cover bitmask (disjunction)
+    // As filter_treasure, but the mask is the detector's cover bitmask (the disjunction). Flat: erase_if on
+    // faces[i].bitmask; bitset: bits &= ±detector_mask[i], recompute count_.
+    std::visit([&](auto& a) {
+        using T = std::decay_t<decltype(a)>;
+        if constexpr (std::is_same_v<T, FlatBelief>) filter_inplace(a.worlds, inst_.faces[static_cast<size_t>(i)].bitmask, positive);
+        else filter_bits(a, detector_mask(i), positive);
+    }, bw);
 }
 
 StepResult Environment::apply(Loc& loc, Belief& bw, std::set<int>& collected,
