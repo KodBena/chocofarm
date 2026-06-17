@@ -15,13 +15,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <random>
 #include <set>
 #include <span>
 #include <vector>
 
+#include "chocofarm/belief_key.hpp"
 #include "chocofarm/instance.hpp"
 
 namespace chocofarm {
+
+// The belief value type — the world-set the search reasons over (ADR-0012 P2: the belief seam). STEP 1
+// of the belief-rep cutover (docs/design/cpp-belief-rep-scoping.md §5) introduces this as the ONE belief
+// value the search names, replacing the bare `std::vector<uint32_t>` every caller used to poke directly.
+// It is a plain struct + alias today (the FLAT arm only): a pure refactor, byte-identical to the former
+// vector. The Step-2 swap (`using Belief = std::variant<FlatBelief, BitsetBelief>`) then touches ONLY
+// this alias + the env op bodies — every caller already speaks `const Belief&` / `Belief` / `Belief&`.
+// The worlds stay in ascending worlds()-order (the parity fixtures' documented basis); the seam ops
+// below are the SOLE readers/mutators of `.worlds`, so no caller pokes the representation.
+struct FlatBelief {
+    std::vector<uint32_t> worlds;
+    bool operator==(const FlatBelief&) const = default;
+};
+using Belief = FlatBelief;
 
 // An action: a kind tag + an index. Mirrors the env's ("t", i) / ("d", i) / TERMINATE shape.
 enum class ActionKind { Treasure, Detector, Terminate };
@@ -77,25 +93,51 @@ class Environment {
     int n_teleports() const { return static_cast<int>(inst_.teleports.size()); }
     Point teleport_pt(int k) const { return inst_.teleports[k]; }
 
+    // ---- belief construction (the seam's entry — replaces `bw = env.worlds()`) ----
+    // The full belief: every world (the C(N,K) prior). The flat arm copies `worlds_` (ascending).
+    Belief full_belief() const { return Belief{worlds_}; }
+
+    // ---- belief introspection (the seam ops — NO caller pokes `.worlds` directly) ----
+    int nb(const Belief& b) const { return static_cast<int>(b.worlds.size()); }  // belief size
+    bool empty(const Belief& b) const { return b.worlds.empty(); }
+    // The r-th world by rank (the flat arm: ascending worlds()-order, so worlds[r]). The scripted
+    // parity sources resolve their `bw[idx]` poke through this (L4), preserving the exact index.
+    uint32_t world_at_rank(const Belief& b, int r) const { return b.worlds[static_cast<size_t>(r)]; }
+    // Sample one concrete world uniformly from the belief (mirrors env.sample_world / rng.choice(bw)).
+    // MOVED here from RngWorldSource (L1) so no caller pokes the representation; the uniform draw is the
+    // IDENTICAL std::uniform_int_distribution<size_t>(0, nb-1)(rng) so the RNG stream is byte-identical.
+    uint32_t sample_world(const Belief& b, std::mt19937_64& rng) const {
+        std::uniform_int_distribution<size_t> pick(0, b.worlds.size() - 1);
+        return b.worlds[pick(rng)];
+    }
+    // The ONE belief-identity fingerprint (L2), MOVED off belief_key.hpp into the env so the seam owns
+    // the read of `.worlds`. (count, first, last); {0,0,0} on the empty belief — exactly the former
+    // free belief_key() logic. The `using BeliefKey` TYPE stays in belief_key.hpp (a leaf header
+    // gumbel.hpp/features.hpp include — moving the TYPE would create an include cycle).
+    BeliefKey belief_key(const Belief& b) const {
+        if (b.worlds.empty()) return BeliefKey{0, 0u, 0u};
+        return BeliefKey{static_cast<int>(b.worlds.size()), b.worlds.front(), b.worlds.back()};
+    }
+
     // ---- belief marginals (mirrors env.marginals) ----
-    std::vector<double> marginals(const std::vector<uint32_t>& bw) const;
+    std::vector<double> marginals(const Belief& bw) const;
 
     // ---- dynamics ----
     // Legal action set for (loc, belief, collected): collects with marg>0 and not collected, plus
     // each face whose outcome is still uncertain over the belief (informative). TERMINATE is NOT
     // included here (it is the always-legal extra slot, appended by the Policy / the mask builder),
     // matching env.legal_actions + actions.term_slot exactly.
-    std::vector<Action> legal_actions(const std::vector<uint32_t>& bw,
+    std::vector<Action> legal_actions(const Belief& bw,
                                       const std::set<int>& collected) const;
 
     // Realise `action` against the true `world`. Filters `bw` IN PLACE (move/observe/collect), and
     // returns (reward, dt). The belief filter is the same disjunction/treasure-bit logic as env.py.
-    StepResult apply(Loc& loc, std::vector<uint32_t>& bw, std::set<int>& collected,
+    StepResult apply(Loc& loc, Belief& bw, std::set<int>& collected,
                      const Action& action, uint32_t world) const;
 
     // ---- belief filters (mirror filter_treasure / SenseAction.filter) ----
-    void filter_treasure(std::vector<uint32_t>& bw, int i, bool present) const;
-    void filter_detector(std::vector<uint32_t>& bw, int i, bool positive) const;
+    void filter_treasure(Belief& bw, int i, bool present) const;
+    void filter_detector(Belief& bw, int i, bool positive) const;
 
     // A face's true reading at a concrete world (mirrors SenseAction.observe).
     bool observe(int face_id, uint32_t world) const {
@@ -109,7 +151,7 @@ class Environment {
     // observe(j, w) == ((w & face_masks()[j]) != 0).
     std::span<const uint32_t> face_masks() const { return face_masks_; }
     // Outcome still uncertain over the belief — both polarities live (SenseAction.informative).
-    bool informative(int face_id, const std::vector<uint32_t>& bw) const;
+    bool informative(int face_id, const Belief& bw) const;
 
   private:
     Instance inst_;

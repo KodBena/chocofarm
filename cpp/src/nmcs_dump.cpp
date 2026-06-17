@@ -62,9 +62,13 @@ namespace {
 // the SAME table the SAME way, so the value delivered at each call index is identical on both sides).
 class ScriptedSource final : public chocofarm::NMCSWorldSource {
   public:
-    explicit ScriptedSource(std::vector<double> vals) : vals_(std::move(vals)) {}
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override { return bw[0]; }
-    double playout_value(const chocofarm::Loc&, const std::vector<uint32_t>&,
+    // The scripted source threads `const Environment&` so it resolves its `bw[0]` poke through the seam
+    // (env.world_at_rank, L4) — the lowest-bitmask world (rank 0), byte-identical to the former direct
+    // `bw[0]` (the flat arm is ascending worlds()-order).
+    ScriptedSource(const chocofarm::Environment& env, std::vector<double> vals)
+        : env_(env), vals_(std::move(vals)) {}
+    uint32_t sample_world(const chocofarm::Belief& bw) override { return env_.world_at_rank(bw, 0); }
+    double playout_value(const chocofarm::Loc&, const chocofarm::Belief&,
                          const std::set<int>&, double) override {
         // The fixture guarantees a non-empty table (checked in main before constructing the source);
         // an empty table here would be a programmer bug (ADR-0012 P9: an invariant, an assert).
@@ -73,6 +77,7 @@ class ScriptedSource final : public chocofarm::NMCSWorldSource {
     }
 
   private:
+    const chocofarm::Environment& env_;
     std::vector<double> vals_;
     size_t idx_ = 0;
 };
@@ -104,18 +109,18 @@ int main(int argc, char** argv) {
     chocofarm::NMCSPolicy policy(cfg);
 
     chocofarm::Loc loc{env.entry_point()};
-    std::vector<uint32_t> bw = env.worlds();
+    chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
     std::set<int> collected;
 
     // optionally advance the real (loc, bw, collected) by a prefix slot sequence against the
     // true world bw[0] (the same deterministic world both languages advance by), so the fixed
     // search input can be a mid-episode state, not just the root.
     if (auto pref = opt(args, "--prefix")) {
-        uint32_t world = bw.empty() ? 0u : bw[0];
+        uint32_t world = env.empty(bw) ? 0u : env.world_at_rank(bw, 0);  // rank-0 world (L4)
         std::istringstream iss{std::string(*pref)};
         int slot;
         while (iss >> slot) {
-            if (bw.empty()) break;
+            if (env.empty(bw)) break;
             if (slot >= env.N() + env.n_detectors()) break;  // TERMINATE in prefix: stop
             chocofarm::Action a = (slot < env.N())
                 ? chocofarm::Action{chocofarm::ActionKind::Treasure, slot}
@@ -137,7 +142,7 @@ int main(int argc, char** argv) {
         std::cerr << "nmcs-dump: FATAL: empty scripted playout table on stdin\n";
         return 1;
     }
-    ScriptedSource src(std::move(vals));
+    ScriptedSource src(env, std::move(vals));
 
     int level = std::max(1, cfg.level);
     auto [score, action] = policy.search(env, loc, bw, collected, lam, level, src);

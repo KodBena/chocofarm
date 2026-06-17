@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
     }
     chocofarm::Environment env(*inst);
     chocofarm::Loc loc{env.entry_point()};
-    std::vector<uint32_t> bw = env.worlds();
+    chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
     std::set<int> coll;
 
     std::cout << "config: tasks=" << n_tasks << " threads=" << T << " batch=" << rc.batch_size

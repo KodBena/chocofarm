@@ -117,7 +117,11 @@ int main(int argc, char** argv) {
     std::string why;
     size_t checked = 0;
     for (const std::vector<uint32_t>& bw : beliefs) {
-        const chocofarm::BeliefFeatures prod = chocofarm::belief_features(bw, masks, N, nD, log_nworlds);
+        // STEP 1 retypes belief_features to the seam value type; the harness builds beliefs as raw
+        // vectors, so wrap as FlatBelief{...} for the production call. The naive reference() keeps the
+        // raw vector — its math is identical (the bit-exact net is unchanged).
+        const chocofarm::BeliefFeatures prod =
+            chocofarm::belief_features(chocofarm::FlatBelief{bw}, masks, N, nD, log_nworlds);
         const chocofarm::BeliefFeatures ref = reference(env, bw, N, nD, log_nworlds);
         if (!equal_features(prod, ref, bw.size(), why)) {
             ok = fail("production belief_features != naive reference at field " + why);

@@ -20,7 +20,7 @@ namespace chocofarm {
 // action set + the always-legal TERMINATE slot, 0.0 (exactly) on illegal slots (the M invariant — the
 // same uniform target the runner built inline for RandomPolicy). A search policy (GumbelAZPolicy)
 // overrides this with its real σ-transformed improved-π.
-ActionAndPi Policy::decide_target(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+ActionAndPi Policy::decide_target(const Environment& env, const Loc& loc, const Belief& bw,
                                   const std::set<int>& collected, double lam,
                                   std::mt19937_64& rng) const {
     Action action = decide(env, loc, bw, collected, lam, rng);
@@ -33,7 +33,7 @@ ActionAndPi Policy::decide_target(const Environment& env, const Loc& loc, const 
 }
 
 // ---- GreedyBase: the λ-rational myopic leaf base (mirrors solvers.base.GreedyPolicy) -------------
-Action GreedyBase::decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+Action GreedyBase::decide(const Environment& env, const Loc& loc, const Belief& bw,
                           const std::set<int>& collected, double lam, std::mt19937_64& rng) const {
     (void)rng;  // GreedyPolicy is deterministic (Python calls it with rng=None)
     std::vector<double> marg = env.marginals(bw);
@@ -55,7 +55,7 @@ Action GreedyBase::decide(const Environment& env, const Loc& loc, const std::vec
 // marg·value − λ·(go_there + exit(there) − exit(here)) > 0, else TERMINATE. Same init (best=0.0,
 // act=TERMINATE) and strict `>` first-wins tie as GreedyPolicy. The default ISMCTS playout base.
 Action GreedyStopBase::decide(const Environment& env, const Loc& loc,
-                              const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                              const Belief& bw, const std::set<int>& collected,
                               double lam, std::mt19937_64& rng) const {
     (void)rng;  // deterministic (Python calls it with rng=None, mirrors _base_value)
     std::vector<double> marg = env.marginals(bw);
@@ -77,7 +77,7 @@ Action GreedyStopBase::decide(const Environment& env, const Loc& loc,
 
 // ---- candidate_actions (mirrors solvers.base.candidate_actions) -----------------------------------
 std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
-                                      const std::vector<uint32_t>& bw,
+                                      const Belief& bw,
                                       const std::set<int>& collected, int n_det, int n_tre,
                                       bool include_terminate) {
     std::vector<double> marg = env.marginals(bw);
@@ -111,7 +111,7 @@ std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
 }
 
 // ---- base_value: play the base to the end in a fixed world (mirrors solvers.base._base_value) -----
-double base_value(const Environment& env, const Policy& base, Loc loc, std::vector<uint32_t> bw,
+double base_value(const Environment& env, const Policy& base, Loc loc, Belief bw,
                   std::set<int> collected, uint32_t world, double lam) {
     double R = 0.0, T = 0.0;
     // env.max_steps() is the single episode-horizon home (mirrors _base_value's range(env.max_steps)),

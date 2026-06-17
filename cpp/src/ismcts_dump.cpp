@@ -70,9 +70,12 @@ namespace {
 // next leaf value. Both FIFOs are consumed in CALL ORDER and CYCLED modulo their length.
 class ScriptedISMCTSSource final : public chocofarm::ISMCTSSource {
   public:
-    ScriptedISMCTSSource(std::vector<int> idxs, std::vector<double> leaves,
-                         std::vector<int> world_idxs = {})
-        : idxs_(std::move(idxs)), leaves_(std::move(leaves)),
+    // The scripted source threads `const Environment&` so it resolves its `bw[idx]` pokes through the
+    // seam (env.world_at_rank, L4) — byte-identical to the former direct `bw[idx]` (the flat arm is
+    // ascending worlds()-order, so the r-th element == the r-th rank).
+    ScriptedISMCTSSource(const chocofarm::Environment& env, std::vector<int> idxs,
+                         std::vector<double> leaves, std::vector<int> world_idxs = {})
+        : env_(env), idxs_(std::move(idxs)), leaves_(std::move(leaves)),
           world_idxs_(std::move(world_idxs)) {}
 
     // sample_world: an EMPTY world-index FIFO reproduces the original collapsed behavior (bw[0]),
@@ -81,12 +84,13 @@ class ScriptedISMCTSSource final : public chocofarm::ISMCTSSource {
     // observation outcomes across iterations -> multiple (action, belief_key) children: the
     // multi-determinization sub-child split (the ISMCTS-defining property) is then exercised. The
     // Python multi-world fixture pops the SAME world-index FIFO against the SAME bw ordering, so the
-    // determinizations are identical on both sides.
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override {
-        if (world_idxs_.empty()) return bw[0];
+    // determinizations are identical on both sides. The `bw[idx]` poke routes through env.world_at_rank
+    // (L4), preserving the EXACT index (rank 0, or raw % nb).
+    uint32_t sample_world(const chocofarm::Belief& bw) override {
+        if (world_idxs_.empty()) return env_.world_at_rank(bw, 0);
         int raw = world_idxs_[(widx_++) % world_idxs_.size()];
-        int n = static_cast<int>(bw.size());
-        return bw[((raw % n) + n) % n];  // non-negative modulo; always a legal index into bw
+        int n = env_.nb(bw);
+        return env_.world_at_rank(bw, ((raw % n) + n) % n);  // non-negative modulo; legal rank into bw
     }
 
     int expand_index(int n) override {
@@ -100,13 +104,14 @@ class ScriptedISMCTSSource final : public chocofarm::ISMCTSSource {
         return m;
     }
 
-    double leaf_value(const chocofarm::Loc&, const std::vector<uint32_t>&, const std::set<int>&,
+    double leaf_value(const chocofarm::Loc&, const chocofarm::Belief&, const std::set<int>&,
                       uint32_t, double) override {
         assert(!leaves_.empty() && "ismcts_dump: empty scripted leaf table");
         return leaves_[(lidx_++) % leaves_.size()];
     }
 
   private:
+    const chocofarm::Environment& env_;
     std::vector<int> idxs_;
     std::vector<double> leaves_;
     std::vector<int> world_idxs_;   // OPTIONAL world-index FIFO (empty -> sample_world = bw[0])
@@ -139,18 +144,18 @@ int main(int argc, char** argv) {
     chocofarm::ISMCTSPolicy policy(cfg);
 
     chocofarm::Loc loc{env.entry_point()};
-    std::vector<uint32_t> bw = env.worlds();
+    chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
     std::set<int> collected;
 
     // optionally advance the real (loc, bw, collected) by a prefix slot sequence against the true
     // world bw[0] (the same deterministic world both languages advance by), so the fixed search input
     // can be a mid-episode state, not just the root.
     if (auto pref = opt(args, "--prefix")) {
-        uint32_t world = bw.empty() ? 0u : bw[0];
+        uint32_t world = env.empty(bw) ? 0u : env.world_at_rank(bw, 0);  // rank-0 world (L4)
         std::istringstream iss{std::string(*pref)};
         int slot;
         while (iss >> slot) {
-            if (bw.empty()) break;
+            if (env.empty(bw)) break;
             if (slot >= env.N() + env.n_detectors()) break;  // TERMINATE in prefix: stop
             chocofarm::Action a = (slot < env.N())
                 ? chocofarm::Action{chocofarm::ActionKind::Treasure, slot}
@@ -192,7 +197,7 @@ int main(int argc, char** argv) {
                      "non-empty leaf FIFO (line 2) on stdin\n";
         return 1;
     }
-    ScriptedISMCTSSource src(std::move(idxs), std::move(leaves), std::move(world_idxs));
+    ScriptedISMCTSSource src(env, std::move(idxs), std::move(leaves), std::move(world_idxs));
 
     chocofarm::Action action = policy.run_search(env, loc, bw, collected, lam, src);
 

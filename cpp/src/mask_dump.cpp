@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     }
 
     chocofarm::Loc loc{env.entry_point()};
-    std::vector<uint32_t> bw = env.worlds();
+    chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
     std::set<int> collected;
 
     std::cout.precision(17);
@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     };
 
     for (int slot : seq) {
-        if (bw.empty()) break;
+        if (env.empty(bw)) break;
         print_mask();                       // mask BEFORE applying (the (loc, belief) at this step)
         if (slot == term) break;            // TERMINATE: no step
         chocofarm::Action a;

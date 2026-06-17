@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     // (the full C(N,K) belief makes a 48-sim search heavy; seam faithfulness needs neither a big budget
     // nor a realistic net).
     chocofarm::Loc root_loc{env.entry_point()};
-    std::vector<uint32_t> root_bw = env.worlds();
+    chocofarm::Belief root_bw = env.full_belief();   // the seam's belief construction entry
     std::set<int> root_collected;
 
     chocofarm::GumbelConfig small;

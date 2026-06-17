@@ -23,8 +23,14 @@ namespace chocofarm {
 
 class CyclicGumbelSource final : public GumbelSource {
   public:
-    explicit CyclicGumbelSource(std::vector<double> table) : table_(std::move(table)) {}
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override { return bw.empty() ? 0u : bw[0]; }
+    // The scripted source threads `const Environment&` so it resolves its `bw[0]` poke through the seam
+    // (env.world_at_rank, L4) — the rank-0 world, byte-identical to the former direct `bw[0]` (the flat
+    // arm is ascending worlds()-order). The empty-belief sentinel (0u) is preserved.
+    CyclicGumbelSource(const Environment& env, std::vector<double> table)
+        : env_(env), table_(std::move(table)) {}
+    uint32_t sample_world(const Belief& bw) override {
+        return env_.empty(bw) ? 0u : env_.world_at_rank(bw, 0);
+    }
     std::vector<double> gumbel(int n) override {
         std::vector<double> out(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = table_[(idx_++) % table_.size()];
@@ -32,6 +38,7 @@ class CyclicGumbelSource final : public GumbelSource {
     }
 
   private:
+    const Environment& env_;
     std::vector<double> table_;
     size_t idx_ = 0;
 };

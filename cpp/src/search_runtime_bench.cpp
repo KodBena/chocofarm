@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
 
     // a batch of independent root-state tasks, one RNG seed each.
     chocofarm::Loc root_loc{env.entry_point()};
-    std::vector<uint32_t> root_bw = env.worlds();
+    chocofarm::Belief root_bw = env.full_belief();   // the seam's belief construction entry
     std::set<int> root_collected;
     std::vector<chocofarm::SearchTask> tasks;
     tasks.reserve(static_cast<size_t>(n_tasks));

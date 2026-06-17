@@ -21,10 +21,10 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
 
     // Live episode state (mirrors generate_episode's loc/bw/collected init: start at the entry).
     Loc loc{env.entry_point()};
-    std::vector<uint32_t> bw = env.worlds();   // belief = full world-set
+    Belief bw = env.full_belief();   // belief = full world-set (the seam's construction entry)
     std::set<int> collected;
 
-    const size_t bw0 = bw.size();  // initial belief size (for belief-shrinkage stat)
+    const int bw0 = env.nb(bw);  // initial belief size (for belief-shrinkage stat) — via the seam (L6)
 
     // per-decision records (feat, pi, mask) + the executed-step (r, dt) list for the value target.
     std::vector<std::vector<double>> feats;
@@ -34,7 +34,7 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
     std::vector<int> exec_slots;  // the executed-action slot trace (for wire-content replay parity)
 
     for (int ply = 0; ply < max_steps; ++ply) {
-        if (bw.empty()) break;  // mirrors generate_episode's len(bw)==0 break
+        if (env.empty(bw)) break;  // mirrors generate_episode's len(bw)==0 break (L6, via the seam)
 
         // decide + the improved-policy target (the env<->Policy seam): a SEARCH policy (Gumbel) returns
         // its real σ-transformed improved-π; a search-free policy returns the uniform-over-legal default
@@ -95,7 +95,7 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
     out.n_collect = n_collect;
     out.n_sense = n_sense;
     out.n_terminate = n_terminate;
-    out.belief_shrinkage = (bw0 > 0) ? (1.0 - static_cast<double>(bw.size()) /
+    out.belief_shrinkage = (bw0 > 0) ? (1.0 - static_cast<double>(env.nb(bw)) /  // L6, via the seam
                                               static_cast<double>(bw0)) : 0.0;
     out.world = world;
     out.exec_slots = std::move(exec_slots);

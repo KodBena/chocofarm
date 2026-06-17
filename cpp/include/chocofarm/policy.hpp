@@ -58,7 +58,7 @@ class Policy {
   public:
     virtual ~Policy() = default;
     virtual Action decide(const Environment& env, const Loc& loc,
-                          const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                          const Belief& bw, const std::set<int>& collected,
                           double lam, std::mt19937_64& rng) const = 0;
 
     // Decide AND return the improved-policy target (the PI block the AZ learner trains on). The DEFAULT
@@ -68,7 +68,7 @@ class Policy {
     // σ-transformed improved-π. The runner records this per decision as the PI row (mirrors Python's
     // generate_episode using the search's improved_pi). Not pure — the default is defined in policy.cpp.
     [[nodiscard]] virtual ActionAndPi decide_target(const Environment& env, const Loc& loc,
-                                                    const std::vector<uint32_t>& bw,
+                                                    const Belief& bw,
                                                     const std::set<int>& collected, double lam,
                                                     std::mt19937_64& rng) const;
 };
@@ -79,7 +79,7 @@ class Policy {
 // float-sensitive / RNG-driven aggregates is the ADR-0012 P6 behavioral bar, not byte-identity.
 class RandomPolicy final : public Policy {
   public:
-    Action decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+    Action decide(const Environment& env, const Loc& loc, const Belief& bw,
                   const std::set<int>& collected, double lam, std::mt19937_64& rng) const override {
         (void)loc;  // RandomPolicy is position-blind; loc stays in the seam signature (P2 contract)
         (void)lam;  // P4: threaded through the seam, ignored by this dumb-random policy
@@ -96,7 +96,7 @@ class RandomPolicy final : public Policy {
 // rule the Python GreedyPolicy uses. Detector-blind (a deliberately weak base). λ-threaded (P4).
 class GreedyBase final : public Policy {
   public:
-    Action decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+    Action decide(const Environment& env, const Loc& loc, const Belief& bw,
                   const std::set<int>& collected, double lam, std::mt19937_64& rng) const override;
 };
 
@@ -107,7 +107,7 @@ class GreedyBase final : public Policy {
 // init (best=0.0, act=TERMINATE) and strict `>` first-wins tie as GreedyPolicy. λ-threaded (P4).
 class GreedyStopBase final : public Policy {
   public:
-    Action decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+    Action decide(const Environment& env, const Loc& loc, const Belief& bw,
                   const std::set<int>& collected, double lam, std::mt19937_64& rng) const override;
 };
 
@@ -118,15 +118,17 @@ class GreedyStopBase final : public Policy {
 // treasures, then (if requested) TERMINATE. Used by NMCS (include_terminate=true); a free function
 // so every consumer derives the SAME pruning, not a per-search member (ADR-0012 P1).
 [[nodiscard]] std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
-                                                    const std::vector<uint32_t>& bw,
+                                                    const Belief& bw,
                                                     const std::set<int>& collected, int n_det,
                                                     int n_tre, bool include_terminate);
 
 // Play a deterministic base policy to the end in a fixed `world`; return its λ-value
 // sum(value) − λ·(travel + exit) (mirrors solvers.base._base_value). The leaf utility every search's
-// determinized playout reuses — one home, so NMCS and ISMCTS score a leaf identically (P1).
+// determinized playout reuses — one home, so NMCS and ISMCTS score a leaf identically (P1). `bw` is
+// taken BY VALUE — _base_value mutates a playout COPY of the belief in place (the seam's apply filters
+// it through the run), so the copy is deliberate (a Belief value, not a borrowed ref).
 [[nodiscard]] double base_value(const Environment& env, const Policy& base, Loc loc,
-                                std::vector<uint32_t> bw, std::set<int> collected, uint32_t world,
+                                Belief bw, std::set<int> collected, uint32_t world,
                                 double lam);
 
 // The GENERIC world-sampling seam: the part of a search's RNG use that is NOT search-specific.
@@ -139,23 +141,24 @@ class GreedyStopBase final : public Policy {
 // generic draw is shared (ADR-0012 P1), only the leaf is search-specific.
 struct WorldSource {
     virtual ~WorldSource() = default;
-    // Sample one concrete world from the belief `bw` (mirrors env.sample_world(bw, rng)).
-    virtual uint32_t sample_world(const std::vector<uint32_t>& bw) = 0;
+    // Sample one concrete world from the belief `b` (mirrors env.sample_world(b, rng)).
+    virtual uint32_t sample_world(const Belief& b) = 0;
 };
 
 // The production world sampler: a uniform draw from the belief off a single std::mt19937_64
 // (mirrors env.sample_world -> rng.choice(bw)). Searches that need only the generic draw use this
 // directly; a search needing a leaf-value extension DERIVES from WorldSource and reuses this draw.
+// The uniform draw now lives ON the env (env.sample_world, L1 — the seam owns the read of `.worlds`),
+// so this borrows the env to route through it; the RNG stream is byte-identical (the same
+// std::uniform_int_distribution<size_t>(0, nb-1)(rng) draw, just homed on the env).
 class RngWorldSource : public WorldSource {
   public:
-    explicit RngWorldSource(std::mt19937_64& rng) : rng_(rng) {}
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override {
-        std::uniform_int_distribution<size_t> pick(0, bw.size() - 1);
-        return bw[pick(rng_)];
-    }
+    RngWorldSource(const Environment& env, std::mt19937_64& rng) : env_(env), rng_(rng) {}
+    uint32_t sample_world(const Belief& b) override { return env_.sample_world(b, rng_); }
 
   protected:
-    std::mt19937_64& rng_;  // shared so a derived leaf-value source draws off the SAME stream
+    const Environment& env_;  // borrowed: the home of the uniform draw (the seam, L1)
+    std::mt19937_64& rng_;    // shared so a derived leaf-value source draws off the SAME stream
 };
 
 }  // namespace chocofarm

@@ -64,30 +64,30 @@ double Environment::exit_cost(const Point& loc) const {
     return best + inst_.teleport_overhead;  // min teleport dist + tp (env.exit_cost)
 }
 
-std::vector<double> Environment::marginals(const std::vector<uint32_t>& bw) const {
+std::vector<double> Environment::marginals(const Belief& bw) const {
     std::vector<double> m(inst_.N, 0.0);
-    if (bw.empty()) return m;
-    for (uint32_t w : bw) {
+    if (bw.worlds.empty()) return m;
+    for (uint32_t w : bw.worlds) {
         for (int t = 0; t < inst_.N; ++t) {
             if ((w >> t) & 1u) m[t] += 1.0;
         }
     }
-    double inv = 1.0 / static_cast<double>(bw.size());
+    double inv = 1.0 / static_cast<double>(bw.worlds.size());
     for (double& v : m) v *= inv;  // mean over the world-set (mirrors env.marginals)
     return m;
 }
 
-bool Environment::informative(int face_id, const std::vector<uint32_t>& bw) const {
+bool Environment::informative(int face_id, const Belief& bw) const {
     uint32_t bm = inst_.faces[face_id].bitmask;
     bool any_hit = false, any_miss = false;
-    for (uint32_t w : bw) {
+    for (uint32_t w : bw.worlds) {
         if ((w & bm) != 0) any_hit = true; else any_miss = true;
         if (any_hit && any_miss) return true;  // both polarities live
     }
     return false;  // mirrors SenseAction.informative: hit.any() and (~hit).any()
 }
 
-std::vector<Action> Environment::legal_actions(const std::vector<uint32_t>& bw,
+std::vector<Action> Environment::legal_actions(const Belief& bw,
                                                const std::set<int>& collected) const {
     std::vector<Action> acts;
     std::vector<double> marg = marginals(bw);
@@ -122,15 +122,15 @@ std::size_t filter_inplace(std::vector<uint32_t>& bw, uint32_t mask, bool want) 
     return bw.size();
 }
 
-void Environment::filter_treasure(std::vector<uint32_t>& bw, int i, bool present) const {
-    filter_inplace(bw, uint32_t{1} << i, present);   // a treasure is the single-bit mask 1<<i
+void Environment::filter_treasure(Belief& bw, int i, bool present) const {
+    filter_inplace(bw.worlds, uint32_t{1} << i, present);   // a treasure is the single-bit mask 1<<i
 }
 
-void Environment::filter_detector(std::vector<uint32_t>& bw, int i, bool positive) const {
-    filter_inplace(bw, inst_.faces[i].bitmask, positive);   // a detector is its cover bitmask (disjunction)
+void Environment::filter_detector(Belief& bw, int i, bool positive) const {
+    filter_inplace(bw.worlds, inst_.faces[i].bitmask, positive);  // a detector is its cover bitmask (disjunction)
 }
 
-StepResult Environment::apply(Loc& loc, std::vector<uint32_t>& bw, std::set<int>& collected,
+StepResult Environment::apply(Loc& loc, Belief& bw, std::set<int>& collected,
                               const Action& action, uint32_t world) const {
     StepResult res;
     Point target;

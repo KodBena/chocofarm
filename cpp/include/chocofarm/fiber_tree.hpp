@@ -47,7 +47,7 @@ struct TreeState {
     bool running = false;
 
     TreeState(const GumbelConfig& cfg, const Environment& env, std::vector<double> table)
-        : ynet(ch), policy(cfg, ynet, env), src(std::move(table)) {}
+        : ynet(ch), policy(cfg, ynet, env), src(env, std::move(table)) {}
 
     // The fiber captures `this` and ynet/policy hold references INTO this object, so the only correct
     // relocation semantics are "do not relocate". Make that compile-enforced (a silent dangle becomes a
@@ -61,8 +61,8 @@ struct TreeState {
     // advance the UNCHANGED search to its first parked leaf (or to finish); `running` == parked-at-a-leaf.
     // LIFETIME: loc/bw/coll are captured BY REFERENCE into the fiber and re-read on every leaf across ALL
     // later resume_with() calls — keep them alive until `running` is false; pass named lvalues, never
-    // temporaries (e.g. NOT start(loc, env.worlds(), {}, lam) — that world-set dies at the `;`).
-    void start(const Loc& loc, const std::vector<uint32_t>& bw, const std::set<int>& coll, double lam) {
+    // temporaries (e.g. NOT start(loc, env.full_belief(), {}, lam) — that belief dies at the `;`).
+    void start(const Loc& loc, const Belief& bw, const std::set<int>& coll, double lam) {
         fib = boost::context::fiber{
             std::allocator_arg, boost::context::fixedsize_stack(512 * 1024),
             [this, &loc, &bw, &coll, lam](boost::context::fiber&& caller) {

@@ -64,7 +64,7 @@ struct NMCSConfig {
 // mean-over-`playout_samples` GreedyPolicy playout; an injectable source (the logic-check fixture)
 // returns a scripted value, so both languages run identical nesting on identical leaf returns.
 struct NMCSWorldSource : public WorldSource {
-    virtual double playout_value(const Loc& loc, const std::vector<uint32_t>& bw,
+    virtual double playout_value(const Loc& loc, const Belief& bw,
                                  const std::set<int>& collected, double lam) = 0;
 };
 
@@ -77,18 +77,18 @@ class NMCSPolicy final : public Policy {
     // The Policy contract. Builds the production NMCSWorldSource off `rng` and runs the level-`level`
     // search from the current observed state, returning the FIRST action of the best line (mirrors
     // nmcs.py's decide). λ is the live Dinkelbach penalty threaded through every score (P4).
-    Action decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+    Action decide(const Environment& env, const Loc& loc, const Belief& bw,
                   const std::set<int>& collected, double lam, std::mt19937_64& rng) const override;
 
     // The pure search core, parameterized by an injected NMCSWorldSource (the seam the logic check
     // exploits). Returns (score_of_best_line, first_action). Mirrors nmcs.py's _search exactly.
     std::pair<double, Action> search(const Environment& env, const Loc& loc,
-                                     const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                                     const Belief& bw, const std::set<int>& collected,
                                      double lam, int level, NMCSWorldSource& src) const;
 
     // The level-0 determinized base playout averaged over `playout_samples` sampled worlds (mirrors
     // nmcs.py's _playout): mean GreedyPolicy base_value, or −λ·exit_cost when the belief is empty.
-    double playout(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+    double playout(const Environment& env, const Loc& loc, const Belief& bw,
                    const std::set<int>& collected, double lam, NMCSWorldSource& src) const;
 
     const NMCSConfig& config() const { return cfg_; }
@@ -97,7 +97,7 @@ class NMCSPolicy final : public Policy {
     // Per-move evaluation: mean over `step_samples` determinizations of (immediate λ-step + nested
     // level-(level-1) continuation). At level<=1 the continuation is a base playout (mirrors
     // nmcs.py's _eval_move).
-    double eval_move(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+    double eval_move(const Environment& env, const Loc& loc, const Belief& bw,
                      const std::set<int>& collected, const Action& a, double lam, int level,
                      NMCSWorldSource& src) const;
 

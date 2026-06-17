@@ -70,7 +70,11 @@ int main(int argc, char** argv) {
     sizes.push_back(nworlds);
 
     for (size_t nb : sizes) {
-        const std::span<const uint32_t> bw(bw_full.data(), nb);
+        // STEP 1: belief_features takes the seam value type. Build the FlatBelief for this size ONCE,
+        // outside the timing loop, from the leading nb worlds — the timed work (the §A.4 sweep over
+        // `.worlds`) is byte-identical to the former subspan.
+        const chocofarm::Belief bw{std::vector<uint32_t>(bw_full.begin(),
+                                                         bw_full.begin() + static_cast<std::ptrdiff_t>(nb))};
         using clk = std::chrono::steady_clock;
         long calls = 0;
         double sink = 0.0;

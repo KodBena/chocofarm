@@ -97,7 +97,7 @@ int ISMCTSPolicy::ucb_select(const ISMCTSNode& node) const {
 
 // ---- one determinized iteration (mirrors _iterate) ------------------------------------------------
 double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& nodes, int node,
-                             const Loc& loc, const std::vector<uint32_t>& bw,
+                             const Loc& loc, const Belief& bw,
                              const std::set<int>& collected, uint32_t world, double lam,
                              ISMCTSSource& src, int depth) const {
     if (depth >= cfg_.max_depth) return -lam * env.exit_cost(loc.pt);
@@ -131,12 +131,12 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
             ret = -lam * env.exit_cost(loc.pt);  // stop now: only the exit toll remains
         } else {
             Loc nloc = loc;
-            std::vector<uint32_t> nbw = bw;
+            Belief nbw = bw;
             std::set<int> nc = collected;
             StepResult sr = env.apply(nloc, nbw, nc, act, world);
             double step = sr.reward - lam * sr.dt;
             // register the successor child (still part of this edge's statistics), then the leaf.
-            std::tuple<int, BeliefKey> ckey{a, belief_key(nbw)};
+            std::tuple<int, BeliefKey> ckey{a, env.belief_key(nbw)};
             if (nodes[node].children.find(ckey) == nodes[node].children.end()) {
                 nodes.emplace_back();
                 nodes[node].children[ckey] = static_cast<int>(nodes.size()) - 1;
@@ -156,11 +156,11 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
         ret = -lam * env.exit_cost(loc.pt);  // stop now: only the exit toll remains
     } else {
         Loc nloc = loc;
-        std::vector<uint32_t> nbw = bw;
+        Belief nbw = bw;
         std::set<int> nc = collected;
         StepResult sr = env.apply(nloc, nbw, nc, act, world);
         double step = sr.reward - lam * sr.dt;
-        std::tuple<int, BeliefKey> ckey{a, belief_key(nbw)};
+        std::tuple<int, BeliefKey> ckey{a, env.belief_key(nbw)};
         auto cit = nodes[node].children.find(ckey);
         int child;
         if (cit == nodes[node].children.end()) {
@@ -181,9 +181,9 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
 
 // ---- the pure search core (mirrors decide's loop + final) -----------------------------------------
 Action ISMCTSPolicy::run_search(const Environment& env, const Loc& loc,
-                                const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                                const Belief& bw, const std::set<int>& collected,
                                 double lam, ISMCTSSource& src) const {
-    if (bw.empty()) return terminate_action();  // mirrors decide's len(bw)==0 -> TERMINATE
+    if (env.empty(bw)) return terminate_action();  // mirrors decide's len(bw)==0 -> TERMINATE
     std::vector<ISMCTSNode> nodes;
     nodes.emplace_back();  // the root (index 0)
     for (int i = 0; i < cfg_.iterations; ++i) {
@@ -217,16 +217,16 @@ namespace {
 class RngISMCTSSource final : public ISMCTSSource {
   public:
     RngISMCTSSource(const Environment& env, const Policy& base, std::mt19937_64& rng)
-        : env_(env), base_(base), draw_(rng), rng_(rng) {}
+        : env_(env), base_(base), draw_(env, rng), rng_(rng) {}  // env homes the uniform world draw (L1)
 
-    uint32_t sample_world(const std::vector<uint32_t>& bw) override { return draw_.sample_world(bw); }
+    uint32_t sample_world(const Belief& bw) override { return draw_.sample_world(bw); }
 
     int expand_index(int n) override {
         std::uniform_int_distribution<int> pick(0, n - 1);  // mirrors int(rng.integers(n))
         return pick(rng_);
     }
 
-    double leaf_value(const Loc& loc, const std::vector<uint32_t>& bw,
+    double leaf_value(const Loc& loc, const Belief& bw,
                       const std::set<int>& collected, uint32_t world, double lam) override {
         return base_value(env_, base_, loc, bw, collected, world, lam);  // shared leaf utility (P1)
     }
@@ -239,7 +239,7 @@ class RngISMCTSSource final : public ISMCTSSource {
 };
 }  // namespace
 
-Action ISMCTSPolicy::decide(const Environment& env, const Loc& loc, const std::vector<uint32_t>& bw,
+Action ISMCTSPolicy::decide(const Environment& env, const Loc& loc, const Belief& bw,
                             const std::set<int>& collected, double lam,
                             std::mt19937_64& rng) const {
     RngISMCTSSource src(env, *base_, rng);

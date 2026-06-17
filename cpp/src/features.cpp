@@ -57,7 +57,7 @@ int action_to_slot(const Environment& env, const Action& a) {
     std::abort();
 }
 
-std::vector<float> legal_mask(const Environment& env, const std::vector<uint32_t>& bw,
+std::vector<float> legal_mask(const Environment& env, const Belief& bw,
                               const std::set<int>& collected) {
     // The authoritative legality source is env.legal_actions (mirrors actions.legal_mask): map its
     // output onto slots + the always-legal TERMINATE. Logic-exact -> bit-identical to Python's M.
@@ -211,11 +211,14 @@ namespace {
 
 }  // namespace
 
-// The public sweep entry (feature_compute.hpp): dispatch on belief size to the empty / hot child.
-BeliefFeatures belief_features(std::span<const uint32_t> bw, std::span<const uint32_t> masks,
+// The public sweep entry (feature_compute.hpp): dispatch on belief size to the empty / hot child. STEP 1
+// retypes the entry to `const Belief&` (the seam value type, L3); the flat arm reads `.worlds` and runs
+// the EXISTING §A.4 sweep UNCHANGED (the empty/nonempty children take the flat span, byte-identical).
+BeliefFeatures belief_features(const Belief& bw, std::span<const uint32_t> masks,
                                int N, int nD, double log_nworlds) {
-    return bw.empty() ? belief_features_empty(N, nD)
-                      : belief_features_nonempty(bw, masks, N, nD, log_nworlds);
+    return bw.worlds.empty()
+               ? belief_features_empty(N, nD)
+               : belief_features_nonempty(std::span<const uint32_t>(bw.worlds), masks, N, nD, log_nworlds);
 }
 
 namespace {
@@ -255,7 +258,7 @@ struct CollectedFeatures {
 
 }  // namespace
 
-std::vector<double> FeatureBuilder::build(const Point& loc, const std::vector<uint32_t>& bw,
+std::vector<double> FeatureBuilder::build(const Point& loc, const Belief& bw,
                                           const std::set<int>& collected) const {
     const int N = N_, nD = nD_, n_tel = n_tel_;
 
@@ -328,15 +331,15 @@ void FeatureBuilder::reset_belief_cache() const {
 
 // ---- the memo wrappers: a hit returns the STORED value (bit-identical to a recompute, P6); a miss
 // computes via the private pure function above, stores, returns the cached ref. ----
-const BeliefFeatures& FeatureBuilder::belief_feats_(const std::vector<uint32_t>& bw) const {
-    const BeliefKey key = belief_key(bw);   // the SAME fingerprint gumbel's node cache uses (P1)
+const BeliefFeatures& FeatureBuilder::belief_feats_(const Belief& bw) const {
+    const BeliefKey key = env_.belief_key(bw);  // the SAME fingerprint gumbel's node cache uses (P1; L2)
     if (auto it = belief_cache_.find(key); it != belief_cache_.end())
         for (const auto& entry : it->second)
-            if (std::ranges::equal(entry.first, bw)) return entry.second;  // hit — full-equality verified
+            if (entry.first == bw) return entry.second;  // hit — full belief-equality verified (L5)
     // miss: the cap is a memory backstop (mirrors _belief_cache_cap); compute, store an OWNED copy of bw
     // (a stored span would dangle), return the cached ref.
     if (belief_cache_n_ >= kBeliefCacheCap) { belief_cache_.clear(); belief_cache_n_ = 0; }
-    BeliefFeatures feats = belief_features(std::span<const uint32_t>(bw), env_.face_masks(), N_, nD_, log_nworlds_);
+    BeliefFeatures feats = belief_features(bw, env_.face_masks(), N_, nD_, log_nworlds_);
     auto& bucket = belief_cache_[key];
     bucket.emplace_back(bw, std::move(feats));
     ++belief_cache_n_;

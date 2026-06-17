@@ -47,7 +47,7 @@ int action_to_slot(const Environment& env, const Action& a);
 // same slot bijection). Returned as float (the wire dtype) so the comparison is exact. This is the
 // non-hot ORACLE: the per-step training-mask emission (runner.cpp) + the parity tool use it; the hot
 // search path uses FeatureBuilder::legal_mask_from_features, which the parity harness nets against THIS.
-std::vector<float> legal_mask(const Environment& env, const std::vector<uint32_t>& bw,
+std::vector<float> legal_mask(const Environment& env, const Belief& bw,
                               const std::set<int>& collected);
 
 // --- the featurizer's internal value types (the memo's stored shapes; the pure compute functions in
@@ -104,7 +104,7 @@ class FeatureBuilder {
     int dim() const { return dim_; }
     // `loc` is the current standing point (resolved Point, as in env.coord). `bw`/`collected` are
     // the live belief + collected set. Returns a length-`dim()` float64 vector.
-    std::vector<double> build(const Point& loc, const std::vector<uint32_t>& bw,
+    std::vector<double> build(const Point& loc, const Belief& bw,
                               const std::set<int>& collected) const;
 
     // The legal-action mask sliced from an ALREADY-BUILT feature vector (mirrors
@@ -156,17 +156,17 @@ class FeatureBuilder {
     // that sharing site. ----
     //
     // Belief memo: belief_key fingerprint (the SAME authority gumbel's node cache uses — no second
-    // fingerprint) -> a bucket of (owned bw copy, features); a hit walks the bucket verifying FULL
-    // bw-equality (the fingerprint is collision-resistant, not -free), so a collision never returns
-    // another belief's features. The bucket owns a COPY of bw (a stored span would dangle); paid per miss
-    // only. The cap is a memory backstop mirroring Python's _belief_cache_cap.
+    // fingerprint) -> a bucket of (owned belief copy, features); a hit walks the bucket verifying FULL
+    // belief-equality (the fingerprint is collision-resistant, not -free), so a collision never returns
+    // another belief's features. The bucket owns a COPY of the belief (a stored span would dangle); paid
+    // per miss only. The cap is a memory backstop mirroring Python's _belief_cache_cap.
     static constexpr int kBeliefCacheCap = 50000;
-    mutable std::map<BeliefKey, std::vector<std::pair<std::vector<uint32_t>, BeliefFeatures>>> belief_cache_;
+    mutable std::map<BeliefKey, std::vector<std::pair<Belief, BeliefFeatures>>> belief_cache_;
     mutable int belief_cache_n_ = 0;
     mutable std::unordered_map<Point, GeometryFeatures, PointHash, PointEq> loc_cache_;
 
     // Thin memo wrappers: look up, compute-on-miss via the private pure functions, store, return a ref.
-    [[nodiscard]] const BeliefFeatures& belief_feats_(const std::vector<uint32_t>& bw) const;
+    [[nodiscard]] const BeliefFeatures& belief_feats_(const Belief& bw) const;
     [[nodiscard]] const GeometryFeatures& geometry_feats_(const Point& loc) const;
 };
 

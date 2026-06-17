@@ -50,10 +50,11 @@ int main(int argc, char** argv) {
 
     // Two DISTINCT beliefs that SHARE a (count, first, last) fingerprint (different MIDDLE world) — the
     // exact collision the full-equality guard must distinguish. front()=1, back()=5, size=3 for both.
-    const std::vector<uint32_t> bw1 = {1u, 3u, 5u};
-    const std::vector<uint32_t> bw2 = {1u, 4u, 5u};
+    // STEP 1: the fingerprint + build take the seam value type, so wrap the raw world-sets as FlatBelief.
+    const chocofarm::Belief bw1{{1u, 3u, 5u}};
+    const chocofarm::Belief bw2{{1u, 4u, 5u}};
     bool ok = true;
-    if (chocofarm::belief_key(bw1) != chocofarm::belief_key(bw2))
+    if (env.belief_key(bw1) != env.belief_key(bw2))
         ok = fail("test setup: bw1/bw2 do not share a fingerprint");
 
     const std::vector<double> f1 = fb.build(loc, bw1, coll);   // miss: compute + store
@@ -71,7 +72,7 @@ int main(int argc, char** argv) {
     if (ok && fb_cold.build(loc, bw2, coll) != f2) ok = fail("warm-cache value != cold recompute (bw2)");
 
     if (!ok) return 1;
-    const auto k = chocofarm::belief_key(bw1);
+    const auto k = env.belief_key(bw1);
     std::cout << "RESULT: PASS belief-memo collision guard + hit-exactness (dim=" << fb.dim()
               << ", shared fingerprint=(" << std::get<0>(k) << "," << std::get<1>(k) << ","
               << std::get<2>(k) << "))\n";

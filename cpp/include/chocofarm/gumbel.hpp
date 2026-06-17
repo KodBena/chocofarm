@@ -87,7 +87,11 @@ struct GumbelConfig {
 // worlds regardless of path; this triple fingerprints the modest number of distinct beliefs one search
 // reaches.
 using GBeliefKey = BeliefKey;  // the ONE fingerprint (belief_key.hpp), now shared with FeatureBuilder's memo
-[[nodiscard]] inline GBeliefKey gumbel_belief_key(const std::vector<uint32_t>& bw) { return belief_key(bw); }
+// The fingerprint now lives on the env (Environment::belief_key, the seam owns the read of the belief's
+// representation — L2); this thin helper delegates so the node-cache key build reads one call.
+[[nodiscard]] inline GBeliefKey gumbel_belief_key(const Environment& env, const Belief& bw) {
+    return env.belief_key(bw);
+}
 
 // One information-set node (a belief). Per-action aggregate W (summed λ-penalized return) / N
 // (selection count) over the info set (the ISMCTS/F7 contract), children keyed by (action-slot,
@@ -142,7 +146,7 @@ class GumbelAZPolicy final : public Policy {
     // runs the search from the current observed state, returning the executed action (the SH survivor,
     // temperature 0). λ is the live Dinkelbach penalty threaded through every score (P4).
     [[nodiscard]] Action decide(const Environment& env, const Loc& loc,
-                                const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                                const Belief& bw, const std::set<int>& collected,
                                 double lam, std::mt19937_64& rng) const override;
 
     // The pure search core, parameterized by an injected GumbelSource (the seam the logic check
@@ -155,7 +159,7 @@ class GumbelAZPolicy final : public Policy {
         int n_spent = 0;               // total root-action sims spent (= n_sims when bw non-empty)
         int survivor_slot = -1;        // the SH survivor slot (the executed action's slot)
     };
-    [[nodiscard]] Decision run_search(const Loc& loc, const std::vector<uint32_t>& bw,
+    [[nodiscard]] Decision run_search(const Loc& loc, const Belief& bw,
                                       const std::set<int>& collected, double lam,
                                       GumbelSource& src) const;
 
@@ -165,7 +169,7 @@ class GumbelAZPolicy final : public Policy {
     // decide() is this composed with `.action`. The runtime / the runner use this to capture the
     // improved-π PI target the trainer consumes.
     [[nodiscard]] Decision decide_with_target(const Environment& env, const Loc& loc,
-                                              const std::vector<uint32_t>& bw,
+                                              const Belief& bw,
                                               const std::set<int>& collected, double lam,
                                               std::mt19937_64& rng) const;
 
@@ -173,7 +177,7 @@ class GumbelAZPolicy final : public Policy {
     // search's REAL improved-π (not the search-free uniform default), narrowed to float32. One search,
     // via decide_with_target. This is what makes the C++ Gumbel actor emit a correct AZ PI target.
     [[nodiscard]] ActionAndPi decide_target(const Environment& env, const Loc& loc,
-                                            const std::vector<uint32_t>& bw,
+                                            const Belief& bw,
                                             const std::set<int>& collected, double lam,
                                             std::mt19937_64& rng) const override;
 
@@ -185,20 +189,20 @@ class GumbelAZPolicy final : public Policy {
     // logits over the legal slots (mirrors predict_both). 1b SEAM 1: the masked softmax runs in float64
     // (mlp._masked_softmax), then the STORED prior is narrowed to float32 — the precision the Python
     // search side-reads (root.prior). `kUniform` widens it back at every read site (discrimination ctl).
-    double evaluate(GumbelNode& node, const Loc& loc, const std::vector<uint32_t>& bw,
+    double evaluate(GumbelNode& node, const Loc& loc, const Belief& bw,
                     const std::set<int>& collected) const;
 
     // Sequential Halving over n_sims (Danihelka §2): n_phases = ceil(log2 m), per-phase equal-share
     // budget, drop the worst half each phase by g+logit+σ·q̂, then a remainder loop spends the FULL
     // budget. Returns the surviving slot (the executed action). Mirrors _sequential_halving.
     [[nodiscard]] int sequential_halving(std::vector<GumbelNode>& nodes, const Loc& loc,
-                                         const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                                         const Belief& bw, const std::set<int>& collected,
                                          double lam, GumbelSource& src, std::vector<int> considered,
                                          const std::vector<double>& g, const std::vector<double>& logits,
                                          int& n_spent) const;
 
     // Run `count` sims of root action `slot`, accumulating W/N (mirrors _visit).
-    void visit(std::vector<GumbelNode>& nodes, const Loc& loc, const std::vector<uint32_t>& bw,
+    void visit(std::vector<GumbelNode>& nodes, const Loc& loc, const Belief& bw,
                const std::set<int>& collected, int slot, double lam, GumbelSource& src,
                int count) const;
 
@@ -206,13 +210,13 @@ class GumbelAZPolicy final : public Policy {
     // descend the interior with PUCT for the remaining depth (mirrors _simulate_root_action). Returns
     // the λ-penalized return.
     [[nodiscard]] double simulate_root_action(std::vector<GumbelNode>& nodes, const Loc& loc,
-                                              const std::vector<uint32_t>& bw,
+                                              const Belief& bw,
                                               const std::set<int>& collected, int slot, uint32_t world,
                                               double lam, GumbelSource& src) const;
 
     // Interior PUCT descent; net value at the leaf (mirrors _descend). `node` is an arena index.
     [[nodiscard]] double descend(std::vector<GumbelNode>& nodes, int node, const Loc& loc,
-                                 const std::vector<uint32_t>& bw, const std::set<int>& collected,
+                                 const Belief& bw, const std::set<int>& collected,
                                  uint32_t world, double lam, GumbelSource& src, int depth) const;
 
     // AlphaZero PUCT select: argmax q + c_puct·p·√(ΣN)/(1+n) over node.legal_slots, strict-`>`

@@ -115,14 +115,14 @@ int main(int argc, char** argv) {
     DetNet net(chocofarm::n_action_slots(env));
 
     chocofarm::Loc loc{env.entry_point()};
-    std::vector<uint32_t> bw = env.worlds();
+    chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry
     std::set<int> collected;
     // a fixed, varied gumbel script (cycled to fill the n_slots draw) — identical for both runs.
     std::vector<double> gtable{0.40, -0.65, 1.10, 0.05, -0.30, 0.85, -1.20, 0.55,
                                0.20, -0.45, 0.95, -0.10, 0.70};
 
     // --- direct (synchronous) run: the reference ---
-    chocofarm::CyclicGumbelSource src_direct(gtable);
+    chocofarm::CyclicGumbelSource src_direct(env, gtable);
     chocofarm::GumbelAZPolicy direct_policy(cfg, net, env);
     chocofarm::GumbelAZPolicy::Decision direct = direct_policy.run_search(loc, bw, collected, lam, src_direct);
 

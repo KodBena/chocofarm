@@ -50,7 +50,7 @@ namespace chocofarm {
 // trivially vector-storable behind the std::span run() consumes.
 struct SearchTask {
     Loc loc;                       // observed agent location
-    std::vector<uint32_t> bw;      // observed belief world-set (bitmasks over treasure ids)
+    Belief bw;                     // observed belief (the seam value type; flat world-set today)
     std::set<int> collected;       // treasures already collected
     double lam = 0.0;              // the live Dinkelbach penalty (per-decision, not frozen)
     std::uint64_t seed = 0;        // the per-tree RNG seed (seeds the std::mt19937_64 the source draws off)
