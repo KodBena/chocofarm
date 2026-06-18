@@ -250,19 +250,20 @@ class CppActorExecutor:
         src = RedisParamsSource(self._conn, self.run, "gen",
                                 version_supplier=lambda: self._published_version,
                                 initial_version=self._published_version)
-        self._server = InferenceServer(src, bind=self.infer_endpoint, max_batch=256)
-        # PRE-COMPILE the XLA kernels for every batch size the wire path can produce (B in 1..pool_batch)
-        # BEFORE the runner's first generate. The greedy drain yields B per instantaneous load, so a cold
-        # server would JIT-compile each new B inside the first timed iters — the confound that poisoned the
-        # DPS numbers (the host/VM are idle; it is per-B XLA compile, not jitter). Warming here makes iter 0
-        # JIT-clean (ADR-0009 measure-honesty). Log count + wall so the pre-compile is operator-visible.
+        # max_batch IS the fixed forward shape now: every forward pads to it, so XLA compiles ONE
+        # executable. Tie it to pool_batch (the ONE batch contract — ADR-0012 P1) so the runner's in-flight
+        # cap and the server's fixed shape are the same swept knob.
+        self._server = InferenceServer(src, bind=self.infer_endpoint, max_batch=self.pool_batch)
+        # PRE-COMPILE the ONE fixed forward shape (B=max_batch=pool_batch, in_dim) the server now uses —
+        # every forward pads to it, so there is a single XLA executable, not one per drained B. Warming it
+        # once up front makes the first generation steady-state (ADR-0009 measure-honesty; the per-B
+        # recompile mis-read as "jitter" is gone). Log wall so the pre-compile is operator-visible.
         import time as _time
-        warm_bs = range(1, self.pool_batch + 1)
         _t0 = _time.perf_counter()
-        self._server.warmup(warm_bs)
+        self._server.warmup([self.pool_batch])
         _warm_wall = _time.perf_counter() - _t0
-        print(f"[CppActorExecutor] InferenceServer warmup: pre-compiled {self.pool_batch} batch sizes "
-              f"(B=1..{self.pool_batch}) in {_warm_wall:.2f}s", flush=True)
+        print(f"[CppActorExecutor] InferenceServer warmup: pre-compiled the fixed (B={self.pool_batch}, "
+              f"in_dim={self.in_dim}) forward in {_warm_wall:.2f}s", flush=True)
         self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._server_thread.start()
 

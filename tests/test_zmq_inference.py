@@ -241,9 +241,11 @@ def test_run_microbatch_refuses_ragged_batch():
 
 
 def test_params_from_manifest_blob_matches_valuemlp_params():
-    """The jax-free param reconstruction (manifest+blob → flat dict) yields EXACTLY ValueMLP._params()
-    — so the server runs the SSOT weights without constructing a ValueMLP (staying off the held-out
-    jax/numba boundary). Residual ON to exercise the optional block."""
+    """The jax-free param reconstruction (manifest+blob → flat dict) yields ValueMLP._params() cast to
+    float32 — the server's inference precision (the SSOT bar; the f64 wire weights are cast ONCE here at
+    load, not per forward — ADR-0012 P1/P6). So the server runs the SSOT weights, at f32, without
+    constructing a ValueMLP (staying off the held-out jax/numba boundary). Residual ON to exercise the
+    optional block."""
     from chocofarm.az.mlp import ValueMLP
     from chocofarm.az.transport import pack_net
     net = ValueMLP(in_dim=6, hidden=8, n_actions=5, seed=3, y_mean=1.5, y_std=2.5, residual=True)
@@ -252,7 +254,8 @@ def test_params_from_manifest_blob_matches_valuemlp_params():
     ref = net._params()
     assert set(params.keys()) == set(ref.keys())
     for k in ref:
-        np.testing.assert_array_equal(params[k], ref[k])
+        assert params[k].dtype == np.float32                       # cast once at load — the server is f32
+        np.testing.assert_array_equal(params[k], ref[k].astype(np.float32))
     assert y_mean == pytest.approx(1.5)
     assert y_std == pytest.approx(2.5)
 

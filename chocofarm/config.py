@@ -31,6 +31,21 @@ from __future__ import annotations
 
 import os
 
+# --- inference / XLA process tuning (SSOT) — set at IMPORT so it lands BEFORE jax initializes ---
+# XLA reads XLA_FLAGS (and its Eigen threadpool sizing) ONCE, at first jax use. The inference server's
+# hot path imports jax.numpy directly and NOT mlp_jax, so the per-module XLA pins that used to live in
+# mlp_jax.py / mlp_jax_train.py never reached the server's jax — leaving its forwards on a multi-threaded
+# Eigen pool that spins / work-steals on the tiny per-leaf matmul (on a 4-vCPU host, single-threaded
+# wins). Pinning it HERE — config is a leaf module imported before jax in every jax-using path — is the
+# ONE home (ADR-0012 P1) and is what actually reaches the server. `setdefault` so an operator override wins.
+os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+# The fixed inference batch size — the JAX forward is padded to this ONE shape so XLA compiles a single
+# executable, not one per drained B. DEFAULT only; the LIVE value rides --cpp-pool-batch (the one batch
+# contract both the C++ runner's RuntimeConfig and the Python server's pad derive from — ADR-0012 P1/P7).
+DEFAULT_INFERENCE_BATCH = 64
+
 # Transport role — the EPHEMERAL memory-cache redis (allkeys-lru). Env vars override at runtime.
 DEFAULT_TRANSPORT_REDIS_HOST = "127.0.0.1"
 DEFAULT_TRANSPORT_REDIS_PORT = 6380

@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from chocofarm import config as _config  # noqa: F401 — side-effect: applies the XLA/OMP thread pin (SSOT) before any jax import
 from chocofarm.model.env import Collected, Environment, Loc, WorldSet, is_terminate
 from chocofarm.az.features import FeatureBuilder, feature_dim
 from chocofarm.az.actions import n_action_slots, legal_mask_from_features

@@ -87,7 +87,7 @@ DrainedRequest = tuple[bytes, list[bytes], "npt.NDArray[np.float32]"]
 
 def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
                    y_mean: float, y_std: float,
-                   requests: list[BatchRow]) -> list[tuple[bytes, bytes]]:
+                   requests: list[BatchRow], pad_to: int | None = None) -> list[tuple[bytes, bytes]]:
     """The PURE microbatch core (design §3): STACK the drained requests' feature rows into one
     `(B, in_dim)` float32 matrix, run ONE `forward_fn(params, Xb, jnp)`, DE-STANDARDIZE the value
     (v = v_std·y_std + y_mean), and SCATTER `(value, logits[i])` back per request as an encoded
@@ -112,6 +112,15 @@ def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
             # (ADR-0002 fail-loud). Every leaf of one net has the same feature dim by construction.
             raise ValueError(f"batched request {i} has shape {r.shape}, expected ({in_dim},) — ragged batch")
     Xb = np.stack(rows).astype(np.float32, copy=False)   # (B, in_dim) float32, the one stacked input
+    B = Xb.shape[0]
+    # PAD to a single fixed shape (pad_to, in_dim) so XLA compiles ONE executable instead of one per
+    # drained B (the per-B recompile that dominated the server profile). Padded rows are zero and the
+    # forward is row-independent, so the real rows' outputs are byte-identical to the unpadded forward
+    # (ADR-0012 P6) — only the first B are read back below. pad_to is the server's max_batch and the drain
+    # caps B at max_batch, so this only ever pads UP.
+    if pad_to is not None and pad_to > B:
+        Xb = np.concatenate([Xb, np.zeros((pad_to - B, in_dim), dtype=np.float32)], axis=0)
+    import chocofarm.config  # noqa: F401 — applies the XLA/OMP thread pin (SSOT) before jax initializes
     import jax.numpy as jnp                               # local import: the JAX backend lives in the shell
     v_std, logits = forward_fn(params, jnp.asarray(Xb), jnp)
     v = np.asarray(v_std, dtype=np.float32).ravel() * np.float32(y_std) + np.float32(y_mean)
@@ -140,7 +149,10 @@ def params_from_manifest_blob(manifest_json: str, blob: bytes) -> tuple[dict[str
         shape = tuple(int(s) for s in e["shape"])
         count = int(np.prod(shape)) if shape else 1
         arr = np.frombuffer(blob, dtype=np.dtype(e["dtype"]), count=count, offset=int(e["off"]))
-        params[e["name"]] = arr.reshape(shape).copy()   # copy: own writable arrays, not a blob view
+        # cast to f32 ONCE at load (ADR-0012 P1/P6): inference is float32 (the SSOT bar the C++/numpy
+        # paths use), so the server must not carry f64 weights that force a per-forward f64->f32 recast
+        # (and an f64 matmul). astype yields an owned, writable, contiguous f32 array.
+        params[e["name"]] = arr.reshape(shape).astype(np.float32)
     y_mean = float(m["y_mean"])
     y_std = float(m["y_std"])
     return params, y_mean, y_std
@@ -310,7 +322,8 @@ class InferenceServer:
         params, y_mean, y_std = reloaded if reloaded is not None else self._params_source.current()
         rows = [(ident, X) for ident, _envelope, X in drained]
         for (ident, resp), (_ident, envelope, _X) in zip(
-                run_microbatch(self._forward_fn, params, y_mean, y_std, rows), drained):
+                run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch),
+                drained):
             self._sock.send_multipart([ident, *envelope, resp])
 
     def warmup(self, batch_sizes: Iterable[int]) -> None:
@@ -349,7 +362,7 @@ class InferenceServer:
             rows: list[BatchRow] = [(b"", np.zeros((in_dim,), dtype=np.float32)) for _ in range(b)]
             # run_microbatch returns encoded response frames built from np.asarray(forward outputs) — the
             # asarray blocks until XLA has actually compiled+run shape (B, in_dim). Discard the responses.
-            run_microbatch(self._forward_fn, params, y_mean, y_std, rows)
+            run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch)
 
     def serve_forever(self) -> None:
         """The greedy-drain loop: block for ≥1 request, drain to the cap, run one forward, scatter,

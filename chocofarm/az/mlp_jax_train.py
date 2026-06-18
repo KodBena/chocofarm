@@ -35,11 +35,9 @@ from __future__ import annotations
 
 import os
 
-# Match mlp_jax.py: keep XLA single-threaded (the loop / bench is core-pinned). Set before jax
-# imports. Training runs once per iteration over a batch — off the per-leaf hot path — so this is
-# about not fighting the taskset pin, not about training throughput.
-os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+# The XLA/OMP single-thread pin lives in ONE home now (chocofarm/config.py, ADR-0012 P1). Importing
+# config here — before the jax import below — applies it (config sets the env at its import).
+from chocofarm import config as _config  # noqa: F401 — side-effect import: applies the XLA/OMP pin pre-jax
 
 import numpy as np
 import jax
