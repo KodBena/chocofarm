@@ -48,7 +48,7 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -312,6 +312,44 @@ class InferenceServer:
         for (ident, resp), (_ident, envelope, _X) in zip(
                 run_microbatch(self._forward_fn, params, y_mean, y_std, rows), drained):
             self._sock.send_multipart([ident, *envelope, resp])
+
+    def warmup(self, batch_sizes: Iterable[int]) -> None:
+        """PRE-COMPILE the XLA kernels for each batch size B the wire path can produce, BEFORE the loop
+        serves a single real request (ADR-0009 measure-honesty).
+
+        Why this exists (the confound it removes): `run_microbatch` does `np.stack(rows) -> (B, in_dim)`
+        and runs the jitted `forward_core`, so XLA compiles ONCE PER EXACT BATCH SIZE B. The greedy drain
+        (`_drain`) yields B in 1..max_batch depending on instantaneous load, so a COLD server JIT-compiles
+        each new B *inside the first timed iterations* — a per-B compile latency the host/VM are otherwise
+        idle for. That cold-compile cost has been mis-read as run-to-run "jitter" and has poisoned the
+        before/after DPS numbers. Forcing every reachable B to compile up front makes the first real
+        generation's throughput equal to steady state, so any measured delta is a REAL property of the
+        code under test, not a JIT artifact.
+
+        Mechanism (P1/P7 — REUSE, do not re-author the forward): for each B this runs the SAME forward
+        path the loop runs — `run_microbatch(self._forward_fn, params, y_mean, y_std, [rows…])` over a
+        dummy `(B, in_dim)` zero matrix — and blocks on the result by reading it back (`run_microbatch`
+        already does `np.asarray` on the forward outputs, so its return forces XLA compilation to
+        COMPLETE, not merely enqueue). No socket, no scatter to a client — the responses are discarded.
+
+        `in_dim` is DERIVED from the live params' `W1` first dim via `_params_source.current()` (P1 — the
+        feature dim has one home, the net's first weight; never a hardcoded width). Fail-loud on any error
+        (ADR-0002): a missing `W1`, a bad B, or a forward failure raises here at standup, where it is a
+        loud pre-flight abort, not a silent first-request stall."""
+        params, y_mean, y_std = self._params_source.current()
+        if "W1" not in params:
+            raise KeyError(
+                "InferenceServer.warmup: params has no 'W1' weight to derive in_dim from — cannot build a "
+                "dummy batch matching the forward's input shape (ADR-0002, refusing to guess the width).")
+        in_dim = int(params["W1"].shape[0])
+        for b in batch_sizes:
+            b = int(b)
+            if b < 1:
+                raise ValueError(f"InferenceServer.warmup: batch size {b} < 1 (the drain produces B≥1).")
+            rows: list[BatchRow] = [(b"", np.zeros((in_dim,), dtype=np.float32)) for _ in range(b)]
+            # run_microbatch returns encoded response frames built from np.asarray(forward outputs) — the
+            # asarray blocks until XLA has actually compiled+run shape (B, in_dim). Discard the responses.
+            run_microbatch(self._forward_fn, params, y_mean, y_std, rows)
 
     def serve_forever(self) -> None:
         """The greedy-drain loop: block for ≥1 request, drain to the cap, run one forward, scatter,

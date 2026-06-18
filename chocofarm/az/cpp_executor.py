@@ -251,6 +251,18 @@ class CppActorExecutor:
                                 version_supplier=lambda: self._published_version,
                                 initial_version=self._published_version)
         self._server = InferenceServer(src, bind=self.infer_endpoint, max_batch=256)
+        # PRE-COMPILE the XLA kernels for every batch size the wire path can produce (B in 1..pool_batch)
+        # BEFORE the runner's first generate. The greedy drain yields B per instantaneous load, so a cold
+        # server would JIT-compile each new B inside the first timed iters — the confound that poisoned the
+        # DPS numbers (the host/VM are idle; it is per-B XLA compile, not jitter). Warming here makes iter 0
+        # JIT-clean (ADR-0009 measure-honesty). Log count + wall so the pre-compile is operator-visible.
+        import time as _time
+        warm_bs = range(1, self.pool_batch + 1)
+        _t0 = _time.perf_counter()
+        self._server.warmup(warm_bs)
+        _warm_wall = _time.perf_counter() - _t0
+        print(f"[CppActorExecutor] InferenceServer warmup: pre-compiled {self.pool_batch} batch sizes "
+              f"(B=1..{self.pool_batch}) in {_warm_wall:.2f}s", flush=True)
         self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._server_thread.start()
 
