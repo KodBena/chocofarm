@@ -41,16 +41,34 @@
 
 namespace chocofarm {
 
+// The runner's wire transport scheduling mode (the SELECTABLE arm — docs/design/cpp-eval-transport-adapter.md
+// §4 Stage B). This is a TRANSPORT-SCHEDULING knob only (it changes WHEN/HOW MANY leaf messages are
+// outstanding, never the wire frame / codec / wire_spec — ADR-0012 P7), so both modes produce
+// behaviorally-equivalent search (the forward is row-independent; replies route per corr-id):
+//   * StrictBarrier — the DEFAULT, untouched production path: each round gather ALL parked slots into ONE
+//     batched submit (one corr-id, S=#parked), await the ONE reply, resume all (D=1 outstanding/thread).
+//   * PipelinedBucket — arm 3: keep MULTIPLE coalesced messages outstanding (D>1, non-blocking), resume
+//     each fiber as ITS reply lands (out of order by corr-id), re-submit immediately to hold D. Pairs with
+//     the server's bucketed-E + group-wakeup drain (the Stage A StageAServer behavior, a server flag) — the
+//     server, not the runner, decides the forward shape. The strict-barrier path stays the production default.
+enum class WireMode { StrictBarrier, PipelinedBucket };
+
 // The wire-path runtime knobs (the ONE home is RuntimeConfig; these arrive as --serve startup args, never
 // ActorConfig — P1). `endpoint` is the ipc:// (or tcp://) the in-process JAX InferenceServer binds;
 // `pool_threads` = T OS worker threads; `pool_batch` = the in-flight leaf target across the pool
 // (fibers_per_thread K = ceil(pool_batch/pool_threads), derived in RuntimeConfig). `timeout_ms` bounds the
-// per-leaf DEALER recv (a timed-out leaf aborts the whole generate loudly — Q5/OR-5).
+// per-leaf DEALER recv (a timed-out leaf aborts the whole generate loudly — Q5/OR-5). `mode` selects the
+// transport scheduling arm (StrictBarrier = production default; PipelinedBucket = arm 3, behind a flag);
+// `max_inflight_msgs` is the per-thread in-flight message cap D for PipelinedBucket (ignored under
+// StrictBarrier, which is structurally D=1) — the non-blocking driver holds up to D coalesced messages
+// outstanding before it blocks on a reply.
 struct WireRunnerConfig {
     std::string endpoint;
     int pool_threads = 4;
     int pool_batch = 32;
     int timeout_ms = 15000;
+    WireMode mode = WireMode::StrictBarrier;
+    int max_inflight_msgs = 8;
 };
 
 // Run cfg.episodes self-play episodes over the wire-batched driver, writing the four (X, PI, M, Y) result
@@ -61,6 +79,20 @@ struct WireRunnerConfig {
 // Gumbel search config; `cfg` carries the live lam/max_steps/seed/res_token (P4). `stats_out` (optional)
 // is the same per-episode JSON aggregate-stat sink run_episodes forwards (additive to the wire write).
 [[nodiscard]] std::expected<int, Error> run_episodes_wire_batched(
+    const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc, RedisClient& redis,
+    const RunnerConfig& cfg, const WireRunnerConfig& wcfg, std::ostream* stats_out = nullptr);
+
+// Arm 3 (docs/design/cpp-eval-transport-adapter.md §4 Stage B): the NON-BLOCKING, HIGH-D pipelined driver.
+// Same contract as run_episodes_wire_batched (same per-episode seed fold / world draw / record-assembly /
+// λ-return target / redis write / whole-pass-abort semantics — RE-DERIVED from the SAME serial run_episode
+// and the SAME per-slot state machine), but the transport schedule differs: it keeps up to
+// wcfg.max_inflight_msgs coalesced messages outstanding per thread WITHOUT a strict per-round barrier,
+// resumes each fiber as its own reply lands (OUT OF ORDER by corr-id), and re-submits immediately to hold D
+// — pairing with the server's bucketed-E + group-wakeup drain (which assembles the forward shape). The
+// wire frame / codec / wire_spec are UNCHANGED (ADR-0012 P7 — transport scheduling, not a codec change).
+// run_episodes_wire_batched delegates here when wcfg.mode == WireMode::PipelinedBucket, so the production
+// StrictBarrier path stays byte-untouched and this arm is reachable only behind the mode flag.
+[[nodiscard]] std::expected<int, Error> run_episodes_wire_pipelined(
     const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc, RedisClient& redis,
     const RunnerConfig& cfg, const WireRunnerConfig& wcfg, std::ostream* stats_out = nullptr);
 

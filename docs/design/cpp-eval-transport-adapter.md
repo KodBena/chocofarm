@@ -142,6 +142,58 @@ as the residual for a later overcommit lever. Escalate: if forward-idle >> forwa
 point -> runner-up #3 (shm ring); if the single server's loop is CPU-saturated while gen cores starve ->
 runner-up #2 (P=2 demux).
 
+## 5. Stage B — executed results (2026-06-19, append-only record)
+
+Stage B was run e2e on the REAL Gumbel-AZ search (the unchanged `run_search` / fiber-mux), every leaf
+resolved remotely on the bucketed-E + group-wakeup server (the Stage A `StageAServer`, a server flag —
+NOT the production default). Arm 3 (`pipelined-bucket`) is a SELECTABLE runner transport mode behind a
+flag; the strict-barrier default (`run_episodes_wire_batched`), the production server, and the wire_spec
+are UNCHANGED. Rig: n_sims=256, m=24, hidden=256, `taskset -c 0,1,2,3`, 5 iters/arm, 8s/iter,
+pool_batch=64, D(in-flight msgs)=8. Harness: `cpp/src/wire_ab_bench.cpp` + `cpp/stage_a/stage_b_ab.py`;
+raw output under `~/w/vdc/chocobo/runs/stage_b_ab/`.
+
+**A/B table (decisions/s/core, mean ± stddev [min–max]):**
+
+| arm | 1 thread | 2 threads |
+| — | — | — |
+| arm 1 (strict-barrier) | 69.86 ± 3.33 [65.59–73.78] | 47.44 ± 0.27 [46.98–47.79] |
+| arm 3 (pipelined-bucket) | 72.65 ± 0.20 [72.36–72.93] | 47.27 ± 0.29 [46.70–47.50] |
+
+(Arm 2 greedy-async ~37 dps from `wire_pool_bench` is the cited reference, not re-run.)
+
+**Findings (raw, ADR-0009 — pre-registered predictions met/missed loudly):**
+
+- **Arm 3 does NOT beat arm 1 with non-overlapping bands at 1 thread** (arm3 min 72.36 ≤ arm1 max
+  73.78 — overlapping; the means are within ~4%). Arm 3 is *tighter* (σ=0.20 vs 3.33) but not a
+  separated win. The Stage B acceptance gate ("non-overlapping bands at 1 thread") is **NOT met**.
+- **Per-core drop at 2 threads:** both arms sit at ~47/core — neither exhibits the feared 49→30 drop;
+  the multi-fiber pool already overlaps the RTT under both schedules, so the threading drop the design
+  worried about is a strict-barrier-with-low-K artifact, not present at pool_batch=64. Arm 3 does not
+  cure a drop arm 1 also does not suffer here.
+- **Measured in-flight depth (the key overcommit number):** the single-tree-per-thread search sustains a
+  server mean **rows/forward ≈ 53.7 at 1 thread**, **≈ 30.5 at 2 threads** (the queue splits across two
+  per-thread DEALERs). Both are **far below the serve fast region B≈192** — an overcommit gap of ~3.6×
+  (1t) to ~6× (2t). This is exactly the §2/§4 caveat: K=64 fibers across ONE thread fill ~54 rows, but
+  reaching B≥192 needs many more concurrent trees per server (the ELF overcommit of §4), which a single
+  per-thread pool does not supply.
+- **Why 1-thread arm1 ≈ arm3:** at T=1, K=ceil(64/1)=64 parked fibers, the strict barrier ALREADY
+  gathers ~54 rows into one batch (S≈54, D=1) — so the D>1 pipelining adds little when one round's gather
+  is already large. The pipelining lever pays only when a single round's gather is SMALL (few fibers
+  ready at once), which is the deep-overcommit regime Stage B's single per-thread pool does not reach.
+
+**Byte-identity (Gate 2):** HELD. `CHOCO_RUN_ZMQ=1 CHOCO_RUN_CPP=1 pytest tests/test_zmq_net_cpp.py
+tests/test_cpp_runner.py -k "gumbel or wire"` → 4 passed. The forward is row-independent and replies
+route per corr-id, so per-leaf predictions and the search are unchanged across the schedule.
+
+**Recommendation:** the single-tree (single per-thread pool) gain is **NOT worth lifting arm 3 as the
+default on its own** — it is a ~4% mean improvement with overlapping bands, exactly the "modest gain"
+the model predicted. The transport adapter's value is gated on the **overcommit phase** (§4: many
+concurrent trees per server to push rows/forward from ~54 toward B≈192, where the serve curve's 235–264k
+fast region lives and where D>1 non-blocking pipelining stops the search idling). Arm 3 is correct,
+non-regressing, and ready to carry that phase; it should ride as a selectable flag until overcommit
+makes the per-round gather small enough that D>1 separates from the strict barrier. The adapter is
+validated as CORRECT (parity held) but its throughput payoff is deferred to overcommit, as predicted.
+
 ## Key sources
 
 SEED RL (arXiv:1910.06591) · Triton dynamic batcher ·

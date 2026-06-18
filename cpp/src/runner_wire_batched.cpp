@@ -61,6 +61,10 @@ std::expected<int, Error> run_episodes_wire_batched(
     const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc,
     [[maybe_unused]] RedisClient& redis, const RunnerConfig& cfg, const WireRunnerConfig& wcfg,
     std::ostream* stats_out) {
+    // Arm-3 dispatch (ADR-0012 P7 transport-scheduling flag): a PipelinedBucket request delegates to the
+    // non-blocking high-D driver, leaving this strict-barrier body the byte-untouched production default.
+    if (wcfg.mode == WireMode::PipelinedBucket)
+        return run_episodes_wire_pipelined(env, fb, gc, redis, cfg, wcfg, stats_out);
     // NB `redis` is the API-symmetry seam with run_episodes (the serve dispatch passes it uniformly), but
     // the WIRE driver does NOT use this shared connection: hiredis's redisContext is not thread-safe, so
     // each worker thread creates its OWN RedisClient (below) for its result writes (single-writer-per-
@@ -345,6 +349,279 @@ std::expected<int, Error> run_episodes_wire_batched(
         return std::unexpected(have_error.load()
                                    ? first_error
                                    : make_error("run_episodes_wire_batched: a leaf/transport/write failed"));
+    }
+    return written.load();
+}
+
+// ============================================================================================
+// Arm 3 — the NON-BLOCKING, HIGH-D PIPELINED driver (docs/design/cpp-eval-transport-adapter.md §4 Stage B).
+//
+// Same per-slot EpisodeSlot state machine, same per-episode seed fold / world draw / record-assembly /
+// λ-return target / redis write / whole-pass-abort semantics as the strict-barrier driver above (RE-DERIVED
+// from the SAME serial run_episode) — only the TRANSPORT SCHEDULE differs:
+//
+//   STRICT BARRIER (above): gather ALL parked -> ONE submit -> await the ONE reply -> resume all. D=1
+//     message outstanding per thread; the search idles the whole round-trip each round.
+//   PIPELINED (here): keep up to D = wcfg.max_inflight_msgs COALESCED messages outstanding per thread; on
+//     each reply (ONE corr-id, recv_batch), resume just those slots, advance them, and RE-ISSUE messages
+//     to refill back to D — so the search never idles the full RTT and the server's group-wakeup drain
+//     coalesces across the D outstanding messages (and across threads) into one big bucketed forward. A
+//     slot is single-writer-per-thread (its row stays alive in the slot until its reply resumes it), so an
+//     out-of-order reply routes to the right slot by corr-id with no extra bookkeeping (wire_leaf_pool.hpp
+//     already maps corr-id -> ordered slot list).
+//
+// S-coalescing: each issue gathers ALL currently-parked-and-unsubmitted slots into ONE message (one
+// corr-id) — naturally S>1 when several are ready, degrading to S=1 when only one is. The wire frame /
+// codec / wire_spec are UNCHANGED (P7): this is submit_batch/recv_batch over the SAME corr-id transport.
+// ============================================================================================
+std::expected<int, Error> run_episodes_wire_pipelined(
+    const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc,
+    [[maybe_unused]] RedisClient& redis, const RunnerConfig& cfg, const WireRunnerConfig& wcfg,
+    std::ostream* stats_out) {
+    const int n_slots = n_action_slots(env);
+    const int feat_dim = fb.dim();
+    const std::vector<uint32_t>& worlds = env.worlds();
+    if (worlds.empty())
+        return std::unexpected(make_error("run_episodes_wire_pipelined: empty world-set (no prior)"));
+
+    RuntimeConfig rc;
+    rc.thread_pool_size = wcfg.pool_threads;
+    rc.batch_size = wcfg.pool_batch;
+    const int T = std::max(1, rc.thread_pool_size);
+    const int K = rc.fibers_per_thread();
+    const int D = std::max(1, wcfg.max_inflight_msgs);  // per-thread in-flight message cap
+
+    void* zctx = zmq_ctx_new();
+    if (zctx == nullptr)
+        return std::unexpected(make_error("run_episodes_wire_pipelined: zmq_ctx_new failed"));
+
+    std::atomic<int> written{0};
+    std::atomic<bool> failed{false};
+    Error first_error;
+    std::atomic<bool> have_error{false};
+    std::mutex err_mu;
+    std::atomic<uint64_t> corr_seq{0};
+    // In-flight-depth telemetry (the key Stage B number — the rows/forward a single real tree sustains).
+    // Accumulated across threads: total leaves coalesced into messages / total messages issued = mean S
+    // (rows per WIRE message); the SERVER reports rows/FORWARD (its drain coalesces across messages). Both
+    // are reported — the server's mean rows/forward is the in-flight depth the design's overcommit phase needs.
+    std::atomic<long> total_leaves{0};
+    std::atomic<long> total_msgs{0};
+
+    auto set_error = [&](Error e) {
+        failed.store(true);
+        std::lock_guard<std::mutex> lk(err_mu);
+        if (!have_error.load()) {
+            first_error = std::move(e);
+            have_error.store(true);
+        }
+    };
+
+    auto worker = [&](int tid) {
+        auto pool_e = WireLeafPool::create(zctx, wcfg.endpoint, wcfg.timeout_ms, corr_seq);
+        if (!pool_e) { set_error(pool_e.error()); return; }
+        WireLeafPool pool = std::move(*pool_e);
+
+        FeatureBuilder rec_fb(env);  // per-thread (the fb memo is single-thread state) — same as strict
+
+        auto wredis_e = RedisClient::create();  // per-thread connection (hiredis ctx not thread-safe)
+        if (!wredis_e) { set_error(wredis_e.error()); return; }
+        RedisClient wredis = std::move(*wredis_e);
+
+        int next_idx = tid;
+        std::vector<EpisodeSlot> slots(static_cast<size_t>(K));
+        const wire::count_t in_dim = static_cast<wire::count_t>(feat_dim);
+        // A slot is "submitted" while its leaf is outstanding to the server (awaiting a reply); it must NOT
+        // be re-gathered into another message until that reply resumes it. The corr-id transport routes the
+        // reply to the slot; this flag prevents double-submitting a parked-but-already-in-flight slot.
+        std::vector<char> submitted(static_cast<size_t>(K), 0);
+        int inflight_msgs = 0;  // messages this thread has outstanding (== D cap)
+        long my_leaves = 0, my_msgs = 0;
+
+        // ---- the per-slot episode state machine: IDENTICAL to the strict driver's (re-derived from the
+        // SAME serial run_episode). spawn_ply / finalize_and_write / apply_decision / advance / fill are
+        // line-for-line the strict-barrier driver's lambdas — only the OUTER drain (below) differs. ----
+        auto spawn_ply = [&](int s) {
+            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            sl.ts = std::make_unique<TreeState>(gc, env, sl.rng);
+            sl.ts->start(sl.loc, sl.bw, sl.collected, cfg.lam);
+        };
+        auto finalize_and_write = [&](int s) {
+            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            const double exit_c = env.exit_cost(sl.loc.pt);
+            const int nb_final = env.nb(sl.bw);
+            EpisodeBlocks ep = std::move(sl.eb).finalize(exit_c, nb_final);
+            if (stats_out) {
+                std::lock_guard<std::mutex> lk(err_mu);
+                (*stats_out) << "{\"idx\":" << sl.idx
+                             << ",\"world\":" << ep.world
+                             << ",\"length\":" << ep.ep_length
+                             << ",\"lam_return\":" << ep.lam_return
+                             << ",\"n_collect\":" << ep.n_collect
+                             << ",\"n_sense\":" << ep.n_sense
+                             << ",\"n_terminate\":" << ep.n_terminate
+                             << ",\"belief_shrinkage\":" << ep.belief_shrinkage
+                             << ",\"exec_slots\":[";
+                for (size_t k = 0; k < ep.exec_slots.size(); ++k)
+                    (*stats_out) << (k ? "," : "") << ep.exec_slots[k];
+                (*stats_out) << "]}\n";
+            }
+            sl.active = false;
+            sl.ts.reset();
+            if (ep.n == 0) return;
+            auto wr = wredis.write_results(cfg.res_token, sl.idx, ep.X, ep.n, ep.feat_dim, ep.PI, ep.M,
+                                           ep.Y, ep.n_slots);
+            if (!wr) { set_error(wr.error()); return; }
+            written.fetch_add(1, std::memory_order_relaxed);
+        };
+        auto apply_decision = [&](int s) -> bool {
+            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            const GumbelAZPolicy::Decision& dec = sl.ts->decision;
+            Action action = dec.action;
+            std::vector<double> feat = rec_fb.build(sl.loc.pt, sl.bw, sl.collected);
+            std::vector<float> mask = legal_mask(env, sl.bw, sl.collected);
+            std::vector<float> pi(dec.improved.begin(), dec.improved.end());
+            if (action.kind == ActionKind::Terminate) {
+                sl.eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
+                                      /*is_terminate=*/true, /*is_collect=*/false, term_slot(env));
+                finalize_and_write(s);
+                return false;
+            }
+            const bool is_collect = (action.kind == ActionKind::Treasure);
+            sl.eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
+                                  /*is_terminate=*/false, is_collect, action_to_slot(env, action));
+            StepResult sr = env.apply(sl.loc, sl.bw, sl.collected, action, sl.world);
+            sl.eb.record_step(sr.reward, sr.dt);
+            ++sl.ply;
+            if (sl.ply >= cfg.max_steps || env.empty(sl.bw)) {
+                finalize_and_write(s);
+                return false;
+            }
+            return true;
+        };
+        auto advance = [&](int s) -> bool {
+            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            while (!failed.load()) {
+                if (!apply_decision(s)) return false;
+                spawn_ply(s);
+                if (sl.ts->running) return true;
+            }
+            return false;
+        };
+        auto fill = [&](int s) -> bool {
+            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            while (next_idx < cfg.episodes && !failed.load()) {
+                const int idx = next_idx;
+                next_idx += T;
+                sl.idx = idx;
+                sl.rng.seed(fold_seed(cfg.seed, idx));
+                std::uniform_int_distribution<size_t> wpick(0, worlds.size() - 1);
+                sl.world = worlds[wpick(sl.rng)];
+                sl.loc = Loc{env.entry_point()};
+                sl.bw = env.full_belief();
+                sl.collected = CollectedSet{};
+                sl.bw0 = env.nb(sl.bw);
+                sl.ply = 0;
+                sl.eb = EpisodeBuilder::create(sl.world, cfg.lam, feat_dim, n_slots, sl.bw0);
+                sl.active = true;
+                if (env.empty(sl.bw)) {
+                    finalize_and_write(s);
+                    if (failed.load()) return false;
+                    continue;
+                }
+                spawn_ply(s);
+                if (sl.ts->running) return true;
+                if (advance(s)) return true;
+                if (failed.load()) return false;
+            }
+            return false;
+        };
+
+        // A slot is "ready" iff it is parked at a leaf AND not already outstanding to the server.
+        auto is_ready = [&](int s) -> bool {
+            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            return sl.active && sl.ts && sl.ts->running && !submitted[static_cast<size_t>(s)];
+        };
+
+        // Issue ONE coalesced message: gather ALL currently-ready slots' rows into one submit_batch (one
+        // corr-id, S = #ready), mark them submitted, bump the in-flight count. Returns false on a submit
+        // error (loud abort) or when nothing was ready (no message issued). S-coalescing happens here.
+        std::vector<float> gather;
+        std::vector<int> gathered;
+        auto issue_one = [&]() -> bool {
+            gather.clear();
+            gathered.clear();
+            for (int s = 0; s < K; ++s) {
+                if (is_ready(s)) {
+                    std::span<const float> feats = slots[static_cast<size_t>(s)].ts->ch.features;
+                    gather.insert(gather.end(), feats.begin(), feats.end());
+                    gathered.push_back(s);
+                }
+            }
+            if (gathered.empty()) return false;  // nothing ready to send
+            auto sub = pool.submit_batch(gathered, gather, in_dim);
+            if (!sub) { set_error(sub.error()); return false; }
+            for (int s : gathered) submitted[static_cast<size_t>(s)] = 1;
+            ++inflight_msgs;
+            my_leaves += static_cast<long>(gathered.size());
+            ++my_msgs;
+            return true;
+        };
+
+        // prime K slots (each fill leaves the slot parked at a leaf, or finalizes a degenerate episode).
+        for (int s = 0; s < K && !failed.load(); ++s) fill(s);
+
+        // ---- the PIPELINED drain: hold up to D coalesced messages outstanding; resume-and-refill ----
+        // Issue up to D messages from the initially-ready slots, then loop: recv ONE reply (out-of-order by
+        // corr-id), resume + advance just those slots, and re-issue to refill back to D. Continue while any
+        // message is outstanding (a reply may unpark a slot that then re-parks at its next leaf).
+        while (inflight_msgs < D && issue_one()) {}  // prime the pipe to depth D
+        while (inflight_msgs > 0 && !failed.load()) {
+            auto reply = pool.recv_batch();
+            if (!reply) { set_error(reply.error()); break; }  // recv/decode/corr-id/count: loud abort
+            --inflight_msgs;  // this corr-id's message is resolved
+            // Resume each slot this message answered, advance its episode, then re-park or refill.
+            for (const Completion& c : *reply) {
+                if (failed.load()) break;
+                const int s = c.slot;
+                EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+                submitted[static_cast<size_t>(s)] = 0;  // no longer outstanding
+                sl.ts->resume_with(c.pred);
+                if (sl.ts->running) continue;  // re-parked at the next leaf — will be re-gathered on issue
+                if (advance(s)) continue;      // parked again down the chain — re-gathered on issue
+                if (failed.load()) break;
+                fill(s);                       // finalized — start the next episode in this slot (or idle)
+            }
+            // Refill the pipe: issue coalesced messages over whatever is now ready, back up to depth D.
+            while (inflight_msgs < D && !failed.load() && issue_one()) {}
+        }
+        total_leaves.fetch_add(my_leaves, std::memory_order_relaxed);
+        total_msgs.fetch_add(my_msgs, std::memory_order_relaxed);
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(T));
+    for (int t = 0; t < T; ++t) threads.emplace_back(worker, t);
+    for (std::thread& th : threads) th.join();
+
+    zmq_ctx_term(zctx);
+
+    if (failed.load()) {
+        std::lock_guard<std::mutex> lk(err_mu);
+        return std::unexpected(have_error.load()
+                                   ? first_error
+                                   : make_error("run_episodes_wire_pipelined: a leaf/transport/write failed"));
+    }
+    // Emit the wire-side coalescing telemetry to stats_out (one trailing JSON line) when a sink is present —
+    // the harness reads it to report mean rows/WIRE-MESSAGE (S); the SERVER reports mean rows/FORWARD (the
+    // in-flight depth the overcommit phase needs). Guarded so it does not interleave with episode lines.
+    if (stats_out) {
+        const long lv = total_leaves.load(), ms = total_msgs.load();
+        const double mean_s = ms ? static_cast<double>(lv) / static_cast<double>(ms) : 0.0;
+        std::lock_guard<std::mutex> lk(err_mu);
+        (*stats_out) << "{\"wire_summary\":1,\"leaves\":" << lv << ",\"msgs\":" << ms
+                     << ",\"mean_rows_per_msg\":" << mean_s << ",\"inflight_cap_D\":" << D
+                     << ",\"threads\":" << T << ",\"fibers_per_thread\":" << K << "}\n";
     }
     return written.load();
 }

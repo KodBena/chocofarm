@@ -364,3 +364,12 @@ target_compile_options(chocofarm-wire-batched-smoke PRIVATE -Wall -Wextra)
 add_executable(chocofarm-wire-batched-runtime-check src/wire_batched_runtime_check.cpp src/runner_wire_batched.cpp)
 target_link_libraries(chocofarm-wire-batched-runtime-check PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
 target_compile_options(chocofarm-wire-batched-runtime-check PRIVATE -Wall -Wextra)
+
+# The Stage B e2e A/B THROUGHPUT bench (NOT the runner): drives the REAL Gumbel-AZ search (every leaf
+# remote on the JAX server) for a wall budget under ONE selectable transport mode (--wire-mode
+# strict-barrier = arm 1, pipelined-bucket = arm 3), reporting decisions/s/core — the eval-transport-adapter
+# Stage B A/B (docs/design/cpp-eval-transport-adapter.md §4). Links run_episodes_wire_batched (which carries
+# both modes) + boost.context (the fiber mux). Separate from the runner (P3, one-owner).
+add_executable(chocofarm-wire-ab-bench src/wire_ab_bench.cpp src/runner_wire_batched.cpp)
+target_link_libraries(chocofarm-wire-ab-bench PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
+target_compile_options(chocofarm-wire-ab-bench PRIVATE -Wall -Wextra)
