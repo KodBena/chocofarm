@@ -235,4 +235,29 @@ std::expected<void, Error> RedisClient::write_results(std::string_view res_token
     return {};
 }
 
+std::expected<RedisClient::ResultBlocks, Error>
+RedisClient::read_results(std::string_view res_token, int idx) {
+    // The symmetric read of write_results: GET each of the four raw little-endian float32 blocks and
+    // decode them into float32 vectors. A missing key or a non-float-sized blob is a typed Error (P9
+    // rule 5). Used by the batched-runtime parity check, not the hot path.
+    ResultKeys k = result_keys(res_token, idx);
+    auto load = [&](const std::string& key, std::vector<float>& out) -> std::expected<void, Error> {
+        std::string bytes;
+        auto have = redis_get_bytes(ctx_, key, bytes);
+        if (!have) return std::unexpected(have.error());
+        if (!*have) return std::unexpected(make_error("chocofarm: result block missing: " + key));
+        if (bytes.size() % sizeof(float) != 0)
+            return std::unexpected(make_error("chocofarm: result block not float32-sized: " + key));
+        out.resize(bytes.size() / sizeof(float));
+        std::memcpy(out.data(), bytes.data(), bytes.size());  // raw little-endian float32 (P7 wire)
+        return {};
+    };
+    ResultBlocks rb;
+    if (auto r = load(k.X, rb.X); !r) return std::unexpected(r.error());
+    if (auto r = load(k.PI, rb.PI); !r) return std::unexpected(r.error());
+    if (auto r = load(k.M, rb.M); !r) return std::unexpected(r.error());
+    if (auto r = load(k.Y, rb.Y); !r) return std::unexpected(r.error());
+    return rb;
+}
+
 }  // namespace chocofarm

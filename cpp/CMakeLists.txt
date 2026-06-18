@@ -158,8 +158,32 @@ if(CHOCO_BELIEF_ZDD)
   target_compile_definitions(chocofarm_core PUBLIC CHOCO_BELIEF_ZDD)
 endif()
 
-add_executable(chocofarm-cpp-runner src/main.cpp)
-target_link_libraries(chocofarm-cpp-runner PRIVATE chocofarm_core)
+# boost.context — the Option-A fiber mechanism (docs/notes/cpp-continuation-refactor-decision-2026-06-16.md).
+# The resumable-search prototype runs the UNCHANGED run_search inside a stackful fiber. Located via
+# find_package(Boost) with a find_library fallback (boost ships no pkg-config; the lib is libboost_context).
+# Resolved HERE (before the first consumer, chocofarm-cpp-runner) so ${BOOST_CONTEXT_LINK} is set when the
+# runner's wire generation path (src/runner_wire_batched.cpp) links it (the runner is the production --serve
+# binary; the fiber benches/checks below reuse the same ${BOOST_CONTEXT_LINK}).
+find_package(Boost QUIET COMPONENTS context)
+if(Boost_FOUND)
+  set(BOOST_CONTEXT_LINK Boost::context)
+else()
+  find_library(BOOST_CONTEXT_LIBRARY boost_context REQUIRED)
+  find_path(BOOST_CONTEXT_INCLUDE boost/context/fiber.hpp REQUIRED)
+  add_library(boost_context_manual INTERFACE)
+  target_include_directories(boost_context_manual INTERFACE ${BOOST_CONTEXT_INCLUDE})
+  target_link_libraries(boost_context_manual INTERFACE ${BOOST_CONTEXT_LIBRARY})
+  set(BOOST_CONTEXT_LINK boost_context_manual)
+endif()
+
+# The runner gains the WIRE generation path (serve.handle_generate dispatches on --infer-endpoint to
+# run_episodes_wire_batched, docs/design/cpp-wire-generation-roadmap.md Phase D+E). That driver uses
+# TreeState -> boost/context/fiber.hpp, so src/runner_wire_batched.cpp is compiled INTO this executable
+# (kept out of chocofarm_core — boost off the core link surface, the established discipline) and
+# ${BOOST_CONTEXT_LINK} is added. zmq is PUBLIC/transitive via chocofarm_core (CMakeLists:147) — NOT
+# re-added (CRITIQUE E1). The serial/one-shot CLI path links boost too but does not use fibers (acceptable).
+add_executable(chocofarm-cpp-runner src/main.cpp src/runner_wire_batched.cpp)
+target_link_libraries(chocofarm-cpp-runner PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
 target_compile_options(chocofarm-cpp-runner PRIVATE -Wall -Wextra)
 
 # A tiny parity fixture (NOT the runner): replays an action sequence and dumps the legality mask, so
@@ -273,21 +297,6 @@ add_executable(chocofarm-local-mlp-bench src/local_mlp_bench.cpp)
 target_link_libraries(chocofarm-local-mlp-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-local-mlp-bench PRIVATE -Wall -Wextra)
 
-# boost.context — the Option-A fiber mechanism (docs/notes/cpp-continuation-refactor-decision-2026-06-16.md).
-# The resumable-search prototype runs the UNCHANGED run_search inside a stackful fiber. Located via
-# find_package(Boost) with a find_library fallback (boost ships no pkg-config; the lib is libboost_context).
-find_package(Boost QUIET COMPONENTS context)
-if(Boost_FOUND)
-  set(BOOST_CONTEXT_LINK Boost::context)
-else()
-  find_library(BOOST_CONTEXT_LIBRARY boost_context REQUIRED)
-  find_path(BOOST_CONTEXT_INCLUDE boost/context/fiber.hpp REQUIRED)
-  add_library(boost_context_manual INTERFACE)
-  target_include_directories(boost_context_manual INTERFACE ${BOOST_CONTEXT_INCLUDE})
-  target_link_libraries(boost_context_manual INTERFACE ${BOOST_CONTEXT_LIBRARY})
-  set(BOOST_CONTEXT_LINK boost_context_manual)
-endif()
-
 # The Option-A foundation proof (NOT the runner): run the unchanged run_search inside a boost.context
 # fiber with a YieldingNetEvaluator, and assert fiber-driven == direct (the §7.1 validity precondition,
 # near-trivial under A). Separate from the runner (P3, one-owner).
@@ -322,3 +331,26 @@ target_compile_options(chocofarm-wire-pool-bench PRIVATE -Wall -Wextra)
 add_executable(chocofarm-zmq-net-probe src/zmq_net_probe.cpp)
 target_link_libraries(chocofarm-zmq-net-probe PRIVATE chocofarm_core)
 target_compile_options(chocofarm-zmq-net-probe PRIVATE -Wall -Wextra)
+
+# ---- the WIRE-batched generation driver (docs/design/cpp-wire-generation-roadmap.md, Phases A-F) ----
+# run_episodes_wire_batched (runner_wire_batched.cpp) is the T×K greedy-async fiber-pool driver that
+# resolves every Gumbel-AZ leaf REMOTELY on the JAX InferenceServer over a DEALER socket (no local
+# forward). It uses TreeState -> boost/context/fiber.hpp, so it is kept OUT of chocofarm_core and compiled
+# per-executable with ${BOOST_CONTEXT_LINK} added to every target that links it (mirroring wire-pool-bench).
+# zmq is PUBLIC/transitive via chocofarm_core (CMakeLists:147) — NOT re-added (CRITIQUE E1).
+
+# The Phase B SMOKE (NOT the runner): runs --episodes self-play episodes through run_episodes_wire_batched
+# against a warm Python InferenceServer (stood up by cpp/parity/_wire_smoke_server.py), writing the four
+# EpisodeBlocks per non-empty episode to redis — the Python harness reads them back + asserts sane shapes.
+add_executable(chocofarm-wire-batched-smoke src/wire_batched_smoke.cpp src/runner_wire_batched.cpp)
+target_link_libraries(chocofarm-wire-batched-smoke PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
+target_compile_options(chocofarm-wire-batched-smoke PRIVATE -Wall -Wextra)
+
+# The Phase C CROSS-RUNTIME parity check (NOT the runner): drives the SAME corpus through serial
+# run_episodes (local NetForward leaf) and wire run_episodes_wire_batched (the JAX server leaf), asserting
+# layer-2 single-tree NeedsLeaf-sequence (RNG ctor + canned leaf, fibered==direct) + layer-4 aggregate
+# action-dist/improved-π within a Monte-Carlo CI (the Q7 behavioral bar — NOT byte-identity). Uses redis
+# (read-back). boost.context (the fiber mux). Separate (P3, one-owner).
+add_executable(chocofarm-wire-batched-runtime-check src/wire_batched_runtime_check.cpp src/runner_wire_batched.cpp)
+target_link_libraries(chocofarm-wire-batched-runtime-check PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
+target_compile_options(chocofarm-wire-batched-runtime-check PRIVATE -Wall -Wextra)

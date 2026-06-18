@@ -99,6 +99,16 @@ class RedisClient {
                                                           std::span<const float> M,
                                                           std::span<const float> Y, int n_slots);
 
+    // The four float32 result blocks read back (the symmetric counterpart to write_results) — the
+    // raw little-endian float32 bytes of X/PI/M/Y under az:res:<token>:<idx>:{X,PI,M,Y}, decoded into
+    // four float32 vectors. Used by the batched-runtime parity check to read back what the driver wrote
+    // and byte-compare it to the serial reference. A missing key or a redis error is a typed Error (P9
+    // rule 5). (Not on the runner's hot path — the parent reconciliation reads results in Python.)
+    struct ResultBlocks {
+        std::vector<float> X, PI, M, Y;
+    };
+    [[nodiscard]] std::expected<ResultBlocks, Error> read_results(std::string_view res_token, int idx);
+
   private:
     explicit RedisClient(redisContext* ctx) noexcept : ctx_(ctx) {}
     redisContext* ctx_ = nullptr;

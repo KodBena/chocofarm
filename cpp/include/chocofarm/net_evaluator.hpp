@@ -25,8 +25,11 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <cassert>
+#include <cstddef>
 #include <expected>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "chocofarm/error.hpp"

@@ -17,6 +17,19 @@ Division of labour — the C++ actor owns GENERATION, exit_loop owns the rest (t
     retune lands WITHOUT a respawn — then a `generate` control message) to play E episodes against those
     weights, and reads the four (X, PI, M, Y) float32 result blocks back into exit_loop's flat
     `list[_Record]`. The value target is the actor's own pure-MC λ-return.
+
+The WIRE generation path (docs/design/cpp-wire-generation-roadmap.md, Phase D+E): when `pool_batch>0`, the
+executor ALSO stands up an in-process JAX `InferenceServer` daemon thread over the live net on an `ipc://`
+endpoint, and passes `--infer-endpoint`/`--pool-threads`/`--pool-batch` to the `--serve` runner so its
+generation resolves every Gumbel-AZ search LEAF REMOTELY on that batched server over a DEALER socket (the
+T×K fiber-pool driver, `run_episodes_wire_batched`) instead of a serial local `NetForward`-per-leaf. The
+server is the SSOT batched leaf evaluator (the SAME `forward_core` every Python path runs); it serves
+GENERATION only (eval stays in-process Python, ADR-0008). The redis weight seam now feeds THIS in-process
+server (via `RedisParamsSource`, version-gated), not a C++ local `NetForward`. Weights are published
+publish-THEN-bump (publish the blob FIRST, then advance the version the server's reload poll wants — a
+missing-blob reload-abort window otherwise, CRITIQUE B2). The pool knobs ride `--serve` STARTUP args, never
+`ActorConfig` (their ONE home is `RuntimeConfig` — ADR-0012 P1 / Q6). When `pool_batch==0` (the default),
+no server is stood up and the runner uses the serial local-`NetForward` path (binary dispatch).
   * evaluate(): runs exit_loop's OWN greedy `GumbelPolicy` eval on the trained net IN-PROCESS (Python).
     The eval measures the net's greedy rate — a language-agnostic quantity — and "swap into GENERATION"
     leaves eval to the loop. No subprocess, no redis: a pure-Python search over the passed net.
@@ -69,7 +82,7 @@ class CppActorExecutor:
 
     def __init__(self, runner_path: str, instance: str, faces: str, env: "Environment",
                  base_seed: int, use_jax_mlp: bool, in_dim: int, n_slots: int,
-                 gen_timeout_s: int = 3600) -> None:
+                 gen_timeout_s: int = 3600, pool_threads: int = 0, pool_batch: int = 0) -> None:
         self.runner = runner_path
         self.instance = instance
         self.faces = faces
@@ -83,6 +96,22 @@ class CppActorExecutor:
         self.n_slots = int(n_slots)
         self.gen_timeout_s = int(gen_timeout_s)
         self.run = uuid.uuid4().hex[:12]            # namespace this run's redis keys
+        # the WIRE generation knobs (--serve STARTUP args, never ActorConfig — their ONE home is
+        # RuntimeConfig, P1). pool_batch>0 turns the wire path ON: the executor stands up an in-process
+        # JAX InferenceServer and the runner resolves every leaf remotely over it. pool_batch==0 (default)
+        # = the serial local-NetForward path (no server). The endpoint is namespaced by this run.
+        self.pool_threads = int(pool_threads)
+        self.pool_batch = int(pool_batch)
+        self.wire = self.pool_batch > 0
+        self.infer_endpoint = f"ipc:///tmp/choco-infer-{self.run}.sock" if self.wire else ""
+        # the in-process JAX InferenceServer (the SSOT batched leaf evaluator on the wire path): built in
+        # _ensure_actor (lazily, after the first net publish so RedisParamsSource can load it), torn down in
+        # close(). `_published_version` is the version supplier RedisParamsSource.poll() reads (publish-then-
+        # bump, CRITIQUE B2); start it at -1 so the FIRST generate's publish-then-bump to its version is the
+        # initial load. None until the server is up.
+        self._server: Any = None
+        self._server_thread: Any = None
+        self._published_version: int = -1
         self.cores: list[int] = []                  # the runner is one subprocess running episodes
         #                                             serially; no per-worker core pin (unlike the pool)
         self._eval_seed = self.base_seed + 10_000   # fixed eval randomness (only the net changes/iter)
@@ -128,7 +157,14 @@ class CppActorExecutor:
                 "--explore-plies 0 to accept greedy (temperature-0) generation with the C++ actor, or use "
                 "the Python pool (--workers>0) for the exploration prefix.")
         hs = dict(hot_search) if hot_search else {}
+        # PUBLISH-THEN-BUMP (CRITIQUE B2): write the net blob to redis FIRST, THEN advance the version the
+        # wire server's RedisParamsSource.poll() wants. The reverse order opens a window where poll() wants a
+        # version whose blob is not yet written -> read_weights raises -> a loud reload-abort mid-generate.
+        # On the SERIAL path (no server) the bump is harmless bookkeeping. The server is built (lazily, in
+        # _ensure_actor) AFTER this first publish-then-bump, so its RedisParamsSource initial-load finds the
+        # blob; subsequent generates' bumps are picked up by the server's between-batch reload poll.
         self.transport.publish_weights(net, "gen", version, self.run)
+        self._published_version = version
         tok = f"{self.run}-gen-{version}"
         n_eps = len(worlds)
         # Drive the persistent runner over the ActorTransport. Adopt the live config FIRST: project
@@ -165,13 +201,58 @@ class CppActorExecutor:
         and firing the fail-loud guards above needs no built binary) and probe its readiness with a ping.
         The spawn + ping are the loud-at-first-generate readiness check: a missing binary, or a runner
         that died on startup (e.g. redis unreachable), raises a `ControlError` here, not a silent hang
-        (ADR-0002 / P5). The runner is held across generations (the no-respawn win)."""
+        (ADR-0002 / P5). The runner is held across generations (the no-respawn win).
+
+        On the WIRE path (self.wire), an in-process JAX `InferenceServer` daemon thread is stood up FIRST
+        (BEFORE the runner's first ping) over the live net via a version-gated `RedisParamsSource` on the
+        run-namespaced `ipc://` endpoint; the runner is then spawned with `--infer-endpoint`/`--pool-threads`
+        /`--pool-batch` so its generation resolves every leaf remotely on that server. The server is built
+        AFTER the first publish-then-bump (its RedisParamsSource initial-load needs the blob), so this is
+        called from generate() only after `self.transport.publish_weights` + `self._published_version=...`."""
         if self._actor is None:
+            extra = ["--run", self.run]
+            if self.wire:
+                self._start_server()
+                extra += ["--infer-endpoint", self.infer_endpoint,
+                          "--pool-threads", str(self.pool_threads),
+                          "--pool-batch", str(self.pool_batch)]
             actor = SubprocessActorTransport(self.runner, recv_timeout_s=self.gen_timeout_s,
-                                             extra_args=("--run", self.run))
+                                             extra_args=tuple(extra))
             actor.ping()  # readiness: the runner spawned + speaks the protocol (serving=False pre-configure)
             self._actor = actor
         return self._actor
+
+    def _start_server(self) -> None:
+        """Stand up the in-process JAX `InferenceServer` daemon thread (the SSOT batched leaf evaluator for
+        the wire path) over the live net via `RedisParamsSource(self._conn, self.run, "gen", lambda:
+        self._published_version, initial_version=self._published_version)` on `self.infer_endpoint`. Built
+        AFTER the first publish-then-bump (so RedisParamsSource's initial load finds the blob). SINGLE-
+        THREADED server (JAX/XLA owns the forward — the R14 / jaxtrain-deadlock invariant; no XLA in a worker
+        thread). Asserts the OR-4 geometry invariant: the server's in_dim/n_actions (derived from the SAME
+        self.env the C++ actor's instance/faces describe) MUST equal the actor's fb.dim()/n_slots — a
+        mismatch is a ragged-batch loud reject downstream, so fail loud HERE at standup (ADR-0002)."""
+        import threading
+
+        from chocofarm.az.actions import n_action_slots
+        from chocofarm.az.features import feature_dim
+        from chocofarm.az.inference_server import InferenceServer, RedisParamsSource
+
+        # OR-4 (CRITIQUE B3): the server's geometry must match the C++ actor's (same instance/faces -> same
+        # feature dim / action-slot count). self.env is the SAME Environment the executor derived in_dim/
+        # n_slots from at construction; assert it loudly before any leaf crosses the wire.
+        srv_in_dim, srv_n_actions = feature_dim(self.env), n_action_slots(self.env)
+        if srv_in_dim != self.in_dim or srv_n_actions != self.n_slots:
+            raise RuntimeError(
+                f"CppActorExecutor: inference-server geometry (in_dim={srv_in_dim}, n_actions="
+                f"{srv_n_actions}) != actor geometry (in_dim={self.in_dim}, n_slots={self.n_slots}). The "
+                "Python self.env and the C++ actor's instance/faces must describe the SAME env (OR-4) — a "
+                "mismatch is a ragged-batch / dimension-corruption hazard. Refusing to serve.")
+        src = RedisParamsSource(self._conn, self.run, "gen",
+                                version_supplier=lambda: self._published_version,
+                                initial_version=self._published_version)
+        self._server = InferenceServer(src, bind=self.infer_endpoint, max_batch=256)
+        self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._server_thread.start()
 
     def _actor_config(self, hs: dict[str, Any]) -> ActorConfig:
         """Project the live hot_search bag (the per-iteration HOT search knobs) + the runner's instance/
@@ -249,10 +330,22 @@ class CppActorExecutor:
 
     def close(self) -> None:
         # reap the persistent actor (graceful shutdown then bounded SIGTERM/SIGKILL — actor_transport),
-        # THEN close redis. Both paths are best-effort + idempotent (close runs on every exit path).
+        # THEN tear down the in-process wire server (stop -> join -> close, the clean shutdown sequence the
+        # InferenceServer's bounded-poll loop wants), THEN close redis. The actor is reaped first so no leaf
+        # is in flight to the server when it stops (the control channel is lock-step — the generate reply is
+        # already received, CRITIQUE B4 — so this ordering is tidy shutdown, not mid-generate-block
+        # avoidance). All paths are best-effort + idempotent (close runs on every exit path).
         if self._actor is not None:
             try:
                 self._actor.close()
+            except Exception:
+                pass
+        if self._server is not None:
+            try:
+                self._server.stop()
+                if self._server_thread is not None:
+                    self._server_thread.join(timeout=5.0)
+                self._server.close()
             except Exception:
                 pass
         try:

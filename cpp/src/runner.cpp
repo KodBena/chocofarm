@@ -10,9 +10,96 @@
 #include "chocofarm/runner.hpp"
 
 #include <cmath>
+#include <utility>
 #include <vector>
 
 namespace chocofarm {
+
+EpisodeBuilder EpisodeBuilder::create(uint32_t world, double lam, int feat_dim, int n_slots, int bw0) {
+    EpisodeBuilder b;
+    b.world_ = world;
+    b.lam_ = lam;
+    b.feat_dim_ = feat_dim;
+    b.n_slots_ = n_slots;
+    b.bw0_ = bw0;
+    return b;
+}
+
+void EpisodeBuilder::record_decision(std::vector<double> feat, std::vector<float> pi,
+                                     std::vector<float> mask, bool is_terminate, bool is_collect,
+                                     int exec_slot) {
+    // mirrors run_episode's record block (runner.cpp:54-67): push the (feat, pi, mask) row + the trace
+    // slot; bump the aggregate counters. The TERMINATE decision executes no step (record_step is NOT
+    // called for it).
+    feats_.push_back(std::move(feat));
+    pis_.push_back(std::move(pi));
+    masks_.push_back(std::move(mask));
+    exec_slots_.push_back(exec_slot);
+    if (is_terminate) {
+        n_terminate_ = 1;
+    } else if (is_collect) {
+        ++n_collect_;
+    } else {
+        ++n_sense_;
+    }
+}
+
+void EpisodeBuilder::record_step(double reward, double dt) {
+    step_rt_.emplace_back(reward, dt);  // the executed (r, dt) the value-target suffix sums (runner.cpp:69)
+}
+
+EpisodeBlocks EpisodeBuilder::finalize(double exit_c, int nb_final) && {
+    // ---- the verbatim runner.cpp:72-117 value-target + aggregate-stats math (Chunk 3 extraction) ----
+    int n_dec = static_cast<int>(step_rt_.size());  // executed (non-TERMINATE) decisions
+    int n_rec = static_cast<int>(feats_.size());    // all recorded decisions (incl. trailing TERMINATE)
+
+    // value targets: pure-MC λ-penalized return-to-go (suffix_returns_to_go). g_j = Σ_{t>=j} r_t -
+    // λ·(Σ_{t>=j} dt_t + exit_c). The exit toll is in every suffix (charged once at episode end).
+    std::vector<double> g_steps(static_cast<size_t>(n_dec), 0.0);
+    double suffix_r = 0.0, suffix_t = 0.0;
+    for (int j = n_dec - 1; j >= 0; --j) {
+        suffix_r += step_rt_[static_cast<size_t>(j)].first;
+        suffix_t += step_rt_[static_cast<size_t>(j)].second;
+        g_steps[static_cast<size_t>(j)] = suffix_r - lam_ * (suffix_t + exit_c);
+    }
+
+    EpisodeBlocks out;
+    out.n = n_rec;
+    out.feat_dim = feat_dim_;
+    out.n_slots = n_slots_;
+    // ---- aggregate stats (P6 behavioral parity) ----
+    out.ep_length = n_dec;
+    // the full-episode λ-return = the return-to-go from the FIRST executed decision; with no
+    // executed step the episode is a bare exit, value = the exit toll −λ·exit_c.
+    out.lam_return = (n_dec > 0) ? g_steps[0] : (-lam_ * exit_c);
+    out.n_collect = n_collect_;
+    out.n_sense = n_sense_;
+    out.n_terminate = n_terminate_;
+    out.belief_shrinkage = (bw0_ > 0) ? (1.0 - static_cast<double>(nb_final) /  // L6, via the seam
+                                               static_cast<double>(bw0_)) : 0.0;
+    out.world = world_;
+    out.exec_slots = std::move(exec_slots_);
+    out.X.resize(static_cast<size_t>(n_rec) * feat_dim_);
+    out.PI.resize(static_cast<size_t>(n_rec) * n_slots_);
+    out.M.resize(static_cast<size_t>(n_rec) * n_slots_);
+    out.Y.resize(static_cast<size_t>(n_rec));
+    for (int j = 0; j < n_rec; ++j) {
+        for (int c = 0; c < feat_dim_; ++c)
+            out.X[static_cast<size_t>(j) * feat_dim_ + c] =
+                static_cast<float>(feats_[static_cast<size_t>(j)][static_cast<size_t>(c)]);
+        for (int c = 0; c < n_slots_; ++c) {
+            out.PI[static_cast<size_t>(j) * n_slots_ + c] =
+                pis_[static_cast<size_t>(j)][static_cast<size_t>(c)];
+            out.M[static_cast<size_t>(j) * n_slots_ + c] =
+                masks_[static_cast<size_t>(j)][static_cast<size_t>(c)];
+        }
+        // the trailing TERMINATE decision (j >= n_dec) has no step: its target is the exit toll
+        // continuation, -λ·exit_c (mirrors generate_episode's terminal-decision g).
+        double g = (j < n_dec) ? g_steps[static_cast<size_t>(j)] : (-lam_ * exit_c);
+        out.Y[static_cast<size_t>(j)] = static_cast<float>(g);
+    }
+    return out;
+}
 
 EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
                           uint32_t world, double lam, std::mt19937_64& rng, int max_steps) {
@@ -26,12 +113,9 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
 
     const int bw0 = env.nb(bw);  // initial belief size (for belief-shrinkage stat) — via the seam (L6)
 
-    // per-decision records (feat, pi, mask) + the executed-step (r, dt) list for the value target.
-    std::vector<std::vector<double>> feats;
-    std::vector<std::vector<float>> pis, masks;
-    std::vector<std::pair<double, double>> step_rt;  // (r, dt) for each EXECUTED (non-TERMINATE) step
-    int n_collect = 0, n_sense = 0, n_terminate = 0;
-    std::vector<int> exec_slots;  // the executed-action slot trace (for wire-content replay parity)
+    // Re-expressed (Chunk 3) as the EpisodeBuilder accumulator + the serial ply loop — the suffix math
+    // now lives in EpisodeBuilder::finalize (the ONE home; behaviour-preserving extraction).
+    EpisodeBuilder eb = EpisodeBuilder::create(world, lam, feat_dim, n_slots, bw0);
 
     for (int ply = 0; ply < max_steps; ++ply) {
         if (env.empty(bw)) break;  // mirrors generate_episode's len(bw)==0 break (L6, via the seam)
@@ -49,80 +133,31 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
         std::vector<double> feat = fb.build(loc.pt, bw, collected);
         std::vector<float> mask = legal_mask(env, bw, collected);
         std::vector<float> pi = std::move(ap.pi);  // the improved-policy target (the PI block)
-        (void)n_slots;
 
         if (action.kind == ActionKind::Terminate) {
             // the TERMINATE decision executes no step (mirrors generate_episode): record it, break.
-            feats.push_back(std::move(feat));
-            pis.push_back(std::move(pi));
-            masks.push_back(std::move(mask));
-            n_terminate = 1;
-            exec_slots.push_back(term_slot(env));   // record the TERMINATE decision in the trace
+            eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
+                               /*is_terminate=*/true, /*is_collect=*/false, term_slot(env));
             break;
         }
-        feats.push_back(std::move(feat));
-        pis.push_back(std::move(pi));
-        masks.push_back(std::move(mask));
-        if (action.kind == ActionKind::Treasure) ++n_collect; else ++n_sense;
-        exec_slots.push_back(action_to_slot(env, action));
+        const bool is_collect = (action.kind == ActionKind::Treasure);
+        eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
+                           /*is_terminate=*/false, is_collect, action_to_slot(env, action));
         StepResult sr = env.apply(loc, bw, collected, action, world);
-        step_rt.emplace_back(sr.reward, sr.dt);
+        eb.record_step(sr.reward, sr.dt);
     }
 
-    double exit_c = env.exit_cost(loc.pt);
-    int n_dec = static_cast<int>(step_rt.size());  // executed (non-TERMINATE) decisions
-    int n_rec = static_cast<int>(feats.size());    // all recorded decisions (incl. trailing TERMINATE)
-
-    // value targets: pure-MC λ-penalized return-to-go (suffix_returns_to_go). g_j = Σ_{t>=j} r_t -
-    // λ·(Σ_{t>=j} dt_t + exit_c). The exit toll is in every suffix (charged once at episode end).
-    std::vector<double> g_steps(n_dec, 0.0);
-    double suffix_r = 0.0, suffix_t = 0.0;
-    for (int j = n_dec - 1; j >= 0; --j) {
-        suffix_r += step_rt[j].first;
-        suffix_t += step_rt[j].second;
-        g_steps[j] = suffix_r - lam * (suffix_t + exit_c);
-    }
-
-    EpisodeBlocks out;
-    out.n = n_rec;
-    out.feat_dim = feat_dim;
-    out.n_slots = n_slots;
-    // ---- aggregate stats (P6 behavioral parity) ----
-    out.ep_length = n_dec;
-    // the full-episode λ-return = the return-to-go from the FIRST executed decision; with no
-    // executed step the episode is a bare exit, value = the exit toll −λ·exit_c.
-    out.lam_return = (n_dec > 0) ? g_steps[0] : (-lam * exit_c);
-    out.n_collect = n_collect;
-    out.n_sense = n_sense;
-    out.n_terminate = n_terminate;
-    out.belief_shrinkage = (bw0 > 0) ? (1.0 - static_cast<double>(env.nb(bw)) /  // L6, via the seam
-                                              static_cast<double>(bw0)) : 0.0;
-    out.world = world;
-    out.exec_slots = std::move(exec_slots);
-    out.X.resize(static_cast<size_t>(n_rec) * feat_dim);
-    out.PI.resize(static_cast<size_t>(n_rec) * n_slots);
-    out.M.resize(static_cast<size_t>(n_rec) * n_slots);
-    out.Y.resize(n_rec);
-    for (int j = 0; j < n_rec; ++j) {
-        for (int c = 0; c < feat_dim; ++c)
-            out.X[static_cast<size_t>(j) * feat_dim + c] = static_cast<float>(feats[j][c]);
-        for (int c = 0; c < n_slots; ++c) {
-            out.PI[static_cast<size_t>(j) * n_slots + c] = pis[j][c];
-            out.M[static_cast<size_t>(j) * n_slots + c] = masks[j][c];
-        }
-        // the trailing TERMINATE decision (j >= n_dec) has no step: its target is the exit toll
-        // continuation, -λ·exit_c (mirrors generate_episode's terminal-decision g).
-        double g = (j < n_dec) ? g_steps[j] : (-lam * exit_c);
-        out.Y[j] = static_cast<float>(g);
-    }
-    return out;
+    const double exit_c = env.exit_cost(loc.pt);
+    const int nb_final = env.nb(bw);  // L6, via the seam (the belief-shrinkage stat reads this)
+    return std::move(eb).finalize(exit_c, nb_final);
 }
 
-// A small splitmix64-style fold over (seed, idx) to seed each episode's RNG and pick its world.
-// (This is the C++ runner's OWN per-episode seeding; it is NOT the Python worker's numpy seed fold —
-// the RNGs differ across the language boundary by design, so parity is the ADR-0012 P6 behavioral
-// bar, not byte-identity. The harness reproduces THIS fold to match worlds episode-for-episode.)
-static uint64_t fold_seed(uint64_t seed, int idx) {
+// A small splitmix64-style fold over (seed, idx) to seed each episode's RNG and pick its world. The ONE
+// home (P1 — declared in runner.hpp): both run_episodes and the LOCAL batched driver seed off THIS, so
+// they pick the SAME world + stream per idx. (It is NOT the Python worker's numpy seed fold — the RNGs
+// differ across the language boundary by design, so cross-language parity is the ADR-0012 P6 behavioral
+// bar; the harness reproduces THIS fold to match worlds episode-for-episode.)
+uint64_t fold_seed(uint64_t seed, int idx) {
     uint64_t z = seed + static_cast<uint64_t>(idx) * 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;

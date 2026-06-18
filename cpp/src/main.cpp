@@ -117,12 +117,20 @@ int main(int argc, char** argv) {
             std::cerr << prog << ": FATAL: --serve requires --run <id> (the redis weight-key namespace)\n";
             return 2;
         }
+        // The wire-path startup knobs (their ONE home is RuntimeConfig; they ride --serve STARTUP args, never
+        // ActorConfig — ADR-0012 P1 / Q6). A non-empty --infer-endpoint selects the WIRE generation path
+        // (every leaf resolved remotely on the JAX InferenceServer over a DEALER); absent -> serial.
+        // --pool-threads / --pool-batch override RuntimeConfig::from_env's defaults (0 -> the env/default).
+        chocofarm::ServeOptions opts;
+        if (auto v = opt(args, "--infer-endpoint")) opts.infer_endpoint = std::string(*v);
+        if (auto v = opt(args, "--pool-threads")) opts.pool_threads = to_int(*v);
+        if (auto v = opt(args, "--pool-batch")) opts.pool_batch = to_int(*v);
         auto redis = chocofarm::RedisClient::create();  // CHOCO_TRANSPORT_REDIS_* contract (no hardcoded port)
         if (!redis) {
             std::cerr << prog << ": FATAL: " << redis.error().message << "\n";
             return 1;
         }
-        return chocofarm::serve(*redis, std::string(*serve_run), std::cin, std::cout);
+        return chocofarm::serve(*redis, std::string(*serve_run), opts, std::cin, std::cout);
     }
 
     std::optional<std::string_view> instance = opt(args, "--instance");

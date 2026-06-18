@@ -42,26 +42,23 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <deque>
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/fiber_tree.hpp"
 #include "chocofarm/gumbel.hpp"
-#include "chocofarm/inference_wire.hpp"
 #include "chocofarm/instance.hpp"
 #include "chocofarm/net_evaluator.hpp"
 #include "chocofarm/runtime_config.hpp"
+#include "chocofarm/wire_leaf_pool.hpp"
 
 namespace {
 [[nodiscard]] std::optional<std::string_view> opt(std::span<const std::string_view> args,
@@ -77,35 +74,13 @@ namespace {
     return std::chrono::duration<double>(b - a).count();
 }
 
-// Receive one reply and split it into its echoed correlation id (the LEADING frame, an opaque u64 the
-// server round-tripped) and the response payload (the LAST frame). Fails loud (returns false) on a
-// recv error or a malformed envelope (fewer than 2 frames, or a leading frame that is not 8 bytes) —
-// ADR-0002: a desynchronized wire is never silently papered over.
-[[nodiscard]] bool recv_corr_payload(void* sock, uint64_t& corr, std::vector<unsigned char>& payload) {
-    std::vector<std::vector<unsigned char>> frames;
-    int more = 1;
-    while (more) {
-        zmq_msg_t m;
-        zmq_msg_init(&m);
-        if (zmq_msg_recv(&m, sock, 0) < 0) {
-            zmq_msg_close(&m);
-            return false;
-        }
-        const auto* d = static_cast<const unsigned char*>(zmq_msg_data(&m));
-        frames.emplace_back(d, d + zmq_msg_size(&m));
-        more = zmq_msg_more(&m);
-        zmq_msg_close(&m);
-    }
-    if (frames.size() < 2 || frames.front().size() != sizeof(uint64_t)) return false;
-    std::memcpy(&corr, frames.front().data(), sizeof(uint64_t));   // opaque round-trip: native bytes
-    payload = std::move(frames.back());
-    return true;
-}
-
-// The fiber<->driver channel, the YieldingNetEvaluator, the scripted Gumbel source, and the per-tree
-// TreeState are the ONE-home shared primitives — chocofarm::{FiberLeafChannel, YieldingNetEvaluator}
-// (fiber_leaf.hpp), CyclicGumbelSource (cyclic_gumbel.hpp), TreeState (fiber_tree.hpp). This bench is now
-// only the GREEDY-ASYNC T×K DRIVER over those primitives (the corr-id transport + the work loop).
+// The fiber<->driver channel, the YieldingNetEvaluator, the scripted Gumbel source, the per-tree
+// TreeState, AND the corr-id DEALER transport are the ONE-home shared primitives —
+// chocofarm::{FiberLeafChannel, YieldingNetEvaluator} (fiber_leaf.hpp), CyclicGumbelSource
+// (cyclic_gumbel.hpp), TreeState (fiber_tree.hpp), WireLeafPool (wire_leaf_pool.hpp — the submit/poll/
+// corr-id transport lifted out of this bench's former worker lambda, P1). This bench is now only the
+// GREEDY-ASYNC T×K DRIVER over those primitives (the scripted-task fill + the work loop); the wire
+// driver run_episodes_wire_batched reuses the SAME WireLeafPool with a real episode loop.
 
 const std::vector<double> kGtable{0.40, -0.65, 1.10, 0.05, -0.30, 0.85, -1.20, 0.55,
                                   0.20, -0.45, 0.95, -0.10, 0.70};
@@ -170,31 +145,23 @@ int main(int argc, char** argv) {
     std::atomic<uint64_t> corr_seq{0};
 
     auto worker = [&](int tid) {
-        void* sock = zmq_socket(zctx, ZMQ_DEALER);
-        int linger = 0;
-        zmq_setsockopt(sock, ZMQ_LINGER, &linger, sizeof(linger));
-        zmq_setsockopt(sock, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
-        if (zmq_connect(sock, std::string(*endpoint).c_str()) != 0) {
-            failed.store(true);
-            zmq_close(sock);
-            return;
-        }
+        // the corr-id submit/poll DEALER transport now lives in the shared WireLeafPool (P1). A connect
+        // failure is the pool's loud error arm (a dead endpoint surfaces only at the first poll recv,
+        // CRITIQUE D2 — lazy connect).
+        auto pool_e = chocofarm::WireLeafPool::create(zctx, std::string(*endpoint), timeout_ms, corr_seq);
+        if (!pool_e) { failed.store(true); return; }
+        chocofarm::WireLeafPool pool = std::move(*pool_e);
+
         // this thread's disjoint task subset: tid, tid+T, tid+2T, ...
         std::deque<int> my_tasks;
         for (int i = tid; i < n_tasks; i += T) my_tasks.push_back(i);
 
         std::vector<std::unique_ptr<chocofarm::TreeState>> slots(static_cast<size_t>(K));
-        std::unordered_map<uint64_t, int> inflight;  // corr-id -> slot id of its outstanding leaf
         long my_leaves = 0;
         int my_decided = 0;
 
         auto submit = [&](int s) {
-            std::vector<unsigned char> req = chocofarm::wire::encode_request(slots[static_cast<size_t>(s)]->ch.features);
-            uint64_t corr = corr_seq.fetch_add(1, std::memory_order_relaxed);
-            // frame 1: the corr-id (opaque u64, the server echoes it back verbatim). frame 2: the payload.
-            if (zmq_send(sock, &corr, sizeof(corr), ZMQ_SNDMORE) < 0) { failed.store(true); return; }
-            if (zmq_send(sock, req.data(), req.size(), 0) < 0) { failed.store(true); return; }
-            inflight.emplace(corr, s);
+            if (!pool.submit(s, slots[static_cast<size_t>(s)]->ch.features)) failed.store(true);
         };
         // (re)fill slot s with the next task; submit its first leaf. Returns true if a leaf was submitted.
         auto fill = [&](int s) -> bool {
@@ -209,19 +176,11 @@ int main(int argc, char** argv) {
         };
 
         for (int s = 0; s < K && !failed.load(); ++s) fill(s);
-        while (!inflight.empty() && !failed.load()) {
-            uint64_t corr = 0;
-            std::vector<unsigned char> payload;
-            if (!recv_corr_payload(sock, corr, payload)) { failed.store(true); break; }
-            auto decoded = chocofarm::wire::decode_response(payload);
-            if (!decoded) { failed.store(true); break; }
-            auto it = inflight.find(corr);
-            if (it == inflight.end()) { failed.store(true); break; }  // unknown corr-id: a desync, loud
-            int s = it->second; inflight.erase(it);  // corr-id: this reply is for slot s's outstanding leaf
-            chocofarm::NetPrediction pred;
-            pred.value = decoded->value;
-            pred.logits = std::move(decoded->logits);
-            slots[static_cast<size_t>(s)]->resume_with(pred);
+        while (pool.any_outstanding() && !failed.load()) {
+            auto c = pool.poll();
+            if (!c) { failed.store(true); break; }  // recv error / decode fail / unknown corr-id: loud
+            const int s = c->slot;
+            slots[static_cast<size_t>(s)]->resume_with(c->pred);
             ++my_leaves;
             if (slots[static_cast<size_t>(s)]->running) {
                 submit(s);  // parked at the next leaf — keep the pipe full
@@ -230,7 +189,6 @@ int main(int argc, char** argv) {
                 fill(s);  // finished — start the next task in this slot
             }
         }
-        zmq_close(sock);
         leaf_total.fetch_add(my_leaves);
         decided_total.fetch_add(my_decided);
     };

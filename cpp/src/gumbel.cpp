@@ -592,35 +592,10 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     return out;
 }
 
-namespace {
-// The production Gumbel source: the generic uniform sample_world (reused from the shared
-// RngWorldSource — ADR-0012 P1) + a real gumbel draw off the same std::mt19937_64. RNG note (P6):
-// std::mt19937_64 / the std gumbel transform do NOT match numpy's stream, so production parity is the
-// BEHAVIORAL bar; the discrete logic is validated RNG-free by the scripted source in gumbel_dump.cpp.
-class RngGumbelSource final : public GumbelSource {
-  public:
-    RngGumbelSource(const Environment& env, std::mt19937_64& rng) : draw_(env, rng), rng_(rng) {}
-
-    uint32_t sample_world(const Belief& bw) override { return draw_.sample_world(bw); }
-
-    std::vector<double> gumbel(int n) override {
-        // Gumbel(0,1) via the inverse-CDF transform -log(-log(U)), U in (0,1) (mirrors numpy's gumbel
-        // family, NOT its exact stream — the behavioral bar). U is drawn off (0,1) open to avoid log(0).
-        std::vector<double> out(static_cast<size_t>(n));
-        std::uniform_real_distribution<double> unif(
-            std::numeric_limits<double>::min(), 1.0);  // (0,1], min() avoids log(0)
-        for (int i = 0; i < n; ++i) {
-            double u = unif(rng_);
-            out[static_cast<size_t>(i)] = -std::log(-std::log(u));
-        }
-        return out;
-    }
-
-  private:
-    RngWorldSource draw_;   // the shared generic uniform-from-belief draw (ADR-0012 P1)
-    std::mt19937_64& rng_;  // the SAME stream the draw uses, for the gumbel draw
-};
-}  // namespace
+// RngGumbelSource (the production Gumbel source) now lives in gumbel.hpp (the ONE home, ADR-0012 P1):
+// promoted out of this anonymous namespace so the LOCAL batched driver's per-slot TreeState constructs
+// the SAME source decide_with_target does — byte-identical RNG draw order across the serial and batched
+// paths. The class body is unchanged; decide_with_target below constructs the header class identically.
 
 GumbelAZPolicy::Decision GumbelAZPolicy::decide_with_target(
     const Environment& env, const Loc& loc, const Belief& bw,

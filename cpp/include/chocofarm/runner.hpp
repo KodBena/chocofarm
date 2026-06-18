@@ -19,6 +19,8 @@
 #include <ostream>
 #include <random>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "chocofarm/env.hpp"
 #include "chocofarm/error.hpp"
@@ -60,13 +62,77 @@ struct EpisodeBlocks {
     std::vector<int> exec_slots;  // executed action slots in order (+ TERMINATE slot if it ended so)
 };
 
+// EpisodeBuilder — the per-episode RECORD-ASSEMBLY accumulator extracted from run_episode (the ONE home
+// for the float-sensitive value-target suffix math, ADR-0012 P1/P3 / docs/design/
+// cpp-local-batched-runtime.md Chunk 3). It owns the (feat, pi, mask) record accumulation and the
+// pure-MC λ-penalized return-to-go finalization, WITHOUT the serial ply loop — so the K-fiber-mux
+// batched driver (run_episodes_batched) can drive K episodes' record accumulation + finalization
+// concurrently while run_episode keeps its serial loop. The suffix math at finalize() is moved VERBATIM
+// from the former run_episode body (behaviour-preserving extraction): byte-identical EpisodeBlocks
+// before/after (the §5 layer-3 wire-content parity gate).
+//
+// Value semantics: built by the static factory create(), fed record_decision()/record_step() per ply,
+// consumed by finalize() && (rvalue-qualified — the builder is spent). It holds the per-episode aggregate
+// counters (n_collect/n_sense/n_terminate) and the world + bw0 for the stats; lam is captured at create
+// (the live per-decision λ, P4 — constant within one episode).
+class EpisodeBuilder {
+  public:
+    // Build the accumulator for one episode. `feat_dim`/`n_slots` size the output blocks; `world`/`bw0`
+    // are stamped into the stats; `lam` is this episode's live Dinkelbach penalty (constant within the
+    // episode). The env/fb are NOT held (the builder is pure record assembly); the caller owns dynamics.
+    [[nodiscard]] static EpisodeBuilder create(uint32_t world, double lam, int feat_dim, int n_slots,
+                                               int bw0);
+
+    // Record one DECIDED ply (mirrors run_episode's record block, runner.cpp:54-67): the feature row,
+    // the improved-π PI row, and the legality mask. `is_terminate` marks the trailing TERMINATE decision
+    // (which executes no step); `exec_slot` is the executed action slot (or the TERMINATE slot). Moves
+    // the vectors in (the caller is done with them).
+    void record_decision(std::vector<double> feat, std::vector<float> pi, std::vector<float> mask,
+                         bool is_terminate, bool is_collect, int exec_slot);
+
+    // Record the env.apply result for a NON-TERMINATE step (mirrors run_episode's step push,
+    // runner.cpp:68-69): the immediate (reward, dt) the value-target suffix sums. Call exactly once per
+    // record_decision whose is_terminate==false, AFTER that record_decision.
+    void record_step(double reward, double dt);
+
+    // The suffix-return value target + the aggregate stats (the verbatim runner.cpp:72-117 math),
+    // CONSUMED (rvalue-qualified). `exit_cost` is env.exit_cost(loc.pt) at episode end (the exit toll in
+    // every value suffix). `nb_final` is env.nb(bw) at episode end (for the belief-shrinkage stat).
+    [[nodiscard]] EpisodeBlocks finalize(double exit_cost, int nb_final) &&;
+
+  private:
+    EpisodeBuilder() = default;
+
+    uint32_t world_ = 0;
+    double lam_ = 0.0;
+    int feat_dim_ = 0;
+    int n_slots_ = 0;
+    int bw0_ = 0;
+    std::vector<std::vector<double>> feats_;
+    std::vector<std::vector<float>> pis_;
+    std::vector<std::vector<float>> masks_;
+    std::vector<std::pair<double, double>> step_rt_;  // (r, dt) per EXECUTED (non-TERMINATE) step
+    std::vector<int> exec_slots_;
+    int n_collect_ = 0;
+    int n_sense_ = 0;
+    int n_terminate_ = 0;
+};
+
 // Run ONE episode against `world` under `policy`, building the per-decision records. `rng` is the
 // per-episode RNG (seeded by the caller). `max_steps` is the live horizon (P4). Mirrors
 // generate_episode: record (feat, pi, mask, g) per decision incl. a trailing TERMINATE decision,
-// with g the pure-MC suffix return-to-go.
+// with g the pure-MC suffix return-to-go. Re-expressed (Chunk 3) as EpisodeBuilder + the serial ply
+// loop — behaviour-preserving (byte-identical EpisodeBlocks before/after).
 [[nodiscard]] EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb,
                                         const Policy& policy, uint32_t world, double lam,
                                         std::mt19937_64& rng, int max_steps);
+
+// A splitmix64-style fold over (cfg.seed, episode idx) — the C++ runner's OWN per-episode seeding (NOT
+// the Python worker's numpy seed fold; the RNGs differ across the language boundary by design, so parity
+// is the ADR-0012 P6 behavioral bar). The ONE home (P1): both run_episodes and the LOCAL batched driver
+// (run_episodes_batched) seed each episode's persistent rng with THIS fold, so they pick the SAME world
+// + draw the SAME stream per idx (the byte-identity basis for the batched↔serial parity).
+[[nodiscard]] uint64_t fold_seed(uint64_t seed, int idx);
 
 // Configuration for a runner pass (all live scalars; P4). `run`/`phase`/`version` select the weights
 // to read; `episodes` is E; `lam`/`max_steps` are the live knobs; `seed` seeds the per-episode RNG

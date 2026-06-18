@@ -349,11 +349,14 @@ def run(args: argparse.Namespace) -> None:
     if args.cpp_runner:
         from chocofarm.az.cpp_executor import CppActorExecutor
         executor = CppActorExecutor(args.cpp_runner, args.cpp_instance, args.cpp_faces, env,
-                                    master_seed, cfg0.search.use_jax_mlp, in_dim, n_slots)
-        print(f"C++ Gumbel ACTOR generation (runner={args.cpp_runner}); eval/train/replay/checkpoint "
-              f"in-process; weights + transitions over redis run={executor.run}. Value target is the "
-              f"actor's pure-MC λ-return (Part-B blend is fail-loud-guarded — not yet on the C++ wire).",
-              flush=True)
+                                    master_seed, cfg0.search.use_jax_mlp, in_dim, n_slots,
+                                    pool_threads=args.cpp_pool_threads, pool_batch=args.cpp_pool_batch)
+        _wire = " WIRE leaf-eval (in-process JAX server, T={}/B={})".format(
+            args.cpp_pool_threads, args.cpp_pool_batch) if args.cpp_pool_batch > 0 else " serial local-NetForward leaf"
+        print(f"C++ Gumbel ACTOR generation (runner={args.cpp_runner};{_wire}); eval/train/replay/"
+              f"checkpoint in-process; weights + transitions over redis run={executor.run}. Value target "
+              f"is the actor's pure-MC λ-return (Part-B blend is fail-loud-guarded — not yet on the C++ "
+              f"wire).", flush=True)
     elif cfg0.par.workers and cfg0.par.workers > 0:
         from chocofarm.az.parallel import ParallelExecutor
         # workers / cores / seed are RESTART (the pool is built once before the loop); read them off
@@ -577,6 +580,17 @@ def main() -> None:
                          "Python Environment, so the (X,PI,M,Y) dims match the net)")
     ap.add_argument("--cpp-faces", type=str, default="chocofarm/data/faces.json",
                     help="faces JSON the C++ runner loads (alongside --cpp-instance)")
+    # --- the C++ WIRE generation path (docs/design/cpp-wire-generation-roadmap.md): when --cpp-pool-batch>0,
+    #     the executor stands up an in-process JAX InferenceServer and the --serve runner resolves every
+    #     Gumbel-AZ leaf REMOTELY over it (the T×K fiber pool), instead of a serial local NetForward-per-leaf.
+    #     The pool knobs ride --serve STARTUP args (their ONE home is RuntimeConfig, not ActorConfig — P1).
+    #     --cpp-pool-batch=0 (default) keeps the serial local-leaf path (binary dispatch). ---
+    ap.add_argument("--cpp-pool-threads", type=int, default=4,
+                    help="C++ wire pool: T OS worker threads (only used when --cpp-pool-batch>0)")
+    ap.add_argument("--cpp-pool-batch", type=int, default=0,
+                    help="C++ wire pool: the in-flight leaf-eval target across the pool (the server batch "
+                         "B). >0 turns the WIRE leaf-eval path ON (an in-process JAX InferenceServer over "
+                         "an ipc:// DEALER); 0 (default) = the serial local-NetForward leaf path.")
     # --- Part B: lower-variance value target (mutually exclusive; default = pure MC) ---
     ap.add_argument("--td-lambda", type=float, default=1.0,
                     help="TD(λ) blend weight on the value target (Part B): 1.0 = pure MC (current "

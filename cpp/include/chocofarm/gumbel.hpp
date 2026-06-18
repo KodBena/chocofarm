@@ -52,8 +52,10 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <tuple>
 #include <unordered_map>
@@ -171,6 +173,41 @@ struct GumbelSource : public WorldSource {
     // One i.i.d. Gumbel(0,1) draw per slot, length `n` (mirrors rng.gumbel(size=n_slots)). Returned by
     // value (a length-n vector). The logic check returns a fixed scripted vector here.
     [[nodiscard]] virtual std::vector<double> gumbel(int n) = 0;
+};
+
+// The PRODUCTION Gumbel source (the ONE home, ADR-0012 P1): the generic uniform sample_world (reused
+// from the shared RngWorldSource) + a real gumbel draw off the SAME std::mt19937_64. RNG note (P6):
+// std::mt19937_64 / the std gumbel transform do NOT match numpy's stream, so production parity is the
+// BEHAVIORAL bar; the discrete logic is validated RNG-free by the scripted source in gumbel_dump.cpp.
+//
+// It is declared HERE (promoted from gumbel.cpp's anonymous namespace) so the LOCAL batched driver's
+// per-slot TreeState can host the SAME source decide_with_target builds — byte-identical RNG draw order
+// across the serial and batched paths (the §1-tension-#4 per-slot-RNG-isolation invariant of
+// docs/design/cpp-local-batched-runtime.md rests on the draw order being identical per tree). Header-
+// only (its body uses only RngWorldSource + the std gumbel transform), so there is exactly one
+// definition both gumbel.cpp's decide_with_target and the batched driver construct.
+class RngGumbelSource final : public GumbelSource {
+  public:
+    RngGumbelSource(const Environment& env, std::mt19937_64& rng) : draw_(env, rng), rng_(rng) {}
+
+    uint32_t sample_world(const Belief& bw) override { return draw_.sample_world(bw); }
+
+    std::vector<double> gumbel(int n) override {
+        // Gumbel(0,1) via the inverse-CDF transform -log(-log(U)), U in (0,1) (mirrors numpy's gumbel
+        // family, NOT its exact stream — the behavioral bar). U is drawn off (0,1) open to avoid log(0).
+        std::vector<double> out(static_cast<size_t>(n));
+        std::uniform_real_distribution<double> unif(
+            std::numeric_limits<double>::min(), 1.0);  // (0,1], min() avoids log(0)
+        for (int i = 0; i < n; ++i) {
+            double u = unif(rng_);
+            out[static_cast<size_t>(i)] = -std::log(-std::log(u));
+        }
+        return out;
+    }
+
+  private:
+    RngWorldSource draw_;   // the shared generic uniform-from-belief draw (ADR-0012 P1)
+    std::mt19937_64& rng_;  // the SAME stream the draw uses, for the gumbel draw
 };
 
 // Gumbel-AlphaZero search as a pluggable Policy. Construction takes the scalar config + the injected

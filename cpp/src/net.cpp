@@ -9,16 +9,19 @@
 //   ADR-0012 P9: the matmul/relu/require helpers are PURE VALUE-FUNCTIONS — they take typed,
 //   bounds-carrying std::span<const float> inputs and RETURN their result by value (no raw pointers,
 //   no `void f(..., Out& out)` out-parameters). The manifest validators return a small typed result
-//   OR a typed Error (rule 5). The arithmetic core (matvec_bias, relu, predict) is total — it neither
-//   throws nor returns expected; the only error surface is the manifest validation at create().
+//   OR a typed Error (rule 5). The arithmetic core (matvec_bias, relu, forward_one, predict) is total —
+//   it neither throws nor returns expected; the only error surface is the manifest validation at
+//   create(). predict() calls the one single-row core forward_one (P1); no Eigen/BLAS/-ffast-math.
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/net.hpp"
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace chocofarm {
 
@@ -200,12 +203,10 @@ std::expected<NetForward, Error> NetForward::create(const WeightPayload& payload
     return nf;
 }
 
-std::expected<NetPrediction, Error> NetForward::predict(std::span<const float> x) const {
+NetPrediction NetForward::forward_one(std::span<const float> x) const {
     // x.size() == in_dim() is the caller's invariant (the manifest-validating create() reconciled the
     // dims). A mismatch is a programmer bug, not a boundary failure — an assert, not an Error (P9).
-    // This LOCAL forward is TOTAL: it always returns the VALUE arm. The std::expected return is the
-    // NetEvaluator port shape (shared with the fallible remote ZmqNetClient), not a real error surface.
-    assert(static_cast<int>(x.size()) == in_dim_ && "NetForward::predict: x length != in_dim");
+    assert(static_cast<int>(x.size()) == in_dim_ && "NetForward::forward_one: x length != in_dim");
 
     // forward_core, verbatim, B=1, float32:
     //   z1 = X@W1 + b1; a1 = ReLU(z1)
@@ -236,6 +237,13 @@ std::expected<NetPrediction, Error> NetForward::predict(std::span<const float> x
         out.logits = matvec_bias(head_in, Wp_.v, hidden_, n_actions_, bp_.v);
     }
     return out;
+}
+
+std::expected<NetPrediction, Error> NetForward::predict(std::span<const float> x) const {
+    // This LOCAL forward is TOTAL: it always returns the VALUE arm. The std::expected return is the
+    // NetEvaluator port shape (shared with the fallible remote ZmqNetClient), not a real error surface.
+    // The compute is the shared single-row core (one home — P1).
+    return forward_one(x);
 }
 
 }  // namespace chocofarm

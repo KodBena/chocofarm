@@ -81,6 +81,11 @@ class NetForward final : public NetEvaluator {
   private:
     NetForward() noexcept = default;  // the factory fills the fields; construction never throws
 
+    // The single-row forward core (forward_core's graph, B=1, float32) — the ONE home (ADR-0012 P1)
+    // predict() calls. Total: the caller guarantees x.size()==in_dim_ (an assert, not an Error — P9).
+    // Returned by value (free under NRVO).
+    [[nodiscard]] NetPrediction forward_one(std::span<const float> x) const;
+
     // Row-major weight matrices/biases in float32 (the manifest blob is float64; cast once at build,
     // matching the Python f32 inference cache — float32-equivalence is the bar, not byte-identity).
     struct Mat { int rows = 0, cols = 0; std::vector<float> v; };  // row-major, v[r*cols + c]

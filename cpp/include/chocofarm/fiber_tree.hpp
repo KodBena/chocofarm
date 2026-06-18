@@ -25,6 +25,8 @@
 
 #include <boost/context/fiber.hpp>
 
+#include <optional>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -41,13 +43,27 @@ struct TreeState {
     FiberLeafChannel ch;
     YieldingNetEvaluator ynet;
     GumbelAZPolicy policy;
-    CyclicGumbelSource src;
+    CyclicGumbelSource src;             // the scripted RNG-free source (the benches + the Option-A proof)
+    std::optional<RngGumbelSource> rng_src;  // the PRODUCTION source (the additive RNG ctor; empty for cyclic)
     GumbelAZPolicy::Decision decision;
     boost::context::fiber fib;
     bool running = false;
 
+    // The SCRIPTED (RNG-free) ctor — the benches + fiber_proto path, unchanged: `table` scripts the
+    // CyclicGumbelSource draws (sample_world -> bw[0], gumbel -> the cycled table). rng_src stays empty,
+    // so the search runs off `src` (byte-identical to before this additive edit).
     TreeState(const GumbelConfig& cfg, const Environment& env, std::vector<double> table)
         : ynet(ch), policy(cfg, ynet, env), src(env, std::move(table)) {}
+
+    // The PRODUCTION (RNG-backed) ctor — the LOCAL batched driver path (docs/design/
+    // cpp-local-batched-runtime.md §1 tension #4): builds the SAME RngGumbelSource decide_with_target
+    // does, off the slot's PERSISTENT std::mt19937_64 (held by reference — the slot owns it, alive for
+    // the tree's whole life). The `src` member is constructed with an empty table (never used on this
+    // path: rng_src is non-empty, so active_source() returns the RNG source). The world-pick draw runs
+    // off the SAME rng ONCE at slot fill BEFORE this ctor's start() (mirroring runner.cpp:150-153) —
+    // owned by the driver, not here.
+    TreeState(const GumbelConfig& cfg, const Environment& env, std::mt19937_64& rng)
+        : ynet(ch), policy(cfg, ynet, env), src(env, {}), rng_src(std::in_place, env, rng) {}
 
     // The fiber captures `this` and ynet/policy hold references INTO this object, so the only correct
     // relocation semantics are "do not relocate". Make that compile-enforced (a silent dangle becomes a
@@ -58,16 +74,24 @@ struct TreeState {
     TreeState(TreeState&&) = delete;
     TreeState& operator=(TreeState&&) = delete;
 
+    // The source the search draws off: the PRODUCTION RngGumbelSource when the RNG ctor built it, else
+    // the scripted CyclicGumbelSource (the ONE selection point — neither path branches inside the
+    // search; only the injected source differs, P9).
+    [[nodiscard]] GumbelSource& active_source() {
+        return rng_src ? static_cast<GumbelSource&>(*rng_src) : static_cast<GumbelSource&>(src);
+    }
+
     // advance the UNCHANGED search to its first parked leaf (or to finish); `running` == parked-at-a-leaf.
     // LIFETIME: loc/bw/coll are captured BY REFERENCE into the fiber and re-read on every leaf across ALL
     // later resume_with() calls — keep them alive until `running` is false; pass named lvalues, never
     // temporaries (e.g. NOT start(loc, env.full_belief(), {}, lam) — that belief dies at the `;`).
     void start(const Loc& loc, const Belief& bw, const CollectedSet& coll, double lam) {
+        GumbelSource& source = active_source();
         fib = boost::context::fiber{
             std::allocator_arg, boost::context::fixedsize_stack(512 * 1024),
-            [this, &loc, &bw, &coll, lam](boost::context::fiber&& caller) {
+            [this, &loc, &bw, &coll, lam, &source](boost::context::fiber&& caller) {
                 ch.caller = std::move(caller);
-                decision = policy.run_search(loc, bw, coll, lam, src);
+                decision = policy.run_search(loc, bw, coll, lam, source);
                 ch.at_leaf = false;  // the search returned — no more leaves
                 return std::move(ch.caller);
             }};
