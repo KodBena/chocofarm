@@ -92,15 +92,31 @@ bool read_framed(std::vector<unsigned char>& out) {
 std::vector<unsigned char> roundtrip_request(std::span<const unsigned char> frame) {
     auto decoded = chocofarm::wire::decode_request(frame);
     if (!decoded) return {};   // unknown protocol byte / wrong length is loud (caller sees empty)
-    return chocofarm::wire::encode_request(*decoded);
+    auto re = chocofarm::wire::encode_request(decoded->flat, decoded->B, decoded->in_dim);
+    if (!re) return {};
+    return *re;
 }
 
-// Decode a RESPONSE [ver:u8][n_actions:u32][value:f32][logits:f32×n_actions] to its (value, logits)
-// fields via the shared codec, then re-encode from them — same exact-inverse proof for the response.
+// Decode a batched RESPONSE [ver:u8][B:u32][n_actions:u32][ B × (value:f32, logits:f32×n_actions) ] to
+// its B predictions via the shared codec, then re-encode from them — same exact-inverse proof for the
+// response. Re-flattens the B predictions' values + logits into the encode_response (values, flat) shape.
 std::vector<unsigned char> roundtrip_response(std::span<const unsigned char> frame) {
     auto decoded = chocofarm::wire::decode_response(frame);
     if (!decoded) return {};
-    return chocofarm::wire::encode_response(decoded->value, decoded->logits);
+    const auto& preds = *decoded;
+    chocofarm::wire::count_t n_actions =
+        preds.empty() ? 0 : static_cast<chocofarm::wire::count_t>(preds[0].logits.size());
+    std::vector<float> values;
+    std::vector<float> logits_flat;
+    values.reserve(preds.size());
+    logits_flat.reserve(preds.size() * n_actions);
+    for (const auto& p : preds) {
+        values.push_back(p.value);
+        logits_flat.insert(logits_flat.end(), p.logits.begin(), p.logits.end());
+    }
+    auto re = chocofarm::wire::encode_response(values, logits_flat, n_actions);
+    if (!re) return {};
+    return *re;
 }
 
 int run_wire() {

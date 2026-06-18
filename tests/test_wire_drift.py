@@ -149,11 +149,12 @@ def test_wire_spec_field_widths_agree():
     assert _cpp_int_const(src, "VERSION_BYTES") == wire_spec.VERSION_BYTES
     assert _cpp_int_const(src, "COUNT_BYTES") == wire_spec.COUNT_BYTES
     assert _cpp_int_const(src, "FLOAT_BYTES") == wire_spec.FLOAT_BYTES
-    # The C++ HEADER_BYTES is DERIVED (`= VERSION_BYTES + COUNT_BYTES;`), not a literal — exactly the
-    # derive-don't-duplicate posture (P1), so there is no second literal here to drift-check. We pin the
-    # two component widths above and confirm the Python codec's own fixed-header struct equals their
-    # sum, so the request/response header size both sides build is reconciled to the same components.
-    py_header = wire_spec.VERSION_BYTES + wire_spec.COUNT_BYTES
+    # The C++ HEADER_BYTES is DERIVED (`= VERSION_BYTES + COUNT_BYTES + COUNT_BYTES;`), not a literal —
+    # exactly the derive-don't-duplicate posture (P1), so there is no second literal here to drift-check.
+    # We pin the component widths above and confirm the Python codec's own fixed-header struct equals
+    # their sum (the BATCHED header is [version][B:u32][in_dim|n_actions:u32] — version + TWO counts), so
+    # the request/response header size both sides build is reconciled to the same components.
+    py_header = wire_spec.VERSION_BYTES + wire_spec.COUNT_BYTES + wire_spec.COUNT_BYTES
     assert wire._REQ_HEADER.size == py_header
     assert wire._RESP_HEADER.size == py_header
 
@@ -205,38 +206,50 @@ def test_wire_codec_emits_exactly_the_spec_bytes():
     would differ from this little-endian reference and this reds — closing the hole where the codec's
     own round-trip stays green under a SYMMETRIC encode∘decode drift."""
     rng = np.random.default_rng(7)
-    X = rng.standard_normal(11).astype(np.float64)   # arbitrary input dtype; the wire is '<f4'
-    # reference: the spec's header struct + a little-endian f32 payload, derived from wire_spec ONLY.
-    ref_req = (struct.pack(wire_spec.REQ_HEADER_FMT, wire_spec.PROTOCOL_VERSION, X.shape[0])
+    # the BATCHED frame: a (B, in_dim) request matrix and B value+logits response rows. B=2 here so the
+    # reference exercises the multi-row layout (the row-major byte order + the per-row response records).
+    B, in_dim, n_actions = 2, 11, 6
+    X = rng.standard_normal((B, in_dim)).astype(np.float64)   # arbitrary input dtype; the wire is '<f4'
+    # reference: the spec's header struct + a little-endian f32 row-major payload, derived from wire_spec ONLY.
+    ref_req = (struct.pack(wire_spec.REQ_HEADER_FMT, wire_spec.PROTOCOL_VERSION, B, in_dim)
                + X.astype(wire_spec.FLOAT_DTYPE).tobytes())
     assert wire.encode_request(X) == ref_req
 
-    value, logits = -1.75, rng.standard_normal(6).astype(np.float64)
-    ref_resp = (struct.pack(wire_spec.RESP_HEADER_FMT, wire_spec.PROTOCOL_VERSION, logits.shape[0])
-                + struct.pack(wire_spec.VALUE_FMT, value)
-                + logits.astype(wire_spec.FLOAT_DTYPE).tobytes())
-    assert wire.encode_response(value, logits) == ref_resp
-    # the value-only edge (n_actions == 0, empty logits block).
-    ref_valonly = (struct.pack(wire_spec.RESP_HEADER_FMT, wire_spec.PROTOCOL_VERSION, 0)
-                   + struct.pack(wire_spec.VALUE_FMT, value))
-    assert wire.encode_response(value, None) == ref_valonly
+    values = rng.standard_normal(B).astype(np.float64)
+    logits = rng.standard_normal((B, n_actions)).astype(np.float64)
+    ref_resp = bytearray(struct.pack(wire_spec.RESP_HEADER_FMT, wire_spec.PROTOCOL_VERSION, B, n_actions))
+    for r in range(B):
+        ref_resp += struct.pack(wire_spec.VALUE_FMT, values[r])
+        ref_resp += logits[r].astype(wire_spec.FLOAT_DTYPE).tobytes()
+    assert wire.encode_response(values, logits) == bytes(ref_resp)
+    # the value-only edge (n_actions == 0, empty per-row logits block).
+    ref_valonly = bytearray(struct.pack(wire_spec.RESP_HEADER_FMT, wire_spec.PROTOCOL_VERSION, B, 0))
+    for r in range(B):
+        ref_valonly += struct.pack(wire_spec.VALUE_FMT, values[r])
+    assert wire.encode_response(values, None) == bytes(ref_valonly)
 
 
 def test_wire_codec_decodes_spec_bytes_to_exact_values():
     """The codec's DECODE reads the spec's little-endian-f32 bytes back to the exact values. Built from
     the spec-derived reference bytes (NOT from `encode_*`), so a decode-side dtype/byte-order drift is
     caught independently of the encode side."""
-    payload = np.array([1.5, -2.25, 0.0, 3.125], dtype=wire_spec.FLOAT_DTYPE)
-    ref_req = struct.pack(wire_spec.REQ_HEADER_FMT, wire_spec.PROTOCOL_VERSION, payload.size) + payload.tobytes()
+    # a B=2, in_dim=2 request matrix, row-major.
+    mat = np.array([[1.5, -2.25], [0.0, 3.125]], dtype=wire_spec.FLOAT_DTYPE)
+    ref_req = (struct.pack(wire_spec.REQ_HEADER_FMT, wire_spec.PROTOCOL_VERSION, 2, 2)
+               + mat.tobytes())
     got = wire.decode_request(ref_req)
     assert got.dtype == np.dtype(wire_spec.FLOAT_DTYPE)
-    assert np.array_equal(got, payload)
+    assert np.array_equal(got, mat)
 
-    logits = np.array([0.5, -0.5, 7.0], dtype=wire_spec.FLOAT_DTYPE)
-    ref_resp = (struct.pack(wire_spec.RESP_HEADER_FMT, wire_spec.PROTOCOL_VERSION, logits.size)
-                + struct.pack(wire_spec.VALUE_FMT, 9.5) + logits.tobytes())
-    val, got_logits = wire.decode_response(ref_resp)
-    assert val == 9.5
+    # a B=2, n_actions=3 batched response: per-row (value, logits) records.
+    values = np.array([9.5, -1.25], dtype=wire_spec.FLOAT_DTYPE)
+    logits = np.array([[0.5, -0.5, 7.0], [1.0, 2.0, 3.0]], dtype=wire_spec.FLOAT_DTYPE)
+    ref_resp = bytearray(struct.pack(wire_spec.RESP_HEADER_FMT, wire_spec.PROTOCOL_VERSION, 2, 3))
+    for r in range(2):
+        ref_resp += struct.pack(wire_spec.VALUE_FMT, float(values[r]))
+        ref_resp += logits[r].tobytes()
+    got_v, got_logits = wire.decode_response(bytes(ref_resp))
+    assert np.array_equal(got_v, values)
     assert got_logits is not None and np.array_equal(got_logits, logits)
 
 
@@ -565,11 +578,14 @@ def test_cpp_golden_wire_roundtrip(tmp_path):
     bytes Python sent. End-to-end proof that the two codecs agree, not just their declared constants."""
     bin_path = _build_golden(tmp_path)
     rng = np.random.default_rng(23)
-    # golden vectors: a typical request, a value+logits response, AND the value-only (n_actions=0) edge.
-    X = rng.standard_normal(17).astype(np.float32)
+    # golden vectors (BATCHED): a B=3 request matrix, a B=3 value+logits response, AND the value-only
+    # (n_actions=0) edge — exercising the multi-row layout across the language boundary.
+    B, in_dim, n_actions = 3, 17, 9
+    X = rng.standard_normal((B, in_dim)).astype(np.float32)
     req = wire.encode_request(X)
-    resp_full = wire.encode_response(1.2345, rng.standard_normal(9).astype(np.float32))
-    resp_valonly = wire.encode_response(-0.5, None)
+    resp_full = wire.encode_response(rng.standard_normal(B).astype(np.float32),
+                                     rng.standard_normal((B, n_actions)).astype(np.float32))
+    resp_valonly = wire.encode_response(rng.standard_normal(B).astype(np.float32), None)
 
     for resp in (resp_full, resp_valonly):
         stdin = _framed(req) + _framed(resp)

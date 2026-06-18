@@ -91,7 +91,13 @@ int main(int argc, char** argv) {
         std::vector<float> x(static_cast<size_t>(in_dim));
         for (int j = 0; j < in_dim; ++j)
             x[static_cast<size_t>(j)] = 0.01f * static_cast<float>((i * 7 + j) % 13 - 6);
-        std::vector<unsigned char> req = chocofarm::wire::encode_request(x);
+        // a single-leaf probe request is the degenerate B=1 batched frame.
+        auto req_e = chocofarm::wire::encode_request(x, /*B=*/1, static_cast<chocofarm::wire::count_t>(in_dim));
+        if (!req_e) {
+            std::cerr << "dealer-probe: FATAL: encode " << i << " failed: " << req_e.error().message << "\n";
+            return 1;
+        }
+        const std::vector<unsigned char>& req = *req_e;
         // send as ONE frame; the ROUTER prepends identity -> [identity][req], server reads frames[-1]=req.
         if (zmq_send(sock, req.data(), req.size(), 0) < 0) {
             std::cerr << "dealer-probe: FATAL: send " << i << " failed: " << zmq_strerror(zmq_errno())
@@ -117,9 +123,15 @@ int main(int argc, char** argv) {
             std::cerr << "dealer-probe: decode " << i << " failed: " << decoded.error().message << "\n";
             break;
         }
-        if (i == 0) first_value = decoded->value;
-        if (!std::isfinite(decoded->value)) all_finite = false;
-        for (float l : decoded->logits)
+        if (decoded->size() != 1) {
+            std::cerr << "dealer-probe: reply " << i << " carried " << decoded->size()
+                      << " predictions, expected 1 (B=1 probe)\n";
+            break;
+        }
+        const chocofarm::wire::ResponseFields& pred = (*decoded)[0];
+        if (i == 0) first_value = pred.value;
+        if (!std::isfinite(pred.value)) all_finite = false;
+        for (float l : pred.logits)
             if (!std::isfinite(l)) all_finite = false;
         ++got;
     }

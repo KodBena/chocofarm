@@ -161,8 +161,16 @@ int main(int argc, char** argv) {
         if (rounds == 0) first_batch = static_cast<int>(active.size());
         ++rounds;
         for (int i : active) {
-            std::vector<unsigned char> req =
-                chocofarm::wire::encode_request(trees[static_cast<size_t>(i)]->ch.features);
+            std::span<const float> feats = trees[static_cast<size_t>(i)]->ch.features;
+            // a per-leaf submit is the degenerate B=1 batched frame.
+            auto req_e = chocofarm::wire::encode_request(
+                feats, /*B=*/1, static_cast<chocofarm::wire::count_t>(feats.size()));
+            if (!req_e) {
+                std::cerr << "wire-parallel-bench: FATAL: encode failed: " << req_e.error().message << "\n";
+                failed = true;
+                break;
+            }
+            const std::vector<unsigned char>& req = *req_e;
             if (zmq_send(sock, req.data(), req.size(), 0) < 0) {
                 std::cerr << "wire-parallel-bench: FATAL: send failed: " << zmq_strerror(zmq_errno())
                           << "\n";
@@ -187,9 +195,15 @@ int main(int argc, char** argv) {
                 failed = true;
                 break;
             }
+            if (decoded->size() != 1) {
+                std::cerr << "wire-parallel-bench: FATAL: reply carried " << decoded->size()
+                          << " predictions, expected 1 (B=1 per-leaf)\n";
+                failed = true;
+                break;
+            }
             chocofarm::NetPrediction pred;
-            pred.value = decoded->value;
-            pred.logits = std::move(decoded->logits);
+            pred.value = (*decoded)[0].value;
+            pred.logits = std::move((*decoded)[0].logits);
             trees[static_cast<size_t>(i)]->resume_with(pred);
             ++leaf_total;
         }

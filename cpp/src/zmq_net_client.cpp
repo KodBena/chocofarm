@@ -126,7 +126,12 @@ std::expected<NetPrediction, Error> ZmqNetClient::predict(std::span<const float>
                 "chocofarm ZmqNetClient: feature vector has a non-finite (NaN/Inf) entry — refusing to RPC"));
 
     // ---- encode → send (the shared codec; the byte layout has one home — wire_spec) ----
-    std::vector<unsigned char> req = wire::encode_request(x);
+    // A single-leaf RPC is the degenerate B=1 batched request (the batched frame subsumes single-leaf).
+    auto req_e = wire::encode_request(x, /*B=*/1, static_cast<wire::count_t>(x.size()));
+    if (!req_e)
+        return std::unexpected(make_error("chocofarm ZmqNetClient: encode_request failed: " +
+                                          req_e.error().message));
+    const std::vector<unsigned char>& req = *req_e;
     int sent = zmq_send(sock_, req.data(), req.size(), 0);
     if (sent < 0)
         return std::unexpected(make_error(
@@ -166,10 +171,16 @@ std::expected<NetPrediction, Error> ZmqNetClient::predict(std::span<const float>
     auto decoded = wire::decode_response(reply);
     if (!decoded)
         return std::unexpected(decoded.error());   // malformed reply: the codec's typed rejection (§5)
+    // A single-leaf RPC expects exactly ONE prediction back (B=1). A reply carrying a different count is
+    // a desynchronized wire — a loud typed failure, never a silent wrong-row read (ADR-0002).
+    if (decoded->size() != 1)
+        return std::unexpected(make_error(
+            "chocofarm ZmqNetClient: reply carried " + std::to_string(decoded->size()) +
+            " predictions, expected 1 (single-leaf B=1 RPC)"));
 
     NetPrediction out;
-    out.value = decoded->value;
-    out.logits = std::move(decoded->logits);
+    out.value = (*decoded)[0].value;
+    out.logits = std::move((*decoded)[0].logits);
     return out;
 }
 

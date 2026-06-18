@@ -5,9 +5,16 @@ chocofarm/az/inference_server.py — the Shape B batched ZeroMQ inference SERVIC
 
 The production leaf evaluator (design §0): a single Python process that holds the weights, batches
 leaf-evaluation requests from N independent workers, and runs ONE `forward.forward_core` over the
-stacked `(B, in_dim)` matrix — the SAME SSOT every Python path runs (R11; there is no second
+stacked `(N_total, in_dim)` matrix — the SAME SSOT every Python path runs (R11; there is no second
 transcription here). The per-leaf cost amortizes over the batch; the net's architecture stays free to
 change because the wire (inference_wire.py) carries only float vectors and `(value, logits)`.
+
+BATCHED WIRE (the firewall #2 lever): each request frame now carries B leaves (the batched
+inference_wire frame; B=1 is the degenerate single-leaf case). The driver's strict gather-barrier sends
+ALL its parked leaves in ONE message; the server decodes the `(B, in_dim)` matrix, stacks it with any
+OTHER concurrently-queued requests' rows into one forward, and scatters each request's OWN B
+predictions back as one batched response frame. This collapses the ~820k one-leaf frames into one
+frame per gather-barrier — the per-leaf ZMQ+codec overhead that was the binding bottleneck.
 
 Three parts, separated so the batching LOGIC is testable without a socket and the weight reload is
 mockable without redis:
@@ -70,14 +77,15 @@ if TYPE_CHECKING:
 ForwardFn = Callable[[dict[str, "npt.NDArray[Any]"], Any, Any],
                      tuple[Any, "Any | None"]]
 
-# A batch row: (identity_frame, feature_row) — the ROUTER identity bytes to scatter the response back
-# to, and the decoded float32 feature vector (shape (in_dim,)). This is `run_microbatch`'s VALUE-LEVEL
-# input: the pure batching core knows only identities and rows, never the transport envelope.
+# A batch row: (identity_frame, feature_matrix) — the ROUTER identity bytes to scatter the response
+# back to, and the decoded float32 feature MATRIX (shape (B_i, in_dim) — the request's B leaves). This
+# is `run_microbatch`'s VALUE-LEVEL input: the pure batching core knows only identities and matrices,
+# never the transport envelope.
 BatchRow = tuple[bytes, "npt.NDArray[np.float32]"]
 
-# A drained request: (identity_frame, envelope_frames, feature_row). `envelope_frames` are the ROUTER
-# frames BETWEEN the identity and the payload (`frames[1:-1]`) — the transport-routing envelope the
-# server echoes back VERBATIM. For a REQ client this is the single empty delimiter `[b""]` (so the
+# A drained request: (identity_frame, envelope_frames, feature_matrix). `envelope_frames` are the
+# ROUTER frames BETWEEN the identity and the payload (`frames[1:-1]`) — the transport-routing envelope
+# the server echoes back VERBATIM. For a REQ client this is the single empty delimiter `[b""]` (so the
 # reply is byte-identical to the legacy `[identity][b""][resp]`); for a DEALER client carrying an
 # 8-byte correlation id it is `[corr_id]`; for a bare single-frame DEALER it is `[]`. The server never
 # PARSES the envelope — it round-trips it opaquely — so the correlation id needs no cross-language wire
@@ -88,36 +96,39 @@ DrainedRequest = tuple[bytes, list[bytes], "npt.NDArray[np.float32]"]
 def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
                    y_mean: float, y_std: float,
                    requests: list[BatchRow], pad_to: int | None = None) -> list[tuple[bytes, bytes]]:
-    """The PURE microbatch core (design §3): STACK the drained requests' feature rows into one
-    `(B, in_dim)` float32 matrix, run ONE `forward_fn(params, Xb, jnp)`, DE-STANDARDIZE the value
-    (v = v_std·y_std + y_mean), and SCATTER `(value, logits[i])` back per request as an encoded
-    response frame. Returns `[(identity, response_bytes), …]` aligned 1:1 with `requests`.
+    """The PURE microbatch core (design §3): CONCATENATE the drained requests' feature MATRICES (each a
+    request's B_i leaves) into one `(N_total, in_dim)` float32 matrix, run ONE `forward_fn(params, Xb,
+    jnp)`, DE-STANDARDIZE the value (v = v_std·y_std + y_mean), and SCATTER each request's OWN B_i
+    predictions back as ONE batched response frame. Returns `[(identity, response_bytes), …]` aligned
+    1:1 with `requests` (one reply per request, carrying that request's B_i predictions).
 
     This is the whole batching contract as a deterministic function of its inputs — no socket, no
-    redis — so the always-on test asserts B concurrent requests collapse to ONE `forward_fn` call and
-    each request gets ITS OWN row back (the drain/stack/scatter logic), against a stub forward.
+    redis — so the always-on test asserts that requests collapse to ONE `forward_fn` call and each
+    request gets ITS OWN rows back (the drain/concat/scatter logic), against a stub forward.
 
     `forward_fn` is the injected forward (the real `forward_core` under JAX in production; a stub in the
     test). The response carries the RAW logits (NOT softmaxed) + the de-standardized value — masking is
-    client-side (design §2). A value-only net (`logits is None`) scatters `n_actions=0` to every
-    request. Refuses an empty batch (ADR-0002 — the loop only calls this with ≥1 drained request)."""
+    client-side (design §2). A value-only net (`logits is None`) scatters `n_actions=0`. Refuses an
+    empty batch (ADR-0002 — the loop only calls this with ≥1 drained request)."""
     if not requests:
         raise ValueError("run_microbatch called with an empty batch (the drain guarantees ≥1 request)")
     identities = [ident for ident, _ in requests]
-    rows = [row for _, row in requests]
-    in_dim = rows[0].shape[0]
-    for i, r in enumerate(rows):
-        if r.shape != (in_dim,):
+    mats = [np.atleast_2d(m) for _, m in requests]
+    in_dim = mats[0].shape[1]
+    counts: list[int] = []
+    for i, m in enumerate(mats):
+        if m.ndim != 2 or m.shape[1] != in_dim:
             # A ragged batch (mixed in_dim) is a malformed mix the server must not silently pad/truncate
             # (ADR-0002 fail-loud). Every leaf of one net has the same feature dim by construction.
-            raise ValueError(f"batched request {i} has shape {r.shape}, expected ({in_dim},) — ragged batch")
-    Xb = np.stack(rows).astype(np.float32, copy=False)   # (B, in_dim) float32, the one stacked input
+            raise ValueError(f"batched request {i} has shape {m.shape}, expected (B_i, {in_dim}) — ragged batch")
+        counts.append(m.shape[0])
+    Xb = np.concatenate(mats, axis=0).astype(np.float32, copy=False)   # (N_total, in_dim), the one input
     B = Xb.shape[0]
     # PAD to a single fixed shape (pad_to, in_dim) so XLA compiles ONE executable instead of one per
     # drained B (the per-B recompile that dominated the server profile). Padded rows are zero and the
     # forward is row-independent, so the real rows' outputs are byte-identical to the unpadded forward
     # (ADR-0012 P6) — only the first B are read back below. pad_to is the server's max_batch and the drain
-    # caps B at max_batch, so this only ever pads UP.
+    # caps the total at max_batch, so this only ever pads UP.
     if pad_to is not None and pad_to > B:
         Xb = np.concatenate([Xb, np.zeros((pad_to - B, in_dim), dtype=np.float32)], axis=0)
     import chocofarm.config  # noqa: F401 — applies the XLA/OMP thread pin (SSOT) before jax initializes
@@ -126,9 +137,12 @@ def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
     v = np.asarray(v_std, dtype=np.float32).ravel() * np.float32(y_std) + np.float32(y_mean)
     logits_np = None if logits is None else np.asarray(logits, dtype=np.float32)
     out: list[tuple[bytes, bytes]] = []
-    for i, ident in enumerate(identities):
-        row_logits = None if logits_np is None else logits_np[i]
-        out.append((ident, encode_response(float(v[i]), row_logits)))
+    off = 0
+    for ident, n in zip(identities, counts):
+        v_rows = v[off:off + n]
+        l_rows = None if logits_np is None else logits_np[off:off + n]
+        out.append((ident, encode_response(v_rows, l_rows)))
+        off += n
     return out
 
 
@@ -286,7 +300,8 @@ class InferenceServer:
         if self._stop:
             return []
         drained: list[DrainedRequest] = []
-        while len(drained) < self._max_batch:
+        total_rows = 0   # the concatenated row count across drained requests (each carries B_i leaves)
+        while total_rows < self._max_batch:
             try:
                 frames = self._sock.recv_multipart(flags=zmq.NOBLOCK)
             except zmq.Again:
@@ -295,11 +310,12 @@ class InferenceServer:
             envelope = frames[1:-1]   # transport-routing frames (REQ delimiter / DEALER corr-id / none)
             payload = frames[-1]
             try:
-                X = decode_request(payload)
+                X = decode_request(payload)   # a (B_i, in_dim) matrix (B_i ≥ 1; B_i=1 is single-leaf)
             except Exception as exc:   # malformed request: loud reject of THIS frame, batch unaffected
                 self._reject(ident, exc)
                 continue
             drained.append((ident, envelope, X))
+            total_rows += X.shape[0]
         return drained
 
     def _reject(self, ident: bytes, exc: Exception) -> None:
@@ -359,9 +375,10 @@ class InferenceServer:
             b = int(b)
             if b < 1:
                 raise ValueError(f"InferenceServer.warmup: batch size {b} < 1 (the drain produces B≥1).")
-            rows: list[BatchRow] = [(b"", np.zeros((in_dim,), dtype=np.float32)) for _ in range(b)]
+            # ONE request carrying a (b, in_dim) matrix — concatenated + padded to (max_batch, in_dim).
+            rows: list[BatchRow] = [(b"", np.zeros((b, in_dim), dtype=np.float32))]
             # run_microbatch returns encoded response frames built from np.asarray(forward outputs) — the
-            # asarray blocks until XLA has actually compiled+run shape (B, in_dim). Discard the responses.
+            # asarray blocks until XLA has actually compiled+run shape (max_batch, in_dim). Discard them.
             run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch)
 
     def serve_forever(self) -> None:

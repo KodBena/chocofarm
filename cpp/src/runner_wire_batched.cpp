@@ -1,10 +1,12 @@
 // cpp/src/runner_wire_batched.cpp
 // Purpose: run_episodes_wire_batched (see runner_wire_batched.hpp) — the wire-batched generation driver.
 //   T worker threads, each multiplexing K resumable EpisodeSlots over its own WireLeafPool DEALER socket
-//   in a greedy-async loop, feeding the batched JAX InferenceServer. The per-ply episode logic (record-
-//   assembly, env.apply stepping, per-episode seeding + world draw, the pure-MC λ-return suffix target)
-//   is RE-DERIVED from the serial run_episode (runner.cpp:40-119) — same draws, same records, same
-//   EpisodeBlocks — and re-homed as a per-slot state machine; only the leaf is remote (over the wire).
+//   in a STRICT GATHER-BARRIER loop, feeding the batched JAX InferenceServer: gather ALL currently-parked
+//   slots' feature rows into ONE batched request (one corr-id, one send), await the ONE batched reply,
+//   resume all, repeat. The per-ply episode logic (record-assembly, env.apply stepping, per-episode
+//   seeding + world draw, the pure-MC λ-return suffix target) is RE-DERIVED from the serial run_episode
+//   (runner.cpp:40-119) — same draws, same records, same EpisodeBlocks — and re-homed as a per-slot
+//   state machine; only the leaf is remote (over the wire).
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/runner_wire_batched.hpp"
@@ -14,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -131,33 +134,19 @@ std::expected<int, Error> run_episodes_wire_batched(
         // this thread's disjoint episode subset: tid, tid+T, tid+2T, ...
         int next_idx = tid;
         std::vector<EpisodeSlot> slots(static_cast<size_t>(K));
+        const wire::count_t in_dim = static_cast<wire::count_t>(feat_dim);
 
-        // submit slot `s`'s currently-parked leaf into the pool (the corr-id DEALER send). A submit failure
-        // is a loud whole-pass abort (ADR-0002). Called ONLY when sl.ts->running (parked at a leaf) —
-        // per-tree-in-flight==1 is structural (a slot is resubmitted only after its resume).
-        auto submit_parked = [&](int s) -> bool {
-            if (!pool.submit(s, slots[static_cast<size_t>(s)].ts->ch.features)) {
-                set_error(make_error("run_episodes_wire_batched: leaf submit failed"));
-                return false;
-            }
-            return true;
-        };
-
-        // spawn the current ply's search tree on slot `s` for its LIVE (loc, bw, collected) AND submit its
-        // first leaf IF it parked — the ONE place a tree transitions into "parked", so "parked ⟹ submitted"
-        // holds BY CONSTRUCTION at the sole spawn producer (a caller cannot park-and-forget-to-submit; the
-        // original 0-write bug's whole class is closed here). Builds the RNG-ctor TreeState off the slot's
-        // persistent rng (the same RngGumbelSource decide_target builds, byte-identical draw order per tree),
-        // starts it, and submits iff `running`. If the search returns WITHOUT parking (degenerate empty-
-        // belief guard inside run_search), there is no leaf to submit and the caller drives the decision
-        // through on_search_done (`ts->running` is false). Returns false ONLY on a submit failure (failed
-        // set); a non-parking spawn returns true (no error — the slot just is not outstanding).
-        auto spawn_ply = [&](int s) -> bool {
+        // spawn the current ply's search tree on slot `s` for its LIVE (loc, bw, collected). The ONE
+        // place a tree transitions into "parked". Builds the RNG-ctor TreeState off the slot's persistent
+        // rng (the same RngGumbelSource decide_target builds, byte-identical draw order per tree), starts
+        // it. Leaves the slot PARKED (sl.ts->running) at its first leaf, OR finished (degenerate empty-
+        // belief guard inside run_search returns without parking). NB: unlike the prior greedy-async
+        // driver, spawn does NOT submit — the STRICT GATHER-BARRIER gathers all parked slots into ONE
+        // batched submit below, so submission is decoupled from spawning.
+        auto spawn_ply = [&](int s) {
             EpisodeSlot& sl = slots[static_cast<size_t>(s)];
             sl.ts = std::make_unique<TreeState>(gc, env, sl.rng);  // the PRODUCTION RNG ctor (fiber_tree.hpp:65)
             sl.ts->start(sl.loc, sl.bw, sl.collected, cfg.lam);
-            if (sl.ts->running) return submit_parked(s);  // parked ⟹ submit (the invariant, at its producer)
-            return true;                                  // degenerate non-parking spawn: nothing to submit
         };
 
         // finalize the episode in slot `s` and write its EpisodeBlocks (idx-keyed redis, same as
@@ -237,26 +226,28 @@ std::expected<int, Error> run_episodes_wire_batched(
         };
 
         // Drive slot `s`'s episode forward from a JUST-FINISHED search (ts->running false): apply the
-        // decision, then spawn the next ply — and KEEP draining any chain of non-parking plies (a degenerate
-        // empty-belief guard inside run_search returns without parking) until the slot is either parked-AND-
-        // submitted (returns true, a leaf is outstanding) or the episode finalized (returns false). spawn_ply
-        // submits on park, so "parked ⟹ submitted" holds without a separate submit here. Stops on `failed`.
+        // decision, then spawn the next ply — and KEEP draining any chain of non-parking plies (a
+        // degenerate empty-belief guard inside run_search returns without parking) until the slot is
+        // either PARKED at a leaf (returns true — its row will be gathered into the next barrier) or the
+        // episode finalized (returns false). Does NOT submit (the strict barrier gathers parked slots).
+        // Stops on `failed`.
         auto advance = [&](int s) -> bool {
             EpisodeSlot& sl = slots[static_cast<size_t>(s)];
             while (!failed.load()) {
                 if (!apply_decision(s)) return false;     // the episode finalized this ply
-                if (!spawn_ply(s)) return false;          // spawn submitted-on-park, or hit a submit error
-                if (sl.ts->running) return true;          // parked at the next leaf (already submitted)
+                spawn_ply(s);
+                if (sl.ts->running) return true;          // parked at the next leaf (to be gathered)
                 // a non-parking next ply (degenerate): loop to apply ITS immediate decision + spawn again.
             }
             return false;
         };
 
-        // (re)fill slot `s` with the next episode in this thread's subset; start its first ply's tree and
-        // submit the first leaf. Returns true iff a leaf is now in flight on this slot. Mirrors run_episodes'
-        // per-episode seed fold + world draw (runner.cpp:185-188), then run_episode's first-ply spawn.
-        // Skips immediately-finalizing episodes (empty belief / a search that returns without parking),
-        // trying the next idx — so a returned true always means a leaf is outstanding.
+        // (re)fill slot `s` with the next episode in this thread's subset; start its first ply's tree.
+        // Returns true iff the slot is now PARKED at a leaf (its row to be gathered). Mirrors
+        // run_episodes' per-episode seed fold + world draw (runner.cpp:185-188), then run_episode's
+        // first-ply spawn. Skips immediately-finalizing episodes (empty belief / a search that returns
+        // without parking), trying the next idx — so a returned true always means a leaf is parked. Does
+        // NOT submit (the strict barrier gathers parked slots into one batched send).
         auto fill = [&](int s) -> bool {
             EpisodeSlot& sl = slots[static_cast<size_t>(s)];
             while (next_idx < cfg.episodes && !failed.load()) {
@@ -280,44 +271,65 @@ std::expected<int, Error> run_episodes_wire_batched(
                     if (failed.load()) return false;
                     continue;
                 }
-                if (!spawn_ply(s)) return false;        // spawn submits-on-park (or a submit error -> false)
-                if (sl.ts->running) return true;        // a leaf is outstanding (spawn_ply already submitted)
+                spawn_ply(s);
+                if (sl.ts->running) return true;        // parked at the first leaf (to be gathered)
                 // degenerate: the first ply's search returned without parking (empty-belief guard inside
-                // run_search). Drive it forward; advance() submits-on-park and drains any non-parking chain.
-                if (advance(s)) return true;            // parked-AND-submitted somewhere down the chain
+                // run_search). Drive it forward; advance() drains any non-parking chain to a park/finalize.
+                if (advance(s)) return true;            // parked somewhere down the chain
                 if (failed.load()) return false;
                 // the episode finalized without ever parking a leaf — try the next idx in this slot.
             }
             return false;
         };
 
-        // prime K slots: each fill spawns + submits its first leaf (or finalizes a degenerate episode + moves on).
+        // prime K slots: each fill spawns the first ply (or finalizes a degenerate episode + moves on),
+        // leaving the slot PARKED at a leaf (no submit yet — the barrier gathers them below).
         for (int s = 0; s < K && !failed.load(); ++s) fill(s);
 
-        // the greedy-async drain: resume ONE slot per reply, then resubmit it (still parked) or advance its
-        // episode (decision done → record/step/finalize, then re-park or refill the slot). Per-tree-in-
-        // flight==1 is structural (a slot is resubmitted only AFTER its resume).
-        while (pool.any_outstanding() && !failed.load()) {
-            auto c = pool.poll();
-            if (!c) {                       // recv error / decode fail / unknown corr-id: loud abort
-                set_error(c.error());
-                break;
+        // ---- the STRICT GATHER-BARRIER drain ----
+        // Each round: gather ALL currently-parked slots' feature rows into ONE batched request, send it
+        // (one corr-id), await the ONE batched reply, then resume EACH parked slot in order — re-parking
+        // it (still running → its row joins the next gather) or advancing its episode (decision done →
+        // record/step/finalize, then re-spawn / refill). Loop until no slot is parked.
+        //
+        // (Rejected alternative: flush when ≥ a partial-parked threshold, keeping more RTT overlap. Left
+        //  as an open question; we defaulted to the strict barrier.)
+        std::vector<float> gather;            // the B parked rows, row-major (B·in_dim), rebuilt per round
+        std::vector<int> gathered_slots;      // the parked slots, in gather order (the scatter order)
+        auto any_parked = [&]() -> bool {
+            for (int s = 0; s < K; ++s)
+                if (slots[static_cast<size_t>(s)].active && slots[static_cast<size_t>(s)].ts &&
+                    slots[static_cast<size_t>(s)].ts->running)
+                    return true;
+            return false;
+        };
+        while (any_parked() && !failed.load()) {
+            gather.clear();
+            gathered_slots.clear();
+            for (int s = 0; s < K; ++s) {
+                EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+                if (sl.active && sl.ts && sl.ts->running) {
+                    std::span<const float> feats = sl.ts->ch.features;
+                    gather.insert(gather.end(), feats.begin(), feats.end());
+                    gathered_slots.push_back(s);
+                }
             }
-            const int s = c->slot;
-            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
-            sl.ts->resume_with(c->pred);
-            if (sl.ts->running) {
-                if (!submit_parked(s)) break;   // parked at the next leaf — keep the pipe full
-                continue;
+            auto sub = pool.submit_batch(gathered_slots, gather, in_dim);
+            if (!sub) { set_error(sub.error()); break; }
+            auto reply = pool.recv_batch();
+            if (!reply) { set_error(reply.error()); break; }   // recv/decode/corr-id/count: loud abort
+            // scatter the B predictions to their slots IN ORDER, resume each, then re-park or advance.
+            for (const Completion& c : *reply) {
+                if (failed.load()) break;
+                const int s = c.slot;
+                EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+                sl.ts->resume_with(c.pred);
+                if (sl.ts->running) continue;   // parked at the next leaf — its row joins the next gather
+                // the search returned its Decision: apply it + spawn/advance to the next leaf or finalize.
+                if (advance(s)) continue;       // parked again (down the chain) — joins the next gather
+                if (failed.load()) break;
+                fill(s);                        // finalized — start the next episode in this slot (or idle)
             }
-            // the search returned its Decision: apply it + spawn the next ply (advance submits-on-park and
-            // drains any non-parking chain). True -> a leaf is ALREADY outstanding again (advance submitted
-            // it — do NOT submit again); false -> the episode finalized, so refill the slot.
-            if (failed.load()) break;
-            if (advance(s)) continue;          // a leaf is outstanding (advance already submitted on park)
-            if (failed.load()) break;
-            // the episode finalized — start the next episode in this slot (or leave it idle if exhausted).
-            fill(s);
         }
     };
 

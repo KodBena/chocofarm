@@ -61,58 +61,69 @@ def _pyzmq_available() -> bool:
 # ===========================================================================
 # ALWAYS-ON 1 — the wire codec round-trips (identity), incl. value-only, and rejects malformed frames
 # ===========================================================================
+@pytest.mark.parametrize("B", [1, 2, 5, 64])
 @pytest.mark.parametrize("in_dim", [1, 2, 7, 65, 300])
 @pytest.mark.parametrize("n_actions", [0, 1, 65])
-def test_codec_round_trips_request_and_response(in_dim, n_actions):
-    """encode∘decode == identity over random float32 vectors, for the REQUEST (feature vector) and the
-    RESPONSE (de-std value + raw logits). `n_actions=0` is the value-only case (logits=None, empty
-    block). float32 is the wire dtype, so the round-trip is EXACT (no precision is lost re-reading the
-    same bytes)."""
-    rng = np.random.default_rng(1234 + in_dim * 131 + n_actions)
-    X = rng.standard_normal(in_dim).astype(np.float32)
+def test_codec_round_trips_request_and_response(B, in_dim, n_actions):
+    """encode∘decode == identity over random float32 BATCHES, for the REQUEST (a (B, in_dim) matrix) and
+    the RESPONSE (B de-std values + B raw-logits rows). B=1 is the degenerate single-leaf case;
+    `n_actions=0` is the value-only case (logits=None, empty per-row block). float32 is the wire dtype,
+    so the round-trip is EXACT (no precision lost re-reading the same bytes)."""
+    rng = np.random.default_rng(1234 + B * 911 + in_dim * 131 + n_actions)
+    X = rng.standard_normal((B, in_dim)).astype(np.float32)
     back_X = wire.decode_request(wire.encode_request(X))
     assert back_X.dtype == np.float32
+    assert back_X.shape == (B, in_dim)
     np.testing.assert_array_equal(back_X, X)   # EXACT — same f32 bytes re-read
 
-    value = float(rng.standard_normal())
-    logits = None if n_actions == 0 else rng.standard_normal(n_actions).astype(np.float32)
-    back_v, back_l = wire.decode_response(wire.encode_response(value, logits))
-    # value is encoded as a single f32, so it round-trips to its float32 image exactly
-    assert back_v == pytest.approx(np.float32(value), abs=0.0, rel=0.0) or back_v == float(np.float32(value))
+    values = rng.standard_normal(B).astype(np.float32)
+    logits = None if n_actions == 0 else rng.standard_normal((B, n_actions)).astype(np.float32)
+    back_v, back_l = wire.decode_response(wire.encode_response(values, logits))
+    assert back_v.shape == (B,)
+    np.testing.assert_array_equal(back_v, values)   # f32 round-trips its image exactly
     if n_actions == 0:
         assert back_l is None
     else:
         assert back_l is not None
         assert back_l.dtype == np.float32
+        assert back_l.shape == (B, n_actions)
         np.testing.assert_array_equal(back_l, logits)
 
 
+def test_codec_single_leaf_is_b1():
+    """A 1-D feature vector encodes as the degenerate B=1 batched request (the batched frame subsumes
+    single-leaf); decode returns a (1, in_dim) matrix."""
+    back_X = wire.decode_request(wire.encode_request(np.arange(5, dtype=np.float32)))
+    assert back_X.shape == (1, 5)
+    np.testing.assert_array_equal(back_X[0], np.arange(5, dtype=np.float32))
+
+
 def test_codec_value_only_response_is_empty_logits():
-    """The value-only path: `encode_response(v, None)` carries n_actions=0 and an EMPTY logits block,
-    and decodes back to `(v, None)` — mirroring forward_core's `logits=None`."""
-    frame = wire.encode_response(3.5, None)
+    """The value-only path: `encode_response(values, None)` carries n_actions=0 and an EMPTY per-row
+    logits block, and decodes back to `(values, None)` — mirroring forward_core's `logits=None`."""
+    frame = wire.encode_response(np.array([3.5, -1.0], dtype=np.float32), None)
     v, logits = wire.decode_response(frame)
     assert logits is None
-    assert v == float(np.float32(3.5))
+    np.testing.assert_array_equal(v, np.array([3.5, -1.0], dtype=np.float32))
 
 
 def test_codec_rejects_bad_protocol_byte():
     """A request/response whose first byte is not the supported PROTOCOL_VERSION is a LOUD WireError —
     a codec mismatch fails loudly rather than misreading the next field as a float (ADR-0002)."""
-    good = wire.encode_request(np.ones(4, dtype=np.float32))
+    good = wire.encode_request(np.ones((1, 4), dtype=np.float32))
     bad = bytes([wire.PROTOCOL_VERSION + 7]) + good[1:]
     with pytest.raises(wire.WireError):
         wire.decode_request(bad)
-    good_resp = wire.encode_response(1.0, np.ones(3, dtype=np.float32))
+    good_resp = wire.encode_response(np.ones(1, dtype=np.float32), np.ones((1, 3), dtype=np.float32))
     bad_resp = bytes([wire.PROTOCOL_VERSION + 7]) + good_resp[1:]
     with pytest.raises(wire.WireError):
         wire.decode_response(bad_resp)
 
 
 def test_codec_rejects_wrong_length_payload():
-    """A request whose payload byte count is not exactly `in_dim × f32` is a LOUD WireError — the codec
-    refuses a truncated/over-long frame instead of zero-filling or truncating it (ADR-0002)."""
-    good = wire.encode_request(np.ones(8, dtype=np.float32))
+    """A request whose payload byte count is not exactly `B·in_dim × f32` is a LOUD WireError — the
+    codec refuses a truncated/over-long frame instead of zero-filling or truncating it (ADR-0002)."""
+    good = wire.encode_request(np.ones((2, 8), dtype=np.float32))
     with pytest.raises(wire.WireError):
         wire.decode_request(good[:-4])        # one float short
     with pytest.raises(wire.WireError):
@@ -122,12 +133,19 @@ def test_codec_rejects_wrong_length_payload():
 def test_codec_rejects_nan_feature():
     """A NaN/Inf feature is rejected at ENCODE (a malformed request never reaches the wire) — ADR-0002:
     never a coerced/zero-filled forward."""
-    bad = np.array([1.0, np.nan, 2.0, 3.0], dtype=np.float32)
+    bad = np.array([[1.0, np.nan, 2.0, 3.0]], dtype=np.float32)
     with pytest.raises(wire.WireError):
         wire.encode_request(bad)
-    worse = np.array([1.0, np.inf, 2.0], dtype=np.float32)
+    worse = np.array([[1.0, np.inf, 2.0]], dtype=np.float32)
     with pytest.raises(wire.WireError):
         wire.encode_request(worse)
+
+
+def test_codec_rejects_ragged_response_logits():
+    """A logits matrix whose row count != B is a LOUD WireError at encode (ADR-0002 — never a ragged
+    scatter)."""
+    with pytest.raises(wire.WireError):
+        wire.encode_response(np.ones(3, dtype=np.float32), np.ones((2, 5), dtype=np.float32))
 
 
 # ===========================================================================
@@ -176,18 +194,22 @@ def test_valuemlp_adapter_value_only_returns_none_logits():
 # ALWAYS-ON 3 — the greedy-drain batching LOGIC over a FAKE forward (pure function, no socket)
 # ===========================================================================
 def test_run_microbatch_collapses_B_requests_to_one_forward():
-    """B concurrent requests collapse to EXACTLY ONE forward call (the greedy-drain microbatch), and
-    each request's identity gets ITS OWN row back. Uses a STUB forward (no JAX, no socket) so the
-    drain → stack → one-forward → scatter logic is asserted directly and deterministically."""
-    in_dim, n_actions, B = 6, 4, 5
+    """Several requests (each carrying its OWN B_i leaves) CONCATENATE into EXACTLY ONE forward call
+    (the microbatch), and each request gets back ONE batched response carrying its OWN B_i predictions.
+    Uses a STUB forward (no JAX, no socket) so the concat → one-forward → scatter logic is asserted
+    directly and deterministically. The requests carry differing B_i (1, 3, 2) to exercise the
+    variable-width scatter back to per-request frames."""
+    in_dim, n_actions = 6, 4
     rng = np.random.default_rng(7)
-    rows = [rng.standard_normal(in_dim).astype(np.float32) for _ in range(B)]
-    requests = [(f"ident-{i}".encode(), rows[i]) for i in range(B)]
+    counts = [1, 3, 2]
+    mats = [rng.standard_normal((c, in_dim)).astype(np.float32) for c in counts]
+    requests = [(f"ident-{i}".encode(), mats[i]) for i in range(len(counts))]
+    total = sum(counts)
 
     calls = {"n": 0, "batch_shape": None}
 
     def stub_forward(params, Xb, xp):
-        # assert ALL rows arrived in ONE stacked (B, in_dim) call — the collapse the design promises
+        # assert ALL rows arrived in ONE concatenated (total, in_dim) call — the collapse the design promises
         calls["n"] += 1
         calls["batch_shape"] = tuple(np.asarray(Xb).shape)
         Xb = np.asarray(Xb)
@@ -199,23 +221,24 @@ def test_run_microbatch_collapses_B_requests_to_one_forward():
     y_mean, y_std = 2.0, 3.0
     out = run_microbatch(stub_forward, params={}, y_mean=y_mean, y_std=y_std, requests=requests)
 
-    assert calls["n"] == 1, "B requests must collapse to ONE forward call"
-    assert calls["batch_shape"] == (B, in_dim)
-    assert len(out) == B
-    # each identity gets ITS OWN row's value+logits, de-standardized — scatter correctness
+    assert calls["n"] == 1, "the requests must concatenate into ONE forward call"
+    assert calls["batch_shape"] == (total, in_dim)
+    assert len(out) == len(counts)
+    # each identity gets ITS OWN B_i rows' value+logits, de-standardized — scatter correctness
     for i, (ident, resp) in enumerate(out):
         assert ident == f"ident-{i}".encode()
         v, logits = wire.decode_response(resp)
-        expected_v = np.float32(rows[i].sum()) * np.float32(y_std) + np.float32(y_mean)
-        assert v == pytest.approx(float(expected_v), abs=1e-5)
+        assert v.shape == (counts[i],)
+        expected_v = mats[i].sum(axis=1).astype(np.float32) * np.float32(y_std) + np.float32(y_mean)
+        np.testing.assert_allclose(v, expected_v, atol=1e-5)
         assert logits is not None
-        np.testing.assert_allclose(logits, rows[i][:n_actions].astype(np.float32) * 10.0, atol=1e-5)
+        np.testing.assert_allclose(logits, mats[i][:, :n_actions] * 10.0, atol=1e-5)
 
 
 def test_run_microbatch_value_only_scatters_empty_logits():
     """A value-only net (stub forward returns logits=None) scatters n_actions=0 to every request — the
     value-only batched path."""
-    requests = [(b"a", np.ones(3, dtype=np.float32)), (b"b", np.full(3, 2.0, dtype=np.float32))]
+    requests = [(b"a", np.ones((1, 3), dtype=np.float32)), (b"b", np.full((1, 3), 2.0, dtype=np.float32))]
 
     def stub(params, Xb, xp):
         return np.asarray(Xb).sum(axis=1), None
@@ -235,7 +258,7 @@ def test_run_microbatch_refuses_empty_batch():
 
 def test_run_microbatch_refuses_ragged_batch():
     """ADR-0002: a ragged batch (mixed in_dim) is rejected, never silently padded/truncated."""
-    requests = [(b"a", np.ones(4, dtype=np.float32)), (b"b", np.ones(5, dtype=np.float32))]
+    requests = [(b"a", np.ones((1, 4), dtype=np.float32)), (b"b", np.ones((1, 5), dtype=np.float32))]
     with pytest.raises(ValueError):
         run_microbatch(lambda p, x, xp: (x.sum(1), None), {}, 0.0, 1.0, requests)
 
@@ -432,9 +455,10 @@ def test_server_echoes_corr_id_envelope_across_a_batch():
             j = by_corr[corr_echo]
             assert j not in seen, f"corr-id for request {j} came back twice"
             seen[j] = True
-            v, _l = wire.decode_response(resp)
-            assert abs(float(v) - float(ref_v[j])) < 1e-4, (
-                f"corr-id {corr_echo.hex()} routed to request {j}, but value {v} != ref {ref_v[j]}")
+            v, _l = wire.decode_response(resp)   # B=1 reply: v is a length-1 array
+            assert v.shape == (1,)
+            assert abs(float(v[0]) - float(ref_v[j])) < 1e-4, (
+                f"corr-id {corr_echo.hex()} routed to request {j}, but value {v[0]} != ref {ref_v[j]}")
         assert len(seen) == B, "not every request received its echoed reply"
     finally:
         sock.close(0)

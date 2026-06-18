@@ -69,12 +69,13 @@ class ZmqNetClient:
 
     def predict(self, X: npt.NDArray[np.floating]) -> tuple[float, npt.NDArray[np.float32] | None]:
         """Blocking forward RPC over one feature vector `X` (shape (in_dim,)): encode → send → recv →
-        decode → `(value, logits)`. The value is de-standardized and the logits RAW (NOT softmaxed) —
-        the consumer masks. A NaN/Inf feature is rejected by the codec before it ever hits the wire
-        (ADR-0002). A timeout / transport failure raises `InferenceClientError` LOUDLY — no silent local
-        fallback (design §5)."""
+        decode → `(value, logits)`. The request is the degenerate B=1 batched frame (the batched frame
+        subsumes single-leaf); the reply carries one prediction, unwrapped here to `(value, logits)`.
+        The value is de-standardized and the logits RAW (NOT softmaxed) — the consumer masks. A NaN/Inf
+        feature is rejected by the codec before it ever hits the wire (ADR-0002). A timeout / transport
+        failure raises `InferenceClientError` LOUDLY — no silent local fallback (design §5)."""
         import zmq
-        req = encode_request(X)   # codec validates finite + 1-D before anything touches the socket
+        req = encode_request(X)   # codec validates finite + 1-D (→ B=1) before anything touches the socket
         try:
             self._sock.send(req)
             reply = self._sock.recv()
@@ -86,7 +87,13 @@ class ZmqNetClient:
         except zmq.ZMQError as exc:
             raise InferenceClientError(
                 f"inference RPC to {self._endpoint} failed at the transport: {exc}") from exc
-        return decode_response(reply)
+        values, logits = decode_response(reply)
+        # a single-leaf RPC expects exactly ONE prediction back (B=1) — a different count is a
+        # desynchronized wire, a loud failure rather than a silent wrong-row read (ADR-0002).
+        if values.shape[0] != 1:
+            from chocofarm.az.inference_wire import WireError
+            raise WireError(f"single-leaf RPC reply carried {values.shape[0]} predictions, expected 1 (B=1)")
+        return float(values[0]), (None if logits is None else logits[0])
 
     def close(self) -> None:
         """Close the REQ socket and (if we created it) terminate the context. Idempotent-safe."""

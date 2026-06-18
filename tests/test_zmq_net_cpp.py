@@ -185,8 +185,8 @@ def test_cpp_zmq_client_rejects_wrong_length_reply():
     sock = ctx.socket(zmq.ROUTER)
     endpoint = "tcp://127.0.0.1:5779"
     sock.bind(endpoint)
-    # a VALID response frame, then truncated by one f32 — the codec must reject the byte-count mismatch.
-    good = wire.encode_response(1.5, np.ones(3, dtype=np.float32))
+    # a VALID B=1 response frame, then truncated by one f32 — the codec must reject the byte-count mismatch.
+    good = wire.encode_response(np.array([1.5], dtype=np.float32), np.ones((1, 3), dtype=np.float32))
     truncated = good[:-4]
     stop = threading.Event()
 

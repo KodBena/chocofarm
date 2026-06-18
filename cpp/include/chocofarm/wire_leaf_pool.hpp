@@ -1,12 +1,18 @@
 // cpp/include/chocofarm/wire_leaf_pool.hpp
 // Purpose: WireLeafPool — the reusable PER-THREAD DEALER leaf-resolver lifted out of
 //   wire_pool_bench.cpp's worker lambda (the ONE home for the corr-id transport, ADR-0012 P1). It owns
-//   one ZMQ DEALER socket over which K parked tree-fibers' leaf forwards are multiplexed to the batched
-//   JAX InferenceServer: submit() stamps a globally-unique u64 correlation id (a SHARED process-global
-//   atomic, passed by reference), carries it as the LEADING zmq frame ahead of wire::encode_request(X)
-//   ([corr-id][payload]), and tracks corr-id -> slot; poll() blocks up to the socket RCVTIMEO for ONE
-//   reply, validates the envelope, decodes via wire::decode_response, and routes the reply to ITS slot
-//   by the echoed corr-id (the server round-trips that leading frame OPAQUELY — frames[1:-1] in
+//   one ZMQ DEALER socket over which parked tree-fibers' leaf forwards are sent to the batched JAX
+//   InferenceServer as the BATCHED wire frame. TWO submit paths over the SAME corr-id transport:
+//     * submit_batch(slots, flat, in_dim) — the STRICT GATHER-BARRIER (the wire driver): gather B
+//       parked rows into ONE encode_request(flat, B, in_dim), one corr-id, one send; recv_batch()
+//       decodes the one batched reply and scatters the B predictions to their slots IN ORDER.
+//     * submit(slot, X) / poll() — the degenerate B=1 per-leaf path (the wire-pool bench's greedy-async
+//       loop): one row per frame, one prediction per reply.
+//   submit/submit_batch stamps a globally-unique u64 correlation id (a SHARED process-global atomic,
+//   passed by reference), carries it as the LEADING zmq frame ahead of the encoded payload
+//   ([corr-id][payload]), and tracks corr-id -> the ordered slot list; recv_batch()/poll() block up to
+//   the socket RCVTIMEO for ONE reply, validate the envelope, decode via wire::decode_response, and
+//   route by the echoed corr-id (the server round-trips that leading frame OPAQUELY — frames[1:-1] in
 //   inference_server.py — so the corr-id is a TRANSPORT-envelope concern that NEVER enters the value
 //   codec, ADR-0012 P7 serialization⊥transport).
 //
@@ -104,49 +110,92 @@ class WireLeafPool final {
         return *this;
     }
 
-    // Submit slot `slot`'s outstanding leaf: stamp a unique corr-id, send [corr-id][encode_request(X)],
-    // and record corr-id -> slot. A send failure (the socket died) is the typed error arm (ADR-0002).
-    // `features` is a bounds-carrying view valid for the duration of this call (the fiber's parked row).
+    // Submit slot `slot`'s outstanding leaf as a DEGENERATE B=1 batched request: stamp a unique corr-id,
+    // send [corr-id][encode_request(X, B=1, in_dim)], and record corr-id -> [slot]. A send failure (the
+    // socket died) or an encode failure (an empty row) is the typed error arm (ADR-0002). `features` is
+    // a bounds-carrying view valid for the duration of this call (the fiber's parked row). This is the
+    // greedy-async per-leaf path (the wire-pool bench); the wire driver uses submit_batch (the strict
+    // gather-barrier).
     [[nodiscard]] std::expected<void, Error> submit(int slot, std::span<const float> features) {
-        std::vector<unsigned char> req = wire::encode_request(features);
+        return submit_batch(std::span<const int>(&slot, 1), features,
+                            static_cast<wire::count_t>(features.size()));
+    }
+
+    // Submit a BATCH of parked slots' feature rows as ONE batched request (the strict gather-barrier):
+    // stamp ONE unique corr-id, send [corr-id][encode_request(flat, B, in_dim)] where flat is the B
+    // rows row-major (B = slots.size()), and record corr-id -> the ORDERED slot list. The reply's B
+    // predictions scatter back to these slots IN ORDER (recv_batch). A send/encode failure is the typed
+    // error arm. `flat` is a bounds-carrying view (B·in_dim floats) valid for the call.
+    [[nodiscard]] std::expected<void, Error> submit_batch(std::span<const int> slots,
+                                                          std::span<const float> flat,
+                                                          wire::count_t in_dim) {
+        const wire::count_t B = static_cast<wire::count_t>(slots.size());
+        auto req = wire::encode_request(flat, B, in_dim);
+        if (!req)
+            return std::unexpected(make_error("WireLeafPool::submit_batch: encode failed: " +
+                                              req.error().message));
         const uint64_t corr = corr_seq_->fetch_add(1, std::memory_order_relaxed);
-        // frame 1: the corr-id (opaque u64, echoed back verbatim). frame 2: the value payload.
+        // frame 1: the corr-id (opaque u64, echoed back verbatim). frame 2: the batched value payload.
         if (zmq_send(sock_, &corr, sizeof(corr), ZMQ_SNDMORE) < 0)
-            return std::unexpected(make_error(std::string("WireLeafPool::submit: zmq_send(corr) failed: ") +
+            return std::unexpected(make_error(std::string("WireLeafPool::submit_batch: zmq_send(corr) failed: ") +
                                               zmq_strerror(zmq_errno())));
-        if (zmq_send(sock_, req.data(), req.size(), 0) < 0)
-            return std::unexpected(make_error(std::string("WireLeafPool::submit: zmq_send(payload) failed: ") +
+        if (zmq_send(sock_, req->data(), req->size(), 0) < 0)
+            return std::unexpected(make_error(std::string("WireLeafPool::submit_batch: zmq_send(payload) failed: ") +
                                               zmq_strerror(zmq_errno())));
-        inflight_.emplace(corr, slot);
+        inflight_.emplace(corr, std::vector<int>(slots.begin(), slots.end()));
         return {};
     }
 
-    // Block up to the socket RCVTIMEO for ONE reply, decode it, and route it to its slot by the echoed
-    // corr-id. A recv error/timeout, a malformed envelope (<2 frames or a non-8-byte leading frame), a
-    // decode failure, or an UNKNOWN corr-id is the loud error arm (ADR-0002): the wire is desynchronized
-    // and the driver MUST abort the whole pass — never a silent wrong-slot apply, never a zero/stale leaf.
+    // Block up to the socket RCVTIMEO for ONE reply, decode it, and route its FIRST prediction to its
+    // slot by the echoed corr-id (the degenerate B=1 per-leaf path; the batch under this corr-id is one
+    // slot). A recv error/timeout, a malformed envelope, a decode failure, an unknown corr-id, or a
+    // reply whose B != the submitted batch size is the loud error arm (ADR-0002): the wire is
+    // desynchronized and the driver MUST abort the whole pass — never a silent wrong-slot apply.
     [[nodiscard]] std::expected<Completion, Error> poll() {
+        auto batch = recv_batch();
+        if (!batch) return std::unexpected(batch.error());
+        if (batch->size() != 1)
+            return std::unexpected(make_error("WireLeafPool::poll: reply carried " +
+                                              std::to_string(batch->size()) +
+                                              " predictions, expected 1 (B=1 per-leaf path)"));
+        return std::move((*batch)[0]);
+    }
+
+    // Block up to the socket RCVTIMEO for ONE batched reply, decode its B predictions, and route them to
+    // their slots IN ORDER by the echoed corr-id's recorded slot list. A recv error/timeout, a malformed
+    // envelope (<2 frames or a non-8-byte leading frame), a decode failure, an UNKNOWN corr-id, or a
+    // reply whose prediction count != the submitted batch size is the loud error arm (ADR-0002): the
+    // wire is desynchronized and the driver MUST abort the whole pass — never a silent wrong-slot apply,
+    // never a zero/stale leaf. Returns the B completions (slot + decoded NetPrediction) in submit order.
+    [[nodiscard]] std::expected<std::vector<Completion>, Error> recv_batch() {
         uint64_t corr = 0;
         std::vector<unsigned char> payload;
         auto rcv = recv_corr_payload(corr, payload);
         if (!rcv) return std::unexpected(rcv.error());
         auto decoded = wire::decode_response(payload);
         if (!decoded)
-            return std::unexpected(make_error("WireLeafPool::poll: malformed response payload: " +
+            return std::unexpected(make_error("WireLeafPool::recv_batch: malformed response payload: " +
                                               decoded.error().message));
         auto it = inflight_.find(corr);
         if (it == inflight_.end())
-            return std::unexpected(make_error("WireLeafPool::poll: unknown correlation id " +
+            return std::unexpected(make_error("WireLeafPool::recv_batch: unknown correlation id " +
                                               std::to_string(corr) + " (a desynchronized wire)"));
-        Completion c;
-        c.slot = it->second;
+        std::vector<int> slots = std::move(it->second);
         inflight_.erase(it);
-        c.pred.value = decoded->value;
-        c.pred.logits = std::move(decoded->logits);
-        return c;
+        if (decoded->size() != slots.size())
+            return std::unexpected(make_error("WireLeafPool::recv_batch: reply carried " +
+                                              std::to_string(decoded->size()) + " predictions for a batch of " +
+                                              std::to_string(slots.size()) + " (a desynchronized wire)"));
+        std::vector<Completion> out(slots.size());
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            out[i].slot = slots[i];
+            out[i].pred.value = (*decoded)[i].value;
+            out[i].pred.logits = std::move((*decoded)[i].logits);
+        }
+        return out;
     }
 
-    // True iff at least one submitted leaf has not yet been resolved by a poll().
+    // True iff at least one submitted batch has not yet been resolved by a poll()/recv_batch().
     [[nodiscard]] bool any_outstanding() const { return !inflight_.empty(); }
 
   private:
@@ -187,7 +236,7 @@ class WireLeafPool final {
 
     void* sock_ = nullptr;                            // the owned DEALER socket (closed in dtor / on move)
     std::atomic<uint64_t>* corr_seq_ = nullptr;       // borrowed process-global corr-id source (P1)
-    std::unordered_map<uint64_t, int> inflight_;      // corr-id -> slot of its outstanding leaf (per-thread)
+    std::unordered_map<uint64_t, std::vector<int>> inflight_;  // corr-id -> ordered slot list of its batch
 };
 
 }  // namespace chocofarm

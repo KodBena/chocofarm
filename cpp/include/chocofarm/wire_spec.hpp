@@ -12,11 +12,13 @@
 //   ── DERIVED FROM chocofarm/az/wire_spec.py — DO NOT EDIT EITHER SIDE WITHOUT THE OTHER. ──
 //   The drift test is the mechanical net that makes that instruction enforced, not advisory.
 //
-//   The frame (the §2 contract):
-//       Request  : [ver:u8][in_dim   :u32 LE][X      : f32×in_dim   LE]
-//       Response : [ver:u8][n_actions:u32 LE][value:f32 LE][logits : f32×n_actions LE]
-//   n_actions == 0 ⇒ value-only (empty logits block). All multi-byte fields little-endian. Bump
-//   PROTOCOL_VERSION on ANY layout change so an old pairing fails loudly at decode (unknown byte).
+//   The BATCHED frame (the §2 contract; B=1 is the degenerate single-leaf case, so the batched frame
+//   SUBSUMES single-leaf — there is no dual-mode):
+//       Request  : [ver:u8][B:u32 LE][in_dim:u32 LE][X : f32×(B·in_dim) LE]   (row-major)
+//       Response : [ver:u8][B:u32 LE][n_actions:u32 LE][ B × (value:f32 LE, logits:f32×n_actions LE) ]
+//   n_actions == 0 ⇒ value-only (every prediction's logits block empty). All multi-byte fields
+//   little-endian. Bump PROTOCOL_VERSION on ANY layout change so an old pairing fails loudly at decode
+//   (unknown byte) — the single-leaf → batched migration is exactly such a bump (v1 → v2).
 //
 // Public Domain (The Unlicense).
 #pragma once
@@ -27,7 +29,8 @@
 namespace chocofarm::wire {
 
 // The protocol-version header byte (mirrors wire_spec.PROTOCOL_VERSION). Bump on ANY layout change.
-inline constexpr std::uint8_t PROTOCOL_VERSION = 1;
+// v2: the BATCHED frame (a B:u32 count ahead of in_dim/n_actions). v1 was the single-leaf frame.
+inline constexpr std::uint8_t PROTOCOL_VERSION = 2;
 
 // Fixed-field byte widths (mirror wire_spec.VERSION_BYTES / COUNT_BYTES / FLOAT_BYTES). The version
 // byte is u8; the length prefix (in_dim / n_actions) is u32; the payload/value floats are f32. These
@@ -43,9 +46,9 @@ using version_t = std::uint8_t;
 using count_t = std::uint32_t;
 using float_t = float;   // IEEE-754 binary32, matching numpy '<f4'
 
-// Fixed-header byte size = the version byte + the u32 count (the same for request and response — both
-// are [version][count]). Derived from the widths, never a separate literal.
-inline constexpr std::size_t HEADER_BYTES = VERSION_BYTES + COUNT_BYTES;   // 5
+// Fixed-header byte size = the version byte + the TWO u32 counts (the same for request and response —
+// both are [version][B][in_dim|n_actions]). Derived from the widths, never a separate literal.
+inline constexpr std::size_t HEADER_BYTES = VERSION_BYTES + COUNT_BYTES + COUNT_BYTES;   // 9
 
 static_assert(sizeof(version_t) == VERSION_BYTES, "wire version_t width must match VERSION_BYTES");
 static_assert(sizeof(count_t) == COUNT_BYTES, "wire count_t width must match COUNT_BYTES");

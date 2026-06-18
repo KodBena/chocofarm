@@ -6,10 +6,12 @@
 //   same redis-write / `written` all-or-nothing semantics — but resolves every Gumbel-AZ search LEAF
 //   REMOTELY on the batched JAX InferenceServer over a DEALER socket instead of locally per leaf.
 //
-//   The control structure is a GREEDY-ASYNC fiber pool (NOT a barrier): T worker threads, each owning a
+//   The control structure is a STRICT GATHER-BARRIER fiber pool: T worker threads, each owning a
 //   disjoint episode subset {tid, tid+T, …}, K EpisodeSlots, its own WireLeafPool (wire_leaf_pool.hpp),
 //   and its own per-slot rng. Each slot parks ONE tree at exactly one leaf (TreeState, fiber_tree.hpp);
-//   the driver keeps up to T×K leaves in flight so the server's greedy drain assembles a big batch. The
+//   each round the thread gathers ALL its parked slots' feature rows into ONE batched wire request
+//   (submit_batch — one corr-id), awaits the ONE batched reply, scatters the B predictions back to the
+//   slots in order (recv_batch), and resumes all — so the server's drain assembles a big batch. The
 //   episode/RNG/stepping logic is RE-DERIVED from the SERIAL run_episode (runner.cpp:40-119) — NOT lifted
 //   from the discarded local-batched runner — and re-homed as a resumable per-slot state machine; only the
 //   leaf-resolution step differs (remote, over the wire). NO local NetForward / predict_batch is called.

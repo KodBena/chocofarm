@@ -13,10 +13,12 @@
 //       C++ leg exercises THIS codec (it compiles with a bare `g++ -std=c++23` over only the mirror
 //       headers + this one — still dependency-free).
 //
-//   The frame (the docs/design/zmq-inference-service.md §2 contract):
-//       Request  : [ver:u8][in_dim   :u32 LE][X      : f32×in_dim   LE]
-//       Response : [ver:u8][n_actions:u32 LE][value:f32 LE][logits : f32×n_actions LE]
-//   n_actions == 0 ⇒ value-only (empty logits block, mirroring forward_core's logits=None).
+//   The BATCHED frame (the docs/design/zmq-inference-service.md §2 contract; B=1 is the degenerate
+//   single-leaf case, so the batched frame SUBSUMES single-leaf — there is no dual-mode):
+//       Request  : [ver:u8][B:u32 LE][in_dim:u32 LE][X : f32×(B·in_dim) LE]   (row-major)
+//       Response : [ver:u8][B:u32 LE][n_actions:u32 LE][ B × (value:f32 LE, logits:f32×n_actions LE) ]
+//   n_actions == 0 ⇒ value-only (every prediction's logits block empty, mirroring forward_core's
+//   logits=None).
 //
 //   ADR-0012 P9 / ADR-0002 (translate-and-validate, never coerce): ENCODE is total (a well-typed input
 //   always produces a frame) and returns the bytes by value. DECODE is a BOUNDARY — an unknown protocol
@@ -40,11 +42,19 @@
 
 namespace chocofarm::wire {
 
-// One decoded response: the de-standardized value + the raw policy logits (empty when value-only,
+// One decoded prediction: the de-standardized value + the raw policy logits (empty when value-only,
 // mirroring the Python (value, logits=None) and the NetPrediction shape net.hpp defines).
 struct ResponseFields {
     float value = 0.0f;
     std::vector<float> logits;   // raw logits over n_actions slots (empty when n_actions == 0)
+};
+
+// A decoded BATCHED request: B feature rows of width in_dim, row-major in `flat` (so row r, column c is
+// flat[r*in_dim + c]). The server-side decode; the driver only ENCODES requests.
+struct RequestFields {
+    count_t B = 0;
+    count_t in_dim = 0;
+    std::vector<float> flat;     // B·in_dim floats, row-major
 };
 
 // ---- little-endian field helpers (host is LE — wire_spec's standing assumption) ----
@@ -77,24 +87,39 @@ inline void put_f32(std::vector<unsigned char>& out, float_t v) {
 }
 
 // ---- request codec ----
-// Encode one feature vector X into a request frame [ver][in_dim][X:f32]. in_dim is DERIVED from the
-// vector — never a separate argument that could disagree with the payload (P1). Total: a well-formed
-// span always yields a frame (the caller is responsible for non-empty / finite, matching the C++
-// NetForward's own predict contract — finiteness is the server's boundary, exactly as the Python
-// client lets the server reject non-finite; encode here mirrors the byte layout only).
-[[nodiscard]] inline std::vector<unsigned char> encode_request(std::span<const float> X) {
+// Encode a BATCHED feature matrix into a request frame [ver][B][in_dim][X:f32×(B·in_dim)] (X row-major:
+// row r, column c at flat[r*in_dim + c]). `flat` is the B·in_dim contiguous rows; `B`/`in_dim` are
+// passed explicitly (the matrix shape the driver gathers) and validated against the span length —
+// never silently re-derived in a way that could disagree with the payload (P1). A flat.size() that is
+// not exactly B·in_dim is the typed Error arm (ADR-0002 — never a ragged encode). B=1 is the
+// degenerate single-leaf case. Finiteness is the server's boundary (the C++ NetForward / driver feeds
+// real finite features), exactly as the Python client lets the server reject non-finite; encode here
+// mirrors the byte layout only.
+[[nodiscard]] inline std::expected<std::vector<unsigned char>, Error> encode_request(
+    std::span<const float> flat, count_t B, count_t in_dim) {
+    if (B == 0)
+        return std::unexpected(make_error("chocofarm wire: encode_request B is 0 (empty batch)"));
+    if (in_dim == 0)
+        return std::unexpected(make_error("chocofarm wire: encode_request in_dim is 0 (no features)"));
+    std::size_t want = static_cast<std::size_t>(B) * in_dim;
+    if (flat.size() != want)
+        return std::unexpected(make_error("chocofarm wire: encode_request flat has " +
+                                          std::to_string(flat.size()) + " floats, expected " +
+                                          std::to_string(want) + " (= B " + std::to_string(B) +
+                                          " × in_dim " + std::to_string(in_dim) + ")"));
     std::vector<unsigned char> out;
-    out.reserve(HEADER_BYTES + X.size() * FLOAT_BYTES);
+    out.reserve(HEADER_BYTES + flat.size() * FLOAT_BYTES);
     out.push_back(static_cast<unsigned char>(PROTOCOL_VERSION));
-    put_count(out, static_cast<count_t>(X.size()));
-    for (float v : X) put_f32(out, v);
+    put_count(out, B);
+    put_count(out, in_dim);
+    for (float v : flat) put_f32(out, v);
     return out;
 }
 
-// Decode a request frame back to the feature vector X (float32, length in_dim). BOUNDARY validation
-// (ADR-0002): an unknown protocol byte, a frame too short for its header, an in_dim of 0, or a payload
-// whose byte count is not exactly `in_dim × f32` is a typed Error — never a zero-filled/truncated row.
-[[nodiscard]] inline std::expected<std::vector<float>, Error> decode_request(
+// Decode a BATCHED request frame back to its (B, in_dim, flat) fields. BOUNDARY validation (ADR-0002):
+// an unknown protocol byte, a frame too short for its header, a B or in_dim of 0, or a payload whose
+// byte count is not exactly `B·in_dim × f32` is a typed Error — never a zero-filled/truncated matrix.
+[[nodiscard]] inline std::expected<RequestFields, Error> decode_request(
     std::span<const unsigned char> frame) {
     if (frame.size() < HEADER_BYTES)
         return std::unexpected(make_error("chocofarm wire: request frame too short (" +
@@ -105,64 +130,96 @@ inline void put_f32(std::vector<unsigned char>& out, float_t v) {
         return std::unexpected(make_error("chocofarm wire: request protocol byte " +
                                           std::to_string(ver) + " != supported " +
                                           std::to_string(PROTOCOL_VERSION) + " (codec mismatch)"));
-    count_t in_dim = read_count(frame, VERSION_BYTES);
+    count_t B = read_count(frame, VERSION_BYTES);
+    count_t in_dim = read_count(frame, VERSION_BYTES + COUNT_BYTES);
+    if (B == 0)
+        return std::unexpected(make_error("chocofarm wire: request B is 0 (empty batch)"));
     if (in_dim == 0)
         return std::unexpected(make_error("chocofarm wire: request in_dim is 0 (no feature vector)"));
-    std::size_t want = HEADER_BYTES + static_cast<std::size_t>(in_dim) * FLOAT_BYTES;
+    std::size_t n = static_cast<std::size_t>(B) * in_dim;
+    std::size_t want = HEADER_BYTES + n * FLOAT_BYTES;
     if (frame.size() != want)
         return std::unexpected(make_error("chocofarm wire: request payload is " +
                                           std::to_string(frame.size()) + " bytes, expected " +
-                                          std::to_string(want) + " (= in_dim " + std::to_string(in_dim) +
-                                          " × f32 + header)"));
-    std::vector<float> X(in_dim);
-    for (count_t i = 0; i < in_dim; ++i)
-        X[i] = read_f32(frame, HEADER_BYTES + static_cast<std::size_t>(i) * FLOAT_BYTES);
-    return X;
+                                          std::to_string(want) + " (= B " + std::to_string(B) +
+                                          " × in_dim " + std::to_string(in_dim) + " × f32 + header)"));
+    RequestFields r;
+    r.B = B;
+    r.in_dim = in_dim;
+    r.flat.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+        r.flat[i] = read_f32(frame, HEADER_BYTES + i * FLOAT_BYTES);
+    return r;
 }
 
 // ---- response codec ----
-// Encode a NetPrediction into a response frame [ver][n_actions][value][logits:f32]. An EMPTY logits
-// span ⇒ n_actions=0 (value-only, mirroring forward_core's logits=None). value is the de-standardized
-// scalar; the logits are raw (NOT softmaxed) — masking is client-side (§2). Total.
-[[nodiscard]] inline std::vector<unsigned char> encode_response(float value,
-                                                                std::span<const float> logits) {
+// Encode B predictions into a batched response frame [ver][B][n_actions][ B × (value, logits:f32) ].
+// `values` is the length-B de-standardized scalars; `logits_flat` is the B·n_actions raw (NOT
+// softmaxed) logits row-major (empty ⇒ n_actions=0, value-only, mirroring forward_core's logits=None).
+// `n_actions` is one field for the whole batch (every row of one net has the same action count); it is
+// validated against logits_flat.size()==B·n_actions (ADR-0002 — never a ragged scatter). Masking is
+// client-side (§2). The server is the only producer of responses; the C++ side (wire_golden) re-encodes
+// what it decoded, so this completes the round-trip.
+[[nodiscard]] inline std::expected<std::vector<unsigned char>, Error> encode_response(
+    std::span<const float> values, std::span<const float> logits_flat, count_t n_actions) {
+    count_t B = static_cast<count_t>(values.size());
+    if (B == 0)
+        return std::unexpected(make_error("chocofarm wire: encode_response B is 0 (no predictions)"));
+    std::size_t want = static_cast<std::size_t>(B) * n_actions;
+    if (logits_flat.size() != want)
+        return std::unexpected(make_error("chocofarm wire: encode_response logits_flat has " +
+                                          std::to_string(logits_flat.size()) + " floats, expected " +
+                                          std::to_string(want) + " (= B " + std::to_string(B) +
+                                          " × n_actions " + std::to_string(n_actions) + ")"));
     std::vector<unsigned char> out;
-    out.reserve(HEADER_BYTES + FLOAT_BYTES + logits.size() * FLOAT_BYTES);
+    out.reserve(HEADER_BYTES + static_cast<std::size_t>(B) * (1 + n_actions) * FLOAT_BYTES);
     out.push_back(static_cast<unsigned char>(PROTOCOL_VERSION));
-    put_count(out, static_cast<count_t>(logits.size()));
-    put_f32(out, value);
-    for (float v : logits) put_f32(out, v);
+    put_count(out, B);
+    put_count(out, n_actions);
+    for (count_t r = 0; r < B; ++r) {
+        put_f32(out, values[r]);
+        for (count_t c = 0; c < n_actions; ++c)
+            put_f32(out, logits_flat[static_cast<std::size_t>(r) * n_actions + c]);
+    }
     return out;
 }
 
-// Decode a response frame back to (value, logits). BOUNDARY validation (ADR-0002): an unknown protocol
-// byte, a frame too short for the header+value, or a logits block whose byte count is not exactly
-// `n_actions × f32` is a typed Error. n_actions==0 ⇒ empty logits (value-only).
-[[nodiscard]] inline std::expected<ResponseFields, Error> decode_response(
+// Decode a batched response frame back to B ResponseFields (each value + its n_actions raw logits).
+// BOUNDARY validation (ADR-0002): an unknown protocol byte, a B of 0, a frame too short for the header,
+// or a body whose byte count is not exactly `B·(1 + n_actions) × f32` is a typed Error. n_actions==0 ⇒
+// every prediction has empty logits (value-only).
+[[nodiscard]] inline std::expected<std::vector<ResponseFields>, Error> decode_response(
     std::span<const unsigned char> frame) {
-    std::size_t fixed = HEADER_BYTES + FLOAT_BYTES;   // header + the value scalar
-    if (frame.size() < fixed)
+    if (frame.size() < HEADER_BYTES)
         return std::unexpected(make_error("chocofarm wire: response frame too short (" +
                                           std::to_string(frame.size()) + " bytes) for its " +
-                                          std::to_string(fixed) + "-byte header+value"));
+                                          std::to_string(HEADER_BYTES) + "-byte header"));
     version_t ver = frame[0];
     if (ver != PROTOCOL_VERSION)
         return std::unexpected(make_error("chocofarm wire: response protocol byte " +
                                           std::to_string(ver) + " != supported " +
                                           std::to_string(PROTOCOL_VERSION) + " (codec mismatch)"));
-    count_t n_actions = read_count(frame, VERSION_BYTES);
-    std::size_t want = fixed + static_cast<std::size_t>(n_actions) * FLOAT_BYTES;
+    count_t B = read_count(frame, VERSION_BYTES);
+    count_t n_actions = read_count(frame, VERSION_BYTES + COUNT_BYTES);
+    if (B == 0)
+        return std::unexpected(make_error("chocofarm wire: response B is 0 (no predictions)"));
+    std::size_t per = static_cast<std::size_t>(1 + n_actions);   // floats per prediction (value + logits)
+    std::size_t want = HEADER_BYTES + static_cast<std::size_t>(B) * per * FLOAT_BYTES;
     if (frame.size() != want)
-        return std::unexpected(make_error("chocofarm wire: response logits block makes the frame " +
+        return std::unexpected(make_error("chocofarm wire: response body makes the frame " +
                                           std::to_string(frame.size()) + " bytes, expected " +
-                                          std::to_string(want) + " (= n_actions " +
-                                          std::to_string(n_actions) + " × f32 + header+value)"));
-    ResponseFields r;
-    r.value = read_f32(frame, HEADER_BYTES);
-    r.logits.resize(n_actions);
-    for (count_t i = 0; i < n_actions; ++i)
-        r.logits[i] = read_f32(frame, fixed + static_cast<std::size_t>(i) * FLOAT_BYTES);
-    return r;
+                                          std::to_string(want) + " (= B " + std::to_string(B) +
+                                          " × (value + n_actions " + std::to_string(n_actions) +
+                                          ") × f32 + header)"));
+    std::vector<ResponseFields> out(B);
+    for (count_t r = 0; r < B; ++r) {
+        std::size_t base = HEADER_BYTES + static_cast<std::size_t>(r) * per * FLOAT_BYTES;
+        out[r].value = read_f32(frame, base);
+        out[r].logits.resize(n_actions);
+        for (count_t c = 0; c < n_actions; ++c)
+            out[r].logits[c] = read_f32(frame, base + static_cast<std::size_t>(1 + c) * FLOAT_BYTES);
+    }
+    return out;
 }
 
 }  // namespace chocofarm::wire
