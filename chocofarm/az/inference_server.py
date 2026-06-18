@@ -77,6 +77,33 @@ if TYPE_CHECKING:
 ForwardFn = Callable[[dict[str, "npt.NDArray[Any]"], Any, Any],
                      tuple[Any, "Any | None"]]
 
+# The PRODUCTION forward: `forward_core` wrapped in ONE `jax.jit`. The server pads every batch to ONE
+# shape (max_batch), so this compiles a SINGLE executable and each forward becomes one compiled-graph call
+# — collapsing the per-primitive EAGER dispatch (the `@`/`maximum` Python-level primitive dispatch the
+# profile showed dominating the forward) into one XLA-executed forward. ADR-0012 P6: jit is a numerically-
+# equivalent reordering of the SAME `forward_core` (the existing ABS_TOL=1e-4 bar holds, NOT byte
+# identity); P1/P7: still the one `forward_core`, only wrapped — no second transcription. Built LAZILY so
+# the module import stays jax-free (the hot-import discipline below): the first call imports jax and jits;
+# `params`/`X` ride as traced ARGS (not baked constants) so a same-shape weight reload reuses the compiled
+# executable rather than forcing a recompile. The `xp` slot is ignored — the production backend is always
+# jnp (the always-on test injects its OWN un-jitted forward_fn, so this is the production path only).
+_jit_forward_cache: list[Any] = []
+# `forward_core` viewed through the typed ForwardFn Callable, so the jitted call below is a TYPED call:
+# forward_core is the backend-polymorphic SSOT and carries no annotations, and calling it directly in a
+# typed context trips mypy --strict's no-untyped-call. Assigning it to a ForwardFn slot is the same move
+# the InferenceServer default already makes.
+_FORWARD: ForwardFn = forward_core
+
+
+def jit_forward_core(params: "dict[str, npt.NDArray[Any]]", X: Any, xp: Any) -> "tuple[Any, Any | None]":
+    if not _jit_forward_cache:
+        import jax
+        import jax.numpy as jnp
+        _jit_forward_cache.append(jax.jit(lambda p, x: _FORWARD(p, x, jnp)))
+    v, logits = _jit_forward_cache[0](params, X)   # unpack→repack: a tuple literal, not a bare Any return
+    return v, logits
+
+
 # A batch row: (identity_frame, feature_matrix) — the ROUTER identity bytes to scatter the response
 # back to, and the decoded float32 feature MATRIX (shape (B_i, in_dim) — the request's B leaves). This
 # is `run_microbatch`'s VALUE-LEVEL input: the pure batching core knows only identities and matrices,
@@ -251,7 +278,8 @@ class InferenceServer:
     forward; no XLA-in-a-worker-thread). Workers connect a REQ/DEALER socket and make a blocking
     `predict` RPC each; the SERVER batches whatever is concurrently in-flight.
 
-    `forward_fn` defaults to the SSOT `forward_core`; the always-on test injects a stub to assert the
+    `forward_fn` defaults to `jit_forward_core` (the SSOT `forward_core` wrapped in one `jax.jit`); the
+    always-on test injects a stub to assert the
     drain/scatter without a real forward. `max_batch` caps the greedy drain so an unbounded burst can't
     build an oversized matmul; B self-scales with load below the cap (no latency timer to tune)."""
 
@@ -260,7 +288,7 @@ class InferenceServer:
     _POLL_INTERVAL_MS = 100
 
     def __init__(self, params_source: ParamsSource, *, bind: str = "tcp://127.0.0.1:5599",
-                 max_batch: int = 256, forward_fn: ForwardFn = forward_core,
+                 max_batch: int = 256, forward_fn: ForwardFn = jit_forward_core,
                  context: "zmq.Context[zmq.Socket[bytes]] | None" = None) -> None:
         import zmq
         self._params_source = params_source
