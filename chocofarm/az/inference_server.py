@@ -74,34 +74,45 @@ if TYPE_CHECKING:
 # `xp` parameter rides (ADR-0012 P8: an honest `Any` at a real either-backend boundary, not a
 # convenience relaxation — the value genuinely IS "numpy-or-jax array"). `params` stays `NDArray[Any]`
 # (forward_core indexes it by key; the weight arrays are numpy on both paths).
-ForwardFn = Callable[[dict[str, "npt.NDArray[Any]"], Any, Any],
-                     tuple[Any, "Any | None"]]
+# The injected forward's contract: `(params, Xb_host, y_mean, y_std) -> one array`. The returned array is
+# `(B, 1+n_actions)` — column 0 the DE-STANDARDIZED value, columns 1.. the raw logits — or `(B, 1)` for a
+# value-only net. This single-homes the array path: ONE host→device hand-off (the cast happens INSIDE the
+# forward, no separate eager `jnp.asarray` convert), the value de-standardized ON-device, and ONE
+# device→host pull in `run_microbatch` (a single `np.asarray` over the whole block) — replacing the old
+# `(v_std, logits)` two-pull tuple + a numpy de-standardize. The always-on test injects a stub returning
+# the same shape over numpy.
+ForwardFn = Callable[[dict[str, "npt.NDArray[Any]"], Any, float, float], Any]
 
-# The PRODUCTION forward: `forward_core` wrapped in ONE `jax.jit`. The server pads every batch to ONE
-# shape (max_batch), so this compiles a SINGLE executable and each forward becomes one compiled-graph call
-# — collapsing the per-primitive EAGER dispatch (the `@`/`maximum` Python-level primitive dispatch the
-# profile showed dominating the forward) into one XLA-executed forward. ADR-0012 P6: jit is a numerically-
-# equivalent reordering of the SAME `forward_core` (the existing ABS_TOL=1e-4 bar holds, NOT byte
-# identity); P1/P7: still the one `forward_core`, only wrapped — no second transcription. Built LAZILY so
-# the module import stays jax-free (the hot-import discipline below): the first call imports jax and jits;
-# `params`/`X` ride as traced ARGS (not baked constants) so a same-shape weight reload reuses the compiled
-# executable rather than forcing a recompile. The `xp` slot is ignored — the production backend is always
-# jnp (the always-on test injects its OWN un-jitted forward_fn, so this is the production path only).
+# forward_core's OWN signature (params, X, xp) -> (v_std, logits|None) — the backend-polymorphic SSOT the
+# jitted production forward composes. A typed alias so calling it in a typed context is not a
+# no-untyped-call (forward_core itself carries no annotations).
+ForwardCore = Callable[[dict[str, "npt.NDArray[Any]"], Any, Any], "tuple[Any, Any | None]"]
+_FORWARD_CORE: ForwardCore = forward_core
+
 _jit_forward_cache: list[Any] = []
-# `forward_core` viewed through the typed ForwardFn Callable, so the jitted call below is a TYPED call:
-# forward_core is the backend-polymorphic SSOT and carries no annotations, and calling it directly in a
-# typed context trips mypy --strict's no-untyped-call. Assigning it to a ForwardFn slot is the same move
-# the InferenceServer default already makes.
-_FORWARD: ForwardFn = forward_core
 
 
-def jit_forward_core(params: "dict[str, npt.NDArray[Any]]", X: Any, xp: Any) -> "tuple[Any, Any | None]":
+def jit_forward_core(params: "dict[str, npt.NDArray[Any]]", Xb: Any, y_mean: float, y_std: float) -> Any:
+    """The PRODUCTION forward (the InferenceServer default forward_fn): `forward_core` wrapped in ONE
+    `jax.jit` that ALSO casts the host batch, de-standardizes the value, and packs `[v | logits]` into one
+    device array — so the whole forward is a single compiled-graph call with ONE host→device crossing (the
+    cast, folded in — no separate eager convert) and (via run_microbatch) ONE device→host pull. The server
+    pads every batch to one shape, so it compiles a SINGLE executable. ADR-0012 P6: a numerically-
+    equivalent reordering of the SAME `forward_core` (the ABS_TOL=1e-4 wire-parity bar holds, NOT byte
+    identity); P1/P7: still the one `forward_core`, only wrapped — no second transcription. Built LAZILY so
+    the module import stays jax-free (the hot-import discipline below); `Xb`/`y_mean`/`y_std` ride as traced
+    ARGS so a same-shape weight+scale reload reuses the executable, no recompile."""
     if not _jit_forward_cache:
+        import chocofarm.config  # noqa: F401 — XLA/OMP thread pin (SSOT) applied before jax initializes
         import jax
         import jax.numpy as jnp
-        _jit_forward_cache.append(jax.jit(lambda p, x: _FORWARD(p, x, jnp)))
-    v, logits = _jit_forward_cache[0](params, X)   # unpack→repack: a tuple literal, not a bare Any return
-    return v, logits
+
+        def _fwd(p: Any, x: Any, ym: Any, ys: Any) -> Any:
+            v_std, logits = _FORWARD_CORE(p, x, jnp)
+            v = jnp.reshape(v_std, (-1, 1)) * ys + ym            # de-standardize ON-device → (B, 1)
+            return v if logits is None else jnp.concatenate([v, logits], axis=1)
+        _jit_forward_cache.append(jax.jit(_fwd))
+    return _jit_forward_cache[0](params, Xb, y_mean, y_std)
 
 
 # A batch row: (identity_frame, feature_matrix) — the ROUTER identity bytes to scatter the response
@@ -125,17 +136,18 @@ def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
                    requests: list[BatchRow], pad_to: int | None = None) -> list[tuple[bytes, bytes]]:
     """The PURE microbatch core (design §3): CONCATENATE the drained requests' feature MATRICES (each a
     request's B_i leaves) into one `(N_total, in_dim)` float32 matrix, run ONE `forward_fn(params, Xb,
-    jnp)`, DE-STANDARDIZE the value (v = v_std·y_std + y_mean), and SCATTER each request's OWN B_i
-    predictions back as ONE batched response frame. Returns `[(identity, response_bytes), …]` aligned
-    1:1 with `requests` (one reply per request, carrying that request's B_i predictions).
+    y_mean, y_std)` — which casts, runs the net, and DE-STANDARDIZES the value ON-device — then make ONE
+    device→host pull of the returned `(rows, 1+n_actions)` block (column 0 the de-standardized value,
+    columns 1.. the raw logits; `(rows, 1)` value-only) and SCATTER each request's OWN B_i predictions back
+    as ONE batched response frame. Returns `[(identity, response_bytes), …]` aligned 1:1 with `requests`.
 
     This is the whole batching contract as a deterministic function of its inputs — no socket, no
     redis — so the always-on test asserts that requests collapse to ONE `forward_fn` call and each
     request gets ITS OWN rows back (the drain/concat/scatter logic), against a stub forward.
 
-    `forward_fn` is the injected forward (the real `forward_core` under JAX in production; a stub in the
-    test). The response carries the RAW logits (NOT softmaxed) + the de-standardized value — masking is
-    client-side (design §2). A value-only net (`logits is None`) scatters `n_actions=0`. Refuses an
+    `forward_fn` is the injected forward (the jitted `forward_core` in production; a stub in the test).
+    The response carries the RAW logits (NOT softmaxed) + the de-standardized value — masking is
+    client-side (design §2). A value-only net (no logits column) scatters `n_actions=0`. Refuses an
     empty batch (ADR-0002 — the loop only calls this with ≥1 drained request)."""
     if not requests:
         raise ValueError("run_microbatch called with an empty batch (the drain guarantees ≥1 request)")
@@ -158,16 +170,20 @@ def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
     # caps the total at max_batch, so this only ever pads UP.
     if pad_to is not None and pad_to > B:
         Xb = np.concatenate([Xb, np.zeros((pad_to - B, in_dim), dtype=np.float32)], axis=0)
-    import chocofarm.config  # noqa: F401 — applies the XLA/OMP thread pin (SSOT) before jax initializes
-    import jax.numpy as jnp                               # local import: the JAX backend lives in the shell
-    v_std, logits = forward_fn(params, jnp.asarray(Xb), jnp)
-    v = np.asarray(v_std, dtype=np.float32).ravel() * np.float32(y_std) + np.float32(y_mean)
-    logits_np = None if logits is None else np.asarray(logits, dtype=np.float32)
+    # ONE host→device hand-off + de-standardize, folded into the forward; ONE device→host pull here. The
+    # production forward casts Xb (no eager pre-`jnp.asarray`), de-standardizes on-device, and returns the
+    # combined `(rows, 1+n_actions)` block; a value-only net returns `(rows, 1)`. The stub returns the same
+    # over numpy. (The XLA pin + jax import live inside the jitted forward, ahead of its first jax touch.)
+    out_arr = np.asarray(forward_fn(params, Xb, float(y_mean), float(y_std)), dtype=np.float32)
+    if out_arr.ndim != 2 or out_arr.shape[0] < B:
+        raise ValueError(f"forward returned shape {out_arr.shape}, expected (>={B}, 1+n_actions)")
+    v = out_arr[:, 0]
+    has_logits = out_arr.shape[1] > 1
     out: list[tuple[bytes, bytes]] = []
     off = 0
     for ident, n in zip(identities, counts):
         v_rows = v[off:off + n]
-        l_rows = None if logits_np is None else logits_np[off:off + n]
+        l_rows = out_arr[off:off + n, 1:] if has_logits else None
         out.append((ident, encode_response(v_rows, l_rows)))
         off += n
     return out

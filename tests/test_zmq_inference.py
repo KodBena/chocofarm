@@ -208,15 +208,16 @@ def test_run_microbatch_collapses_B_requests_to_one_forward():
 
     calls = {"n": 0, "batch_shape": None}
 
-    def stub_forward(params, Xb, xp):
+    def stub_forward(params, Xb, y_mean, y_std):
         # assert ALL rows arrived in ONE concatenated (total, in_dim) call — the collapse the design promises
         calls["n"] += 1
         calls["batch_shape"] = tuple(np.asarray(Xb).shape)
         Xb = np.asarray(Xb)
-        # a deterministic, row-distinguishable fake: v_std[i] = sum(row_i); logits[i] = row_i broadcast
-        v_std = Xb.sum(axis=1)
-        logits = Xb[:, :n_actions] * 10.0
-        return v_std, logits
+        # a deterministic, row-distinguishable fake: v_std[i] = sum(row_i); logits[i] = row_i broadcast. The
+        # forward now DE-STANDARDIZES on its side and returns the combined (B, 1+n_actions) block.
+        v = (Xb.sum(axis=1) * y_std + y_mean).reshape(-1, 1).astype(np.float32)
+        logits = (Xb[:, :n_actions] * 10.0).astype(np.float32)
+        return np.concatenate([v, logits], axis=1)
 
     y_mean, y_std = 2.0, 3.0
     out = run_microbatch(stub_forward, params={}, y_mean=y_mean, y_std=y_std, requests=requests)
@@ -240,8 +241,9 @@ def test_run_microbatch_value_only_scatters_empty_logits():
     value-only batched path."""
     requests = [(b"a", np.ones((1, 3), dtype=np.float32)), (b"b", np.full((1, 3), 2.0, dtype=np.float32))]
 
-    def stub(params, Xb, xp):
-        return np.asarray(Xb).sum(axis=1), None
+    def stub(params, Xb, y_mean, y_std):
+        # value-only: return just the (B, 1) de-standardized value column (no logits columns)
+        return (np.asarray(Xb).sum(axis=1) * y_std + y_mean).reshape(-1, 1).astype(np.float32)
 
     out = run_microbatch(stub, {}, 0.0, 1.0, requests)
     assert [ident for ident, _ in out] == [b"a", b"b"]
@@ -253,14 +255,14 @@ def test_run_microbatch_value_only_scatters_empty_logits():
 def test_run_microbatch_refuses_empty_batch():
     """ADR-0002: an empty batch is a loud refusal (the drain guarantees ≥1; calling with [] is a bug)."""
     with pytest.raises(ValueError):
-        run_microbatch(lambda p, x, xp: (x.sum(1), None), {}, 0.0, 1.0, [])
+        run_microbatch(lambda p, x, ym, ys: x.sum(1).reshape(-1, 1), {}, 0.0, 1.0, [])
 
 
 def test_run_microbatch_refuses_ragged_batch():
     """ADR-0002: a ragged batch (mixed in_dim) is rejected, never silently padded/truncated."""
     requests = [(b"a", np.ones((1, 4), dtype=np.float32)), (b"b", np.ones((1, 5), dtype=np.float32))]
     with pytest.raises(ValueError):
-        run_microbatch(lambda p, x, xp: (x.sum(1), None), {}, 0.0, 1.0, requests)
+        run_microbatch(lambda p, x, ym, ys: x.sum(1).reshape(-1, 1), {}, 0.0, 1.0, requests)
 
 
 def test_params_from_manifest_blob_matches_valuemlp_params():
