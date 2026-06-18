@@ -52,10 +52,12 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory_resource>
 #include <random>
 #include <tuple>
 #include <unordered_map>
@@ -132,28 +134,68 @@ struct GBeliefChildKeyHash {
 // N[slot]==0 -> q==0.0, the SAME unvisited-completion the map's `find==end` gave; total_n sums all slots,
 // and unvisited entries are 0 so the sum equals the map's visited-only sum). `legal_slots` tracks the env
 // order the PUCT scan + the improved-π iterate (the Python `node.legal` list order).
+// ALLOCATION (ADR-0012 P9 rule 4, MEASURED — ADR-0009): the node pool is rebuilt fresh PER DECISION
+// and each GumbelNode owns FIVE std::vector + a std::unordered_map, with O(tree-size) nodes per
+// decision all freed at decision end. The K=64 e2e wire profile (perf report on chocofarm-cpp-r:
+// _int_malloc 4.06%, unlink_chunk 1.03%, _int_free ~1.5%, __memmove_avx 0.87% — ~6% of runner
+// self-cycles) placed that allocator traffic in the SEARCH DESCENT here, NOT at the per-leaf feature
+// path (already heap-reuse-clean via ws_) nor the per-decision feat/mask/pi vectors (std::move'd into
+// EpisodeBuilder storage — >1-owner, no arena). So the node pool's per-decision malloc/free churn is
+// the measured bucket, and it is served from a per-policy std::pmr::monotonic_buffer_resource (a typed
+// pmr arena, geometric 2x upstream growth) RESET via release() per decision. To route the node's own
+// inner containers through that arena the node is ALLOCATOR-AWARE (uses-allocator construction): its
+// pmr containers and the allocator-extended ctors below let std::pmr::vector<GumbelNode>::emplace_back
+// PROPAGATE the arena's allocator into each node's W/N/legal_slots/prior(_d)/children. The CONTENTS and
+// the find/insert-only children operations are UNCHANGED — only the allocator differs, so the node
+// graph and every lookup are byte-identical to the std::vector/std::unordered_map form (P6: an
+// allocator swap perturbs no value, and children is read by .find() only, never iterated per decision).
 struct GumbelNode {
+    using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
+
     bool evaluated = false;                 // has `evaluate` populated this node?
     double value = 0.0;                     // scalar net value V at this belief
-    std::vector<float> prior;               // (n_slots,) masked-softmax prior P(s,·) — FLOAT32 (1b seam 1:
+    std::pmr::vector<float> prior;          // (n_slots,) masked-softmax prior P(s,·) — FLOAT32 (1b seam 1:
                                             //   the in-search prior the Python search side-reads as
                                             //   root.prior, a float32 array; softmaxed in f64, stored f32)
-    std::vector<double> prior_d;            // (n_slots,) the SAME masked-softmax prior in FULL float64 —
+    std::pmr::vector<double> prior_d;       // (n_slots,) the SAME masked-softmax prior in FULL float64 —
                                             //   the pre-narrowing double prior. The DISCRIMINATION control
                                             //   (kUniform) reads THIS at every site so the uniform arm is
                                             //   the genuine 1a all-float64 port; the mixed (default) arm
                                             //   reads the float32 `prior`. See gumbel.cpp seam map.
-    std::vector<int> legal_slots;           // legal action slots, in env.legal_actions + TERMINATE order
-    std::vector<double> W;                  // (n_slots,) action-slot -> summed λ-penalized return (0 unvisited)
-    std::vector<int> N;                     // (n_slots,) action-slot -> selection count (0 unvisited)
+    std::pmr::vector<int> legal_slots;      // legal action slots, in env.legal_actions + TERMINATE order
+    std::pmr::vector<double> W;             // (n_slots,) action-slot -> summed λ-penalized return (0 unvisited)
+    std::pmr::vector<int> N;                // (n_slots,) action-slot -> selection count (0 unvisited)
     // (action-slot, belief_key) -> child arena idx. A find/insert-only transposition table (never iterated
-    // in key order), so an unordered_map is bit-exact with the former std::map — see GBeliefChildKeyHash.
-    std::unordered_map<std::tuple<int, GBeliefKey>, int, GBeliefChildKeyHash> children;
+    // in key order), so a pmr::unordered_map is bit-exact with the former std::unordered_map / the older
+    // std::map — same GBeliefChildKeyHash + tuple operator==, only the allocator differs (GBeliefChildKeyHash).
+    std::pmr::unordered_map<std::tuple<int, GBeliefKey>, int, GBeliefChildKeyHash> children;
 
-    // Construct with W/N sized to the slot space, zero-initialized (the unvisited semantics: N[slot]==0).
-    GumbelNode() = default;
-    explicit GumbelNode(int n_slots)
-        : W(static_cast<size_t>(n_slots), 0.0), N(static_cast<size_t>(n_slots), 0) {}
+    // The allocator-aware ctors (uses-allocator construction): the no-arg + n_slots forms forward an
+    // allocator (the pmr arena, supplied by std::pmr::vector<GumbelNode>::emplace_back) to EVERY inner
+    // pmr container, so the node's storage is served from the per-policy monotonic_buffer_resource. The
+    // n_slots ctor still sizes W/N to the slot space zero-initialized (the unvisited semantics N[slot]==0).
+    explicit GumbelNode(const allocator_type& alloc = {})
+        : prior(alloc), prior_d(alloc), legal_slots(alloc), W(alloc), N(alloc), children(alloc) {}
+    GumbelNode(int n_slots, const allocator_type& alloc)
+        : prior(alloc), prior_d(alloc), legal_slots(alloc),
+          W(static_cast<size_t>(n_slots), 0.0, alloc), N(static_cast<size_t>(n_slots), 0, alloc),
+          children(alloc) {}
+    // The allocator-extended copy/move ctors uses-allocator construction REQUIRES so the NodePool can
+    // grow (it move-constructs the existing nodes into the new arena block, propagating THIS arena's
+    // allocator to each rebuilt inner container — without these, std::vector<GumbelNode>::emplace_back's
+    // realloc cannot satisfy uses_allocator). Each inner container's (value, alloc) ctor copies/moves the
+    // contents byte-identically and binds it to `alloc`. The non-allocator copy/move stay defaulted.
+    GumbelNode(const GumbelNode& o, const allocator_type& alloc)
+        : evaluated(o.evaluated), value(o.value), prior(o.prior, alloc), prior_d(o.prior_d, alloc),
+          legal_slots(o.legal_slots, alloc), W(o.W, alloc), N(o.N, alloc), children(o.children, alloc) {}
+    GumbelNode(GumbelNode&& o, const allocator_type& alloc)
+        : evaluated(o.evaluated), value(o.value), prior(std::move(o.prior), alloc),
+          prior_d(std::move(o.prior_d), alloc), legal_slots(std::move(o.legal_slots), alloc),
+          W(std::move(o.W), alloc), N(std::move(o.N), alloc), children(std::move(o.children), alloc) {}
+    GumbelNode(const GumbelNode&) = default;
+    GumbelNode(GumbelNode&&) = default;
+    GumbelNode& operator=(const GumbelNode&) = default;
+    GumbelNode& operator=(GumbelNode&&) = default;
 
     // Q(slot) = W/N, or 0.0 unvisited (mirrors _Node.q). Dense: N[slot]==0 <=> unvisited (the former
     // `N.find==end` branch), so the unvisited->0.0 semantics is preserved exactly.
@@ -163,6 +205,12 @@ struct GumbelNode {
         return W[static_cast<size_t>(slot)] / static_cast<double>(n);
     }
 };
+
+// The per-decision node pool (the search-tree arena). A std::pmr::vector<GumbelNode> so its element
+// storage AND each node's inner containers draw from the SAME per-policy monotonic_buffer_resource;
+// the resource is release()'d per decision (run_search), so the whole tree's allocations are recycled
+// from the up-front buffer instead of churning the global allocator per decision (ADR-0012 P9 rule 4).
+using NodePool = std::pmr::vector<GumbelNode>;
 
 // The Gumbel search's RNG seam. Two draws route through it so the deterministic logic check can script
 // both RNG-free across languages: (a) `gumbel(n)` — one i.i.d. Gumbel draw per slot over the FULL slot
@@ -270,27 +318,27 @@ class GumbelAZPolicy final : public Policy {
     // Sequential Halving over n_sims (Danihelka §2): n_phases = ceil(log2 m), per-phase equal-share
     // budget, drop the worst half each phase by g+logit+σ·q̂, then a remainder loop spends the FULL
     // budget. Returns the surviving slot (the executed action). Mirrors _sequential_halving.
-    [[nodiscard]] int sequential_halving(std::vector<GumbelNode>& nodes, const Loc& loc,
+    [[nodiscard]] int sequential_halving(NodePool& nodes, const Loc& loc,
                                          const Belief& bw, const CollectedSet& collected,
                                          double lam, GumbelSource& src, std::vector<int> considered,
                                          const std::vector<double>& g, const std::vector<double>& logits,
                                          int& n_spent) const;
 
     // Run `count` sims of root action `slot`, accumulating W/N (mirrors _visit).
-    void visit(std::vector<GumbelNode>& nodes, const Loc& loc, const Belief& bw,
+    void visit(NodePool& nodes, const Loc& loc, const Belief& bw,
                const CollectedSet& collected, int slot, double lam, GumbelSource& src,
                int count) const;
 
     // One sim of a root action: realize it, average the leaf over c_outcome immediate determinizations,
     // descend the interior with PUCT for the remaining depth (mirrors _simulate_root_action). Returns
     // the λ-penalized return.
-    [[nodiscard]] double simulate_root_action(std::vector<GumbelNode>& nodes, const Loc& loc,
+    [[nodiscard]] double simulate_root_action(NodePool& nodes, const Loc& loc,
                                               const Belief& bw,
                                               const CollectedSet& collected, int slot, uint32_t world,
                                               double lam, GumbelSource& src) const;
 
     // Interior PUCT descent; net value at the leaf (mirrors _descend). `node` is an arena index.
-    [[nodiscard]] double descend(std::vector<GumbelNode>& nodes, int node, const Loc& loc,
+    [[nodiscard]] double descend(NodePool& nodes, int node, const Loc& loc,
                                  const Belief& bw, const CollectedSet& collected,
                                  uint32_t world, double lam, GumbelSource& src, int depth) const;
 
@@ -331,6 +379,27 @@ class GumbelAZPolicy final : public Policy {
     // the _into signatures / read by name in evaluate, P9 rule). `mutable` for the same reason fb_'s memos
     // are: the observable value-for-input is invariant, only the storage is reused (logical-const, single-owner).
     mutable FeatureWorkspace ws_;
+
+    // The per-decision node-pool arena (ADR-0012 P9 rule 4; the SAME per-policy == per-TreeState/per-fiber
+    // ownership as ws_, clobber-safe across the K concurrently-parked wire fibers — each holds its OWN
+    // GumbelAZPolicy, so its OWN arena). A std::pmr::monotonic_buffer_resource: it carves the per-decision
+    // node pool (the NodePool vector + each node's inner pmr containers) from `arena_buf_` up front, and
+    // when that is exhausted requests the next chunk from the upstream allocator GEOMETRICALLY (the standard
+    // monotonic_buffer_resource grows the requested block size ~2x as it goes — the 2x-growth arena the
+    // maintainer directed, allocated up front + in batches from the normal allocator, NOT brk/sbrk).
+    // run_search() calls arena_.release() at the START of each decision, recycling the whole prior tree's
+    // storage back to `arena_buf_` (a monotonic resource frees nothing until release()) and reusing it
+    // across that fiber's decisions. MEASURED justification (ADR-0009, the P9-rule-4 obligation): the K=64
+    // e2e wire profile's ~6% allocator bucket (_int_malloc 4.06% + unlink_chunk/_int_free/__memmove) in
+    // the search descent (see GumbelNode). Explicit typed members read by name (no thread_local / global) —
+    // the P9-rule-4 typed-arena form. `mutable`: logical-const, single-owner storage reuse, exactly as ws_.
+    // MEMORY TRADE: kArenaInitialBytes is an INLINE member buffer, so it is a fixed per-policy / per-fiber
+    // resident floor (~kArenaInitialBytes x K across the K wire fibers, e.g. 16 MiB at K=64) traded for the
+    // up-front no-upstream-touch the maintainer directed — sized so a typical decision's tree fits without
+    // the monotonic resource reaching upstream, the geometric 2x growth covering the deep-tree tail.
+    static constexpr std::size_t kArenaInitialBytes = 256 * 1024;  // up-front; grows ~2x from upstream
+    mutable std::array<std::byte, kArenaInitialBytes> arena_buf_;
+    mutable std::pmr::monotonic_buffer_resource arena_{arena_buf_.data(), arena_buf_.size()};
 };
 
 }  // namespace chocofarm

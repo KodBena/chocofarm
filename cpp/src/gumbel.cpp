@@ -71,6 +71,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <span>
 
 namespace chocofarm {
 
@@ -207,7 +208,7 @@ namespace {
 // per-leaf evaluate() prior build through here; the per-decision improved_policy keeps the value-returning
 // form (one alloc per decision, not per leaf).
 void masked_softmax_1a_into(const std::vector<double>& completed,
-                            const std::vector<int>& legal_slots, int n_slots,
+                            std::span<const int> legal_slots, int n_slots,
                             std::vector<double>& out) {
     out.assign(static_cast<size_t>(n_slots), 0.0);
     if (legal_slots.empty()) return;
@@ -224,7 +225,7 @@ void masked_softmax_1a_into(const std::vector<double>& completed,
 }
 
 [[nodiscard]] std::vector<double> masked_softmax_1a(const std::vector<double>& completed,
-                                                    const std::vector<int>& legal_slots,
+                                                    std::span<const int> legal_slots,
                                                     int n_slots) {
     std::vector<double> out;
     masked_softmax_1a_into(completed, legal_slots, n_slots, out);
@@ -304,7 +305,7 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
     // store BOTH: the full-float64 prior (prior_d, read by the uniform discrimination arm) AND its
     // float32 narrowing (prior, read by the default mixed arm — the precision Python's root.prior holds).
     const std::vector<double>& prior_d = ws_.prior_scratch;
-    node.prior_d = prior_d;
+    node.prior_d.assign(prior_d.begin(), prior_d.end());  // pmr<-std value copy (byte-identical; allocator differs)
     node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
     for (int s = 0; s < n_slots_; ++s)
         node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_d[static_cast<size_t>(s)]);
@@ -363,7 +364,7 @@ int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
 }
 
 // ---- interior PUCT descent; net value at the leaf (mirrors _descend) ------------------------------
-double GumbelAZPolicy::descend(std::vector<GumbelNode>& nodes, int node, const Loc& loc,
+double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
                                const Belief& bw, const CollectedSet& collected,
                                uint32_t world, double lam, GumbelSource& src, int depth) const {
     if (depth >= cfg_.max_depth || env_.empty(bw)) {
@@ -410,7 +411,7 @@ double GumbelAZPolicy::descend(std::vector<GumbelNode>& nodes, int node, const L
 }
 
 // ---- one sim of a root action (mirrors _simulate_root_action) -------------------------------------
-double GumbelAZPolicy::simulate_root_action(std::vector<GumbelNode>& nodes, const Loc& loc,
+double GumbelAZPolicy::simulate_root_action(NodePool& nodes, const Loc& loc,
                                             const Belief& bw,
                                             const CollectedSet& collected, int slot, uint32_t world,
                                             double lam, GumbelSource& src) const {
@@ -443,7 +444,7 @@ double GumbelAZPolicy::simulate_root_action(std::vector<GumbelNode>& nodes, cons
 }
 
 // ---- run `count` sims of root action `slot` (mirrors _visit) --------------------------------------
-void GumbelAZPolicy::visit(std::vector<GumbelNode>& nodes, const Loc& loc,
+void GumbelAZPolicy::visit(NodePool& nodes, const Loc& loc,
                            const Belief& bw, const CollectedSet& collected, int slot,
                            double lam, GumbelSource& src, int count) const {
     for (int i = 0; i < count; ++i) {
@@ -455,7 +456,7 @@ void GumbelAZPolicy::visit(std::vector<GumbelNode>& nodes, const Loc& loc,
 }
 
 // ---- Sequential Halving (Danihelka §2) (mirrors _sequential_halving) ------------------------------
-int GumbelAZPolicy::sequential_halving(std::vector<GumbelNode>& nodes, const Loc& loc,
+int GumbelAZPolicy::sequential_halving(NodePool& nodes, const Loc& loc,
                                        const Belief& bw,
                                        const CollectedSet& collected, double lam, GumbelSource& src,
                                        std::vector<int> considered, const std::vector<double>& g,
@@ -563,6 +564,11 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     // narrow across decisions (low cross-decision reuse), and this keeps the long-lived serve-path builder
     // from accumulating a process-lifetime cache. Correctness-safe (a hit is bit-identical), always sound.
     fb_.reset_belief_cache();
+    // Recycle the per-decision node-pool arena: a monotonic_buffer_resource frees nothing until release(),
+    // so release() here hands the whole PRIOR decision's node storage back to arena_buf_ for this decision
+    // to reuse (ADR-0012 P9 rule 4). Same per-decision reset point as the belief cache; same per-policy /
+    // per-fiber ownership (gumbel.hpp arena_). Correctness-safe: every node below is freshly constructed.
+    arena_.release();
     Decision out;
     // empty-belief guard (mirrors decide_with_target's len(bw)==0): the only continuation is to exit.
     if (env_.empty(bw)) {
@@ -574,7 +580,7 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
         return out;
     }
 
-    std::vector<GumbelNode> nodes;
+    NodePool nodes{&arena_};       // the per-decision node pool, served from the per-policy pmr arena
     nodes.emplace_back(n_slots_);  // the root (arena index 0); dense W/N sized to the slot space
     evaluate(nodes[0], loc, bw, collected);
 
