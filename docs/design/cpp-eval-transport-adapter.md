@@ -194,6 +194,40 @@ non-regressing, and ready to carry that phase; it should ride as a selectable fl
 makes the per-round gather small enough that D>1 separates from the strict barrier. The adapter is
 validated as CORRECT (parity held) but its throughput payoff is deferred to overcommit, as predicted.
 
+## 6. The overcommit restructure (design — the deferred lever Stage B gated)
+
+Stage B quantified the gap: one tree sustains ~54 in-flight leaves; the serve fast region is B≈192.
+Closing it needs TWO mechanisms (Stage B had neither fully — one tree through a greedy drain):
+
+- **M1 — overcommit: N independent trees per producer thread.** A producer runs N concurrent `TreeState`s
+  (N self-play episodes interleaved), not one. Independent trees do NOT interact under virtual-loss, so
+  their in-flight leaves SUM (unlike adding fibers to one tree, which only collides). The arm3 driver
+  already pools out-of-order corr-id replies, so it interleaves N trees' leaves onto the thread's one
+  socket for free. P9: each thread OWNS its N trees + its DEALER socket — single-writer-per-tree stays
+  structural (this is why per-thread-N is chosen over a global work-stealing tree pool, which would break
+  the single-writer invariant).
+- **M2 — the server assembles: a fill-or-delay drain (DEFERRED to increment ii).** More queued leaves make
+  even the existing greedy bucketed drain gather more; only if that stalls below the fast region do we add
+  a min-batch / max-delay accumulation (Triton `preferred_batch_size` + `max_queue_delay`): the server
+  waits briefly to fill toward a bucket before forwarding. Throughput-only makes the wait FREE —
+  overcommitted producers never idle during it. Gated on measurement, not built up front.
+- **M3 — 1:3 affinity pinning.** The server is already a separate thread/process; pin it to 1 core and the
+  3 producer threads to the other 3 (an affinity change, not a re-architecture). Stage A proved
+  cross-process `ipc://` hits the roofline, so SHM stays unneeded even with the server isolated.
+
+**Build in two MEASURED increments:** (i) M1 overcommit + M3 1:3 pinning on the EXISTING greedy bucketed
+drain — measure rows/forward and dps; (ii) M2 fill-or-delay ONLY if (i) stalls below the fast region.
+Avoids building the delayed-batcher speculatively. **N start = 2**, sweep N ∈ {1,2,3,4}.
+
+**Validation:** headline metric is rows/forward → does it reach ~192; then dps vs the model's optimistic
+~456 (`docs/notes/serve-produce-core-allocation.md`). Byte-identity holds PER TREE (independent trees,
+row-independent forward, corr-id routing) — same fast-tier parity gate; ≥5-iter A/B with variance, the
+strict-barrier single-tree run as baseline.
+
+**Honest risk:** the ~456 is an optimistic upper bound; the cross-tree fiber-mux bookkeeping, the per-tree
+memory (N × the pmr arena + tree state), and the server's assembly overhead all eat into it. Increment (i)
+is exactly where we learn how much survives.
+
 ## Key sources
 
 SEED RL (arXiv:1910.06591) · Triton dynamic batcher ·
