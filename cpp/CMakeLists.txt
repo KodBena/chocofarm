@@ -323,6 +323,16 @@ add_executable(chocofarm-wire-pool-bench src/wire_pool_bench.cpp)
 target_link_libraries(chocofarm-wire-pool-bench PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK} Threads::Threads)
 target_compile_options(chocofarm-wire-pool-bench PRIVATE -Wall -Wextra)
 
+# The Stage A PURE-TRANSPORT microbench (NOT the runner): pre-baked synthetic 241-float rows driven over
+# the real ZMQ + corr-id WireLeafPool path to the bench-scoped JAX server, isolating the S (leaves/msg)
+# and D (in-flight depth) transport knobs from the search (no MCTS). Maps the throughput surface for the
+# eval-transport-adapter design's Stage A (docs/design/cpp-eval-transport-adapter.md §4). Reuses the
+# shared WireLeafPool corr-id transport + inference_wire codec (P1/P7); no boost (no fibers/search).
+# zmq is PUBLIC/transitive via chocofarm_core. Separate from the runner (P3, one-owner).
+add_executable(chocofarm-stage-a-transport-bench src/stage_a_transport_bench.cpp)
+target_link_libraries(chocofarm-stage-a-transport-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-stage-a-transport-bench PRIVATE -Wall -Wextra)
+
 # A fifth tiny parity fixture (NOT the runner): constructs a ZmqNetClient (the REMOTE NetEvaluator),
 # RPCs the running Python inference service with feature vectors on stdin, and prints the returned
 # (value, logits) — so the cross-language round-trip test (tests/test_zmq_net_cpp.py) can drive the C++
