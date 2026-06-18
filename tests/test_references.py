@@ -59,6 +59,63 @@ def test_names_importable_from_both_and_identical():
     assert harn.DECOMP_ANCHOR == ref.DECOMP_ANCHOR == 0.0941
 
 
+class _FakeRedis:
+    """A dict-backed stand-in for the registry redis (get→bytes, set→stores) so the cache's fetch/store/
+    garbage arms are tested WITHOUT a live redis and without the expensive rate compute."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, bytes] = {}
+
+    def get(self, k: str) -> "bytes | None":
+        return self.store.get(k)
+
+    def set(self, k: str, v: object) -> None:
+        self.store[k] = v if isinstance(v, bytes) else str(v).encode()
+
+
+def test_clairvoyant_cache_round_trips_and_is_loud_on_garbage():
+    """The optimistic cache: a MISS computes + stores; a HIT returns the stored value WITHOUT recomputing;
+    a present-but-malformed blob is a LOUD ValueError (never serve a garbage ceiling — ADR-0002/P2)."""
+    import pytest
+
+    from chocofarm import references as ref
+    from chocofarm.model.env import Environment
+    env = Environment()
+    fake = _FakeRedis()
+    orig_redis, orig_rate = ref._cache_redis, ref.clairvoyant_rate
+    try:
+        ref._cache_redis = lambda: fake                       # type: ignore[assignment]
+        ref.clairvoyant_rate = lambda e: 0.1234               # type: ignore[assignment] # stub the brute force
+        assert ref.cached_clairvoyant_rate(env) == 0.1234     # miss → compute(stub) + store
+        assert fake.store                                     # it was stored
+
+        def _boom(e: object) -> float:
+            raise AssertionError("recomputed on a cache hit")
+        ref.clairvoyant_rate = _boom                          # type: ignore[assignment]
+        assert ref.cached_clairvoyant_rate(env) == 0.1234     # hit → stored value, no recompute
+
+        key = ref._CLAIRVOYANT_KEY_PREFIX + ref._env_clairvoyant_fingerprint(env)
+        fake.store[key] = b"not-a-float"
+        with pytest.raises(ValueError):
+            ref.cached_clairvoyant_rate(env)
+    finally:
+        ref._cache_redis, ref.clairvoyant_rate = orig_redis, orig_rate   # type: ignore[assignment]
+
+
+def test_clairvoyant_cache_degrades_to_compute_when_redis_down():
+    """A redis OUTAGE (no client) degrades to a DIRECT compute — the cache is optimistic, it never fails
+    the run for being unable to reach redis."""
+    from chocofarm import references as ref
+    from chocofarm.model.env import Environment
+    orig_redis, orig_rate = ref._cache_redis, ref.clairvoyant_rate
+    try:
+        ref._cache_redis = lambda: None                       # type: ignore[assignment]
+        ref.clairvoyant_rate = lambda e: 0.5                  # type: ignore[assignment]
+        assert ref.cached_clairvoyant_rate(Environment()) == 0.5
+    finally:
+        ref._cache_redis, ref.clairvoyant_rate = orig_redis, orig_rate   # type: ignore[assignment]
+
+
 if __name__ == "__main__":
     # plain-runnable (no pytest needed) — mirrors test_smoke.py's bare-script path.
     for name, fn in sorted(globals().items()):
