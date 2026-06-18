@@ -94,6 +94,34 @@ struct PointEq {
     }
 };
 
+// A caller-owned, reused scratch for the HOT per-leaf evaluate() path (ADR-0012 P9 hot-path exception).
+// build_into / legal_mask_into write INTO these buffers instead of returning fresh vectors, so a search
+// tree's many leaves reuse ONE allocation set instead of churning fresh heap (de)allocations per leaf.
+// The values written are byte-identical to the value-returning build()/legal_mask_from_features (P6) —
+// only the storage is reused.
+//
+// MEASURED SCOPE (honest, ADR-0009): a before/after K=64 wire profile showed the FEATURE triple
+// (feat64/feat32/mask) reuse is metric-NEUTRAL on the malloc bucket — it is a byte-identical steady-state
+// refactor, not the source of the ~20% bucket. The bucket the profile actually flagged is the per-leaf
+// temporaries DOWNSTREAM of the feature build inside GumbelAZPolicy::evaluate (the net-output-as-double
+// `logits_d` + the masked-softmax `prior_d`, each ~n_slots, freshly heap-allocated every leaf). Those are
+// the `logits_d`/`prior_scratch` buffers below; reusing them is the per-leaf win this workspace now targets.
+//
+// `feat64` is build()'s float64 output; `feat32` is its float32 narrowing (the wire dtype the NetEvaluator
+// port consumes); `mask` is the sliced legal mask. `logits_d` is the net logits widened to double over the
+// slot space; `prior_scratch` is the masked-softmax prior (assigned into node.prior_d). OWNERSHIP is the
+// caller's (the search holds one per GumbelAZPolicy — i.e. per TreeState/per fiber, so the buffers are
+// reused across that one tree's sequential leaves and isolated across concurrently-parked fibers); these
+// are explicitly-typed members passed by name to the _into signatures, NOT a hidden global / thread_local
+// (P9 rule).
+struct FeatureWorkspace {
+    std::vector<double> feat64;        // build_into target — length dim()
+    std::vector<float> feat32;         // the float32 narrowing of feat64 (the wire/port dtype)
+    std::vector<float> mask;           // legal_mask_into target — length n_slots
+    std::vector<double> logits_d;      // evaluate(): net logits widened to double over the slot space
+    std::vector<double> prior_scratch; // evaluate(): the masked-softmax prior (then assigned into prior_d)
+};
+
 // The §2.2 feature vector for (loc, bw, collected), mirroring features.FeatureBuilder.build. The
 // layout is the canonical ordered block table (per-treasure N×5, per-detector nD×3, global
 // 6+n_tel). Returned as float64 internally, cast to float32 at the wire by the runner. Float-
@@ -107,6 +135,15 @@ class FeatureBuilder {
     std::vector<double> build(const Point& loc, const Belief& bw,
                               const CollectedSet& collected) const;
 
+    // The hot-path variant: write the length-dim() float64 feature row into the caller-owned `out`
+    // (resized as needed, then overwritten) instead of allocating a fresh vector per call (P9). The
+    // WRITTEN VALUES are byte-identical to build()'s return for the same (loc, bw, collected) — this is
+    // build()'s body with `out` as the destination; build() is a thin wrapper that calls this into a
+    // local. Route ONLY the per-leaf search through here; the record-assembly / parity callers keep the
+    // value-returning build().
+    void build_into(const Point& loc, const Belief& bw, const CollectedSet& collected,
+                    std::vector<double>& out) const;
+
     // The legal-action mask sliced from an ALREADY-BUILT feature vector (mirrors
     // actions.legal_mask_from_features): the per-treasure `available` block IS the collect-legal mask,
     // the per-detector `informative` block IS the sense-legal mask, TERMINATE always legal. The hot-path
@@ -117,6 +154,14 @@ class FeatureBuilder {
     // legal_mask(env, bw, collected) ORACLE for the same state: available == (marg>0 ∧ ¬collected) ==
     // the collect test; informative == (0<cnt<nb) == env.informative (the parity harness nets the two).
     [[nodiscard]] std::vector<float> legal_mask_from_features(std::span<const float> feat) const;
+
+    // The hot-path mask variant: write the length-(N+nD+1) legal mask into the caller-owned `out`
+    // (resized as needed, then overwritten) instead of allocating a fresh vector per call (P9). The
+    // WRITTEN VALUES are byte-identical to legal_mask_from_features for the same `feat` — same slice of
+    // the available/informative blocks + the always-legal TERMINATE; legal_mask_from_features is a thin
+    // wrapper that calls this into a local. `feat` MUST be a length-dim() build()/build_into vector (the
+    // same contract, asserted in the impl, ADR-0002).
+    void legal_mask_into(std::span<const float> feat, std::vector<float>& out) const;
 
     // Drop the per-belief memo (mirrors Python reset_belief_cache). The search calls this at the start
     // of each decision (run_search), scoping the belief cache to one tree's beliefs — which narrow across

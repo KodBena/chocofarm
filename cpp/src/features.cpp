@@ -312,6 +312,17 @@ struct CollectedFeatures {
 
 std::vector<double> FeatureBuilder::build(const Point& loc, const Belief& bw,
                                           const CollectedSet& collected) const {
+    // Thin value-returning wrapper over build_into (P9 rule 2): the non-hot callers (the runner's
+    // record-assembly, the parity harnesses, the cache check) keep the convenient by-value form; the
+    // body lives ONCE in build_into. Bit-identical — `out` is constructed exactly as the former
+    // monolith (`(dim_, 0.0)`), then build_into overwrites it with the SAME writes.
+    std::vector<double> out(static_cast<size_t>(dim_), 0.0);
+    build_into(loc, bw, collected, out);
+    return out;
+}
+
+void FeatureBuilder::build_into(const Point& loc, const Belief& bw, const CollectedSet& collected,
+                                std::vector<double>& out) const {
     const int N = N_, nD = nD_, n_tel = n_tel_;
 
     // Three input groups that do not interact until assembly (the dossier's DAG): belief math (the
@@ -328,7 +339,11 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const Belief& bw,
     // ladder — bit-exact (P6). The per-build layout-mismatch assert is GONE: the ctor's load (Σwidth==dim
     // ==env-derived dim, no dup/neg widths ⇒ a contiguous partition) + its key-set check make the desync
     // that assert guarded structurally unauthorable (dossier §3 — mechanize > assert).
-    std::vector<double> out(dim_, 0.0);
+    // Reuse the caller's buffer: size to dim_ and zero EVERY slot, identical to the former
+    // `std::vector<double> out(dim_, 0.0)` construction (the layout is a contiguous Σwidth==dim
+    // partition, so every slot is then overwritten below — the zero-init is the build() basis kept
+    // exact). `assign` reuses the existing capacity across leaves (no per-leaf alloc on the steady path).
+    out.assign(static_cast<size_t>(dim_), 0.0);
     { const int s = off_.marg;        for (int i = 0; i < N; ++i) out[s + i] = bf.marg[i]; }
     { const int s = off_.collected;   for (int i = 0; i < N; ++i) out[s + i] = cf.coll[i]; }
     { const int s = off_.available;   for (int i = 0; i < N; ++i)
@@ -351,27 +366,36 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const Belief& bw,
     out[off_.nonempty]    = bf.nonempty;                                  // non-empty belief flag
     out[off_.sum_unc]     = sum_unc;                                      // Σ_uncollected unc
     { const int s = off_.dist_w;      for (int k = 0; k < n_tel; ++k) out[s + k] = gf.dist_w[k]; }
-    return out;
 }
 
 std::vector<float> FeatureBuilder::legal_mask_from_features(std::span<const float> feat) const {
-    // `feat` MUST be this builder's build() output (length dim()). The bare span cannot carry that
-    // contract, so assert it (fail-loud, ADR-0002) — a mis-laid buffer is a programmer bug, not a
+    // Thin value-returning wrapper over legal_mask_into (P9 rule 2): the non-hot callers keep the
+    // by-value form; the body lives ONCE in legal_mask_into. Bit-identical — `m` is constructed exactly
+    // as the former monolith (`(N+nD+1, 0.0f)`), then legal_mask_into overwrites it with the SAME writes.
+    std::vector<float> m(static_cast<size_t>(N_ + nD_ + 1), 0.0f);
+    legal_mask_into(feat, m);
+    return m;
+}
+
+void FeatureBuilder::legal_mask_into(std::span<const float> feat, std::vector<float>& out) const {
+    // `feat` MUST be this builder's build()/build_into output (length dim()). The bare span cannot carry
+    // that contract, so assert it (fail-loud, ADR-0002) — a mis-laid buffer is a programmer bug, not a
     // recoverable boundary.
-    assert(feat.size() == static_cast<size_t>(dim_) && "legal_mask_from_features: feat is not a build() vector");
+    assert(feat.size() == static_cast<size_t>(dim_) && "legal_mask_into: feat is not a build() vector");
     // Slice the §2.2 blocks that ARE the mask (design §3): the per-treasure `available` block is the
     // legal-collect mask, the per-detector `informative` block is the legal-sense mask, TERMINATE is
     // always legal. No belief recompute — these blocks were just written by build() from the ONE marg
-    // sweep (ADR-0012 P1). Offsets via the layout SSOT (named, not magic literals).
-    std::vector<float> m(static_cast<size_t>(N_ + nD_ + 1), 0.0f);
+    // sweep (ADR-0012 P1). Offsets via the layout SSOT (named, not magic literals). `assign` reuses the
+    // caller buffer's capacity (no per-leaf alloc on the steady path) and zeros it, identical to the
+    // former `(N+nD+1, 0.0f)` construction — TERMINATE is then set 1.0f, every other slot written below.
+    out.assign(static_cast<size_t>(N_ + nD_ + 1), 0.0f);
     const int avail = off_.available;
     const int info = off_.informative;
     for (int i = 0; i < N_; ++i)
-        m[static_cast<size_t>(i)] = (feat[static_cast<size_t>(avail + i)] > 0.0f) ? 1.0f : 0.0f;
+        out[static_cast<size_t>(i)] = (feat[static_cast<size_t>(avail + i)] > 0.0f) ? 1.0f : 0.0f;
     for (int j = 0; j < nD_; ++j)
-        m[static_cast<size_t>(N_ + j)] = (feat[static_cast<size_t>(info + j)] > 0.0f) ? 1.0f : 0.0f;
-    m[static_cast<size_t>(N_ + nD_)] = 1.0f;  // TERMINATE always legal (term_slot = N+nD)
-    return m;
+        out[static_cast<size_t>(N_ + j)] = (feat[static_cast<size_t>(info + j)] > 0.0f) ? 1.0f : 0.0f;
+    out[static_cast<size_t>(N_ + nD_)] = 1.0f;  // TERMINATE always legal (term_slot = N+nD)
 }
 
 void FeatureBuilder::reset_belief_cache() const {

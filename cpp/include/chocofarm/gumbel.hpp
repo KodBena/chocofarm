@@ -315,6 +315,22 @@ class GumbelAZPolicy final : public Policy {
     FeatureBuilder fb_;
     int n_slots_;
     int term_slot_;
+
+    // The per-leaf evaluate() scratch (ADR-0012 P9 hot-path exception): evaluate() reuses these buffers
+    // across THIS policy's leaves — the feature triple via fb_.build_into / fb_.legal_mask_into, plus the
+    // logits_d / prior_scratch the masked-softmax prior build now writes into — instead of allocating fresh
+    // vectors per leaf. MEASURED (honest, ADR-0009): a before/after K=64 wire profile showed the FEATURE
+    // triple (feat64/feat32/mask) reuse is metric-NEUTRAL on the malloc bucket (a byte-identical steady-
+    // state refactor, NOT the source of the ~20% bucket); the bucket the profile flagged is the per-leaf
+    // logits_d + masked-softmax prior temporaries, which ws_.logits_d / ws_.prior_scratch now amortize.
+    // OWNERSHIP is per-policy: each TreeState holds its OWN GumbelAZPolicy (fiber_tree.hpp), so this is
+    // per-tree / per-fiber, NOT shared — within ONE tree the leaves are sequential (the parked fiber holds
+    // ch.features into ws_.feat32 only until the driver encodes it at submit, BEFORE the next resume drives
+    // the next leaf's evaluate), and concurrently-parked fibers each have their OWN ws_, so the reuse is
+    // clobber-safe by ownership (no thread_local / global scratch — the buffers are passed explicitly to
+    // the _into signatures / read by name in evaluate, P9 rule). `mutable` for the same reason fb_'s memos
+    // are: the observable value-for-input is invariant, only the storage is reused (logical-const, single-owner).
+    mutable FeatureWorkspace ws_;
 };
 
 }  // namespace chocofarm

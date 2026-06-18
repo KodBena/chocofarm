@@ -200,11 +200,17 @@ namespace {
 // legal max, exp, zero illegal, normalize. Inputs are slot-indexed; `legal_slots` selects the legal
 // entries. Returns an (n_slots,) row, exactly 0.0 on illegal slots. Robust EXCEPT the per-row max
 // argmax on a near-tie (the 1b hazard — coarse 1a inputs have no near-ties).
-[[nodiscard]] std::vector<double> masked_softmax_1a(const std::vector<double>& completed,
-                                                    const std::vector<int>& legal_slots,
-                                                    int n_slots) {
-    std::vector<double> out(static_cast<size_t>(n_slots), 0.0);
-    if (legal_slots.empty()) return out;
+// The into-variant: write the (n_slots,) softmax row into the caller-owned `out` (resized then fully
+// overwritten — every slot is set to 0.0 first, the legal ones then normalized) instead of allocating a
+// fresh vector per call (ADR-0012 P9 hot-path exception). The WRITTEN VALUES are byte-identical to the
+// value-returning masked_softmax_1a for the same inputs — same body, `out` as the destination. Route the
+// per-leaf evaluate() prior build through here; the per-decision improved_policy keeps the value-returning
+// form (one alloc per decision, not per leaf).
+void masked_softmax_1a_into(const std::vector<double>& completed,
+                            const std::vector<int>& legal_slots, int n_slots,
+                            std::vector<double>& out) {
+    out.assign(static_cast<size_t>(n_slots), 0.0);
+    if (legal_slots.empty()) return;
     double row_max = -std::numeric_limits<double>::infinity();
     for (int s : legal_slots) row_max = std::max(row_max, completed[static_cast<size_t>(s)]);
     double denom = 0.0;
@@ -215,6 +221,13 @@ namespace {
     }
     if (denom <= 0.0) denom = 1.0;
     for (int s : legal_slots) out[static_cast<size_t>(s)] /= denom;
+}
+
+[[nodiscard]] std::vector<double> masked_softmax_1a(const std::vector<double>& completed,
+                                                    const std::vector<int>& legal_slots,
+                                                    int n_slots) {
+    std::vector<double> out;
+    masked_softmax_1a_into(completed, legal_slots, n_slots, out);
     return out;
 }
 }  // namespace
@@ -228,9 +241,23 @@ GumbelAZPolicy::GumbelAZPolicy(const GumbelConfig& cfg, const NetEvaluator& net,
 double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& bw,
                                 const CollectedSet& collected) const {
     // build the feature vector + the legal mask, run one forward through the net port (the leaf seam).
-    std::vector<double> feat64 = fb_.build(loc.pt, bw, collected);
-    std::vector<float> feat(feat64.begin(), feat64.end());  // the wire dtype the port consumes (float32)
-    std::vector<float> mask = fb_.legal_mask_from_features(feat);  // reuse build's belief sweep (P1)
+    // The per-leaf work writes into the policy's reused FeatureWorkspace (ws_) rather than allocating fresh
+    // vectors each leaf (ADR-0012 P9 hot-path exception): the buffers are per-policy == per-tree/per-fiber
+    // (gumbel.hpp ws_), so the reuse is clobber-safe (one tree's leaves run sequentially; the parked fiber's
+    // ch.features aliases ws_.feat32 only until the driver encodes it at submit, before the next leaf's
+    // evaluate overwrites it). The WRITTEN VALUES are byte-identical to the value-returning forms (P6) —
+    // feat32 is the SAME per-element float narrowing of feat64 the former `vector<float>(b,e)` copy produced.
+    //
+    // MEASURED (honest, ADR-0009): a before/after K=64 wire profile showed the FEATURE-triple reuse
+    // (feat64/feat32/mask, below) is metric-NEUTRAL on the malloc bucket — a byte-identical steady-state
+    // refactor, NOT the source of the ~20% bucket. The bucket the profile flagged is the per-leaf
+    // temporaries further down THIS function (logits_d + the masked-softmax prior, each ~n_slots, freshly
+    // heap-allocated every leaf); those now reuse ws_.logits_d / ws_.prior_scratch — the per-leaf win.
+    fb_.build_into(loc.pt, bw, collected, ws_.feat64);
+    ws_.feat32.assign(ws_.feat64.begin(), ws_.feat64.end());  // the wire dtype the port consumes (float32)
+    std::span<const float> feat(ws_.feat32);
+    fb_.legal_mask_into(feat, ws_.mask);  // reuse build's belief sweep (P1)
+    const std::vector<float>& mask = ws_.mask;
 
     auto pred = net_.predict(feat);
     // The local NetForward / the scripted leaf always return the value arm; a remote leaf's failure is
@@ -244,7 +271,12 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
     // prior array the Python search side-reads (root.prior, float32) — the precision the mixed path reads.
     // We ALSO keep `node.prior_d`, the SAME masked softmax in full float64, so the discrimination control
     // (kUniform) can read the genuine pre-narrowing double prior at every site (prior_read).
-    std::vector<double> logits_d(static_cast<size_t>(n_slots_), -1e30);
+    // Reuse the policy's per-leaf scratch for the net-logits-as-double row instead of allocating a fresh
+    // vector each leaf (ADR-0012 P9; ws_ is per-policy == per-tree/per-fiber, clobber-safe — one tree's
+    // leaves run sequentially, each parked fiber has its OWN ws_). `assign` re-fills the whole slot space
+    // with the -1e30 illegal sentinel, byte-identical to the former fresh `vector(n_slots_, -1e30)`.
+    std::vector<double>& logits_d = ws_.logits_d;
+    logits_d.assign(static_cast<size_t>(n_slots_), -1e30);
     // collect the legal slots from the MASK (the available/informative blocks build() already produced
     // — no second env.legal_actions → marginals sweep). Treasure slots 0..N-1 then detector slots
     // N..N+nD-1 (id order), then TERMINATE — the SAME order env.legal_actions yields (available = the
@@ -265,9 +297,13 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
         assert(!np.logits.empty() && "gumbel: net has no policy head (logits empty)");
         logits_d[static_cast<size_t>(s)] = static_cast<double>(np.logits[static_cast<size_t>(s)]);
     }
-    std::vector<double> prior_d = masked_softmax_1a(logits_d, node.legal_slots, n_slots_);
+    // build the masked-softmax prior into the policy's per-leaf scratch (P9), then move it onto the node:
+    // the value is byte-identical to the former fresh-vector masked_softmax_1a, but the per-leaf heap
+    // allocation is amortized into ws_.prior_scratch (reused across this tree's sequential leaves).
+    masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, ws_.prior_scratch);
     // store BOTH: the full-float64 prior (prior_d, read by the uniform discrimination arm) AND its
     // float32 narrowing (prior, read by the default mixed arm — the precision Python's root.prior holds).
+    const std::vector<double>& prior_d = ws_.prior_scratch;
     node.prior_d = prior_d;
     node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
     for (int s = 0; s < n_slots_; ++s)
