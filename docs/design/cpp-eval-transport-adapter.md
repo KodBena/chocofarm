@@ -229,6 +229,42 @@ gate. ≥5-iter A/B with variance; the strict-barrier single-tree run as the bas
 pmr arena + tree state), and the server's assembly overhead all erode it. Increment (i)'s rows/forward is
 exactly where we learn how much survives.
 
+## 7. Increment (i) — executed results (2026-06-19, append-only record)
+
+Built in worktree branch `overcommit-increment-i`: N independent TreeStates per producer thread
+(`trees_per_thread`) + 1:3 affinity pinning, on the greedy bucketed-group bench server. 3 producers,
+pool_batch=64, bucket+group server, n_sims=256, m=24. (Bench `wire_ab_bench` — a search-throughput meter
+that reads HIGHER than the full `exit_loop` e2e; trust the RELATIVE shape, not the absolute dps.)
+
+| N | server rows/forward | dps | dps/core |
+|---|---|---|---|
+| 1 (= strict baseline) | 31 | 108 | 36 |
+| 2 | 58 | 134 | 45 |
+| 3 | 89 | 145 | 48 |
+| 4 | 108 | 153 | 51 |
+| 8 | 180 | 172 | 57 |
+| 9 | **193** | **189** | **63** |
+
+**Findings (correcting §6's optimism AND an interim "plateau" misread):**
+- **Mechanism validated.** rows/forward climbs ~LINEARLY with N (≈ baseline × N) — independent trees'
+  in-flight leaves sum, exactly as designed. At N≈9 it reaches the serve fast region (~B=192).
+- **dps does NOT plateau at N≤4** (an earlier interim claim, retracted): it keeps climbing as more trees
+  fill the server's batch, to ~189 dps (~2.25× baseline) at N=9 where rows/forward saturates ~192. The
+  payoff lives at HIGH N, not N=2–3.
+- **The catch:** that high-N region is (a) SLOW to measure — one measurement "wave" is `total_slots =
+  3×N×22 = 66N` full self-play episodes, ~11M leaf-evals for an N∈{1,8,9} sweep — and (b) hits a SEPARATE
+  nondeterministic STALL at N≳4 (works once, wedges the next). The default sweep is capped N≤3 to avoid it.
+- **NOT WIRED INTO PRODUCTION.** All four pieces (PipelinedBucket mode, `trees_per_thread`, the
+  bucketed-group drain, the 1:3 pinning) are BENCH-ONLY. Production self-play (`exit_loop` → `cpp_executor`
+  → `InferenceServer` + the StrictBarrier runner) is unchanged: strict barrier, 1 tree, fixed-shape pad,
+  no pinning. The demonstrated ~2× is a validated MECHANISM, not a reaped gain.
+
+**The lift (to reap) — its own phase, gated on the stall fix:** (1) port the bucketed-group drain into the
+production `InferenceServer`; (2) plumb `trees_per_thread` from `exit_loop`/`cpp_executor`; (3) wire the 1:3
+affinity pinning into the launch; (4) flip the runner to PipelinedBucket behind the byte-identity gate; then
+an `exit_loop` e2e confirmation. Because the gain needs HIGH N, the N≳4 stall must be diagnosed + fixed
+first (the gating dependency).
+
 ## Key sources
 
 SEED RL (arXiv:1910.06591) · Triton dynamic batcher ·
