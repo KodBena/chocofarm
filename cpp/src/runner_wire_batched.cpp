@@ -411,6 +411,9 @@ std::expected<int, Error> run_episodes_wire_pipelined(
     // would degenerate to forced-flush-only (B=1 again); clamping keeps the floor a meaningful threshold the
     // overcommit wave can actually clear. S_min=1 reproduces the pre-fix behavior exactly.
     const int S_min = std::clamp(wcfg.min_coalesce, 1, K);
+    // The runnable gen-side batch-floor option (the "final bolt"): when on, issue() chunks each non-forced
+    // message at S_min rows (depth>1 overcommit); when off, drain-all (depth≈1). See the header.
+    const bool chunk_floor = wcfg.chunk_floor;
 
     void* zctx = zmq_ctx_new();
     if (zctx == nullptr)
@@ -573,21 +576,19 @@ std::expected<int, Error> run_episodes_wire_pipelined(
             return n;
         };
 
-        // Issue ONE coalesced message: gather ALL currently-ready slots into one submit_batch (drain-all),
-        // mark them submitted, send. So per-thread in-flight message depth is ≈1 (a second issue with no
-        // intervening recv finds nothing ready) — SYNTHESIS §0. `force` only governs the S_min floor guard.
+        // Issue ONE coalesced message. The gather shape depends on `chunk_floor` (the runnable gen-side
+        // batch-floor option — the "final bolt", default OFF):
+        //   * chunk_floor OFF → drain-all: gather ALL currently-ready slots into one submit_batch, so a second
+        //     issue with no intervening recv finds nothing ready and per-thread depth is ≈1 (SYNTHESIS §0); D
+        //     is dead and the S_min floor is inert.
+        //   * chunk_floor ON → chunk-at-S_min: a non-forced message carries exactly S_min ready rows and leaves
+        //     the rest READY, so the refill loop holds ⌊W/S_min⌋ distinct messages outstanding up to D —
+        //     genuine depth>1 (the overcommit the server-side floor re-coalesces). The floor then BINDS: a
+        //     sub-S_min non-forced gather is HELD (not sent) because more replies will arrive to fatten it.
         //
-        // NB — the S_min floor below is RETAINED but INERT on this drain-all path (an empirically-refuted
-        // experiment, kept as reviewed scaffolding): at depth ≈1, whenever a refill finds < S_min ready the
-        // caller's forced flush (inflight_msgs == 0) fires immediately, so the floor never holds. The depth>1
-        // chunk break that would have made it bind (committed in 89d6984) was REVERTED here: chunking caps the
-        // per-message degree at S_min (below the natural drain-all ~74) and floods the single-threaded server
-        // with tiny messages it under-coalesces → a deep cross-thread convoy (wedge + growing producer RSS).
-        // The real lever is server-side (rows/forward amortization of the fixed per-forward cost), not the
-        // producer's per-message degree.
-        //
+        // `force` governs the S_min floor guard either way:
         //   * `force == false`: refuse to issue when FEWER than S_min slots are ready (return false, leave them
-        //     ready) — the (inert-at-depth-1) floor guard.
+        //     ready) — the floor guard (binds under chunk_floor; bypassed at depth-1 when off).
         //   * `force == true` (the FORCED FLUSH): emit ALL ready rows regardless — used only when nothing is
         //     outstanding (inflight_msgs == 0) and ready slots remain, the one state where waiting can gather
         //     no more (no reply will ever arrive), so progress / TERMINATION demand the partial send.
@@ -604,6 +605,11 @@ std::expected<int, Error> run_episodes_wire_pipelined(
                     std::span<const float> feats = slots[static_cast<size_t>(s)].ts->ch.features;
                     gather.insert(gather.end(), feats.begin(), feats.end());
                     gathered.push_back(s);
+                    // THE "FINAL BOLT" (runnable, gated): when chunk_floor is on, a non-forced message is a
+                    // BOUNDED CHUNK of exactly S_min rows — stop gathering and leave the rest READY, so the
+                    // refill loop holds ⌊W/S_min⌋ DISTINCT messages outstanding up to D (genuine depth>1, the
+                    // overcommit the server-side floor then re-coalesces). chunk_floor OFF → drain-all (depth≈1).
+                    if (chunk_floor && !force && static_cast<int>(gathered.size()) >= S_min) break;
                 }
             }
             if (gathered.empty()) return false;  // nothing ready to send

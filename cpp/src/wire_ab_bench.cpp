@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
                      "--version <v> --res-token <t> --wire-mode <strict-barrier|pipelined-bucket> "
                      "[--secs 8 --m 24 --n-sims 256 --max-depth 24 --c-outcome 2 --lam 0.1 --max-steps 40 "
                      "--pool-threads T --pool-batch B --inflight-msgs D --trees-per-thread N "
-                     "--min-coalesce S_min --parity-stats <path>]\n";
+                     "--min-coalesce S_min --gen-chunk-floor <0|1> --parity-stats <path>]\n";
         return 2;
     }
 
@@ -127,6 +127,8 @@ int main(int argc, char** argv) {
     if (auto v = opt(args, "--inflight-msgs")) wcfg.max_inflight_msgs = to_int(*v);
     if (auto v = opt(args, "--trees-per-thread")) wcfg.trees_per_thread = to_int(*v);
     if (auto v = opt(args, "--min-coalesce")) wcfg.min_coalesce = to_int(*v);
+    // The runnable gen-side batch-floor (the "final bolt"): --gen-chunk-floor <0|1>, default 0 (drain-all).
+    if (auto v = opt(args, "--gen-chunk-floor")) wcfg.chunk_floor = (to_int(*v) != 0);
 
     auto inst = load_instance(*instance, *faces);
     if (!inst) {
@@ -167,7 +169,8 @@ int main(int argc, char** argv) {
               << " threads=" << wcfg.pool_threads << " pool_batch=" << wcfg.pool_batch
               << " inflight_D=" << wcfg.max_inflight_msgs
               << " trees_per_thread=" << wcfg.trees_per_thread
-              << " min_coalesce_Smin=" << wcfg.min_coalesce << " secs=" << budget
+              << " min_coalesce_Smin=" << wcfg.min_coalesce
+              << " gen_chunk_floor=" << (wcfg.chunk_floor ? 1 : 0) << " secs=" << budget
               << " endpoint=" << *endpoint << "\n";
 
     // HONEST TIME-BOX (warmup separated from measurement). The driver runs E episodes per pass

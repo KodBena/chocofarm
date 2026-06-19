@@ -60,10 +60,10 @@ enum class WireMode { StrictBarrier, PipelinedBucket };
 // per-leaf DEALER recv (a timed-out leaf aborts the whole generate loudly — Q5/OR-5). `mode` selects the
 // transport scheduling arm (StrictBarrier = production default; PipelinedBucket = arm 3, behind a flag);
 // `max_inflight_msgs` is the per-thread in-flight message cap D for PipelinedBucket (ignored under
-// StrictBarrier, which is structurally D=1). NB — D is currently a DEAD knob: the driver gathers ALL ready
-// slots into ONE message (drain-all), so a second issue with no intervening recv finds nothing ready and
-// per-thread in-flight depth is identically 1 (SYNTHESIS §0). The depth>1 chunked-pipeline that would make D
-// live was reverted (see the min_coalesce note).
+// StrictBarrier, which is structurally D=1). D is LIVE only when `chunk_floor` is on: the chunk break makes
+// each non-forced message carry S_min rows and leave the rest ready, so up to D distinct messages stay
+// outstanding (depth>1). With `chunk_floor` off the driver gathers ALL ready into ONE message (drain-all),
+// a second issue finds nothing ready, and per-thread depth is identically 1 (SYNTHESIS §0) — D is then dead.
 //
 // `trees_per_thread` is the OVERCOMMIT multiplier N (docs/design/cpp-eval-transport-adapter.md §6 M1):
 // each PipelinedBucket producer thread owns N × K INDEPENDENT EpisodeSlots (each a self-contained
@@ -75,20 +75,25 @@ enum class WireMode { StrictBarrier, PipelinedBucket };
 // N=1 reproduces the pre-overcommit slot count exactly. Ignored under StrictBarrier (production default
 // untouched — the strict path keeps its K = ceil(pool_batch/pool_threads) slots).
 //
-// `min_coalesce` is the producer-side minimum coalescing degree S_min — an EMPIRICALLY-REFUTED experiment,
-// RETAINED but INERT (kept as reviewed scaffolding; it does nothing on the current drain-all path).
-// Intent (cpp-eval-wire-formal-diagnosis.md §3 / "How I would design this protocol" item 6): floor the
-// per-message coalescing degree so the cross-thread COALESCING-COLLAPSE convoy becomes unrepresentable.
-// issue() holds a sub-threshold (< S_min) gather unless forced; the forced flush (inflight_msgs == 0 with
-// ready slots remaining) is the termination tail. BUT on the drain-all path per-thread depth is ≈1, so a
-// refill that finds < S_min ready forced-flushes immediately — the floor never holds (INERT; measured:
-// identical B and dps at S_min=1 vs 32). The depth>1 chunked-pipeline that would have made it bind
-// (commit 89d6984) was REVERTED: it capped per-message degree at S_min (below the natural drain-all ~74)
-// and flooded the single-threaded server with tiny messages it under-coalesces → a deep cross-thread convoy
-// (wedge + growing producer RSS). The producer's per-message degree was never the bottleneck — the server's
-// cross-thread rows/forward is (the fixed per-forward cost amortized over the batch), so the real fix is
-// server-side (increment (ii): preferred_batch_size / max_queue_delay). S_min=1 reproduces the pre-fix
-// drain-all behavior. Ignored under StrictBarrier.
+// `min_coalesce` is the producer-side minimum coalescing degree S_min (cpp-eval-wire-formal-diagnosis.md §3
+// / "How I would design this protocol" item 6): the per-message coalescing floor. It BINDS only when
+// `chunk_floor` is on (see below); on the drain-all path (chunk_floor==false) it is INERT (a refill finding
+// < S_min ready forced-flushes immediately at depth≈1, bypassing the hold — measured identical B/dps at
+// S_min=1 vs 32). Clamped to [1, K]. S_min=1 reproduces the pre-fix drain-all behavior. Ignored under
+// StrictBarrier.
+//
+// `chunk_floor` is the RUNNABLE generation-side batch-floor option (the "final bolt" — reverted in e6d2c41,
+// re-instated here behind a flag, default OFF). When TRUE, issue() emits each non-forced message as a
+// BOUNDED CHUNK of exactly S_min ready rows (it stops gathering at S_min and leaves the rest READY), so a
+// ready wave of W slots issues ⌊W/S_min⌋ DISTINCT outstanding messages up to D — genuine in-flight DEPTH > 1,
+// the §6 D-pipeline (overcommit on the wire). The held remainder pools with later-freed slots into the next
+// chunk (no deadlock: the forced flush at inflight==0 always drains the tail). This makes the floor BIND
+// (every steady-state message carries S_min rows) WITHOUT capping aggregate throughput — every ready row
+// still flies, across D chunks. ALONE it floods the single-threaded server with small messages it
+// under-coalesces (the revert's convoy); the design intent is to pair it with the SERVER-side coalescing
+// floor (inference_server min_forward_rows θ, increment ii) that re-assembles the D×T chunks into one large
+// forward — so the producer supplies the overcommit DEPTH while the server controls the forward WIDTH. When
+// FALSE, issue() drains ALL ready into ONE message (depth≈1, the production path). Ignored under StrictBarrier.
 struct WireRunnerConfig {
     std::string endpoint;
     int pool_threads = 4;
@@ -98,6 +103,7 @@ struct WireRunnerConfig {
     int max_inflight_msgs = 8;
     int trees_per_thread = 1;
     int min_coalesce = 32;
+    bool chunk_floor = false;   // gen-side depth>1 chunk-at-S_min (the runnable "final bolt"); default OFF
 };
 
 // Run cfg.episodes self-play episodes over the wire-batched driver, writing the four (X, PI, M, Y) result
