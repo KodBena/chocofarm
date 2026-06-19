@@ -388,7 +388,14 @@ std::expected<int, Error> run_episodes_wire_pipelined(
     rc.thread_pool_size = wcfg.pool_threads;
     rc.batch_size = wcfg.pool_batch;
     const int T = std::max(1, rc.thread_pool_size);
-    const int K = rc.fibers_per_thread();
+    // OVERCOMMIT (§6 M1): N independent TreeStates per thread, on top of the historical per-thread slot
+    // derivation. K = N × ceil(pool_batch/pool_threads). Each slot is a self-contained, independently-
+    // seeded episode (a distinct idx in this thread's stride-T subset) holding its own TreeState parked at
+    // one leaf — so the N×K_base slots' in-flight leaves SUM onto this thread's ONE DEALER socket, routed
+    // back out-of-order by corr-id (no per-tree interaction under virtual loss). P9: single-writer-per-tree
+    // — each slot owns its TreeState, mutated only by this thread; no cross-thread / global tree pool.
+    const int N = std::max(1, wcfg.trees_per_thread);
+    const int K = N * rc.fibers_per_thread();
     const int D = std::max(1, wcfg.max_inflight_msgs);  // per-thread in-flight message cap
 
     void* zctx = zmq_ctx_new();

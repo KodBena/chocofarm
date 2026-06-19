@@ -37,7 +37,7 @@ import threading
 import time
 import uuid
 
-REPO = "/home/bork/w/vdc/1/chocofarm"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # worktree root
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for stage_a_server
 
@@ -90,11 +90,22 @@ def start_server(src, endpoint: str, max_batch: int):
     return server, t
 
 
+# Per-iteration warmup estimate (s): the bench's warmup runs ONE full-occupancy wave (all slots run ~one
+# episode to completion) which also JITs the bucket shapes — empirically ~12–16s at the spec operating
+# point (m=24, n_sims=256, max_steps=40). NOT counted in the measured window. The bench reports the true
+# warmup_wall; this is only used to size the subprocess timeout (warmup + secs + margin) and the up-front
+# expected-wall print. The measure pass also rounds UP to >= one full wave, so a small --secs still costs
+# ~one wave of measure; the timeout accounts for both with a wave-sized floor on the measure term.
+EST_WARMUP_S = 16.0
+EST_WAVE_S = 16.0  # one full-occupancy episode-wave; the measure window is >= this
+TIMEOUT_MARGIN_S = 45.0
+
+
 def run_bench(wire_mode: str, endpoint: str, run: str, version: int, threads: int,
               secs: float, gc_m: int, n_sims: int, pool_batch: int, inflight: int,
               stats_path: str) -> dict:
     """Run ONE wire-ab-bench pass under taskset -c 0,1,2,3, parse its RESULT line. Returns the parsed
-    metrics dict (dps, dps_per_core, episodes, decisions, wall)."""
+    metrics dict (dps, dps_per_core, episodes, decisions, wall — wall is the MEASURE window)."""
     tok = f"stageb-{wire_mode}-{threads}t-{uuid.uuid4().hex[:8]}"
     cmd = [
         "taskset", "-c", "0,1,2,3", AB_BENCH,
@@ -105,7 +116,9 @@ def run_bench(wire_mode: str, endpoint: str, run: str, version: int, threads: in
         "--pool-threads", str(threads), "--pool-batch", str(pool_batch),
         "--inflight-msgs", str(inflight), "--parity-stats", stats_path,
     ]
-    proc = subprocess.run(cmd, cwd=REPO, text=True, capture_output=True, timeout=secs * 8 + 120)
+    # HONEST timeout: the bench is a warmup + (measure >= one wave) time-box. measure ~= max(secs, wave).
+    proc = subprocess.run(cmd, cwd=REPO, text=True, capture_output=True,
+                          timeout=EST_WARMUP_S + max(secs, EST_WAVE_S) + TIMEOUT_MARGIN_S)
     out = proc.stdout + proc.stderr
     result = {"raw": out, "rc": proc.returncode}
     for line in proc.stdout.splitlines():
@@ -149,8 +162,8 @@ def agg(vals: list[float]) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--secs", type=float, default=8.0)
-    ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--secs", type=float, default=5.0)
+    ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--m", type=int, default=24)
     ap.add_argument("--n-sims", type=int, default=256)
@@ -166,6 +179,17 @@ def main() -> int:
     run = f"stageb-{stamp}"
     version = 0
     endpoint = f"ipc:///tmp/choco-stageb-{os.getpid()}.ipc"
+
+    # Up-front EXPECTED total wall so the operator knows the cost before it runs: n_cells × iters ×
+    # (est_warmup + secs). 2 arms × 2 thread-counts = 4 cells.
+    n_cells = 2 * 2
+    est_measure = max(a.secs, EST_WAVE_S)
+    est_per_iter = EST_WARMUP_S + est_measure
+    est_total = n_cells * a.iters * est_per_iter
+    print(f"[stage_b_ab] EXPECTED total wall ~= {est_total:.0f}s ({est_total/60.0:.1f} min): "
+          f"{n_cells} cells x {a.iters} iters x (~{EST_WARMUP_S:.0f}s warmup + ~{est_measure:.0f}s measure)",
+          flush=True)
+    t_sweep0 = time.perf_counter()
 
     src, in_dim, n_actions = build_and_publish(a.hidden, run, version)
     print(f"[stage_b_ab] net published run={run} v={version} in_dim={in_dim} n_actions={n_actions} "
@@ -248,7 +272,10 @@ def main() -> int:
     print(f"\n  arm3 beats arm1 at 1t with NON-OVERLAPPING bands: {nonoverlap} "
           f"(arm3 min {a3_1t['min']:.2f} {'>' if nonoverlap else '<='} arm1 max {a1_1t['max']:.2f})",
           flush=True)
-    print(f"\n[stage_b_ab] wrote {out_json}", flush=True)
+    actual_total = time.perf_counter() - t_sweep0
+    print(f"\n[stage_b_ab] ACTUAL total wall: {actual_total:.0f}s ({actual_total/60.0:.1f} min) "
+          f"(expected ~={est_total:.0f}s)", flush=True)
+    print(f"[stage_b_ab] wrote {out_json}", flush=True)
     return 0
 
 

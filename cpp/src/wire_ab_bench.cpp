@@ -26,8 +26,15 @@
 //                  --res-token <t> --wire-mode <strict-barrier|pipelined-bucket>
 //                  [--secs 8 --m 24 --n-sims 256 --max-depth 24 --c-outcome 2 --lam 0.1 --max-steps 40
 //                   --pool-threads T --pool-batch B --inflight-msgs D --parity-stats <path>]
-//   Output:    a config line, a per-pass "wrote E episodes" line, then a RESULT line with eps/s + dps + wall,
-//              + exit 0, or a loud failure + exit 1.
+//   Timing is an HONEST WALL TIME-BOX: a WARMUP phase (one full-occupancy slot-fill — JITs the server
+//   bucket shapes + fills the slots, NOT counted) is separated from a MEASURE phase that runs short
+//   slot-sized passes and re-checks the `--secs` budget AFTER EACH pass, so the measured window lands
+//   within ~one chunk of `--secs` (not the 11–31× overshoot of a single oversized pass). dps = decisions
+//   over the MEASURE window / measure_wall; total bench_wall ≈ warmup + ~secs.
+//
+//   Output:    a config line, a `warmup=.. measure=.. decisions=.. dps=..` line, then a RESULT line with
+//              eps/s + dps + wall (= the MEASURE window) + warmup_wall + bench_wall, + exit 0, or a loud
+//              failure + exit 1.
 //
 // Public Domain (The Unlicense).
 #include <chrono>
@@ -111,6 +118,7 @@ int main(int argc, char** argv) {
     wcfg.pool_batch = opt(args, "--pool-batch") ? to_int(*opt(args, "--pool-batch")) : 64;
     wcfg.timeout_ms = opt(args, "--timeout-ms") ? to_int(*opt(args, "--timeout-ms")) : 60000;
     if (auto v = opt(args, "--inflight-msgs")) wcfg.max_inflight_msgs = to_int(*v);
+    if (auto v = opt(args, "--trees-per-thread")) wcfg.trees_per_thread = to_int(*v);
 
     auto inst = load_instance(*instance, *faces);
     if (!inst) {
@@ -149,54 +157,110 @@ int main(int argc, char** argv) {
 
     std::cout << "config: wire-mode=" << *wire_mode << " m=" << gc.m << " n_sims=" << gc.n_sims
               << " threads=" << wcfg.pool_threads << " pool_batch=" << wcfg.pool_batch
-              << " inflight_D=" << wcfg.max_inflight_msgs << " secs=" << budget
+              << " inflight_D=" << wcfg.max_inflight_msgs
+              << " trees_per_thread=" << wcfg.trees_per_thread << " secs=" << budget
               << " endpoint=" << *endpoint << "\n";
 
-    // Drive episodes for the wall budget: run a fixed BATCH of episodes per pass, accumulating until the
-    // budget is spent. Each pass uses a fresh res_token suffix so writes don't collide. The episode count
-    // is large enough that a pass spans the budget but the loop re-checks after each. Per-pass seeds vary so
-    // we don't replay the identical corpus (throughput, not parity — the search work is representative).
-    const int eps_per_pass = std::max(wcfg.pool_threads * 8, 64);
-    long total_eps = 0;
-    long total_decisions = 0;  // recorded decisions (read back from redis) — the dps numerator
+    // HONEST TIME-BOX (warmup separated from measurement). The driver runs E episodes per pass
+    // SYNCHRONOUSLY and returns to completion; a pass REFILLS each slot with the next episode as the prior
+    // one finishes (runner_wire_batched fill()), so a pass of E episodes keeps all `total_slots` slots
+    // FULL for ~E/total_slots episode-depths, then drains a short tail. Two consequences fix the old lie:
+    //
+    //   (1) WARMUP (NOT counted) is one full-occupancy pass — it JIT-compiles the server's bucket shapes
+    //       AND fills the slots, AND lets us MEASURE the steady-state episodes/s (eps_rate) to size the
+    //       measure pass. Its stats sink is suppressed so warmup rows don't pollute the measured
+    //       rows/forward (server mean) the harness reads.
+    //
+    //   (2) The MEASURE pass is sized from that rate to ~`budget` seconds of wall: episodes ≈ budget ×
+    //       eps_rate, FLOORED at total_slots so every slot stays full (E ≥ slots ⇒ no low-occupancy
+    //       fragment — what would depress rows/forward + dps). One full-occupancy episode-depth (~one
+    //       episode's wall) is the irreducible granularity, so for a `budget` smaller than that the pass
+    //       rounds UP to one full wave (total_slots) and `measure_wall` reports the true (slightly-over)
+    //       window honestly — never the old 11–31× overshoot of a fixed 8×total_slots oversize pass whose
+    //       budget was checked only between passes (the bug this fixes). dps = decisions / measure_wall;
+    //       the rate is a steady-state quantity so the NUMBER is unchanged from the old meter.
+    const int K_base = (wcfg.pool_batch + wcfg.pool_threads - 1) / std::max(1, wcfg.pool_threads);
+    const int total_slots = wcfg.pool_threads * std::max(1, wcfg.trees_per_thread) * std::max(1, K_base);
+    const int warmup_eps = std::max(total_slots, 8);  // one full-occupancy fill of all slots
     const int n_slots = n_action_slots(env);
-    int pass = 0;
-    auto t0 = std::chrono::steady_clock::now();
-    while (secs(t0, std::chrono::steady_clock::now()) < budget) {
-        const std::string tok = std::string(*res_token) + "-p" + std::to_string(pass);
+
+    // Count recorded decisions (rows) across a pass's episodes — the true search-work numerator (dps).
+    auto count_decisions = [&](const std::string& tok, int n_eps) -> long {
+        long dec = 0;
+        for (int idx = 0; idx < n_eps; ++idx) {
+            auto rb = redis->read_results(tok, idx);
+            if (!rb) continue;
+            if (!rb->PI.empty()) dec += static_cast<long>(rb->PI.size()) / n_slots;
+        }
+        return dec;
+    };
+
+    // ---- WARMUP (NOT counted): full-occupancy fill + JIT, measuring eps_rate to size the measure pass.
+    long warmup_eps_done = 0;
+    auto warm0 = std::chrono::steady_clock::now();
+    {
+        const std::string tok = std::string(*res_token) + "-warmup";
         RunnerConfig rcfg;
         rcfg.run = std::string(*run);
         rcfg.phase = "gen";
         rcfg.version = version;
-        rcfg.episodes = eps_per_pass;
+        rcfg.episodes = warmup_eps;
         rcfg.lam = lam;
         rcfg.max_steps = max_steps;
-        rcfg.seed = 7919ull * static_cast<uint64_t>(pass + 1);
+        rcfg.seed = 104729ull;  // distinct from the measured seed below
         rcfg.res_token = tok;
-
-        auto w = run_episodes_wire_batched(env, fb, gc, *redis, rcfg, wcfg, stats_out);
+        auto w = run_episodes_wire_batched(env, fb, gc, *redis, rcfg, wcfg, nullptr);
         if (!w) {
-            std::cerr << "wire-ab-bench: FATAL: pass " << pass << " failed: " << w.error().message << "\n";
+            std::cerr << "wire-ab-bench: FATAL: warmup failed: " << w.error().message << "\n";
             return 1;
         }
-        total_eps += *w;
-        // count recorded decisions (rows) across this pass's episodes — the true search-work numerator.
-        for (int idx = 0; idx < eps_per_pass; ++idx) {
-            auto rb = redis->read_results(tok, idx);
-            if (!rb) continue;
-            if (!rb->PI.empty())
-                total_decisions += static_cast<long>(rb->PI.size()) / n_slots;
-        }
-        std::cout << "  pass " << pass << ": wrote " << *w << " episodes\n";
-        ++pass;
+        warmup_eps_done = *w;
     }
-    const double wall = secs(t0, std::chrono::steady_clock::now());
+    const double warmup_wall = secs(warm0, std::chrono::steady_clock::now());
+    // Steady-state episodes/s from the warmup window (its first pass also paid the JIT, so this slightly
+    // UNDER-estimates the measure rate — biasing the measure pass to run a touch longer than budget, never
+    // shorter; honest). Fall back to a small positive rate if the warmup somehow wrote nothing.
+    const double eps_rate =
+        (warmup_wall > 0.0 && warmup_eps_done > 0) ? (warmup_eps_done / warmup_wall) : 1.0;
 
-    const double eps_per_s = static_cast<double>(total_eps) / wall;
-    const double dps = static_cast<double>(total_decisions) / wall;
+    // ---- MEASURE: ONE full-occupancy pass sized to ~`budget` seconds of wall (floored at one full wave).
+    const long want_eps = static_cast<long>(budget * eps_rate);
+    const int measure_eps = static_cast<int>(std::max<long>(want_eps, total_slots));
+    long total_decisions = 0;
+    long total_eps = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        const std::string tok = std::string(*res_token) + "-measure";
+        RunnerConfig rcfg;
+        rcfg.run = std::string(*run);
+        rcfg.phase = "gen";
+        rcfg.version = version;
+        rcfg.episodes = measure_eps;
+        rcfg.lam = lam;
+        rcfg.max_steps = max_steps;
+        rcfg.seed = 7919ull;
+        rcfg.res_token = tok;
+        auto w = run_episodes_wire_batched(env, fb, gc, *redis, rcfg, wcfg, stats_out);
+        if (!w) {
+            std::cerr << "wire-ab-bench: FATAL: measure pass failed: " << w.error().message << "\n";
+            return 1;
+        }
+        total_eps = *w;
+        total_decisions = count_decisions(tok, measure_eps);
+    }
+    const double measure_wall = secs(t0, std::chrono::steady_clock::now());
+
+    const double eps_per_s = static_cast<double>(total_eps) / measure_wall;
+    const double dps = static_cast<double>(total_decisions) / measure_wall;
     std::cout.precision(7);
+    std::cout << "warmup=" << warmup_wall << " measure=" << measure_wall
+              << " decisions=" << total_decisions << " dps=" << dps
+              << " measure_eps=" << measure_eps << " eps_rate=" << eps_rate << "\n";
+    // RESULT: keep `wall=` as the MEASUREMENT window (the dps denominator — the number stays valid). The
+    // total bench wall is warmup_wall + measure_wall, surfaced as warmup= above and bench_wall= here.
     std::cout << "RESULT: PASS wire-mode=" << *wire_mode << " threads=" << wcfg.pool_threads
-              << " episodes=" << total_eps << " decisions=" << total_decisions << " wall=" << wall
+              << " episodes=" << total_eps << " decisions=" << total_decisions << " wall=" << measure_wall
+              << " warmup_wall=" << warmup_wall << " bench_wall=" << (warmup_wall + measure_wall)
               << " eps_per_s=" << eps_per_s << " dps=" << dps
               << " dps_per_core=" << (dps / std::max(1, wcfg.pool_threads)) << "\n";
     return 0;

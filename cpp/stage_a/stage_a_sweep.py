@@ -29,7 +29,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-REPO = "/home/bork/w/vdc/1/chocofarm"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # worktree root
 sys.path.insert(0, os.path.join(REPO, "cpp", "stage_a"))
 sys.path.insert(0, REPO)
 
@@ -100,6 +100,14 @@ def main() -> int:
     print(f"[sweep] grid S={S_GRID} D={D_GRID} E={E_GRID} wakeup={WAKE_GRID} reps={a.reps} "
           f"secs={a.secs} warmup={a.warmup}", flush=True)
 
+    # Up-front EXPECTED total wall so the operator knows the cost before it runs: n_cells × (warmup + secs).
+    n_cells = len(E_GRID) * len(WAKE_GRID) * len(S_GRID) * len(D_GRID) * a.reps
+    est_per_cell = a.warmup + a.secs
+    est_total = n_cells * est_per_cell
+    print(f"[sweep] EXPECTED total wall ~= {est_total:.0f}s ({est_total/60.0:.1f} min): "
+          f"{n_cells} cells x (~{a.warmup:.1f}s warmup + {a.secs:.1f}s measure)", flush=True)
+    t_sweep0 = time.perf_counter()
+
     n_done = 0
     with open(jsonl_path, "w") as jf:
         for e_policy in E_GRID:
@@ -134,7 +142,10 @@ def main() -> int:
                     server.close()
                     print(f"[sweep] server down e={e_policy} wakeup={wakeup}", flush=True)
                     time.sleep(0.5)
+    actual_total = time.perf_counter() - t_sweep0
     print(f"[sweep] DONE {n_done} cells -> {jsonl_path}", flush=True)
+    print(f"[sweep] ACTUAL total wall: {actual_total:.0f}s ({actual_total/60.0:.1f} min) "
+          f"(expected ~={est_total:.0f}s)", flush=True)
     return 0
 
 

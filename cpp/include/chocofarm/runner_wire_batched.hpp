@@ -62,6 +62,16 @@ enum class WireMode { StrictBarrier, PipelinedBucket };
 // `max_inflight_msgs` is the per-thread in-flight message cap D for PipelinedBucket (ignored under
 // StrictBarrier, which is structurally D=1) — the non-blocking driver holds up to D coalesced messages
 // outstanding before it blocks on a reply.
+//
+// `trees_per_thread` is the OVERCOMMIT multiplier N (docs/design/cpp-eval-transport-adapter.md §6 M1):
+// each PipelinedBucket producer thread owns N × K INDEPENDENT EpisodeSlots (each a self-contained
+// TreeState parked at one leaf), not K, so its concurrent in-flight leaves SUM toward the server's fast
+// region (the Stage-B measure found one tree parks ~1 leaf; K slots ~54 rows/forward; N multiplies the
+// slot count to push rows/forward toward B≈192). P9 holds structurally: each thread OWNS its N×K trees
+// + its DEALER socket (single-writer-per-tree) — no shared/stolen tree state. The corr-id transport
+// already routes an out-of-order reply to the right (slot=tree-fiber); more slots need no routing change.
+// N=1 reproduces the pre-overcommit slot count exactly. Ignored under StrictBarrier (production default
+// untouched — the strict path keeps its K = ceil(pool_batch/pool_threads) slots).
 struct WireRunnerConfig {
     std::string endpoint;
     int pool_threads = 4;
@@ -69,6 +79,7 @@ struct WireRunnerConfig {
     int timeout_ms = 15000;
     WireMode mode = WireMode::StrictBarrier;
     int max_inflight_msgs = 8;
+    int trees_per_thread = 1;
 };
 
 // Run cfg.episodes self-play episodes over the wire-batched driver, writing the four (X, PI, M, Y) result
