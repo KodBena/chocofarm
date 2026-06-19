@@ -99,13 +99,18 @@ def build_and_publish(hidden: int, run: str, version: int):
     return StaticParamsSource(params, y_mean, y_std), in_dim, n_actions
 
 
-def start_server(src, endpoint: str, max_batch: int, server_core: int):
+def start_server(src, endpoint: str, max_batch: int, server_core: int,
+                 min_forward_rows: int = 0, max_queue_delay_ms: float = 0.0):
     """Stand up the bucketed-E + group-wakeup StageAServer (M2 unchanged). M3: pin the server thread to
     `server_core` from INSIDE the thread (os.sched_setaffinity(0, ...) binds the calling thread) so the
     forward runs on its isolated core. Warms every bucket shape + the max so a partial-drain forward
-    never pays a cold JIT in the timed window."""
+    never pays a cold JIT in the timed window.
+
+    `min_forward_rows`/`max_queue_delay_ms` arm the increment-(ii) server floor (default OFF — the greedy
+    drain); StageAServer forwards them to the base InferenceServer (server-floor-design.md)."""
     server = StageAServer(src, bind=endpoint, max_batch=max_batch, forward_fn=jit_forward_core,
-                          e_policy="bucket", wakeup="group")
+                          e_policy="bucket", wakeup="group",
+                          min_forward_rows=min_forward_rows, max_queue_delay_ms=max_queue_delay_ms)
     server.warmup(sorted(set(BUCKETS) | {max_batch}))
 
     def _serve():
@@ -196,6 +201,12 @@ def main() -> int:
     # S_min: the producer-side minimum coalescing degree (the closed convoy fix). Default 32 matches the
     # runner default; pass --min-coalesce 1 to reproduce the pre-fix (convoy-prone) behavior for an A/B.
     ap.add_argument("--min-coalesce", type=int, default=32)
+    # The increment-(ii) SERVER floor (server-floor-design.md): θ rows / max delay. Default OFF (θ=0) so
+    # the A/B's control arm is the byte-unchanged greedy drain; pass e.g. --min-forward-rows 192
+    # --max-queue-delay-ms 3 for the treatment arm. (Applies to ALL cells in the run — run the sweep once
+    # per θ to compare; candidates θ≈192, delay≈2–5 ms.)
+    ap.add_argument("--min-forward-rows", type=int, default=0)
+    ap.add_argument("--max-queue-delay-ms", type=float, default=0.0)
     ap.add_argument("--threads", type=int, default=3)  # 3 producer threads (1:3 pinning)
     # N sweep default capped at 3: N=4 has a SEPARATE nondeterministic stall bug (out of scope here) — the
     # operator can pass --trees 1,2,3,4 explicitly to probe it, but the default avoids it.
@@ -232,9 +243,11 @@ def main() -> int:
           f"n_actions={n_actions} hidden={a.hidden}", flush=True)
 
     # M3: server pinned to server-core (inside its thread); producers to producer-cores via taskset.
-    server, t = start_server(src, endpoint, a.max_batch, a.server_core)
+    server, t = start_server(src, endpoint, a.max_batch, a.server_core,
+                             a.min_forward_rows, a.max_queue_delay_ms)
     print(f"[overcommit_sweep] server up (bucket+group) endpoint={endpoint} max_batch={a.max_batch} "
-          f"server_core={a.server_core} producer_cores={a.producer_cores} threads={a.threads}",
+          f"server_core={a.server_core} producer_cores={a.producer_cores} threads={a.threads} "
+          f"floor(theta={a.min_forward_rows},delay_ms={a.max_queue_delay_ms})",
           flush=True)
 
     records: list[dict] = []
@@ -289,6 +302,7 @@ def main() -> int:
         "run": run, "secs": a.secs, "iters": a.iters, "hidden": a.hidden, "m": a.m,
         "n_sims": a.n_sims, "pool_batch": a.pool_batch, "inflight_msgs": a.inflight_msgs,
         "min_coalesce": a.min_coalesce,
+        "min_forward_rows": a.min_forward_rows, "max_queue_delay_ms": a.max_queue_delay_ms,
         "threads": a.threads, "server_core": a.server_core, "producer_cores": a.producer_cores,
         "serve_fast_region_B": 192, "model_optimistic_dps": 456, "cells": {},
     }

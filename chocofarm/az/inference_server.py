@@ -331,7 +331,13 @@ class InferenceServer:
     `forward_fn` defaults to `jit_forward_core` (the SSOT `forward_core` wrapped in one `jax.jit`); the
     always-on test injects a stub to assert the
     drain/scatter without a real forward. `max_batch` caps the greedy drain so an unbounded burst can't
-    build an oversized matmul; B self-scales with load below the cap (no latency timer to tune)."""
+    build an oversized matmul; B self-scales with load below the cap (no latency timer to tune).
+
+    `min_forward_rows` (θ) and `max_queue_delay_ms` arm the optional server-side coalescing FLOOR
+    (server-floor-design.md — increment ii of cpp-eval-transport-adapter.md §6), DEFAULT OFF (θ=0): with
+    θ>0 the drain accumulates across producer threads until ≥θ rows or the bounded delay, lifting
+    cross-thread rows/forward to amortize the fixed per-forward cost. Off by default the drain is the
+    byte-unchanged greedy production path (see `_drain`)."""
 
     # The bounded first-request poll interval (ms): the wakeup cadence at which an idle loop re-checks
     # `_stop`. A wakeup-to-recheck, not a spin — an idle server still parks at ~0 CPU between wakeups.
@@ -339,10 +345,31 @@ class InferenceServer:
 
     def __init__(self, params_source: ParamsSource, *, bind: str = "tcp://127.0.0.1:5599",
                  max_batch: int = 256, forward_fn: ForwardFn = jit_forward_core,
+                 min_forward_rows: int = 0, max_queue_delay_ms: float = 0.0,
                  context: "zmq.Context[zmq.Socket[bytes]] | None" = None) -> None:
+        self._max_batch = int(max_batch)
+        # The server-side coalescing floor (server-floor-design.md, increment ii of
+        # cpp-eval-transport-adapter.md §6). Default OFF (θ=0): the drain stays the byte-unchanged greedy
+        # drain (production path untouched). When θ>0 the drain ACCUMULATES across producer threads until
+        # ≥θ rows or `max_queue_delay_ms` elapses — lifting cross-thread rows/forward so the server
+        # amortizes its large fixed per-forward cost over a fuller batch. Live cells read per-drain on
+        # `self` (ADR-0012 P4: a swept tunable lives where it can breathe — read at the point of use, never
+        # baked into a closure), so a sweep need only set the attribute. Fail loud on a value the drain
+        # cannot honor (ADR-0002 / P2: a θ above the max_batch cap is a lying knob — the cap would forbid
+        # ever reaching it; reject before binding the socket).
+        if min_forward_rows < 0:
+            raise ValueError(f"min_forward_rows must be ≥ 0 (θ=0 disables the floor), got {min_forward_rows}")
+        if min_forward_rows > self._max_batch:
+            raise ValueError(
+                f"min_forward_rows={min_forward_rows} exceeds max_batch={self._max_batch}: the drain cap "
+                f"forbids ever reaching θ, so the floor would only ever fire at the delay (ADR-0002 — a "
+                f"config the receiver cannot honor must not be silently accepted; keep θ ≤ max_batch).")
+        if max_queue_delay_ms < 0:
+            raise ValueError(f"max_queue_delay_ms must be ≥ 0, got {max_queue_delay_ms}")
+        self._min_forward_rows = int(min_forward_rows)
+        self._max_queue_delay_ms = float(max_queue_delay_ms)
         import zmq
         self._params_source = params_source
-        self._max_batch = int(max_batch)
         self._forward_fn = forward_fn
         self._owns_context = context is None
         self._ctx: zmq.Context[zmq.Socket[bytes]] = context if context is not None else zmq.Context()
@@ -368,7 +395,19 @@ class InferenceServer:
         forever on `timeout=None` would mean `stop()` could not wake the loop without closing the socket
         out from under a polling thread (a band-aid the bounded poll removes — ADR-0002/P5: fix the
         root, do not race the socket). The interval is long enough that an idle server still parks at
-        ~0 CPU (it is a wakeup-to-recheck, not a spin)."""
+        ~0 CPU (it is a wakeup-to-recheck, not a spin).
+
+        The server-side coalescing FLOOR (server-floor-design.md — increment ii): with `min_forward_rows`
+        (θ) > 0, after the first request lands the drain KEEPS accumulating across producer threads —
+        re-draining whatever is queued, then briefly waiting for the next arrival — until ≥θ rows are
+        gathered OR `max_queue_delay_ms` elapses, then runs one forward. This lifts cross-thread
+        rows/forward so the server amortizes its large fixed per-forward cost over a fuller batch. θ=0
+        (the default) degenerates to a SINGLE greedy NOBLOCK pass — byte-identical to the production
+        drain, no clock read taken (the production path is untouched). `max_queue_delay_ms` is a HARD
+        bound (the escape hatch): the forward fires within it of the first request whether or not θ is
+        reached, so there is no "wait forever for θ rows that never come" wedge — the brief waits are
+        bounded by the remaining delay, never an unbounded block (the producer-floor refutation's lesson:
+        no new wedge, ADR-0002/P5)."""
         import zmq
         while not self._stop:
             # Bounded block for the FIRST request — self-clocks the batch to the load (B≈1 when idle),
@@ -379,23 +418,36 @@ class InferenceServer:
             return []
         drained: list[DrainedRequest] = []
         total_rows = 0   # the concatenated row count across drained requests (each carries B_i leaves)
-        while total_rows < self._max_batch:
-            try:
-                frames = self._sock.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                break   # nothing more currently queued — drain whatever accumulated, run the batch
-            ident = frames[0]
-            envelope = frames[1:-1]   # transport-routing frames (REQ delimiter / DEALER corr-id / none)
-            payload = frames[-1]
-            try:
-                X = decode_request(payload)   # a (B_i, in_dim) matrix (B_i ≥ 1; B_i=1 is single-leaf)
-            except Exception as exc:   # malformed request: loud reject of THIS frame, batch unaffected
-                self._reject(ident, exc)
-                continue
-            drained.append((ident, envelope, X))
-            total_rows += X.shape[0]
+        theta = self._min_forward_rows                            # live floor target (P4 — read per-drain)
+        deadline_ns = (time.monotonic_ns() + int(self._max_queue_delay_ms * 1_000_000)) if theta > 0 else 0
+        while True:
+            # Drain everything CURRENTLY queued (NOBLOCK), up to the max_batch cap — the cap bounds the
+            # matmul even with the floor on (an unbounded burst cannot build an oversized forward).
+            while total_rows < self._max_batch:
+                try:
+                    frames = self._sock.recv_multipart(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break   # nothing more currently queued — drain whatever accumulated
+                ident = frames[0]
+                envelope = frames[1:-1]   # transport-routing frames (REQ delimiter / DEALER corr-id / none)
+                payload = frames[-1]
+                try:
+                    X = decode_request(payload)   # a (B_i, in_dim) matrix (B_i ≥ 1; B_i=1 is single-leaf)
+                except Exception as exc:   # malformed request: loud reject of THIS frame, batch unaffected
+                    self._reject(ident, exc)
+                    continue
+                drained.append((ident, envelope, X))
+                total_rows += X.shape[0]
+            # Floor decision: forward now if the floor is OFF, θ is reached, or the cap is hit; otherwise
+            # block BRIEFLY (bounded by the remaining delay) for the next producer's RTT to land, re-drain.
+            if theta <= 0 or total_rows >= theta or total_rows >= self._max_batch:
+                break
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns < 1_000_000:   # <1ms of the hard delay left — forward now, never spin the tail
+                break
+            self._poller.poll(timeout=remaining_ns // 1_000_000)   # ≤ remaining delay; the deadline caps it
         if _EVLOG_PATH is not None and drained:
-            _ev("DRAIN", f"msgs={len(drained)} rows={total_rows}")
+            _ev("DRAIN", f"msgs={len(drained)} rows={total_rows} floor={theta}")
         return drained
 
     def _reject(self, ident: bytes, exc: Exception) -> None:

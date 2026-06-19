@@ -285,6 +285,22 @@ def test_params_from_manifest_blob_matches_valuemlp_params():
     assert y_std == pytest.approx(2.5)
 
 
+def test_inference_server_rejects_unhonorable_floor():
+    """ADR-0002 / ADR-0012 P2 (translate-and-validate at the boundary, never coerce): the server-side
+    coalescing floor (server-floor-design.md) is validated at CONSTRUCTION, before the socket binds. A
+    θ above the max_batch cap is a knob the drain cannot honor (the cap forbids ever reaching it) — a
+    loud raise, not a silent accept; a negative θ or delay is likewise rejected. (These raises precede
+    the `import zmq` in __init__, so this is an ALWAYS-ON test: no pyzmq, no socket bound.)"""
+    from chocofarm.az.inference_server import InferenceServer
+    src = StaticParamsSource({}, 0.0, 1.0)
+    with pytest.raises(ValueError, match="exceeds max_batch"):
+        InferenceServer(src, max_batch=128, min_forward_rows=256)
+    with pytest.raises(ValueError, match="min_forward_rows must"):
+        InferenceServer(src, min_forward_rows=-1)
+    with pytest.raises(ValueError, match="max_queue_delay_ms must"):
+        InferenceServer(src, max_queue_delay_ms=-1.0)
+
+
 # ===========================================================================
 # OPT-IN — the full server+client parity harness (needs a running server; NO redis)
 # ===========================================================================
@@ -371,6 +387,69 @@ def test_server_client_parity_within_1e_4(residual):
         assert max_dl < 1e-4, f"residual={residual}: max|Δlogit|={max_dl:.3e} exceeds 1e-4"
     print(f"[zmq parity residual={'ON ' if residual else 'OFF'}] N={n_inputs} "
           f"max|Δvalue|={max_dv:.3e} max|Δlogit|={max_dl:.3e} (bar 1e-4)")
+
+
+@pytest.mark.skipif(not (_RUN_ZMQ and _pyzmq_available()),
+                    reason="opt-in zmq floor: set CHOCO_RUN_ZMQ=1 (and have pyzmq) and a server spins in-process")
+def test_server_parity_holds_under_coalescing_floor():
+    """The increment-(ii) server floor (server-floor-design.md) must not corrupt the scatter: with θ>0
+    the drain ACCUMULATES across concurrent clients (re-draining + briefly waiting) before one forward,
+    so this fires B concurrent RPCs at a floor-armed server (θ=8, a 40ms hard delay) and asserts every
+    client still gets ITS OWN row back within the 1e-4 bar (ADR-0012 P6). It exercises the new
+    multi-pass drain loop end-to-end: θ is reached when B≥8 land together, and the hard delay is the
+    escape hatch for the final partial group (no wedge). A correct floor changes only WHEN the forward
+    fires, never WHICH rows scatter to whom."""
+    from chocofarm.az.inference_server import InferenceServer
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.az.transport import pack_net
+
+    in_dim, n_actions = 12, 7
+    rng = np.random.default_rng(7)
+    net = ValueMLP(in_dim=in_dim, hidden=24, n_actions=n_actions, seed=5,
+                   y_mean=0.7, y_std=1.3, residual=True)
+    params, y_mean, y_std = params_from_manifest_blob(*pack_net(net))
+    src = StaticParamsSource(params, y_mean, y_std)
+
+    endpoint = "tcp://127.0.0.1:5702"
+    server = InferenceServer(src, bind=endpoint, max_batch=256,
+                             min_forward_rows=8, max_queue_delay_ms=40.0)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    n_inputs = 320
+    X = rng.standard_normal((n_inputs, in_dim)).astype(np.float32)
+    ref_v, ref_l = _py_forward_f32(params, X, y_mean, y_std)
+
+    max_dv = 0.0
+    max_dl = 0.0
+    try:
+        i = 0
+        for B in (8, 16, 8, 3):   # ≥θ groups (θ reached) and a sub-θ tail (fires at the hard delay)
+            while i < n_inputs:
+                batch = X[i:i + B]
+                if batch.shape[0] == 0:
+                    break
+                got_v, got_l = _concurrent_predict(endpoint, batch)
+                for j in range(batch.shape[0]):
+                    max_dv = max(max_dv, abs(float(got_v[j]) - float(ref_v[i + j])))
+                    if ref_l is not None:
+                        gl = got_l[j]
+                        assert gl is not None
+                        max_dl = max(max_dl, float(np.max(np.abs(
+                            gl.astype(np.float64) - ref_l[i + j].astype(np.float64)))))
+                i += batch.shape[0]
+                if i >= n_inputs:
+                    break
+            if i >= n_inputs:
+                break
+    finally:
+        server.stop()
+        t.join(timeout=5.0)
+        server.close()
+
+    assert max_dv < 1e-4, f"floor: max|Δvalue|={max_dv:.3e} exceeds 1e-4"
+    assert max_dl < 1e-4, f"floor: max|Δlogit|={max_dl:.3e} exceeds 1e-4"
+    print(f"[zmq floor θ=8 delay=40ms] N={n_inputs} max|Δvalue|={max_dv:.3e} max|Δlogit|={max_dl:.3e}")
 
 
 def _concurrent_predict(endpoint, batch):
