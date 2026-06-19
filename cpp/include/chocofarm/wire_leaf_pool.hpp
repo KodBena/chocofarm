@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "chocofarm/error.hpp"
+#include "chocofarm/event_log.hpp"
 #include "chocofarm/inference_wire.hpp"
 #include "chocofarm/net_evaluator.hpp"
 
@@ -142,6 +143,7 @@ class WireLeafPool final {
         if (zmq_send(sock_, req->data(), req->size(), 0) < 0)
             return std::unexpected(make_error(std::string("WireLeafPool::submit_batch: zmq_send(payload) failed: ") +
                                               zmq_strerror(zmq_errno())));
+        CHOCO_EV("SUBMIT", "corr=" << corr << " B=" << B);  // one coalesced message of B rows out
         inflight_.emplace(corr, std::vector<int>(slots.begin(), slots.end()));
         return {};
     }
@@ -172,6 +174,7 @@ class WireLeafPool final {
         std::vector<unsigned char> payload;
         auto rcv = recv_corr_payload(corr, payload);
         if (!rcv) return std::unexpected(rcv.error());
+        CHOCO_EV("RECV", "corr=" << corr);  // this corr's reply arrived (RTT closes)
         auto decoded = wire::decode_response(payload);
         if (!decoded)
             return std::unexpected(make_error("WireLeafPool::recv_batch: malformed response payload: " +

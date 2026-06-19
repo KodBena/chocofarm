@@ -63,6 +63,34 @@ import numpy.typing as npt
 from chocofarm.az.forward import forward_core
 from chocofarm.az.inference_wire import decode_request, encode_response
 
+# ---- optional protocol event log (gated by CHOCO_EVENTLOG; unset => zero behaviour change) ------------
+# Injectable observability: when CHOCO_EVENTLOG names a path, the server appends monotonic-timestamped
+# events `<mono_ns> SRV <kind> <fields>` at the protocol-affecting points (FWD, DRAIN). The C++ producer
+# logs to its OWN file (CHOCO_EVENTLOG_CPP) on the SAME monotonic timebase (Python time.monotonic and C++
+# std::chrono::steady_clock both read CLOCK_MONOTONIC, shared across processes on one Linux host), so
+# tools/event_merge.py orders both into one timeline. BEST-EFFORT debug observability, deliberately NOT a
+# fail-loud path (ADR-0002 governs transport correctness, not a debug log): a log error disables the stream,
+# it never perturbs a forward. `_FWD_SEEN` records every forwarded row count, so a width unseen before (an
+# overshoot / un-warmed XLA shape => a cold compile) is flagged `cold=1` — the XLA-churn signal.
+import os
+import time
+
+_EVLOG_PATH = os.environ.get("CHOCO_EVENTLOG") or None
+_evf = None
+_FWD_SEEN: "set[int]" = set()
+
+
+def _ev(kind: str, fields: str) -> None:
+    global _evf
+    if _EVLOG_PATH is None:
+        return
+    try:
+        if _evf is None:
+            _evf = open(_EVLOG_PATH, "a", buffering=1)
+        _evf.write(f"{time.monotonic_ns()} SRV {kind} {fields}\n")
+    except OSError:
+        pass   # best-effort: a logging failure must never perturb the forward path
+
 if TYPE_CHECKING:
     import zmq
 
@@ -174,7 +202,13 @@ def run_microbatch(forward_fn: ForwardFn, params: dict[str, npt.NDArray[Any]],
     # production forward casts Xb (no eager pre-`jnp.asarray`), de-standardizes on-device, and returns the
     # combined `(rows, 1+n_actions)` block; a value-only net returns `(rows, 1)`. The stub returns the same
     # over numpy. (The XLA pin + jax import live inside the jitted forward, ahead of its first jax touch.)
+    _t0 = time.monotonic_ns() if _EVLOG_PATH is not None else 0
     out_arr = np.asarray(forward_fn(params, Xb, float(y_mean), float(y_std)), dtype=np.float32)
+    if _EVLOG_PATH is not None:
+        _w = int(Xb.shape[0])                        # the forwarded shape's row count (post-pad)
+        _cold = _w not in _FWD_SEEN                  # unseen width => an XLA recompile this call
+        _FWD_SEEN.add(_w)
+        _ev("FWD", f"width={_w} real={B} cold={int(_cold)} dt_us={(time.monotonic_ns() - _t0) // 1000}")
     if out_arr.ndim != 2 or out_arr.shape[0] < B:
         raise ValueError(f"forward returned shape {out_arr.shape}, expected (>={B}, 1+n_actions)")
     v = out_arr[:, 0]
@@ -360,6 +394,8 @@ class InferenceServer:
                 continue
             drained.append((ident, envelope, X))
             total_rows += X.shape[0]
+        if _EVLOG_PATH is not None and drained:
+            _ev("DRAIN", f"msgs={len(drained)} rows={total_rows}")
         return drained
 
     def _reject(self, ident: bytes, exc: Exception) -> None:
