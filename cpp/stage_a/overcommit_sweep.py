@@ -65,12 +65,13 @@ FACES = os.path.join(REPO, "chocofarm", "data", "faces.json")
 
 # The wire-ab-bench is an HONEST warmup + (measure >= one full-occupancy episode-wave) time-box: BOTH the
 # warmup and the measure pass run >= one full wave of `total_slots` episodes, and total_slots scales
-# LINEARLY with N (trees/thread): total_slots = threads * N * ceil(pool_batch/threads). One episode at
-# the spec operating point (m=24, n_sims=256, max_steps=40) takes ~EST_SLOT_WAVE_S of wall when its slot
-# runs it to completion; a full wave is ~that (all slots run concurrently). So the per-iter cost scales
-# with N — a fixed constant under-estimates high-N and trips the subprocess timeout. We DERIVE the wave
+# LINEARLY with N (trees/thread): total_slots = threads * N * ceil(pool_batch/threads). A wave runs
+# total_slots episodes, and because the compute (the fixed producer cores + the single server core) is the
+# bottleneck — not slot concurrency — the wave wall scales ~LINEARLY with total_slots (more slots = more
+# episodes time-sliced over the same cores). So the per-iter cost scales with N — a fixed constant
+# under-estimates high-N and trips the subprocess timeout (the --trees 8,9 failure). We DERIVE the wave
 # wall from the slot geometry instead. (Calibration: N=1, threads=3, batch=64 -> total_slots=66 measured
-# ~13.5s/wave; the per-slot-wave constant below is set a touch high so the timeout never clips a real run.)
+# ~13.5s/wave => ~0.205s/slot; the constant below is set conservatively high so the timeout never clips.)
 EST_SLOT_WAVE_S = 0.30   # est. wall to run one full-occupancy wave, per concurrent slot (conservative)
 TIMEOUT_MARGIN_S = 60.0
 
@@ -208,15 +209,18 @@ def main() -> int:
     version = 0
     endpoint = f"ipc:///tmp/choco-oc-{os.getpid()}.ipc"
 
-    # Up-front EXPECTED total wall: n_cells (1 baseline + |trees_list| overcommit) × iters ×
-    # (warmup + max(secs, wave)).
-    n_cells = 1 + len(trees_list)
-    est_measure = max(a.secs, EST_WAVE_S)
-    est_per_iter = EST_WARMUP_S + est_measure
-    est_total = n_cells * a.iters * est_per_iter
+    # Up-front EXPECTED total wall, N-AWARE: each cell's per-iter cost = warmup_wave + max(secs, wave),
+    # and a wave scales with N (trees/thread). The baseline-strict cell is structurally N=1; each
+    # overcommit cell carries its own N from trees_list. Summed over cells x iters so the high-N tail is
+    # not under-counted (the bug a fixed constant hid). The bench reports the true bench_wall per iter.
+    cell_trees = [1] + trees_list  # baseline-strict (N=1) then the overcommit N sweep
+    est_total = 0.0
+    for tr in cell_trees:
+        wave = est_wave_s(a.threads, tr, a.pool_batch)
+        est_total += a.iters * (wave + max(a.secs, wave))
     print(f"[overcommit_sweep] EXPECTED total wall ~= {est_total:.0f}s ({est_total/60.0:.1f} min): "
-          f"{n_cells} cells x {a.iters} iters x (~{EST_WARMUP_S:.0f}s warmup + ~{est_measure:.0f}s measure)",
-          flush=True)
+          f"{len(cell_trees)} cells x {a.iters} iters x (~warmup_wave + ~max(secs,wave)); "
+          f"per-cell wave ~= {EST_SLOT_WAVE_S:.2f}s x total_slots (scales with N)", flush=True)
     t_sweep0 = time.perf_counter()
 
     src, in_dim, n_actions = build_and_publish(a.hidden, run, version)
