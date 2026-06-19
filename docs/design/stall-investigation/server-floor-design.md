@@ -10,6 +10,24 @@ Purpose: DESIGN (for review, not yet implemented) of the server-side coalescing 
 **Status: DESIGN ONLY — do not implement until reviewed.** This is the lever the empirical work converged
 on after the producer side was twice-refuted (`producer-floor-negative-result.md`).
 
+> **2026-06-19 — IMPLEMENTED (amend-by-append, ADR-0005 Rule 8).** The drain floor below is now in
+> `InferenceServer._drain` (`chocofarm/az/inference_server.py`), default OFF (`min_forward_rows=0`) so the
+> production greedy drain is byte-unchanged; the two knobs (`min_forward_rows` θ, `max_queue_delay_ms`)
+> are constructor params validated fail-loud at construction (θ>max_batch raises — ADR-0002/P2), read
+> live per-drain on `self` (ADR-0012 P4). Bench CLIs plumbed: `overcommit_sweep.py` and `stage_a_server.py`
+> (`--min-forward-rows` / `--max-queue-delay-ms`). Tests: an always-on construction-validation pin and an
+> opt-in (`CHOCO_RUN_ZMQ=1`) parity-under-floor pin in `tests/test_zmq_inference.py`; a direct check
+> confirmed 16 concurrent leaves coalesce into ONE forward (vs 3 greedy) with exact parity.
+>
+> **2026-06-19 — MEASURED (the A/B verdict; full result in `server-gen-floor-result.md`).** The server
+> floor ALONE is a NEGATIVE result: θ=192 lifts rows/forward ~2.2× (N=4 98→215) but LOWERS dps at every N
+> (N=4 141→119, N=9 179→161) and every delay swept (even 1 ms: 130 < greedy 141), because the depth-1
+> producers idle on recv during the accumulation wait. Pairing it with a re-instated GENERATION-side batch
+> floor (the runnable `--gen-chunk-floor`) recovers the loss and then some — but the gain is VARIANCE
+> reduction, not throughput: the gen-floor (S_min=32, D≥16, θ_server=0) holds N=9 dps at [183–184] vs
+> greedy's [169–183], a +3.7% mean that ties greedy's ceiling. **The server-side θ floor is not a
+> production lever** (θ>0 neutral-to-harmful); the live lever is generation-side. Both stay default-OFF.
+
 ## The lever (and why it's the opposite of what failed)
 
 The convoy is the server forwarding too-few rows per forward, paying its large **fixed per-forward cost**

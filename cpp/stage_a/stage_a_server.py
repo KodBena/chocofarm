@@ -67,13 +67,13 @@ from chocofarm.model.env import Environment  # noqa: E402
 BUCKETS = (64, 256, 512)
 
 
-def _bucket_for(n_rows: int) -> int:
-    """Snap a real row count UP to the nearest of {64,256,512} — never pad-to-max. A drain larger than
-    the top bucket is capped at the bench max_batch upstream, so n_rows <= 512 here; clamp defensively."""
-    for b in BUCKETS:
+def _bucket_for(n_rows: int, buckets: "tuple[int, ...]" = BUCKETS) -> int:
+    """Snap a real row count UP to the nearest bucket — never pad-to-max. A drain larger than the top
+    bucket is capped at the bench max_batch upstream, so n_rows <= buckets[-1] here; clamp defensively."""
+    for b in buckets:
         if n_rows <= b:
             return b
-    return BUCKETS[-1]
+    return buckets[-1]
 
 
 class StageAServer(InferenceServer):
@@ -82,12 +82,18 @@ class StageAServer(InferenceServer):
     are untouched on the base class; this overrides only for the bench."""
 
     def __init__(self, *args: Any, e_policy: str = "bucket", wakeup: str = "group",
-                 **kwargs: Any) -> None:
+                 buckets: "tuple[int, ...] | None" = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         if e_policy not in ("padmax", "bucket"):
             raise ValueError(f"e_policy must be padmax|bucket, got {e_policy!r}")
         if wakeup not in ("group", "leaf"):
             raise ValueError(f"wakeup must be group|leaf, got {wakeup!r}")
+        # The AOT bucket set (snap real row count UP to one of these). Default = the module BUCKETS; a
+        # sweep that pushes the server forward WIDTH higher passes a richer set (e.g. up to max_batch) so a
+        # large accumulated batch lands on a compiled shape instead of forcing a cold per-width compile.
+        self._buckets = tuple(sorted(buckets)) if buckets else BUCKETS
+        if self._buckets[-1] > self._max_batch:
+            raise ValueError(f"top bucket {self._buckets[-1]} exceeds max_batch {self._max_batch}")
         self._e_policy = e_policy
         self._wakeup = wakeup
         self.n_forwards = 0
@@ -111,7 +117,7 @@ class StageAServer(InferenceServer):
             if self._e_policy == "padmax":
                 pad_to = self._max_batch
             else:
-                pad_to = _bucket_for(real)
+                pad_to = _bucket_for(real, self._buckets)
             responses = run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=pad_to)
             self.n_forwards += 1
             self.n_real_rows += real
@@ -120,7 +126,8 @@ class StageAServer(InferenceServer):
                 self._sock.send_multipart([ident, *envelope, resp])
 
 
-def build(hidden: int, endpoint: str, max_batch: int, e_policy: str, wakeup: str):
+def build(hidden: int, endpoint: str, max_batch: int, e_policy: str, wakeup: str,
+          min_forward_rows: int = 0, max_queue_delay_ms: float = 0.0):
     env = Environment()
     in_dim, n_actions = feature_dim(env), n_action_slots(env)
     net = ValueMLP(in_dim, hidden=hidden, n_actions=n_actions, seed=17,
@@ -128,7 +135,8 @@ def build(hidden: int, endpoint: str, max_batch: int, e_policy: str, wakeup: str
     params, y_mean, y_std = params_from_manifest_blob(*pack_net(net))
     server = StageAServer(StaticParamsSource(params, y_mean, y_std), bind=endpoint,
                           max_batch=max_batch, forward_fn=jit_forward_core,
-                          e_policy=e_policy, wakeup=wakeup)
+                          e_policy=e_policy, wakeup=wakeup,
+                          min_forward_rows=min_forward_rows, max_queue_delay_ms=max_queue_delay_ms)
     # Warm EVERY bucket shape + the pad-to-max shape up front so a partial-drain forward never pays a
     # cold JIT-compile inside the timed window (ADR-0009 measure-honesty). The bucket forwards compile
     # at {64,256,512}; padmax always compiles at max_batch.
@@ -143,15 +151,20 @@ def main() -> int:
     ap.add_argument("--max-batch", type=int, default=512)
     ap.add_argument("--e-policy", choices=("padmax", "bucket"), default="bucket")
     ap.add_argument("--wakeup", choices=("group", "leaf"), default="group")
+    # The increment-(ii) server floor (server-floor-design.md): default OFF (θ=0) = the greedy drain.
+    ap.add_argument("--min-forward-rows", type=int, default=0)
+    ap.add_argument("--max-queue-delay-ms", type=float, default=0.0)
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
 
-    server, in_dim, n_actions = build(a.hidden, a.endpoint, a.max_batch, a.e_policy, a.wakeup)
+    server, in_dim, n_actions = build(a.hidden, a.endpoint, a.max_batch, a.e_policy, a.wakeup,
+                                      a.min_forward_rows, a.max_queue_delay_ms)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     print(f"[stage_a_server] up hidden={a.hidden} in_dim={in_dim} n_actions={n_actions} "
-          f"max_batch={a.max_batch} e_policy={a.e_policy} wakeup={a.wakeup} endpoint={a.endpoint}",
+          f"max_batch={a.max_batch} e_policy={a.e_policy} wakeup={a.wakeup} "
+          f"floor(theta={a.min_forward_rows},delay_ms={a.max_queue_delay_ms}) endpoint={a.endpoint}",
           flush=True)
 
     rc = 0
