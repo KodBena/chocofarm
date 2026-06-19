@@ -77,3 +77,33 @@ at high N, and whether pre-warming/hard-capping makes the N=8,9 wedge vanish.
 `model-*.md` (5 side-models) · `verify-*.md` (4 audits) · `derive-G1-greedy-stability.md`,
 `mean_rows_per_msg_derivation.md`, `Q-*.md` (capture-up) · `*.py` (bounded Z3 confirmations).
 Live (gitignored) output: `~/w/vdc/chocobo/runs/leaf-eval-model-2/`.
+
+---
+
+## 2026-06-19 EMPIRICAL UPDATE — the overshoot hypothesis above is REFUTED (amend-by-append, ADR-0005)
+
+The "R2 OVERSHOOT / cold-compile" redirect above (a strong hypothesis, marked pending confirm) was tested
+empirically with the gated event-stream instrumentation (`tools/event_log.hpp` C++ side +
+`inference_server.py` `CHOCO_EVENTLOG` FWD/cold-detect + `tools/event_merge.py` cross-side timestamp
+merge), running the bench at N=4 and N=9. **It is refuted; the original convoy diagnosis is correct.**
+
+- **Compile ≠ convoy, both directions.** N=4 (`T·K = 264 < 512`, so overshoot is *unreachable*) is the case
+  that **collapses**; N=9 (`T·K = 594 > 512`) emits **56 overshoot cold compiles** (widths 585–594) yet is
+  the **fastest** case (143 dps, rows/fwd ≈ 197). The overshoot churn exists exactly where the model said,
+  and is **benign** exactly as the model's primary characterization said. It is not the stall.
+- **The stall is the metastable cross-thread COALESCING COLLAPSE (the original convoy), caught live:**
+  `B: 88→1`, server `rows/forward: ~130→1–3` over ~5 s, every forward dropping into the *warmed* 64-bucket,
+  forward rate exploding ~330→1200/s. It is a **rare, deep, mostly self-recovering excursion** — ~4% of
+  pipelined windows at N=4, ~2% at N=9 (pipelined arm only; an interim "31%" figure was **baseline-arm
+  contamination** and is withdrawn). The *stall* proper is the rare excursion that fails to recover and
+  sticks past the timeout ("N=4 broke sometimes").
+- **Recalibrated model assessment.** The v2 model's STRUCTURE (depth-1, dead-D, sockets, two terminals) is
+  confirmed by the run. Its "B≈1 is transient / self-correcting" was **largely right** (the excursions do
+  recover) — it missed only the **metastable tail** (it *can* fail to self-correct), a narrower gap than the
+  interim phrasing "sticky 31% of the time" implied. The G1 derivation bounded the *high* end (no
+  divergence — confirmed, max ≈ 384); the *low*-end stickiness was asserted, not derived, and the tail is
+  where the real failure lives.
+- **Fix direction (corrected, back to the closed invariant):** a **minimum coalescing floor** independent
+  of arrival timing — server `preferred_batch_size` + `max_queue_delay`, or the closed producer-side "never
+  issue a sub-threshold message while `inflight < D` headroom." NOT the pre-warm-overshoot / hard-cap
+  redirect proposed above (that addresses a benign phenomenon).
