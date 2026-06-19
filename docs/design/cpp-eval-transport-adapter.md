@@ -194,42 +194,40 @@ non-regressing, and ready to carry that phase; it should ride as a selectable fl
 makes the per-round gather small enough that D>1 separates from the strict barrier. The adapter is
 validated as CORRECT (parity held) but its throughput payoff is deferred to overcommit, as predicted.
 
-## 6. Overcommit restructure — the throughput phase (plan, 2026-06-19)
+## 6. The overcommit phase — design (the throughput lever; two-increment build)
 
-Stage B quantified the gap: one tree sustains ~54 in-flight leaves; the serve fast region is B≈192. Closing
-it needs TWO mechanisms Stage B lacked — more concurrent INDEPENDENT in-flight leaves, and a server that
-ASSEMBLES them into one forward. Built in two measured increments.
+Status: APPROVED, increment (i) to build. Stage B proved the adapter correct but D-starved on one tree
+(~54 rows/forward vs the B≈192 fast region). This phase fills that gap. It is TWO mechanisms, not one: we
+need ~3.6× more concurrent INDEPENDENT in-flight leaves arriving at the server, AND the server must
+assemble them into one forward — Stage B had neither (one tree, greedy drain forwarding ~54).
 
-**M1 — overcommit: N independent trees per producer thread.** A producer thread runs **N concurrent
-`TreeState`s** (N self-play episodes interleaved), not one. Independent trees do not interact under
-virtual-loss, so their in-flight leaves SUM (unlike adding fibers to one tree, which only collides). The
-arm-3 driver already pools them for free — it routes replies out-of-order by corr-id, so it does not care
-which tree a leaf came from. **P9 stays clean:** each thread owns its N trees + its DEALER socket
-(single-writer-per-tree is structural) — which is why per-thread-N is chosen over a global work-stealing
-tree pool (that would put >1 writer on a tree's state).
+- **M1 — overcommit: N independent trees per producer thread.** A producer runs N concurrent `TreeState`s
+  (N self-play episodes interleaved), not one. Independent trees do not interact under virtual-loss, so
+  their in-flight leaves SUM (unlike more fibers on one tree, which only collide). The arm3 pipelined-bucket
+  driver already routes replies out-of-order by corr-id, so it pools N trees' leaves onto the thread's one
+  socket for free. P9 stays structural: each thread OWNS its N trees + its DEALER socket
+  (single-writer-per-tree); a global work-stealing tree pool is REJECTED for breaking that invariant.
+- **M2 — the server assembles: greedy first, fill-or-delay only if needed.** With more leaves queued the
+  existing greedy bucketed drain already gathers more. Increment (i) ships overcommit on the UNCHANGED
+  greedy drain and MEASURES rows/forward. Only if it stalls below the fast region does increment (ii) add a
+  min-batch / max-delay accumulation (Triton `preferred_batch_size` + `max_queue_delay`): the server waits
+  briefly to fill a bucket before forwarding. Throughput-only makes the wait free — overcommitted producers
+  never idle during it. Do NOT build the delayed-batcher speculatively.
+- **M3 — 1:3 pinning.** The server is already a separate thread/process from the C++ runner; 1 server : 3
+  producers is an AFFINITY change (pin the JAX server to 1 core, the 3 producer threads to the other 3) —
+  no process re-architecture, and Stage A's cross-process `ipc://` already hit the roofline (SHM stays
+  unneeded even with the server isolated to its own core).
 
-**M2 — the server assembles.** With more leaves queued, even the current greedy bucketed-group drain
-gathers more, so increment (i) uses it AS-IS and measures. If rows/forward still stalls below the fast
-region, increment (ii) adds a **min-batch / max-delay** accumulation (Triton `preferred_batch_size` +
-`max_queue_delay`): the server waits briefly to fill toward a bucket before forwarding. Throughput-only
-makes the wait FREE — the overcommitted producers never idle while the server accumulates. Built only if
-(i) measures short (no speculative delayed-batcher).
+**Choices (fixed):** N=2 trees/thread to start (headroom vs the per-tree drop under load), sweep N∈{1,2,3,4}.
+Two-increment build: (i) overcommit + 1:3 on the greedy drain; (ii) the wait policy ONLY if (i) stalls.
 
-**M3 — 1:3 affinity pinning.** The JAX server is already a separate thread/process from the C++ runner, so
-the 1-serve:3-produce split is an AFFINITY change — pin the server to 1 core, the 3 producer threads to the
-other 3 — not a process re-architecture. (Stage A proved cross-process `ipc://` hits the roofline, so SHM
-stays unneeded even with the server isolated to its own core.)
+**Validation:** headline metric rows/forward → does it reach ~192; then dps vs the model's optimistic ~456.
+Byte-identity holds per tree (independent trees, row-independent forward, corr-id routing) — same fast-tier
+gate. ≥5-iter A/B with variance; the strict-barrier single-tree run as the baseline arm.
 
-**Choices fixed:** N=2 trees/thread to start (sweep N∈{1,2,3,4}); the two-increment build above.
-
-**Validation:** headline metric is **rows/forward → does it reach ~192**, then dps vs the model's
-optimistic ~456 (`docs/notes/serve-produce-core-allocation.md`). Byte-identity still holds per tree
-(independent trees, row-independent forward, corr-id routing) — same fast-tier parity gate. >=5-iter A/B
-with variance; the strict-barrier single-tree run is the baseline arm.
-
-**Honest risk:** the ~456 is an OPTIMISTIC upper bound. The cross-tree fiber-mux bookkeeping, the N x
-per-tree memory (N pmr arenas + tree states), and the server's assembly overhead all eat into it.
-Increment (i)'s rows/forward + dps is exactly where we learn how much survives.
+**Honest risk:** ~456 is an upper bound; the cross-tree fiber-mux bookkeeping, the per-tree memory (N × the
+pmr arena + tree state), and the server's assembly overhead all erode it. Increment (i)'s rows/forward is
+exactly where we learn how much survives.
 
 ## Key sources
 
