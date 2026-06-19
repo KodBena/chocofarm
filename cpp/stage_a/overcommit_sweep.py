@@ -121,7 +121,7 @@ def start_server(src, endpoint: str, max_batch: int, server_core: int):
 
 
 def run_bench(wire_mode: str, endpoint: str, run: str, version: int, threads: int, trees: int,
-              secs: float, gc_m: int, n_sims: int, pool_batch: int, inflight: int,
+              secs: float, gc_m: int, n_sims: int, pool_batch: int, inflight: int, min_coalesce: int,
               producer_cores: str, stats_path: str) -> dict:
     """Run ONE wire-ab-bench pass under `taskset -c <producer_cores>` (M3: the 3 producer cores), parse
     its RESULT line. Returns the parsed metrics dict."""
@@ -134,6 +134,7 @@ def run_bench(wire_mode: str, endpoint: str, run: str, version: int, threads: in
         "--m", str(gc_m), "--n-sims", str(n_sims),
         "--pool-threads", str(threads), "--pool-batch", str(pool_batch),
         "--inflight-msgs", str(inflight), "--trees-per-thread", str(trees),
+        "--min-coalesce", str(min_coalesce),  # S_min: the producer-side closed convoy floor
         "--parity-stats", stats_path,
     ]
     # HONEST timeout, N-AWARE: BOTH warmup and measure run >= one full-occupancy wave, and a wave scales
@@ -192,6 +193,9 @@ def main() -> int:
     ap.add_argument("--max-batch", type=int, default=512)
     ap.add_argument("--pool-batch", type=int, default=64)
     ap.add_argument("--inflight-msgs", type=int, default=8)
+    # S_min: the producer-side minimum coalescing degree (the closed convoy fix). Default 32 matches the
+    # runner default; pass --min-coalesce 1 to reproduce the pre-fix (convoy-prone) behavior for an A/B.
+    ap.add_argument("--min-coalesce", type=int, default=32)
     ap.add_argument("--threads", type=int, default=3)  # 3 producer threads (1:3 pinning)
     # N sweep default capped at 3: N=4 has a SEPARATE nondeterministic stall bug (out of scope here) — the
     # operator can pass --trees 1,2,3,4 explicitly to probe it, but the default avoids it.
@@ -241,7 +245,8 @@ def main() -> int:
             fwd0, rows0 = server.n_forwards, server.n_real_rows
             t_iter0 = time.perf_counter()  # END-TO-END iteration wall (spawn + run + teardown)
             r = run_bench(wire_mode, endpoint, run, version, threads, trees, a.secs, a.m,
-                          a.n_sims, a.pool_batch, a.inflight_msgs, a.producer_cores, stats_path)
+                          a.n_sims, a.pool_batch, a.inflight_msgs, a.min_coalesce,
+                          a.producer_cores, stats_path)
             iter_wall = time.perf_counter() - t_iter0
             fwd1, rows1 = server.n_forwards, server.n_real_rows
             d_fwd = fwd1 - fwd0
@@ -283,6 +288,7 @@ def main() -> int:
     summary: dict = {
         "run": run, "secs": a.secs, "iters": a.iters, "hidden": a.hidden, "m": a.m,
         "n_sims": a.n_sims, "pool_batch": a.pool_batch, "inflight_msgs": a.inflight_msgs,
+        "min_coalesce": a.min_coalesce,
         "threads": a.threads, "server_core": a.server_core, "producer_cores": a.producer_cores,
         "serve_fast_region_B": 192, "model_optimistic_dps": 456, "cells": {},
     }

@@ -25,7 +25,13 @@
 //   Protocol:  wire-ab-bench --instance <p> --faces <p> --endpoint <ipc://...> --run <id> --version <v>
 //                  --res-token <t> --wire-mode <strict-barrier|pipelined-bucket>
 //                  [--secs 8 --m 24 --n-sims 256 --max-depth 24 --c-outcome 2 --lam 0.1 --max-steps 40
-//                   --pool-threads T --pool-batch B --inflight-msgs D --parity-stats <path>]
+//                   --pool-threads T --pool-batch B --inflight-msgs D --trees-per-thread N
+//                   --min-coalesce S_min --parity-stats <path>]
+//
+//   --min-coalesce S_min (PipelinedBucket only) is the producer's minimum coalescing degree — the closed
+//   convoy fix (cpp-eval-wire-formal-diagnosis.md §3): the driver never issues a sub-S_min message while
+//   replies are outstanding, so ready slots pool into a fuller batch instead of collapsing to B=1. Default
+//   32; sweep it to confirm it raises rows/forward without capping the B≈192 fast region.
 //   Timing is an HONEST WALL TIME-BOX: a WARMUP phase (one full-occupancy slot-fill — JITs the server
 //   bucket shapes + fills the slots, NOT counted) is separated from a MEASURE phase that runs short
 //   slot-sized passes and re-checks the `--secs` budget AFTER EACH pass, so the measured window lands
@@ -85,7 +91,8 @@ int main(int argc, char** argv) {
         std::cerr << "usage: wire-ab-bench --instance <p> --faces <p> --endpoint <ipc://...> --run <id> "
                      "--version <v> --res-token <t> --wire-mode <strict-barrier|pipelined-bucket> "
                      "[--secs 8 --m 24 --n-sims 256 --max-depth 24 --c-outcome 2 --lam 0.1 --max-steps 40 "
-                     "--pool-threads T --pool-batch B --inflight-msgs D --parity-stats <path>]\n";
+                     "--pool-threads T --pool-batch B --inflight-msgs D --trees-per-thread N "
+                     "--min-coalesce S_min --parity-stats <path>]\n";
         return 2;
     }
 
@@ -119,6 +126,7 @@ int main(int argc, char** argv) {
     wcfg.timeout_ms = opt(args, "--timeout-ms") ? to_int(*opt(args, "--timeout-ms")) : 60000;
     if (auto v = opt(args, "--inflight-msgs")) wcfg.max_inflight_msgs = to_int(*v);
     if (auto v = opt(args, "--trees-per-thread")) wcfg.trees_per_thread = to_int(*v);
+    if (auto v = opt(args, "--min-coalesce")) wcfg.min_coalesce = to_int(*v);
 
     auto inst = load_instance(*instance, *faces);
     if (!inst) {
@@ -158,7 +166,8 @@ int main(int argc, char** argv) {
     std::cout << "config: wire-mode=" << *wire_mode << " m=" << gc.m << " n_sims=" << gc.n_sims
               << " threads=" << wcfg.pool_threads << " pool_batch=" << wcfg.pool_batch
               << " inflight_D=" << wcfg.max_inflight_msgs
-              << " trees_per_thread=" << wcfg.trees_per_thread << " secs=" << budget
+              << " trees_per_thread=" << wcfg.trees_per_thread
+              << " min_coalesce_Smin=" << wcfg.min_coalesce << " secs=" << budget
               << " endpoint=" << *endpoint << "\n";
 
     // HONEST TIME-BOX (warmup separated from measurement). The driver runs E episodes per pass

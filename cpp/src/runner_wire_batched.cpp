@@ -11,6 +11,7 @@
 // Public Domain (The Unlicense).
 #include "chocofarm/runner_wire_batched.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -370,9 +371,21 @@ std::expected<int, Error> run_episodes_wire_batched(
 //     out-of-order reply routes to the right slot by corr-id with no extra bookkeeping (wire_leaf_pool.hpp
 //     already maps corr-id -> ordered slot list).
 //
-// S-coalescing: each issue gathers ALL currently-parked-and-unsubmitted slots into ONE message (one
-// corr-id) — naturally S>1 when several are ready, degrading to S=1 when only one is. The wire frame /
-// codec / wire_spec are UNCHANGED (P7): this is submit_batch/recv_batch over the SAME corr-id transport.
+// CHUNKED ISSUE — genuine in-flight DEPTH > 1 (the producer-coalescing-floor fix). The earlier as-built
+// driver gathered ALL ready slots into ONE message every issue; since a slot regains readiness only inside
+// the post-recv completion loop, the second issue (no intervening recv) found nothing ready, so per-thread
+// in-flight DEPTH was identically 1 (SYNTHESIS §0) and D was a DEAD knob — and the S_min floor was INERT
+// (depth-1 forces a flush after every reply, bypassing the floor). This driver instead emits each non-forced
+// message as a BOUNDED CHUNK of exactly S_min ready rows (issue stops gathering at S_min and leaves the rest
+// ready), so a full ready wave issues ⌈ready/S_min⌉ chunks and the refill loop holds up to D of them
+// outstanding at once — actually using the D-pipeline §6 intends. With D>1 messages outstanding, a refill
+// that finds ready < S_min can HOLD the sub-threshold gather WITHOUT deadlocking, because the other
+// outstanding messages' replies arrive and free slots that POOL with the held ones until ≥ S_min. So
+// "emit a sub-threshold message while replies are outstanding" is STRUCTURALLY UNREPRESENTABLE; the only
+// sub-threshold (terminal forced-flush) fires exactly when inflight==0 with ready slots remaining — the one
+// state where no reply can ever arrive to fatten the batch. The wire frame / codec / wire_spec are UNCHANGED
+// (P7): this is submit_batch/recv_batch over the SAME corr-id transport; only how many leaves ride one
+// envelope, and how many envelopes are outstanding, changes.
 // ============================================================================================
 std::expected<int, Error> run_episodes_wire_pipelined(
     const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc,
@@ -397,6 +410,12 @@ std::expected<int, Error> run_episodes_wire_pipelined(
     const int N = std::max(1, wcfg.trees_per_thread);
     const int K = N * rc.fibers_per_thread();
     const int D = std::max(1, wcfg.max_inflight_msgs);  // per-thread in-flight message cap
+    // The producer-side MINIMUM coalescing degree S_min (the CLOSED fix for the convoy — see the header,
+    // cpp-eval-wire-formal-diagnosis.md §3, SYNTHESIS §0). Clamped into [1, K]: S_min ≤ K because a single
+    // round can offer at most K ready rows, so a floor above K could never be met by a non-forced issue and
+    // would degenerate to forced-flush-only (B=1 again); clamping keeps the floor a meaningful threshold the
+    // overcommit wave can actually clear. S_min=1 reproduces the pre-fix behavior exactly.
+    const int S_min = std::clamp(wcfg.min_coalesce, 1, K);
 
     void* zctx = zmq_ctx_new();
     if (zctx == nullptr)
@@ -550,12 +569,48 @@ std::expected<int, Error> run_episodes_wire_pipelined(
             return sl.active && sl.ts && sl.ts->running && !submitted[static_cast<size_t>(s)];
         };
 
-        // Issue ONE coalesced message: gather ALL currently-ready slots' rows into one submit_batch (one
-        // corr-id, S = #ready), mark them submitted, bump the in-flight count. Returns false on a submit
-        // error (loud abort) or when nothing was ready (no message issued). S-coalescing happens here.
+        // Count the currently-ready slots (parked at a leaf, not already outstanding). The producer's
+        // coalescing-floor decision (issue vs. wait-for-more) reads this snapshot.
+        auto ready_count = [&]() -> int {
+            int n = 0;
+            for (int s = 0; s < K; ++s)
+                if (is_ready(s)) ++n;
+            return n;
+        };
+
+        // Issue ONE coalesced message under the CLOSED minimum-coalescing-degree invariant (S_min — the
+        // convoy fix; see the header / cpp-eval-wire-formal-diagnosis.md §3 / SYNTHESIS §0). It gathers ready
+        // slots into one submit_batch and marks them submitted, in a BOUNDED CHUNK so multiple messages can
+        // be outstanding at once (genuine depth > 1 — the §6 D-pipeline the as-built drain-all-into-one
+        // defeated). The chunk policy depends on `force`:
+        //
+        //   * `force == false` (the throughput path): if FEWER than S_min slots are ready, refuse to issue —
+        //     return false WITHOUT sending and WITHOUT clearing readiness, so those rows stay ready. The
+        //     caller then blocks on an outstanding reply, whose resume re-parks more slots; their rows POOL
+        //     with the already-ready ones into the NEXT issue, which now clears S_min. The wait is free (the
+        //     overcommit's N fibers keep useful work descending); this is NOT an added timer/sleep (the
+        //     rejected server-side max_queue_delay). When ≥ S_min are ready, gather EXACTLY the first S_min
+        //     of them into the message and leave the rest READY — a bounded chunk. So a wave of W ready slots
+        //     issues ⌊W/S_min⌋ FULL chunks (capped by D; the sub-S_min remainder is HELD, not chunked, while
+        //     replies are outstanding), each holding a DISTINCT message outstanding: depth grows to
+        //     min(D, ⌊W/S_min⌋) > 1. The chunk bound floors the per-message degree at exactly S_min
+        //     (making the floor BIND on every steady-state message) WITHOUT capping aggregate throughput:
+        //     every ready row still flies (across the D chunked messages, and the held remainder as replies
+        //     free headroom), and the server coalesces the D outstanding chunks (× T threads) into its
+        //     B≈192 fast-region forward. This is the guard that makes under-coalescing-while-productive
+        //     STRUCTURALLY UNREPRESENTABLE: with D>1 outstanding, a sub-threshold gather is HELD, never sent.
+        //   * `force == true` (the FORCED FLUSH): emit ALL ready rows, sub-threshold or not, in ONE message.
+        //     The caller uses this ONLY when nothing is outstanding (inflight_msgs == 0) and ready slots
+        //     remain — the single state where waiting can gather no more (no reply will ever arrive) and
+        //     progress / TERMINATION DEMAND the partial send. This is the ONLY place a B < S_min message is
+        //     representable, and (inflight==0) the only place the chunk bound is lifted — the terminal tail
+        //     is small (it never re-fills) so a single drain-all message is correct and ends the pass.
+        //
+        // Returns false on a submit error (loud abort), when nothing was ready, OR (force==false) when the
+        // ready degree is below S_min. S-coalescing — including the floor and the chunk bound — happens here.
         std::vector<float> gather;
         std::vector<int> gathered;
-        auto issue_one = [&]() -> bool {
+        auto issue = [&](bool force) -> bool {
             gather.clear();
             gathered.clear();
             for (int s = 0; s < K; ++s) {
@@ -563,9 +618,17 @@ std::expected<int, Error> run_episodes_wire_pipelined(
                     std::span<const float> feats = slots[static_cast<size_t>(s)].ts->ch.features;
                     gather.insert(gather.end(), feats.begin(), feats.end());
                     gathered.push_back(s);
+                    // Non-forced: a bounded CHUNK of exactly S_min rows (the rest stay ready for the next
+                    // chunk — distinct messages, genuine depth > 1). Forced: drain ALL ready (terminal tail).
+                    if (!force && static_cast<int>(gathered.size()) >= S_min) break;
                 }
             }
             if (gathered.empty()) return false;  // nothing ready to send
+            // THE CLOSED INVARIANT: a sub-threshold message is emitted ONLY under force (caller-guaranteed
+            // inflight_msgs == 0 — no more rows can ever arrive). Otherwise hold for a fuller chunk. (On the
+            // non-forced path the break above already guarantees gathered.size() == S_min once enough were
+            // ready, so this guard fires only when the wave itself offered < S_min.)
+            if (!force && static_cast<int>(gathered.size()) < S_min) return false;
             auto sub = pool.submit_batch(gathered, gather, in_dim);
             if (!sub) { set_error(sub.error()); return false; }
             for (int s : gathered) submitted[static_cast<size_t>(s)] = 1;
@@ -575,14 +638,35 @@ std::expected<int, Error> run_episodes_wire_pipelined(
             return true;
         };
 
+        // Refill under the floor: issue FULL (== S_min) coalesced CHUNKS while there is headroom (< D) and
+        // enough ready rows. Because each non-forced issue takes exactly S_min ready slots and leaves the
+        // rest ready, this loop stacks ONE distinct outstanding message per chunk — genuine depth up to
+        // min(D, ⌊ready/S_min⌋): a wave of W ready slots stacks ⌊W/S_min⌋ chunks (capped at D), so D
+        // genuinely binds (no longer the dead knob of the drain-all-into-one path — SYNTHESIS §0). The loop
+        // stops when ready < S_min (the remainder is HELD, to pool with the next reply's resume) or at D.
+        // Then the FORCED-FLUSH backstop: if NOTHING is outstanding yet ready slots remain (no reply can ever
+        // arrive to fatten the batch), issue them anyway — the only sub-threshold send, and the reason the
+        // drain can never wedge holding a partial batch with an empty pipe (the termination guarantee). With
+        // inflight > 0 the backstop NEVER fires (the held remainder waits on a reply, not on a forced flush)
+        // — so the floor BINDS on every steady-state message and the forced flush is termination-only.
+        auto refill = [&]() {
+            while (inflight_msgs < D && !failed.load() && issue(/*force=*/false)) {}
+            if (inflight_msgs == 0 && !failed.load() && ready_count() > 0)
+                issue(/*force=*/true);  // forced flush: nothing outstanding ⇒ waiting gathers nothing more
+        };
+
         // prime K slots (each fill leaves the slot parked at a leaf, or finalizes a degenerate episode).
         for (int s = 0; s < K && !failed.load(); ++s) fill(s);
 
-        // ---- the PIPELINED drain: hold up to D coalesced messages outstanding; resume-and-refill ----
-        // Issue up to D messages from the initially-ready slots, then loop: recv ONE reply (out-of-order by
-        // corr-id), resume + advance just those slots, and re-issue to refill back to D. Continue while any
-        // message is outstanding (a reply may unpark a slot that then re-parks at its next leaf).
-        while (inflight_msgs < D && issue_one()) {}  // prime the pipe to depth D
+        // ---- the PIPELINED drain: hold coalesced S_min-row CHUNKS outstanding, up to D (depth > 1) ----
+        // Prime the pipe (stack S_min-row chunks while ready ≥ S_min, up to D outstanding; forced-flush the
+        // remainder so the loop can run even when the whole prime wave is sub-threshold). Then loop: recv ONE
+        // reply (out-of-order by corr-id), resume + advance just those slots, and refill back toward D.
+        // Continue while any message is outstanding — the refill's forced-flush backstop guarantees we never
+        // exit with inflight_msgs == 0 while ready slots remain (no deadlock holding a partial batch), so the
+        // loop runs exactly until every episode drains. Because the prime stacks up to D distinct chunks, the
+        // post-recv refill restocks the pipe and depth genuinely sits > 1 whenever ≥ 2·S_min rows are ready.
+        refill();  // prime under the floor (with the forced-flush termination backstop)
         while (inflight_msgs > 0 && !failed.load()) {
             auto reply = pool.recv_batch();
             if (!reply) { set_error(reply.error()); break; }  // recv/decode/corr-id/count: loud abort
@@ -599,8 +683,7 @@ std::expected<int, Error> run_episodes_wire_pipelined(
                 if (failed.load()) break;
                 fill(s);                       // finalized — start the next episode in this slot (or idle)
             }
-            // Refill the pipe: issue coalesced messages over whatever is now ready, back up to depth D.
-            while (inflight_msgs < D && !failed.load() && issue_one()) {}
+            refill();  // hold the floor: full messages back up to depth D, then the forced-flush backstop
         }
         total_leaves.fetch_add(my_leaves, std::memory_order_relaxed);
         total_msgs.fetch_add(my_msgs, std::memory_order_relaxed);
@@ -628,6 +711,7 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         std::lock_guard<std::mutex> lk(err_mu);
         (*stats_out) << "{\"wire_summary\":1,\"leaves\":" << lv << ",\"msgs\":" << ms
                      << ",\"mean_rows_per_msg\":" << mean_s << ",\"inflight_cap_D\":" << D
+                     << ",\"min_coalesce_Smin\":" << S_min
                      << ",\"threads\":" << T << ",\"fibers_per_thread\":" << K << "}\n";
     }
     return written.load();

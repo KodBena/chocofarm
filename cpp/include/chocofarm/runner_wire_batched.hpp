@@ -61,7 +61,11 @@ enum class WireMode { StrictBarrier, PipelinedBucket };
 // transport scheduling arm (StrictBarrier = production default; PipelinedBucket = arm 3, behind a flag);
 // `max_inflight_msgs` is the per-thread in-flight message cap D for PipelinedBucket (ignored under
 // StrictBarrier, which is structurally D=1) — the non-blocking driver holds up to D coalesced messages
-// outstanding before it blocks on a reply.
+// outstanding before it blocks on a reply. D is a LIVE knob: the driver emits each non-forced message as a
+// bounded chunk of S_min rows (not a drain-all gather), so a ready wave of W slots stacks ⌊W/S_min⌋
+// distinct outstanding messages up to D — genuine in-flight depth > 1, the §6 D-pipeline. (This overturns
+// the as-built drain-all-into-one driver SYNTHESIS §0 modeled, under which depth was identically 1 and D
+// was dead; see the min_coalesce note below.)
 //
 // `trees_per_thread` is the OVERCOMMIT multiplier N (docs/design/cpp-eval-transport-adapter.md §6 M1):
 // each PipelinedBucket producer thread owns N × K INDEPENDENT EpisodeSlots (each a self-contained
@@ -72,6 +76,36 @@ enum class WireMode { StrictBarrier, PipelinedBucket };
 // already routes an out-of-order reply to the right (slot=tree-fiber); more slots need no routing change.
 // N=1 reproduces the pre-overcommit slot count exactly. Ignored under StrictBarrier (production default
 // untouched — the strict path keeps its K = ceil(pool_batch/pool_threads) slots).
+//
+// `min_coalesce` is the producer-side MINIMUM coalescing degree S_min (the closed fix for the cross-thread
+// COALESCING-COLLAPSE convoy — docs/design/cpp-eval-wire-formal-diagnosis.md §3 / "How I would design this
+// protocol" item 6). S_min is ALSO the per-message CHUNK SIZE: the PipelinedBucket driver emits each
+// non-forced message as exactly S_min ready rows (it stops gathering at S_min and leaves the rest ready),
+// so a ready wave of W slots issues ⌊W/S_min⌋ distinct outstanding messages up to D — which is what makes
+// the floor BIND. The driver refuses to issue a chunk of fewer than S_min ready rows WHILE replies are
+// still outstanding (inflight headroom exists, so blocking on the next reply will free more slots that pool
+// into a full chunk — the wait is free under the overcommit's N fibers, NOT an added timer/sleep). A
+// sub-threshold message is representable ONLY as a FORCED FLUSH — when nothing is outstanding
+// (inflight_msgs == 0) and ready slots remain — the single state where waiting can gather no more and
+// progress/termination demand the partial send. This makes under-coalescing-while-productive STRUCTURALLY
+// UNREPRESENTABLE (a closed invariant in the control flow, not a tunable that can re-open the convoy):
+// S_min only raises the floor; the forced flush always drains the tail (so a high S_min can never
+// deadlock), and S_min=1 degrades to the pre-fix per-row behavior exactly (no regression). It NEVER caps
+// the achievable batch upward — the held remainder stays ready and flies on the next chunk (and the server
+// coalesces the D outstanding chunks × T threads), so a full overcommit wave still reaches the server's
+// B≈192 fast region. Mechanism note (overturning SYNTHESIS §0 for THIS arm): the as-built driver drained
+// ALL ready slots into one message, so per-thread in-flight DEPTH was identically 1, D was dead, and the
+// S_min floor was INERT (depth-1 forces a flush after every reply, bypassing it). Chunking at S_min restores
+// genuine depth > 1 (⌊ready/S_min⌋ outstanding chunks up to D), so the floor now BINDS as a closed invariant
+// — every steady-state message carries exactly S_min rows, the forced flush is reserved for the terminal
+// tail (inflight==0). This floors the PER-THREAD PER-MESSAGE degree at S_min; the server's cross-thread
+// rows/forward (the other writer of the coalescing degree, §3) is unchanged — the producer floor lifts the
+// server's input but does not itself force rows/forward ≥ θ (a server-side increment (ii) lever if the
+// cross-thread convoy survives). Default S_min=32: a PER-THREAD chunk floor large enough to defeat the B=1
+// lockstep convoy yet small enough that an overcommit wave stacks several chunks (depth > 1) toward D; it is
+// NOT a server bucket bound (those are cross-thread) — sweep `--min-coalesce` against rows/forward to tune
+// rather than treat 32 as derived. Ignored under StrictBarrier (the strict barrier is structurally D=1 and
+// gathers all parked at once, so it has no convoy to floor).
 struct WireRunnerConfig {
     std::string endpoint;
     int pool_threads = 4;
@@ -80,6 +114,7 @@ struct WireRunnerConfig {
     WireMode mode = WireMode::StrictBarrier;
     int max_inflight_msgs = 8;
     int trees_per_thread = 1;
+    int min_coalesce = 32;
 };
 
 // Run cfg.episodes self-play episodes over the wire-batched driver, writing the four (X, PI, M, Y) result
