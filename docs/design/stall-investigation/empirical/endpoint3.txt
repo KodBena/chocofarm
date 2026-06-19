@@ -1,0 +1,1 @@
+ipc:///tmp/choco-stall3-1781848602.ipc

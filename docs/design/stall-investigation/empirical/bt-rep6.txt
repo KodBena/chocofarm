@@ -1,0 +1,12 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.opensuse.org/>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+[New Thread 0x7ffff74676c0 (LWP 897383)]
+[New Thread 0x7ffff6c666c0 (LWP 897384)]
+[New Thread 0x7ffff64656c0 (LWP 897385)]
+[New Thread 0x7ffff5c646c0 (LWP 897386)]
+[New Thread 0x7ffff54636c0 (LWP 897387)]

@@ -1,0 +1,98 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.opensuse.org/>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+[New Thread 0x7ffff74676c0 (LWP 897236)]
+[New Thread 0x7ffff6c666c0 (LWP 897237)]
+[New Thread 0x7ffff64656c0 (LWP 897238)]
+[New Thread 0x7ffff5c646c0 (LWP 897239)]
+[New Thread 0x7ffff54636c0 (LWP 897240)]
+[Thread 0x7ffff5c646c0 (LWP 897239) exited]
+[Thread 0x7ffff74676c0 (LWP 897236) exited]
+[Thread 0x7ffff54636c0 (LWP 897240) exited]
+[Thread 0x7ffff6c666c0 (LWP 897237) exited]
+[Thread 0x7ffff64656c0 (LWP 897238) exited]
+[New Thread 0x7ffff6c666c0 (LWP 897282)]
+[New Thread 0x7ffff54636c0 (LWP 897284)]
+[New Thread 0x7ffff64656c0 (LWP 897283)]
+[New Thread 0x7ffff5c646c0 (LWP 897285)]
+[New Thread 0x7ffff74676c0 (LWP 897286)]
+
+Thread 1 "chocofarm-wire-" received signal SIGINT, Interrupt.
+0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+
+===== STOPPED (stall break-in or exit) =====
+  Id   Target Id                                            Frame 
+* 1    Thread 0x7ffff7ea59c0 (LWP 897233) "chocofarm-wire-" 0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  7    Thread 0x7ffff6c666c0 (LWP 897282) "chocofarm-wire-" 0x00007ffff7b786c8 in __ieee754_exp_fma () from /lib64/libm.so.6
+  8    Thread 0x7ffff54636c0 (LWP 897284) "ZMQbg/Reaper"    0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  9    Thread 0x7ffff64656c0 (LWP 897283) "chocofarm-wire-" 0x000000000043a3f1 in chocofarm::FeatureBuilder::build_into(chocofarm::Point const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, std::vector<double, std::allocator<double> >&) const ()
+  10   Thread 0x7ffff5c646c0 (LWP 897285) "ZMQbg/IO/0"      0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  11   Thread 0x7ffff74676c0 (LWP 897286) "chocofarm-wire-" 0x00000000004104eb in std::_Rb_tree<std::tuple<int, unsigned int, unsigned int>, std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > >, std::_Select1st<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >, std::less<std::tuple<int, unsigned int, unsigned int> >, std::allocator<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > > >::_M_erase(std::_Rb_tree_node<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >*) [clone .isra.0] ()
+
+Thread 11 (Thread 0x7ffff74676c0 (LWP 897286) "chocofarm-wire-"):
+#0  0x00000000004104eb in std::_Rb_tree<std::tuple<int, unsigned int, unsigned int>, std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > >, std::_Select1st<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >, std::less<std::tuple<int, unsigned int, unsigned int> >, std::allocator<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > > >::_M_erase(std::_Rb_tree_node<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >*) [clone .isra.0] ()
+#1  0x00000000004104f0 in std::_Rb_tree<std::tuple<int, unsigned int, unsigned int>, std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > >, std::_Select1st<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >, std::less<std::tuple<int, unsigned int, unsigned int> >, std::allocator<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > > >::_M_erase(std::_Rb_tree_node<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >*) [clone .isra.0] ()
+#2  0x00000000004104f0 in std::_Rb_tree<std::tuple<int, unsigned int, unsigned int>, std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > >, std::_Select1st<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >, std::less<std::tuple<int, unsigned int, unsigned int> >, std::allocator<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > > >::_M_erase(std::_Rb_tree_node<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >*) [clone .isra.0] ()
+#3  0x00000000004104f0 in std::_Rb_tree<std::tuple<int, unsigned int, unsigned int>, std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > >, std::_Select1st<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >, std::less<std::tuple<int, unsigned int, unsigned int> >, std::allocator<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > > >::_M_erase(std::_Rb_tree_node<std::pair<std::tuple<int, unsigned int, unsigned int> const, std::vector<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures>, std::allocator<std::pair<std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>, chocofarm::BeliefFeatures> > > > >*) [clone .isra.0] ()
+#4  0x0000000000415722 in chocofarm::run_episodes_wire_pipelined(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*)::{lambda(int)#1}::operator()(int) const ()
+#5  0x00007ffff7cfaa46 in ?? () from /lib64/libstdc++.so.6
+#6  0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#7  0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 10 (Thread 0x7ffff5c646c0 (LWP 897285) "ZMQbg/IO/0"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791ff41 in epoll_wait () from /lib64/libc.so.6
+#4  0x00007ffff7f22391 in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f554d6 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#7  0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 9 (Thread 0x7ffff64656c0 (LWP 897283) "chocofarm-wire-"):
+#0  0x000000000043a3f1 in chocofarm::FeatureBuilder::build_into(chocofarm::Point const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, std::vector<double, std::allocator<double> >&) const ()
+#1  0x000000000045df3c in chocofarm::GumbelAZPolicy::evaluate(chocofarm::GumbelNode&, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&) const ()
+#2  0x00000000004602d4 in chocofarm::GumbelAZPolicy::descend(std::vector<chocofarm::GumbelNode, std::pmr::polymorphic_allocator<chocofarm::GumbelNode> >&, int, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, unsigned int, double, chocofarm::GumbelSource&, int) const ()
+#3  0x00000000004602d4 in chocofarm::GumbelAZPolicy::descend(std::vector<chocofarm::GumbelNode, std::pmr::polymorphic_allocator<chocofarm::GumbelNode> >&, int, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, unsigned int, double, chocofarm::GumbelSource&, int) const ()
+#4  0x0000000000461cc6 in chocofarm::GumbelAZPolicy::simulate_root_action(std::vector<chocofarm::GumbelNode, std::pmr::polymorphic_allocator<chocofarm::GumbelNode> >&, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, int, unsigned int, double, chocofarm::GumbelSource&) const ()
+#5  0x000000000046529a in chocofarm::GumbelAZPolicy::sequential_halving(std::vector<chocofarm::GumbelNode, std::pmr::polymorphic_allocator<chocofarm::GumbelNode> >&, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double, chocofarm::GumbelSource&, std::vector<int, std::allocator<int> >, std::vector<double, std::allocator<double> > const&, std::vector<double, std::allocator<double> > const&, int&) const ()
+#6  0x000000000046614b in chocofarm::GumbelAZPolicy::run_search(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double, chocofarm::GumbelSource&) const ()
+#7  0x000000000041a5bd in void boost::context::detail::fiber_entry<boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}> >(boost::context::detail::transfer_t) ()
+#8  0x00007ffff7fa51f7 in ?? () from /lib64/glibc-hwcaps/x86-64-v3/libboost_context.so.1.91.0
+
+Thread 8 (Thread 0x7ffff54636c0 (LWP 897284) "ZMQbg/Reaper"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791ff41 in epoll_wait () from /lib64/libc.so.6
+#4  0x00007ffff7f22391 in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f554d6 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#7  0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 7 (Thread 0x7ffff6c666c0 (LWP 897282) "chocofarm-wire-"):
+#0  0x00007ffff7b786c8 in __ieee754_exp_fma () from /lib64/libm.so.6
+#1  0x00007ffff7b396cf in expf64 () from /lib64/libm.so.6
+#2  0x000000000045d2e1 in chocofarm::(anonymous namespace)::masked_softmax_1a_into(std::vector<double, std::allocator<double> > const&, std::span<int const, 18446744073709551615ul>, int, std::vector<double, std::allocator<double> >&) ()
+#3  0x000000000045e3a1 in chocofarm::GumbelAZPolicy::evaluate(chocofarm::GumbelNode&, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&) const ()
+#4  0x00000000004602d4 in chocofarm::GumbelAZPolicy::descend(std::vector<chocofarm::GumbelNode, std::pmr::polymorphic_allocator<chocofarm::GumbelNode> >&, int, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, unsigned int, double, chocofarm::GumbelSource&, int) const ()
+#5  0x0000000000461cc6 in chocofarm::GumbelAZPolicy::simulate_root_action(std::vector<chocofarm::GumbelNode, std::pmr::polymorphic_allocator<chocofarm::GumbelNode> >&, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, int, unsigned int, double, chocofarm::GumbelSource&) const ()
+#6  0x000000000046529a in chocofarm::GumbelAZPolicy::sequential_halving(std::vector<chocofarm::GumbelNode, std::pmr::polymorphic_allocator<chocofarm::GumbelNode> >&, chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double, chocofarm::GumbelSource&, std::vector<int, std::allocator<int> >, std::vector<double, std::allocator<double> > const&, std::vector<double, std::allocator<double> > const&, int&) const ()
+#7  0x000000000046614b in chocofarm::GumbelAZPolicy::run_search(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double, chocofarm::GumbelSource&) const ()
+#8  0x000000000041a5bd in void boost::context::detail::fiber_entry<boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}> >(boost::context::detail::transfer_t) ()
+#9  0x00007ffff7fa51f7 in ?? () from /lib64/glibc-hwcaps/x86-64-v3/libboost_context.so.1.91.0
+
+Thread 1 (Thread 0x7ffff7ea59c0 (LWP 897233) "chocofarm-wire-"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff789816c in __futex_abstimed_wait_common () from /lib64/libc.so.6
+#3  0x00007ffff789d5dd in __pthread_clockjoin_ex () from /lib64/libc.so.6
+#4  0x00007ffff7cfaabb in std::thread::join() () from /lib64/libstdc++.so.6
+#5  0x0000000000410d10 in chocofarm::run_episodes_wire_pipelined(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*) ()
+#6  0x000000000041184b in chocofarm::run_episodes_wire_batched(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*) ()
+#7  0x000000000040dead in main ()
+[Inferior 1 (process 897233) killed]

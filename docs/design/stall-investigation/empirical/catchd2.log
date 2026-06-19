@@ -1,0 +1,2 @@
+rep=1 wedged-but-compute-snapshot -> /home/bork/w/vdc/chocobo/runs/stall-diag/btd-rep1.txt (retrying for recv state)
+rep=2 wedged-but-compute-snapshot -> /home/bork/w/vdc/chocobo/runs/stall-diag/btd-rep2.txt (retrying for recv state)

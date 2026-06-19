@@ -1,0 +1,2 @@
+WEDGED pid=898664 — sampling /proc
+STALL SAMPLED rep=1 -> /home/bork/w/vdc/chocobo/runs/stall-diag/procsmp-rep1.txt

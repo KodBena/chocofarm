@@ -1,0 +1,10 @@
+Warning: 'set target-async', an alias for the command 'set mi-async', is deprecated.
+Use 'set mi-async'.
+
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.opensuse.org/>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+/tmp/gdbcmds.897574:11: Error in sourced command file:
+Cannot change this setting while the inferior is running.

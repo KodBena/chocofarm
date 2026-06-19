@@ -1,0 +1,39 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.opensuse.org/>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+[New Thread 0x7ffff74676c0 (LWP 898581)]
+[New Thread 0x7ffff6c666c0 (LWP 898582)]
+[New Thread 0x7ffff64656c0 (LWP 898583)]
+[New Thread 0x7ffff5c646c0 (LWP 898584)]
+[New Thread 0x7ffff54636c0 (LWP 898585)]
+
+Thread 1 "chocofarm-wire-" received signal SIGINT, Interrupt.
+0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+
+=== SNAP 1 ===
+
+LWP 898582 TOP=std::span<unsigned long const, 18446744073709551615ul>::operator[]
+
+LWP 898581 TOP=chocofarm::popcount_and
+
+LWP 898584 TOP=__syscall_cancel_arch
+  tid:err  inflight_msgs:err  pool.inflight_:err  submitted:err
+
+LWP 898578 TOP=__syscall_cancel_arch
+
+=== SNAP 2 ===
+Python Exception <class 'gdb.error'>: Selected thread is running.
+Error occurred in Python: Selected thread is running.
+Cannot execute this command while the selected thread is running.
+
+=== SNAP 3 ===
+Python Exception <class 'gdb.error'>: Selected thread is running.
+Error occurred in Python: Selected thread is running.
+
+Thread 6 (Thread 0x7ffff54636c0 (LWP 898585) "ZMQbg/IO/0"):
+Selected thread is running.
+[Inferior 1 (process 898578) killed]

@@ -1,0 +1,139 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.opensuse.org/>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+[New Thread 0x7ffff74676c0 (LWP 899009)]
+[New Thread 0x7ffff6c666c0 (LWP 899010)]
+[New Thread 0x7ffff64656c0 (LWP 899011)]
+[New Thread 0x7ffff5c646c0 (LWP 899012)]
+[New Thread 0x7ffff54636c0 (LWP 899013)]
+
+Thread 1 "chocofarm-wire-" received signal SIGINT, Interrupt.
+0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+
+===== BREAK-IN =====
+  Id   Target Id                                            Frame 
+* 1    Thread 0x7ffff7ea59c0 (LWP 899006) "chocofarm-wire-" 0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  2    Thread 0x7ffff74676c0 (LWP 899009) "chocofarm-wire-" 0x000000000045477e in std::vector<double, std::allocator<double> >::end (this=0x1400000014) at /usr/include/c++/15/bits/stl_vector.h:1018
+  3    Thread 0x7ffff6c666c0 (LWP 899010) "ZMQbg/Reaper"    0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  4    Thread 0x7ffff64656c0 (LWP 899011) "ZMQbg/IO/0"      0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  5    Thread 0x7ffff5c646c0 (LWP 899012) "chocofarm-wire-" std::__apply_impl<std::uninitialized_construct_using_allocator<int, std::pmr::polymorphic_allocator<int>, int>(int*, std::pmr::polymorphic_allocator<int> const&, int&&)::{lambda((auto:1&&)...)#1}, std::tuple<int&&>, 0ul>(std::uninitialized_construct_using_allocator<int, std::pmr::polymorphic_allocator<int>, int>(int*, std::pmr::polymorphic_allocator<int> const&, int&&)::{lambda((auto:1&&)...)#1}&&, std::tuple<int&&>&&, std::integer_sequence<unsigned long, 0ul>) (__f=..., __t=...) at /usr/include/c++/15/tuple:2922
+  6    Thread 0x7ffff54636c0 (LWP 899013) "chocofarm-wire-" std::span<unsigned long const, 18446744073709551615ul>::size (this=0x7fffed738d80) at /usr/include/c++/15/span:268
+
+--- LWP 899013 top=std::span<unsigned long const, 18446744073709551615ul>::size ---
+  (no worker frame)
+
+--- LWP 899012 top=std::__apply_impl<std::uninitialized_construct_using_allocator<int, std::pmr::polymorphic_allocator<int>, int>(int*, std::pmr::polymorphic_allocator<int> const&, int&&)::{lambda((auto:1&&)...)#1}, std::tuple<int&&>, 0ul>(std::uninitialized_construct_using_allocator<int, std::pmr::polymorphic_allocator<int>, int>(int*, std::pmr::polymorphic_allocator<int> const&, int&&)::{lambda((auto:1&&)...)#1}&&, std::tuple<int&&>&&, std::integer_sequence<unsigned long, 0ul>) ---
+  (no worker frame)
+
+--- LWP 899009 top=std::vector<double, std::allocator<double> >::end ---
+  (no worker frame)
+
+--- LWP 899006 top=__syscall_cancel_arch ---
+  (no worker frame)
+
+Thread 6 (Thread 0x7ffff54636c0 (LWP 899013) "chocofarm-wire-"):
+#0  std::span<unsigned long const, 18446744073709551615ul>::size (this=0x7fffed738d80) at /usr/include/c++/15/span:268
+#1  0x000000000045071d in chocofarm::popcount_and (bits=std::span of length 243 = {...}, mask=std::span of length 243 = {...}) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/include/chocofarm/belief_bitset_ops.hpp:31
+#2  0x00000000004567cb in chocofarm::(anonymous namespace)::belief_features_bitset (env=..., b=..., N=20, nD=44, log_nworlds=9.648853334130548) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/features.cpp:236
+#3  0x000000000045821a in operator()<chocofarm::BitsetBelief> (__closure=0x7fffed739030, a=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/features.cpp:266
+#4  0x00000000004580b9 in std::__invoke_impl<chocofarm::BeliefFeatures, chocofarm::belief_features(const Environment&, const Belief&)::<lambda(const auto:45&)>, const chocofarm::BitsetBelief&>(std::__invoke_other, struct {...} &&) (__f=...) at /usr/include/c++/15/bits/invoke.h:63
+#5  0x0000000000458037 in std::__invoke<chocofarm::belief_features(const Environment&, const Belief&)::<lambda(const auto:45&)>, const chocofarm::BitsetBelief&>(struct {...} &&) (__fn=...) at /usr/include/c++/15/bits/invoke.h:99
+#6  0x0000000000457e57 in std::__detail::__variant::__gen_vtable_impl<std::__detail::__variant::_Multi_array<std::__detail::__variant::__deduce_visit_result<chocofarm::BeliefFeatures> (*)(chocofarm::belief_features(const Environment&, const Belief&)::<lambda(const auto:45&)>&&, const std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>&)>, std::integer_sequence<long unsigned int, 1> >::__visit_invoke(struct {...} &&, const std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> &) (__visitor=..., __vars#0=std::variant [index 1] = {...}) at /usr/include/c++/15/variant:1057
+#7  0x0000000000457ed9 in std::__do_visit<std::__detail::__variant::__deduce_visit_result<chocofarm::BeliefFeatures>, chocofarm::belief_features(const Environment&, const Belief&)::<lambda(const auto:45&)>, const std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>&>(struct {...} &&) (__visitor=...) at /usr/include/c++/15/variant:1892
+#8  0x0000000000457f61 in std::visit<chocofarm::belief_features(const Environment&, const Belief&)::<lambda(const auto:45&)>, const std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief>&>(struct {...} &&) (__visitor=...) at /usr/include/c++/15/variant:1956
+#9  0x00000000004569b3 in chocofarm::belief_features (env=..., bw=std::variant [index 1] = {...}) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/features.cpp:271
+#10 0x0000000000457b2f in chocofarm::FeatureBuilder::belief_feats_ (this=0x7fffefa2aab0, bw=std::variant [index 1] = {...}) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/features.cpp:418
+#11 0x0000000000456fab in chocofarm::FeatureBuilder::build_into (this=0x7fffefa2aab0, loc=..., bw=std::variant [index 1] = {...}, collected=..., out=std::vector of length 241, capacity 241 = {...}) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/features.cpp:330
+#12 0x000000000048ffc8 in chocofarm::GumbelAZPolicy::evaluate (this=0x7fffefa2aa70, node=..., loc=..., bw=std::variant [index 1] = {...}, collected=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:257
+#13 0x0000000000490a9e in chocofarm::GumbelAZPolicy::descend (this=0x7fffefa2aa70, nodes=std::vector of length 425, capacity 512 = {...}, node=424, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=581664, lam=0.10000000000000001, src=..., depth=3) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:379
+#14 0x0000000000490d73 in chocofarm::GumbelAZPolicy::descend (this=0x7fffefa2aa70, nodes=std::vector of length 425, capacity 512 = {...}, node=95, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=581664, lam=0.10000000000000001, src=..., depth=2) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:404
+#15 0x0000000000490d73 in chocofarm::GumbelAZPolicy::descend (this=0x7fffefa2aa70, nodes=std::vector of length 425, capacity 512 = {...}, node=18, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=581664, lam=0.10000000000000001, src=..., depth=1) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:404
+#16 0x0000000000491146 in chocofarm::GumbelAZPolicy::simulate_root_action (this=0x7fffefa2aa70, nodes=std::vector of length 425, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., slot=6, world=36968, lam=0.10000000000000001, src=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:440
+#17 0x0000000000491250 in chocofarm::GumbelAZPolicy::visit (this=0x7fffefa2aa70, nodes=std::vector of length 425, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., slot=6, lam=0.10000000000000001, src=..., count=1) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:452
+#18 0x00000000004919c3 in chocofarm::GumbelAZPolicy::sequential_halving (this=0x7fffefa2aa70, nodes=std::vector of length 425, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., lam=0.10000000000000001, src=..., considered=std::vector of length 1, capacity 1 = {...}, g=std::vector of length 65, capacity 65 = {...}, logits=std::vector of length 65, capacity 65 = {...}, n_spent=@0x7fffed73bc50: 221) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:521
+#19 0x0000000000492441 in chocofarm::GumbelAZPolicy::run_search (this=0x7fffefa2aa70, loc=..., bw=std::variant [index 1] = {...}, collected=..., lam=0.10000000000000001, src=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:623
+#20 0x0000000000416c6f in chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}::operator()(boost::context::fiber&&) const (__closure=0x7fffed73be18, caller=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/include/chocofarm/fiber_tree.hpp:94
+#21 0x000000000042aa13 in std::__invoke_impl<boost::context::fiber, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(std::__invoke_other, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__f=...) at /usr/include/c++/15/bits/invoke.h:63
+#22 0x0000000000429abc in std::__invoke<chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__fn=...) at /usr/include/c++/15/bits/invoke.h:99
+#23 0x0000000000427edc in std::invoke<chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__fn=...) at /usr/include/c++/15/functional:123
+#24 0x0000000000425ca1 in boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}>::run(void*) (this=0x7fffed73be00, fctx=0x7ffff54623f8) at /usr/include/boost/context/fiber_fcontext.hpp:206
+#25 0x0000000000422b5a in boost::context::detail::fiber_entry<boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}> >(boost::context::detail::transfer_t) (t=...) at /usr/include/boost/context/fiber_fcontext.hpp:146
+#26 0x00007ffff7fa51f7 in ?? () from /lib64/glibc-hwcaps/x86-64-v3/libboost_context.so.1.91.0
+
+Thread 5 (Thread 0x7ffff5c646c0 (LWP 899012) "chocofarm-wire-"):
+#0  std::__apply_impl<std::uninitialized_construct_using_allocator<int, std::pmr::polymorphic_allocator<int>, int>(int*, std::pmr::polymorphic_allocator<int> const&, int&&)::{lambda((auto:1&&)...)#1}, std::tuple<int&&>, 0ul>(std::uninitialized_construct_using_allocator<int, std::pmr::polymorphic_allocator<int>, int>(int*, std::pmr::polymorphic_allocator<int> const&, int&&)::{lambda((auto:1&&)...)#1}&&, std::tuple<int&&>&&, std::integer_sequence<unsigned long, 0ul>) (__f=..., __t=...) at /usr/include/c++/15/tuple:2922
+#1  0x000000000049f674 in apply<std::uninitialized_construct_using_allocator<int, pmr::polymorphic_allocator<int>, int>(int*, const pmr::polymorphic_allocator<int>&, int&&)::<lambda(auto:5&& ...)>, std::tuple<int&&> > (__f=..., __t=...) at /usr/include/c++/15/tuple:2935
+#2  0x000000000049f6c4 in std::uninitialized_construct_using_allocator<int, std::pmr::polymorphic_allocator<int>, int> (__p=0x7fffcb2a0030, __a=...) at /usr/include/c++/15/bits/uses_allocator_args.h:241
+#3  0x000000000049dd9f in std::pmr::polymorphic_allocator<int>::construct<int, int> (this=0x7fffcb2415c8, __p=0x7fffcb2a0030) at /usr/include/c++/15/bits/memory_resource.h:304
+#4  0x000000000049bcbb in std::allocator_traits<std::pmr::polymorphic_allocator<int> >::construct<int, int> (__a=..., __p=0x7fffcb2a0030) at /usr/include/c++/15/bits/memory_resource.h:497
+#5  0x000000000049dcf8 in std::__uninitialized_copy_a<std::move_iterator<int*>, std::move_iterator<int*>, int*, std::pmr::polymorphic_allocator<int> > (__first=..., __last=..., __result=0x7fffcb2a0030, __alloc=...) at /usr/include/c++/15/bits/stl_uninitialized.h:603
+#6  0x000000000049bc82 in std::__uninitialized_move_if_noexcept_a<int*, int*, std::pmr::polymorphic_allocator<int> > (__first=0x7fffcb2a0004, __last=0x7fffcb2a0024, __result=0x7fffcb2a0024, __alloc=...) at /usr/include/c++/15/bits/stl_uninitialized.h:664
+#7  0x0000000000499401 in std::vector<int, std::pmr::polymorphic_allocator<int> >::_M_realloc_append<int const&> (this=0x7fffcb2415c8) at /usr/include/c++/15/bits/vector.tcc:628
+#8  0x000000000049771f in std::vector<int, std::pmr::polymorphic_allocator<int> >::push_back (this=0x7fffcb2415c8, __x=@0x7fffead3f7bc: 8) at /usr/include/c++/15/bits/stl_vector.h:1427
+#9  0x00000000004901d6 in chocofarm::GumbelAZPolicy::evaluate (this=0x7fffe843ff30, node=..., loc=..., bw=std::variant [index 1] = {...}, collected=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:288
+#10 0x0000000000490a9e in chocofarm::GumbelAZPolicy::descend (this=0x7fffe843ff30, nodes=std::vector of length 429, capacity 512 = {...}, node=428, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=83458, lam=0.10000000000000001, src=..., depth=2) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:379
+#11 0x0000000000490d73 in chocofarm::GumbelAZPolicy::descend (this=0x7fffe843ff30, nodes=std::vector of length 429, capacity 512 = {...}, node=161, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=83458, lam=0.10000000000000001, src=..., depth=1) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:404
+#12 0x0000000000491146 in chocofarm::GumbelAZPolicy::simulate_root_action (this=0x7fffe843ff30, nodes=std::vector of length 429, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., slot=14, world=83458, lam=0.10000000000000001, src=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:440
+#13 0x0000000000491250 in chocofarm::GumbelAZPolicy::visit (this=0x7fffe843ff30, nodes=std::vector of length 429, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., slot=14, lam=0.10000000000000001, src=..., count=1) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:452
+#14 0x00000000004919c3 in chocofarm::GumbelAZPolicy::sequential_halving (this=0x7fffe843ff30, nodes=std::vector of length 429, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., lam=0.10000000000000001, src=..., considered=std::vector of length 1, capacity 1 = {...}, g=std::vector of length 65, capacity 65 = {...}, logits=std::vector of length 65, capacity 65 = {...}, n_spent=@0x7fffead41850: 217) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:521
+#15 0x0000000000492441 in chocofarm::GumbelAZPolicy::run_search (this=0x7fffe843ff30, loc=..., bw=std::variant [index 1] = {...}, collected=..., lam=0.10000000000000001, src=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:623
+#16 0x0000000000416c6f in chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}::operator()(boost::context::fiber&&) const (__closure=0x7fffead41a18, caller=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/include/chocofarm/fiber_tree.hpp:94
+#17 0x000000000042aa13 in std::__invoke_impl<boost::context::fiber, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(std::__invoke_other, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__f=...) at /usr/include/c++/15/bits/invoke.h:63
+#18 0x0000000000429abc in std::__invoke<chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__fn=...) at /usr/include/c++/15/bits/invoke.h:99
+#19 0x0000000000427edc in std::invoke<chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__fn=...) at /usr/include/c++/15/functional:123
+#20 0x0000000000425ca1 in boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}>::run(void*) (this=0x7fffead41a00, fctx=0x7ffff5c633f8) at /usr/include/boost/context/fiber_fcontext.hpp:206
+#21 0x0000000000422b5a in boost::context::detail::fiber_entry<boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}> >(boost::context::detail::transfer_t) (t=...) at /usr/include/boost/context/fiber_fcontext.hpp:146
+#22 0x00007ffff7fa51f7 in ?? () from /lib64/glibc-hwcaps/x86-64-v3/libboost_context.so.1.91.0
+
+Thread 4 (Thread 0x7ffff64656c0 (LWP 899011) "ZMQbg/IO/0"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791ff41 in epoll_wait () from /lib64/libc.so.6
+#4  0x00007ffff7f22391 in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f554d6 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#7  0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 3 (Thread 0x7ffff6c666c0 (LWP 899010) "ZMQbg/Reaper"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791ff41 in epoll_wait () from /lib64/libc.so.6
+#4  0x00007ffff7f22391 in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f554d6 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#7  0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 2 (Thread 0x7ffff74676c0 (LWP 899009) "chocofarm-wire-"):
+#0  0x000000000045477e in std::vector<double, std::allocator<double> >::end (this=0x1400000014) at /usr/include/c++/15/bits/stl_vector.h:1018
+#1  0x000000000048ffeb in chocofarm::GumbelAZPolicy::evaluate (this=0x7ffff0d608f0, node=..., loc=..., bw=std::variant [index 1] = {...}, collected=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:258
+#2  0x0000000000490a9e in chocofarm::GumbelAZPolicy::descend (this=0x7ffff0d608f0, nodes=std::vector of length 442, capacity 512 = {...}, node=441, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=19204, lam=0.10000000000000001, src=..., depth=3) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:379
+#3  0x0000000000490d73 in chocofarm::GumbelAZPolicy::descend (this=0x7ffff0d608f0, nodes=std::vector of length 442, capacity 512 = {...}, node=373, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=19204, lam=0.10000000000000001, src=..., depth=2) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:404
+#4  0x0000000000490d73 in chocofarm::GumbelAZPolicy::descend (this=0x7ffff0d608f0, nodes=std::vector of length 442, capacity 512 = {...}, node=31, loc=..., bw=std::variant [index 1] = {...}, collected=..., world=19204, lam=0.10000000000000001, src=..., depth=1) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:404
+#5  0x0000000000491146 in chocofarm::GumbelAZPolicy::simulate_root_action (this=0x7ffff0d608f0, nodes=std::vector of length 442, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., slot=12, world=5385, lam=0.10000000000000001, src=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:440
+#6  0x0000000000491250 in chocofarm::GumbelAZPolicy::visit (this=0x7ffff0d608f0, nodes=std::vector of length 442, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., slot=12, lam=0.10000000000000001, src=..., count=1) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:452
+#7  0x00000000004919c3 in chocofarm::GumbelAZPolicy::sequential_halving (this=0x7ffff0d608f0, nodes=std::vector of length 442, capacity 512 = {...}, loc=..., bw=std::variant [index 1] = {...}, collected=..., lam=0.10000000000000001, src=..., considered=std::vector of length 1, capacity 1 = {...}, g=std::vector of length 65, capacity 65 = {...}, logits=std::vector of length 65, capacity 65 = {...}, n_spent=@0x7ffff2366050: 229) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:521
+#8  0x0000000000492441 in chocofarm::GumbelAZPolicy::run_search (this=0x7ffff0d608f0, loc=..., bw=std::variant [index 1] = {...}, collected=..., lam=0.10000000000000001, src=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/gumbel.cpp:623
+#9  0x0000000000416c6f in chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}::operator()(boost::context::fiber&&) const (__closure=0x7ffff2366218, caller=...) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/include/chocofarm/fiber_tree.hpp:94
+#10 0x000000000042aa13 in std::__invoke_impl<boost::context::fiber, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(std::__invoke_other, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__f=...) at /usr/include/c++/15/bits/invoke.h:63
+#11 0x0000000000429abc in std::__invoke<chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__fn=...) at /usr/include/c++/15/bits/invoke.h:99
+#12 0x0000000000427edc in std::invoke<chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber>(chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}&, boost::context::fiber&&) (__fn=...) at /usr/include/c++/15/functional:123
+#13 0x0000000000425ca1 in boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}>::run(void*) (this=0x7ffff2366200, fctx=0x7ffff74663f8) at /usr/include/boost/context/fiber_fcontext.hpp:206
+#14 0x0000000000422b5a in boost::context::detail::fiber_entry<boost::context::detail::fiber_record<boost::context::fiber, boost::context::basic_fixedsize_stack<boost::context::stack_traits>, chocofarm::TreeState::start(chocofarm::Loc const&, std::variant<chocofarm::FlatBelief, chocofarm::BitsetBelief> const&, chocofarm::CollectedSet const&, double)::{lambda(boost::context::fiber&&)#1}> >(boost::context::detail::transfer_t) (t=...) at /usr/include/boost/context/fiber_fcontext.hpp:146
+#15 0x00007ffff7fa51f7 in ?? () from /lib64/glibc-hwcaps/x86-64-v3/libboost_context.so.1.91.0
+
+Thread 1 (Thread 0x7ffff7ea59c0 (LWP 899006) "chocofarm-wire-"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff789816c in __futex_abstimed_wait_common () from /lib64/libc.so.6
+#3  0x00007ffff789d5dd in __pthread_clockjoin_ex () from /lib64/libc.so.6
+#4  0x00007ffff7cfaabb in std::thread::join() () from /lib64/libstdc++.so.6
+#5  0x0000000000413660 in chocofarm::run_episodes_wire_pipelined (env=..., fb=..., gc=..., redis=..., cfg=..., wcfg=..., stats_out=0x0) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/runner_wire_batched.cpp:612
+#6  0x0000000000410a29 in chocofarm::run_episodes_wire_batched (env=..., fb=..., gc=..., redis=..., cfg=..., wcfg=..., stats_out=0x0) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/runner_wire_batched.cpp:67
+#7  0x00000000004083a7 in main (argc=29, argv=0x7fffffffde78) at /home/bork/w/vdc/1/chocofarm-wt-stall/cpp/src/wire_ab_bench.cpp:212
+[Inferior 1 (process 899006) killed]

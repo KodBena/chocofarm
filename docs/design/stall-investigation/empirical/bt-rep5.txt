@@ -1,0 +1,113 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.opensuse.org/>
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+[New Thread 0x7ffff74676c0 (LWP 897316)]
+[New Thread 0x7ffff6c666c0 (LWP 897317)]
+[New Thread 0x7ffff64656c0 (LWP 897318)]
+[New Thread 0x7ffff5c646c0 (LWP 897319)]
+[New Thread 0x7ffff54636c0 (LWP 897320)]
+[Thread 0x7ffff5c646c0 (LWP 897319) exited]
+[Thread 0x7ffff6c666c0 (LWP 897317) exited]
+[Thread 0x7ffff74676c0 (LWP 897316) exited]
+[Thread 0x7ffff64656c0 (LWP 897318) exited]
+[Thread 0x7ffff54636c0 (LWP 897320) exited]
+[New Thread 0x7ffff64656c0 (LWP 897361)]
+[New Thread 0x7ffff54636c0 (LWP 897362)]
+[New Thread 0x7ffff5c646c0 (LWP 897363)]
+[New Thread 0x7ffff6c666c0 (LWP 897364)]
+[New Thread 0x7ffff74676c0 (LWP 897365)]
+
+Thread 1 "chocofarm-wire-" received signal SIGINT, Interrupt.
+0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+
+===== STOPPED (stall break-in or exit) =====
+  Id   Target Id                                            Frame 
+* 1    Thread 0x7ffff7ea59c0 (LWP 897313) "chocofarm-wire-" 0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  7    Thread 0x7ffff64656c0 (LWP 897361) "chocofarm-wire-" 0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  8    Thread 0x7ffff54636c0 (LWP 897362) "chocofarm-wire-" 0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  9    Thread 0x7ffff5c646c0 (LWP 897363) "ZMQbg/Reaper"    0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  10   Thread 0x7ffff6c666c0 (LWP 897364) "chocofarm-wire-" 0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+  11   Thread 0x7ffff74676c0 (LWP 897365) "ZMQbg/IO/0"      0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+
+Thread 11 (Thread 0x7ffff74676c0 (LWP 897365) "ZMQbg/IO/0"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791ff41 in epoll_wait () from /lib64/libc.so.6
+#4  0x00007ffff7f22391 in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f554d6 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#7  0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 10 (Thread 0x7ffff6c666c0 (LWP 897364) "chocofarm-wire-"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791192a in poll () from /lib64/libc.so.6
+#4  0x00007ffff7f22c5a in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f4ba16 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff7f4c0e9 in ?? () from /lib64/libzmq.so.5
+#7  0x00007ffff7f629b0 in zmq_msg_recv () from /lib64/libzmq.so.5
+#8  0x000000000041c84e in chocofarm::WireLeafPool::recv_corr_payload(unsigned long&, std::vector<unsigned char, std::allocator<unsigned char> >&) ()
+#9  0x000000000041f56d in chocofarm::WireLeafPool::recv_batch() ()
+#10 0x0000000000415286 in chocofarm::run_episodes_wire_pipelined(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*)::{lambda(int)#1}::operator()(int) const ()
+#11 0x00007ffff7cfaa46 in ?? () from /lib64/libstdc++.so.6
+#12 0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#13 0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 9 (Thread 0x7ffff5c646c0 (LWP 897363) "ZMQbg/Reaper"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791ff41 in epoll_wait () from /lib64/libc.so.6
+#4  0x00007ffff7f22391 in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f554d6 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#7  0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 8 (Thread 0x7ffff54636c0 (LWP 897362) "chocofarm-wire-"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791192a in poll () from /lib64/libc.so.6
+#4  0x00007ffff7f22c5a in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f4ba16 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff7f4c0e9 in ?? () from /lib64/libzmq.so.5
+#7  0x00007ffff7f629b0 in zmq_msg_recv () from /lib64/libzmq.so.5
+#8  0x000000000041c84e in chocofarm::WireLeafPool::recv_corr_payload(unsigned long&, std::vector<unsigned char, std::allocator<unsigned char> >&) ()
+#9  0x000000000041f56d in chocofarm::WireLeafPool::recv_batch() ()
+#10 0x0000000000415286 in chocofarm::run_episodes_wire_pipelined(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*)::{lambda(int)#1}::operator()(int) const ()
+#11 0x00007ffff7cfaa46 in ?? () from /lib64/libstdc++.so.6
+#12 0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#13 0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 7 (Thread 0x7ffff64656c0 (LWP 897361) "chocofarm-wire-"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff7897e31 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007ffff791192a in poll () from /lib64/libc.so.6
+#4  0x00007ffff7f22c5a in ?? () from /lib64/libzmq.so.5
+#5  0x00007ffff7f4ba16 in ?? () from /lib64/libzmq.so.5
+#6  0x00007ffff7f4c0e9 in ?? () from /lib64/libzmq.so.5
+#7  0x00007ffff7f629b0 in zmq_msg_recv () from /lib64/libzmq.so.5
+#8  0x000000000041c84e in chocofarm::WireLeafPool::recv_corr_payload(unsigned long&, std::vector<unsigned char, std::allocator<unsigned char> >&) ()
+#9  0x000000000041f56d in chocofarm::WireLeafPool::recv_batch() ()
+#10 0x0000000000415286 in chocofarm::run_episodes_wire_pipelined(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*)::{lambda(int)#1}::operator()(int) const ()
+#11 0x00007ffff7cfaa46 in ?? () from /lib64/libstdc++.so.6
+#12 0x00007ffff789b8f0 in start_thread () from /lib64/libc.so.6
+#13 0x00007ffff791fc2c in __clone3 () from /lib64/libc.so.6
+
+Thread 1 (Thread 0x7ffff7ea59c0 (LWP 897313) "chocofarm-wire-"):
+#0  0x00007ffff78a4252 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007ffff7897dd8 in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007ffff789816c in __futex_abstimed_wait_common () from /lib64/libc.so.6
+#3  0x00007ffff789d5dd in __pthread_clockjoin_ex () from /lib64/libc.so.6
+#4  0x00007ffff7cfaabb in std::thread::join() () from /lib64/libstdc++.so.6
+#5  0x0000000000410d10 in chocofarm::run_episodes_wire_pipelined(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*) ()
+#6  0x000000000041184b in chocofarm::run_episodes_wire_batched(chocofarm::Environment const&, chocofarm::FeatureBuilder const&, chocofarm::GumbelConfig const&, chocofarm::RedisClient&, chocofarm::RunnerConfig const&, chocofarm::WireRunnerConfig const&, std::basic_ostream<char, std::char_traits<char> >*) ()
+#7  0x000000000040dead in main ()
+[Inferior 1 (process 897313) killed]
