@@ -26,6 +26,7 @@
 
 #include "chocofarm/fiber_tree.hpp"
 #include "chocofarm/issue_controller.hpp"
+#include "chocofarm/lab_control_wire.hpp"
 #include "chocofarm/runtime_config.hpp"
 #include "chocofarm/wire_leaf_pool.hpp"
 
@@ -521,6 +522,13 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         std::vector<char> submitted(static_cast<size_t>(K), 0);
         int inflight_msgs = 0;  // messages this thread has outstanding (== D cap)
         long my_leaves = 0, my_msgs = 0;
+        long my_decisions = 0;  // CONTROL-LAB: cumulative recorded decisions this thread (the dps numerator)
+
+        // CONTROL-LAB per-forward on-wire decision (lab-gated): rides this thread's feature snapshot in the
+        // request envelope and actuates the gate bit off the reply through the SAME IssueController cell.
+        // Off (the default) the wire is byte-unchanged and the recv path is the plain recv_batch. Requires
+        // an injected controller (the actuation hub); `lab_decision` without a controller is inert.
+        const bool lab_active = wcfg.lab_decision && controller != nullptr;
 
         // ---- the per-slot episode state machine: IDENTICAL to the strict driver's (re-derived from the
         // SAME serial run_episode). spawn_ply / finalize_and_write / apply_decision / advance / fill are
@@ -560,6 +568,8 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         };
         auto apply_decision = [&](int s) -> bool {
             EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            ++my_decisions;   // CONTROL-LAB: every apply_decision is exactly one recorded decision (the
+                              // dps numerator the feature frame carries; counted regardless of the budget).
             // BENCH fixed-decision budget: every apply_decision is exactly one recorded decision (a
             // completed Gumbel search — both the Terminate and the normal branch below record_decision). The
             // first settle_budget run UNCOUNTED (pipeline desync); decision number settle_budget+1 opens the
@@ -720,7 +730,23 @@ std::expected<int, Error> run_episodes_wire_pipelined(
             if (gathered.empty()) return false;  // nothing ready to send
             // The S_min floor guard (inert at depth-1, see above): hold a sub-threshold gather unless forced.
             if (!force && static_cast<int>(gathered.size()) < S_min) return false;
-            auto sub = pool.submit_batch(gathered, gather, in_dim);
+            // CONTROL-LAB: attach this thread's per-forward feature snapshot as an extra envelope frame
+            // (lab_control_wire.hpp). The snapshot is the thread's CURRENT counters at submit time —
+            // inflight messages, ready slots, cumulative msgs/leaves; rtt is left 0 (not yet measured
+            // here). Off the lab path `lab_frame` stays empty ⇒ submit_batch sends the byte-unchanged frame.
+            std::vector<unsigned char> lab_frame;
+            if (lab_active) {
+                lab::LabFeature lf;
+                lf.tid = tid;
+                lf.inflight = inflight_msgs;
+                lf.ready = static_cast<std::int32_t>(gathered.size());
+                lf.msgs = my_msgs;
+                lf.leaves = my_leaves;
+                lf.rtt_us = 0;
+                lf.decisions = my_decisions;
+                lab_frame = lab::encode_feature(lf);
+            }
+            auto sub = pool.submit_batch(gathered, gather, in_dim, lab_frame);
             if (!sub) { set_error(sub.error()); return false; }
             for (int s : gathered) submitted[static_cast<size_t>(s)] = 1;
             ++inflight_msgs;
@@ -760,9 +786,15 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         // deadlock), so the loop runs exactly until every episode drains.
         refill();  // prime under the floor (with the forced-flush termination backstop)
         while (inflight_msgs > 0 && !failed.load() && !budget_done.load(std::memory_order_relaxed)) {
-            auto reply = pool.recv_batch();
+            // CONTROL-LAB: the lab recv ALSO carries this thread's next issue-gate bit (decided by the
+            // server's Controller on the just-completed forward); off the lab path it is the plain
+            // recv_batch (byte-unchanged). The gate is actuated through the SAME IssueController cell that
+            // refill()'s may_issue(tid) reads — one actuation path (P3).
+            LabReplyGate gate;
+            auto reply = lab_active ? pool.recv_batch_lab(gate) : pool.recv_batch();
             if (!reply) { set_error(reply.error()); break; }  // recv/decode/corr-id/count: loud abort
             --inflight_msgs;  // this corr-id's message is resolved
+            if (lab_active && gate.present) controller->set_allow(tid, gate.allow);
             // Resume each slot this message answered, advance its episode, then re-park or refill.
             for (const Completion& c : *reply) {
                 if (failed.load()) break;

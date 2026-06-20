@@ -109,6 +109,15 @@ struct WireRunnerConfig {
     int trees_per_thread = 1;
     int min_coalesce = 32;
     bool chunk_floor = false;   // gen-side depth>1 chunk-at-S_min (the runnable "final bolt"); default OFF
+    // CONTROL-LAB per-forward on-wire decision transport (the Batch-0 harness; PipelinedBucket only),
+    // default OFF (the production/bench path is byte-unchanged when off). When ON *and* an IssueController
+    // is injected, each producer thread rides its per-forward feature snapshot in the request's
+    // LAB-CONTROL envelope frame (lab_control_wire.hpp) and reads its next issue-gate bit off the reply,
+    // actuating through the SAME IssueController::set_allow / may_issue cell (no second actuation path).
+    // The decision epoch is the eval server's forward (the lab StageAServer runs the Controller there).
+    // This SUPERSEDES the async issue_control_bridge FOR THE LAB; with `lab_decision` off the bridge path
+    // is unchanged. Ignored under StrictBarrier and when `controller` is null.
+    bool lab_decision = false;
     // BENCH-ONLY fixed-DECISION measure budget (PipelinedBucket only). 0 = unlimited (run cfg.episodes to
     // completion — the production/default path, byte-unchanged). When > 0, the pipelined driver stops as
     // soon as it has RECORDED this many decisions (completed Gumbel searches) ACROSS the pool and abandons

@@ -111,7 +111,8 @@ int main(int argc, char** argv) {
                      "--pool-threads T --pool-batch B --inflight-msgs D --trees-per-thread N "
                      "--min-coalesce S_min --gen-chunk-floor <0|1> --measure-decisions M "
                      "--settle-decisions S --pool-plies P --pool-seed K --sweep-configs cf:S:D,... "
-                     "--control-endpoint <ipc://...> --controller-cadence-ms ms --parity-stats <path>]\n";
+                     "--control-endpoint <ipc://...> --controller-cadence-ms ms --lab-decision <0|1> "
+                     "--parity-stats <path>]\n";
         return 2;
     }
 
@@ -156,6 +157,13 @@ int main(int argc, char** argv) {
         opt(args, "--control-endpoint") ? std::string(*opt(args, "--control-endpoint")) : "";
     const double controller_cadence_ms = opt(args, "--controller-cadence-ms")
         ? to_double(*opt(args, "--controller-cadence-ms")) : 5.0;
+    // The CONTROL-LAB per-forward on-wire decision transport (--lab-decision 1; sweep only). When ON the
+    // producer rides its feature snapshot in the request envelope and reads the gate bit off the reply,
+    // actuating through a per-config IssueController (created here, NO bridge — the eval server's lab
+    // variant hosts the Controller and decides on the forward). This SUPERSEDES the async --control-endpoint
+    // bridge; the two are mutually exclusive (lab decision is on the forward, not a separate cadence).
+    const bool lab_decision = opt(args, "--lab-decision")
+        ? (to_int(*opt(args, "--lab-decision")) != 0) : false;
 
     GumbelConfig gc;  // the Stage B operating point: m=24, n_sims=256 (overridable)
     gc.m = opt(args, "--m") ? to_int(*opt(args, "--m")) : 24;
@@ -255,13 +263,23 @@ int main(int argc, char** argv) {
             rc.run = std::string(*run); rc.phase = "gen"; rc.version = version;
             rc.episodes = 1'000'000'000; rc.lam = lam; rc.max_steps = max_steps;
             rc.seed = 7919ull; rc.res_token = std::string(*res_token) + "-m";
-            // The ONLINE ISSUE CONTROLLER fixture (--control-endpoint set): a per-config actuation hub
-            // (told this config's D) + a ZMQ bridge to the external Python policy engine. The runner reads
-            // the hub's per-thread issue-allow bits; the bridge keeps them synced with the engine on the
-            // control cadence. No endpoint ⇒ nullptr ⇒ byte-unchanged.
+            // The ONLINE ISSUE CONTROLLER fixture. TWO mutually-exclusive drivers of the SAME hub:
+            //   * --lab-decision: the CONTROL-LAB per-forward on-wire transport — the producer rides
+            //     features in the request and reads the gate off the reply; the eval server's lab variant
+            //     hosts the Controller and decides on the forward. NO bridge (the lab supersedes it).
+            //   * --control-endpoint: the async ZMQ bridge to an external Python policy engine on a cadence.
+            // No driver ⇒ nullptr ⇒ byte-unchanged. Both set ⇒ FATAL (one hub, one driver — ADR-0002).
             std::unique_ptr<IssueController> ctl;
             std::unique_ptr<IssueControlBridge> bridge;
-            if (!control_endpoint.empty()) {
+            if (lab_decision && !control_endpoint.empty()) {
+                std::cerr << "wire-ab-bench: FATAL: --lab-decision and --control-endpoint are mutually "
+                             "exclusive (one IssueController, one driver).\n";
+                return 2;
+            }
+            if (lab_decision) {
+                ctl = std::make_unique<IssueController>(wcm.pool_threads, std::max(1, wcm.max_inflight_msgs));
+                wcm.lab_decision = true;   // producer rides features + actuates the gate off the reply
+            } else if (!control_endpoint.empty()) {
                 ctl = std::make_unique<IssueController>(wcm.pool_threads, std::max(1, wcm.max_inflight_msgs));
                 bridge = std::make_unique<IssueControlBridge>(ctl.get(), control_endpoint, controller_cadence_ms);
                 bridge->start();
