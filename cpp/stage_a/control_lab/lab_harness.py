@@ -183,8 +183,8 @@ def start_server(src, endpoint: str, max_batch: int, decision_deadline_s: float,
 
 def launch_producer(endpoint: str, run: str, version: int, threads: int, pool_batch: int,
                     inflight: int, gc_m: int, n_sims: int, pool_plies: int, total_decisions: int,
-                    log_path: str) -> subprocess.Popen:
-    """Launch ONE CONTINUOUS C++ producer under taskset -c 1,2,3. --sweep-configs with a single config is
+                    log_path: str, producer_cores: str) -> subprocess.Popen:
+    """Launch ONE CONTINUOUS C++ producer under taskset -c <producer_cores>. --sweep-configs with a single config is
     the path that builds the warm pool ONCE and wires the IssueController; --lab-decision 1 rides features
     + actuates the gate off the reply. --measure-decisions is set huge so the single config streams for the
     whole session (the harness boxes by wall time on the server side and kills this at the end). Its stdout
@@ -193,7 +193,7 @@ def launch_producer(endpoint: str, run: str, version: int, threads: int, pool_ba
     # One config: chunk_floor=0 (drain-all, the production depth-1 path), S_min=1, D=inflight.
     sweep = f"0:1:{inflight}"
     cmd = [
-        "taskset", "-c", PRODUCER_CORES, AB_BENCH,
+        "taskset", "-c", producer_cores, AB_BENCH,
         "--instance", INSTANCE, "--faces", FACES, "--endpoint", endpoint,
         "--run", run, "--version", str(version), "--res-token", tok,
         "--wire-mode", "pipelined-bucket",
@@ -419,6 +419,20 @@ def main() -> int:
     ap.add_argument("--pool-batch", type=int, default=192)
     ap.add_argument("--producer-threads", type=int, default=3)
     ap.add_argument("--inflight-msgs", type=int, default=8)
+    ap.add_argument("--server-core", type=int, default=int(SERVER_CORE),
+                    help="the core the in-process JAX eval SERVER thread is pinned to (the harness process "
+                         "affinity, inherited by the daemon serve thread). Default %(default)s. On this "
+                         "libvirt guest the vCPUs are pinned 1:1 to the host cores and the host isolates "
+                         "cores 1-3 (isolcpus), so --server-core 3 would land the serve on the host's "
+                         "isolated core — but the A/B that motivated this flag (all_allow/padmax, 2x480s per "
+                         "arm, interleaved to net out drift; runs/control_lab/pinning-ab/) found core 3 is "
+                         "NOT faster (mean shift -1.4%%, autocorr-corrected Welch p=0.37) and does NOT cut "
+                         "jitter (block-CV 0.179 vs 0.181, Levene p=0.96). Default kept at core 0 (the "
+                         "verdict was a wash). The flag stays for re-testing under a different load.")
+    ap.add_argument("--producer-cores", default=PRODUCER_CORES,
+                    help="comma-separated cores the C++ producer runs under (taskset -c). Default "
+                         "%(default)r. Must be disjoint from --server-core (the server owns its core; the "
+                         "producers must not contend it) — fail loud otherwise (ADR-0002).")
     ap.add_argument("--pool-plies", type=int, default=24)
     ap.add_argument("--decision-deadline-ms", type=float, default=50.0)
     ap.add_argument("--sample-hz", type=float, default=20.0)
@@ -435,9 +449,28 @@ def main() -> int:
     a = ap.parse_args()
     log_trajectory = not a.no_trajectory
 
+    # Pinning is configurable (the server-core A/B): --server-core is the in-process JAX serve thread's core,
+    # --producer-cores the C++ producer's taskset set. Validate the producer set parses + is DISJOINT from the
+    # server core (the server owns its core; a producer sharing it defeats the pin) — fail loud (ADR-0002).
+    server_core = int(a.server_core)
+    try:
+        producer_cores = [int(c) for c in a.producer_cores.split(",") if c.strip() != ""]
+    except ValueError as exc:
+        raise ValueError(f"lab_harness: --producer-cores {a.producer_cores!r} is not a comma-separated list "
+                         f"of ints ({exc}) — refusing to guess (ADR-0002)") from exc
+    if not producer_cores:
+        raise ValueError("lab_harness: --producer-cores is empty — the producer needs at least one core "
+                         "(ADR-0002)")
+    if server_core in producer_cores:
+        raise ValueError(f"lab_harness: --server-core {server_core} is also in --producer-cores "
+                         f"{producer_cores} — the server core must be DISJOINT from the producer cores (the "
+                         f"latency-critical serve must not contend the producer; ADR-0002)")
+    producer_cores_str = ",".join(str(c) for c in producer_cores)
+
     # M3 pinning: this harness process hosts the in-process JAX server thread -> pin to the server core
-    # only; the C++ producer runs under taskset -c 1,2,3 (off core 0). The 1:3 split the stage-b harness uses.
-    os.sched_setaffinity(0, {int(SERVER_CORE)})
+    # only (the daemon serve thread is spawned after this and inherits the mask); the C++ producer runs
+    # under taskset -c <producer_cores> (off the server core). The 1:3 split the stage-b harness uses.
+    os.sched_setaffinity(0, {server_core})
     affinity = sorted(os.sched_getaffinity(0))
 
     specs = [s.strip() for s in a.methods.split(",") if s.strip()]
@@ -454,8 +487,8 @@ def main() -> int:
 
     src, in_dim, n_actions = build_and_publish(a.hidden, run, version)
     print(f"[lab] net published run={run} v={version} in_dim={in_dim} n_actions={n_actions} "
-          f"hidden={a.hidden} | server pinned core {SERVER_CORE} (affinity={affinity}); "
-          f"producers -> taskset -c {PRODUCER_CORES}, threads={T}", flush=True)
+          f"hidden={a.hidden} | server pinned core {server_core} (affinity={affinity}); "
+          f"producers -> taskset -c {producer_cores_str}, threads={T}", flush=True)
 
     server, server_thread = start_server(src, endpoint, a.max_batch, a.decision_deadline_ms / 1000.0,
                                          e_policy=a.e_policy)
@@ -475,7 +508,7 @@ def main() -> int:
     huge_budget = 1_000_000_000
     prod_log = os.path.join(a.out, f"producer-{stamp}.log")
     producer = launch_producer(endpoint, run, version, T, a.pool_batch, a.inflight_msgs, a.m,
-                               a.n_sims, a.pool_plies, huge_budget, prod_log)
+                               a.n_sims, a.pool_plies, huge_budget, prod_log, producer_cores_str)
     print(f"[lab] producer launched (pid={producer.pid}) -> streaming continuously over ONE warm pool; "
           f"log={prod_log}", flush=True)
 
@@ -497,7 +530,7 @@ def main() -> int:
                     "residual": False, "m": a.m, "n_sims": a.n_sims}
         warm_pool_json = {"pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
                           "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms,
-                          "server_core": SERVER_CORE, "producer_cores": PRODUCER_CORES,
+                          "server_core": str(server_core), "producer_cores": producer_cores_str,
                           "k_per_thread": ctx.k_per_thread, "s_min": ctx.s_min}
         # regime: the value DERIVED above from the server's ACTUAL staging state (the data-integrity SSOT —
         # one home: pad policy -> fixed-pad -> staging -> regime). The interim re-align that claimed the lab
@@ -591,7 +624,7 @@ def main() -> int:
         "run": run, "stamp": stamp, "secs": a.secs, "hidden": a.hidden, "m": a.m, "n_sims": a.n_sims,
         "pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
         "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms, "n_threads": T,
-        "server_core": SERVER_CORE, "producer_cores": PRODUCER_CORES, "reward_fn": "reward_forward_rows",
+        "server_core": str(server_core), "producer_cores": producer_cores_str, "reward_fn": "reward_forward_rows",
         # e_policy + regime: the local belt-and-suspenders record is self-describing about the throughput
         # regime it was measured under (padmax->post-staging-staged, bucket->pre-staging-un-staged) — the
         # SAME `regime` the postgres egress derived (one home; §6 #4 RCA), so a reader of the JSON sees the
