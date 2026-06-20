@@ -227,7 +227,12 @@ class LabServer(StageAServer):
         rows = [(ident, X) for ident, _env, X in drained]
         real = int(sum(int(X.shape[0]) for _i, X in rows))
         pad_to = self._max_batch if self._e_policy == "padmax" else _bucket_for_server(self, real)
-        responses = run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=pad_to)
+        # Delegate the forward to the base staging seam (NOT the raw self._forward_fn): the lab runs the
+        # device-resident-staged forward production uses (b5df1e2), and a future base-forward change
+        # propagates here rather than silently diverging (ADR-0012 P1 / cancer-E). INTERIM — the structural
+        # fix is to split _serve_batch so this dispatch lives in a sealed seam no subclass re-implements (P3).
+        forward_fn = self._effective_forward(params, y_mean, y_std)
+        responses = run_microbatch(forward_fn, params, y_mean, y_std, rows, pad_to=pad_to)
         self.n_forwards += 1
         self.n_real_rows += real
         self.n_padded_rows += max(0, pad_to - real)
