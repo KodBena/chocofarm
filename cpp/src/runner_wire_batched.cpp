@@ -529,6 +529,10 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         // Off (the default) the wire is byte-unchanged and the recv path is the plain recv_batch. Requires
         // an injected controller (the actuation hub); `lab_decision` without a controller is inert.
         const bool lab_active = wcfg.lab_decision && controller != nullptr;
+        // Turn on the pool's per-message reply-RTT measurement ONLY on the lab path, so the feature frame's
+        // rtt_us carries this thread's live mean RTT (the per-forward service time the RTT-driven controller
+        // consumes). Off the lab path the pool never reads the clock — the production path is cost-unchanged.
+        if (lab_active) pool.enable_rtt_measurement();
 
         // ---- the per-slot episode state machine: IDENTICAL to the strict driver's (re-derived from the
         // SAME serial run_episode). spawn_ply / finalize_and_write / apply_decision / advance / fill are
@@ -732,8 +736,10 @@ std::expected<int, Error> run_episodes_wire_pipelined(
             if (!force && static_cast<int>(gathered.size()) < S_min) return false;
             // CONTROL-LAB: attach this thread's per-forward feature snapshot as an extra envelope frame
             // (lab_control_wire.hpp). The snapshot is the thread's CURRENT counters at submit time —
-            // inflight messages, ready slots, cumulative msgs/leaves; rtt is left 0 (not yet measured
-            // here). Off the lab path `lab_frame` stays empty ⇒ submit_batch sends the byte-unchanged frame.
+            // inflight messages, ready slots, cumulative msgs/leaves, the live mean reply RTT (the pool's
+            // per-thread EWMA over closed corr-ids, in microseconds; 0 until this thread's first reply, a
+            // documented warm-up). Off the lab path `lab_frame` stays empty ⇒ submit_batch sends the
+            // byte-unchanged frame.
             std::vector<unsigned char> lab_frame;
             if (lab_active) {
                 lab::LabFeature lf;
@@ -742,7 +748,7 @@ std::expected<int, Error> run_episodes_wire_pipelined(
                 lf.ready = static_cast<std::int32_t>(gathered.size());
                 lf.msgs = my_msgs;
                 lf.leaves = my_leaves;
-                lf.rtt_us = 0;
+                lf.rtt_us = pool.mean_rtt_us();   // this thread's live mean reply RTT (µs; 0 until warm)
                 lf.decisions = my_decisions;
                 lab_frame = lab::encode_feature(lf);
             }

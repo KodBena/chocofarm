@@ -26,6 +26,17 @@
 //   which thread submitted its leaf — but that cross-thread migration is NOT built here (ADR-0009: not
 //   before the measure says T×K composition helps). Today a slot is single-writer-per-thread, structural.
 //
+//   REPLY-RTT MEASUREMENT (CONTROL-LAB, opt-in — ADR-0012 P3 one-owner): the pool already owns the corr-id
+//   lifecycle (the `inflight_` map keys a message by its corr-id), so the natural home of a per-message
+//   round-trip is HERE: submit_batch stamps each corr-id's send time, recv_batch/recv_batch_lab close it
+//   with `now - submit_time` on the matching corr-id, and that latency folds into a per-pool EWMA (the pool
+//   is PER-THREAD, so its EWMA is THIS thread's running mean reply RTT). One coalesced message == one server
+//   FORWARD, so a message's RTT IS the per-forward service time the RTT-driven (Vegas-style) issue
+//   controller consumes. The clock reads + the EWMA fold are GATED on enable_rtt_measurement() (set only on
+//   the lab decision path); the default/production path never reads the clock, so it stays byte- AND
+//   cost-unchanged (ADR-0004 minimal-touch / lab-gated). mean_rtt_us() returns 0 until the first reply (a
+//   documented warm-up, not a permanent sentinel); the producer writes it into the FEATURE frame's rtt_us.
+//
 //   ADR-0012 P9: RAII, move-only (the raw `void* sock_` is a unique owning resource, closed in the dtor /
 //   on move-from), a create() factory over a private ctor (a throwing/failing ctor cannot return a value
 //   — the connect failure is the create() error arm), std::span<const float> not a raw pointer/len pair.
@@ -38,6 +49,7 @@
 #include <zmq.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -111,15 +123,34 @@ class WireLeafPool final {
     WireLeafPool(WireLeafPool&& o) noexcept
         : sock_(std::exchange(o.sock_, nullptr)),
           corr_seq_(o.corr_seq_),
-          inflight_(std::move(o.inflight_)) {}
+          inflight_(std::move(o.inflight_)),
+          measure_rtt_(o.measure_rtt_),
+          rtt_seen_(o.rtt_seen_),
+          rtt_us_(o.rtt_us_) {}
     WireLeafPool& operator=(WireLeafPool&& o) noexcept {
         if (this != &o) {
             if (sock_ != nullptr) zmq_close(sock_);
             sock_ = std::exchange(o.sock_, nullptr);
             corr_seq_ = o.corr_seq_;
             inflight_ = std::move(o.inflight_);
+            measure_rtt_ = o.measure_rtt_;
+            rtt_seen_ = o.rtt_seen_;
+            rtt_us_ = o.rtt_us_;
         }
         return *this;
+    }
+
+    // Turn ON per-message reply-RTT measurement (the CONTROL-LAB path; OFF by default ⇒ the production path
+    // never reads the clock, byte- and cost-unchanged). Idempotent. The producer calls this once, right after
+    // create(), only when its lab decision path is active.
+    void enable_rtt_measurement() { measure_rtt_ = true; }
+
+    // This thread's CURRENT mean reply RTT in MICROSECONDS (the per-pool EWMA over closed corr-ids). Returns
+    // 0 before the first reply is measured (a documented warm-up — the FEATURE frame's rtt_us reads 0 until a
+    // thread has closed its first round-trip), and 0 whenever measurement was never enabled. The wire unit is
+    // microseconds (lab_control_wire.hpp LabFeature::rtt_us); the EWMA accumulates in microseconds directly.
+    [[nodiscard]] std::int64_t mean_rtt_us() const {
+        return rtt_seen_ ? static_cast<std::int64_t>(rtt_us_ + 0.5) : 0;
     }
 
     // Submit slot `slot`'s outstanding leaf as a DEGENERATE B=1 batched request: stamp a unique corr-id,
@@ -169,7 +200,14 @@ class WireLeafPool final {
             return std::unexpected(make_error(std::string("WireLeafPool::submit_batch: zmq_send(payload) failed: ") +
                                               zmq_strerror(zmq_errno())));
         CHOCO_EV("SUBMIT", "corr=" << corr << " B=" << B);  // one coalesced message of B rows out
-        inflight_.emplace(corr, std::vector<int>(slots.begin(), slots.end()));
+        // Record corr-id -> (ordered slot list, submit time). The submit timestamp is stamped only when
+        // RTT measurement is on (the lab path); off it stays 0 and the recv side reads no clock either, so
+        // the non-lab path pays nothing (ADR-0004 lab-gated). One message == one server forward, so this
+        // corr-id's round-trip is the per-forward service time the RTT-driven controller wants.
+        Inflight rec;
+        rec.slots.assign(slots.begin(), slots.end());
+        rec.submit_ns = measure_rtt_ ? steady_now_ns() : 0;
+        inflight_.emplace(corr, std::move(rec));
         return {};
     }
 
@@ -208,7 +246,8 @@ class WireLeafPool final {
         if (it == inflight_.end())
             return std::unexpected(make_error("WireLeafPool::recv_batch: unknown correlation id " +
                                               std::to_string(corr) + " (a desynchronized wire)"));
-        std::vector<int> slots = std::move(it->second);
+        note_reply_rtt(it->second.submit_ns);   // close this corr-id's round-trip into the EWMA (lab only)
+        std::vector<int> slots = std::move(it->second.slots);
         inflight_.erase(it);
         if (decoded->size() != slots.size())
             return std::unexpected(make_error("WireLeafPool::recv_batch: reply carried " +
@@ -245,7 +284,8 @@ class WireLeafPool final {
         if (it == inflight_.end())
             return std::unexpected(make_error("WireLeafPool::recv_batch_lab: unknown correlation id " +
                                               std::to_string(corr) + " (a desynchronized wire)"));
-        std::vector<int> slots = std::move(it->second);
+        note_reply_rtt(it->second.submit_ns);   // close this corr-id's round-trip into the EWMA (lab only)
+        std::vector<int> slots = std::move(it->second.slots);
         inflight_.erase(it);
         if (decoded->size() != slots.size())
             return std::unexpected(make_error("WireLeafPool::recv_batch_lab: reply carried " +
@@ -274,6 +314,46 @@ class WireLeafPool final {
   private:
     WireLeafPool(void* sock, std::atomic<uint64_t>& corr_seq) noexcept
         : sock_(sock), corr_seq_(&corr_seq) {}
+
+    // The EWMA smoothing constant for the per-thread mean reply RTT: rtt <- alpha*sample + (1-alpha)*rtt.
+    // alpha=0.1 gives an effective averaging window of ~1/alpha = 10 messages — enough to smooth the
+    // per-message jitter (a coalesced message's RTT moves with its degree B and its queue position behind
+    // the single-threaded server) while still tracking a genuine shift in per-forward service time within a
+    // handful of forwards. Same order as TCP's own SRTT gain (RFC 6298 g=1/8); a fixed estimator constant,
+    // not a swept knob (the swept tunables are the controller's, not this measurement's — ADR-0012 P4).
+    static constexpr double kRttEwmaAlpha = 0.1;
+
+    // One outstanding message: the ordered slot list its batched reply scatters to (the corr-id transport's
+    // routing), plus the steady-clock submit time in ns (0 when RTT measurement is off) for the round-trip.
+    struct Inflight {
+        std::vector<int> slots;
+        std::int64_t submit_ns = 0;
+    };
+
+    // Steady-clock now in nanoseconds (monotonic; the right clock for a duration, never wall time).
+    [[nodiscard]] static std::int64_t steady_now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    // Close one corr-id's round-trip into the per-thread RTT EWMA (microseconds). A no-op unless measurement
+    // is on AND this corr-id carried a submit timestamp. The first sample SEEDS the EWMA (so the running mean
+    // starts at the true first RTT rather than ramping up from 0); subsequent samples fold in at alpha. A
+    // non-positive elapsed (a clock that did not advance — never expected with a monotonic clock) is dropped
+    // rather than poisoning the mean (ADR-0002: do not fold an impossible sample silently into a result).
+    void note_reply_rtt(std::int64_t submit_ns) {
+        if (!measure_rtt_ || submit_ns == 0) return;
+        const std::int64_t elapsed_ns = steady_now_ns() - submit_ns;
+        if (elapsed_ns <= 0) return;
+        const double sample_us = static_cast<double>(elapsed_ns) / 1000.0;
+        if (!rtt_seen_) {
+            rtt_us_ = sample_us;   // seed on the first measured reply
+            rtt_seen_ = true;
+        } else {
+            rtt_us_ = kRttEwmaAlpha * sample_us + (1.0 - kRttEwmaAlpha) * rtt_us_;
+        }
+    }
 
     // Receive ONE reply and split it into its echoed correlation id (the LEADING frame — an opaque u64
     // the server round-tripped) and the response payload (the LAST frame). The error arm is taken on a
@@ -343,7 +423,10 @@ class WireLeafPool final {
 
     void* sock_ = nullptr;                            // the owned DEALER socket (closed in dtor / on move)
     std::atomic<uint64_t>* corr_seq_ = nullptr;       // borrowed process-global corr-id source (P1)
-    std::unordered_map<uint64_t, std::vector<int>> inflight_;  // corr-id -> ordered slot list of its batch
+    std::unordered_map<uint64_t, Inflight> inflight_;  // corr-id -> (ordered slot list, submit time) of its batch
+    bool measure_rtt_ = false;   // CONTROL-LAB opt-in: stamp/close per-message RTT (off ⇒ no clock reads)
+    bool rtt_seen_ = false;      // has the EWMA been seeded by a first measured reply? (false ⇒ rtt_us 0)
+    double rtt_us_ = 0.0;        // the per-thread mean reply RTT EWMA, in microseconds (the wire unit)
 };
 
 }  // namespace chocofarm
