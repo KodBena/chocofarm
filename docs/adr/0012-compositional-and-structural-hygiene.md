@@ -1264,6 +1264,36 @@ floor ≈ 54 %. The rule, the new anti-pattern row, and the gate are
 **unchanged** — the refinement only sharpens *which* crossing is the lever:
 **params-staging**, not the input/output pull the rougher figure implied.
 
+**Follow-on landed (2026-06-20 — the params-staging consolidation in the live
+server).** The queued params lever above is now wired into the production leaf
+evaluator: `inference_server.py::build_staged_forward` builds the server's
+forward as a `lowlatency.LowLatencyFn` whose weights are staged device-resident
+once, and `InferenceServer._effective_forward` calls it from `run_microbatch`
+(default path) instead of re-passing the host weight dict each forward.
+**RECONFIG:** the staged handle is **rebuilt on every version-gated reload** —
+the reload rebinds a fresh params dict (ADR-0001 rebind-not-mutate), detected by
+object identity, so a forward never runs against a stale-version staged net
+(ADR-0002); the rebuild is a **warm XLA-cache hit (~2.7 ms** — the fixed
+`(max_batch, in_dim)` graph is already compiled, only the params re-stage),
+amortized over the version's many forwards, so the cheap-restage extension the
+record contemplated was **not** needed (the lib is used as-is; the cold ~170 ms
+compile stays the one-time `warmup()` cost). Measured in the **real
+`run_microbatch` path** (ADR-0009: warm, median+IQR, fit `time =
+intercept + slope·rows`, R²>0.998, numbers under
+`~/w/vdc/chocobo/bench/run_microbatch_staging/`): the fixed-cost intercept drops
+**~50–80 µs/forward** (the staged intercept is stable ~95 µs across reps; the
+`current` baseline intercept carries the dispatch floor's run-to-run variance,
+putting the delta at +52.8 µs one rep, +79.4 µs another) with the **per-row
+slope unchanged** (≈4.37 vs ≈4.44 µs/row) — a pure fixed-cost reduction
+consistent with (and at the high end exceeding) the ~45–53 µs params-transfer
+the decomposition isolated. Equivalence is behavior-preserving (ADR-0012 P6 /
+ADR-0009): the server-parity opt-in tests pass against the staged path
+(max|Δ| ≈ 2–5×10⁻⁷, residual ON/OFF, batched + the coalescing floor), and a new
+jax-gated test pins `build_staged_forward` allclose (1e-4) to `jit_forward_core`
+through `run_microbatch` plus the rebuild-on-reload guard. The **input/output
+crossing remains the open follow-on** (the grandfathered
+`run_microbatch::np.asarray` pull is untouched — the ~14.5 µs smaller lever).
+
 ## License
 
 Public Domain (The Unlicense).

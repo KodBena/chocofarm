@@ -143,6 +143,78 @@ def jit_forward_core(params: "dict[str, npt.NDArray[Any]]", Xb: Any, y_mean: flo
     return _jit_forward_cache[0](params, Xb, y_mean, y_std)
 
 
+def build_staged_forward(params: "dict[str, npt.NDArray[Any]]", y_mean: float, y_std: float,
+                         pad_to: int) -> ForwardFn:
+    """Build the server's forward as a low-overhead `LowLatencyFn` whose PARAMS are staged DEVICE-RESIDENT
+    ONCE (lowlatency.py — the SSOT dispatcher), returning a `ForwardFn`-shaped callable run_microbatch can
+    call EXACTLY like `jit_forward_core`, but which re-transfers only `Xb` per call instead of the whole
+    weight dict. This consolidates the ~45–53 µs per-forward params host→device re-transfer the
+    `jit_forward_core` path repeats every call (the lever the real-MLP decomposition isolated — ADR-0012
+    P7 cross-DEVICE / `bench_mlp_lowlatency.py`; bench fb9cfbc): the robust AOT handle holds the weights as
+    device buffers and re-passes them with no re-transfer, so each forward pays only the (in-scope) input
+    host→device + the one device→host pull run_microbatch already owns.
+
+    The staged graph is the SAME production `[v | logits]` forward `jit_forward_core` jits — the ONE
+    `forward_core` (P1/P7: no second transcription, only composed), de-standardized ON-device, packed
+    `[v | logits]` — with the y-scale scalars FOLDED into the staged params closure (`p["_ym"]`/`p["_ys"]`)
+    rather than ridden as the two traced args, because the handle stages one params pytree and varies only
+    `x` (the `fn(params, x)` contract). Folding the scalars is a numerically-identical de-standardize (the
+    same multiply-add), so the staged forward is allclose (ABS_TOL=1e-4, the project's forward bar; in
+    practice byte-identical) to the `jit_forward_core` path on the same `(params, Xb)`. The folded params
+    are a SHALLOW COPY (rebind-not-mutate, ADR-0001) — the caller's weight dict is never mutated.
+
+    `pad_to` is the server's `max_batch`: run_microbatch pads every batch to `(pad_to, in_dim)` before the
+    forward, so the handle compiles for that ONE fixed shape (one XLA executable, like jit_forward_core's
+    single padded shape). `in_dim` is DERIVED from `params["W1"]` (P1 — the feature dim's one home; fail
+    loud if absent). The lowlatency `device_put` lives INSIDE the dispatcher (the designated cross-DEVICE
+    boundary, ADR-0012 P7) — this builder adds NO transfer call-site to the server's hot path.
+
+    REBUILT per net reload (the version-gated swap rebinds `params`): the returned handle stages THIS
+    version's weights, so the server rebuilds it whenever the params identity changes (see
+    `InferenceServer._effective_forward`). A rebuild is a warm XLA-cache hit (~2.7 ms — the fixed-shape graph
+    is already compiled; only the params re-stage), amortized over that version's many forwards. Built
+    LAZILY (jax/lowlatency imported in-body) so the module import stays jax-free (the hot-import discipline
+    above)."""
+    import chocofarm.config  # noqa: F401 — XLA/OMP thread pin (SSOT) applied before jax initializes
+    import jax.numpy as jnp
+
+    from chocofarm.az.lowlatency import LowLatencyFn, compile_lowlatency, run
+
+    if "W1" not in params:
+        raise KeyError(
+            "build_staged_forward: params has no 'W1' weight to derive in_dim from — cannot compile the "
+            "staged forward for the fixed (pad_to, in_dim) shape (ADR-0002, refusing to guess the width).")
+    in_dim = int(params["W1"].shape[0])
+
+    def _fwd(p: Any, x: Any) -> Any:
+        # The SAME production graph jit_forward_core jits, with the y-scale folded off the params closure
+        # (p["_ym"]/p["_ys"]) so the de-standardize stays on-device while the signature fits fn(params, x).
+        v_std, logits = _FORWARD_CORE(p, x, jnp)
+        v = jnp.reshape(v_std, (-1, 1)) * p["_ys"] + p["_ym"]   # de-standardize ON-device → (B, 1)
+        return v if logits is None else jnp.concatenate([v, logits], axis=1)
+
+    # Fold the y-scale scalars into a SHALLOW copy of the weights (rebind-not-mutate — never touch the
+    # caller's dict). f32 to match the inference precision the weights already carry (params_from_manifest_blob).
+    staged_params: dict[str, Any] = dict(params)
+    staged_params["_ym"] = np.float32(y_mean)
+    staged_params["_ys"] = np.float32(y_std)
+
+    # AOT-compile for the ONE fixed padded shape, staging the params device-resident at construction (the
+    # ~170 ms cold compile is paid once here — at warmup/reload, off the per-forward path). The example x
+    # pins the (pad_to, in_dim) signature run_microbatch always pads up to.
+    example_x = np.zeros((pad_to, in_dim), dtype=np.float32)
+    handle: "LowLatencyFn[Any, Any]" = compile_lowlatency(_fwd, staged_params, example_x)
+
+    def staged_forward_fn(p: "dict[str, npt.NDArray[Any]]", Xb: Any, ym: float, ys: float) -> Any:
+        # The ForwardFn contract: run_microbatch passes the host (params, Xb, y_mean, y_std); the staged
+        # handle already holds THIS version's weights+scale device-resident, so the host `p`/`ym`/`ys` are
+        # ignored and only `Xb` (the padded (pad_to, in_dim) host batch) is transferred — the params
+        # re-transfer is gone. Returns the device `[v | logits]` block run_microbatch pulls once.
+        return run(handle, Xb)
+
+    return staged_forward_fn
+
+
 # A batch row: (identity_frame, feature_matrix) — the ROUTER identity bytes to scatter the response
 # back to, and the decoded float32 feature MATRIX (shape (B_i, in_dim) — the request's B leaves). This
 # is `run_microbatch`'s VALUE-LEVEL input: the pure batching core knows only identities and matrices,
@@ -333,6 +405,18 @@ class InferenceServer:
     drain/scatter without a real forward. `max_batch` caps the greedy drain so an unbounded burst can't
     build an oversized matmul; B self-scales with load below the cap (no latency timer to tune).
 
+    PARAMS-STAGING (the cross-DEVICE consolidation — ADR-0012 P7 / bench fb9cfbc). With the DEFAULT
+    forward, the server runs each forward through a `LowLatencyFn` (`build_staged_forward`) whose weights
+    are staged DEVICE-RESIDENT for the live net version, so a forward re-transfers only the input batch,
+    eliminating the ~45–53 µs/call weight-dict host→device re-transfer the plain `jit_forward_core` path
+    repeats (measured ~79 µs/forward saved in the real run_microbatch path — the fixed-cost intercept
+    drops, the per-row slope is unchanged; numbers under ~/w/vdc/chocobo/bench/run_microbatch_staging/).
+    The staged handle is REBUILT on every version-gated reload (the reload rebinds a fresh params dict —
+    ADR-0001 rebind-not-mutate — and `_effective_forward` re-stages on the identity change), so a forward
+    never runs against a stale-version staged net (ADR-0002); the rebuild is a warm ~2.7 ms XLA-cache hit
+    amortized over the version's forwards. A non-default injected forward_fn (a test stub) bypasses staging
+    and is called directly — the pure run_microbatch seam is untouched.
+
     `min_forward_rows` (θ) and `max_queue_delay_ms` arm the optional server-side coalescing FLOOR
     (server-floor-design.md — increment ii of cpp-eval-transport-adapter.md §6), DEFAULT OFF (θ=0): with
     θ>0 the drain accumulates across producer threads until ≥θ rows or the bounded delay, lifting
@@ -371,6 +455,20 @@ class InferenceServer:
         import zmq
         self._params_source = params_source
         self._forward_fn = forward_fn
+        # Params-staging (the cross-DEVICE consolidation — ADR-0012 P7 / bench fb9cfbc): when the default
+        # production forward (`jit_forward_core`) is in use, the server runs the forward through a
+        # `LowLatencyFn` (build_staged_forward) that holds THIS net version's weights device-resident, so a
+        # forward re-transfers only the input batch, not the ~45–53 µs/call weight dict. `_staged_fn` is the
+        # built handle's ForwardFn (None until warmup/first serve builds it); `_staged_params_id` is the
+        # IDENTITY of the params object it was staged from, so the version-gated reload (which REBINDS a new
+        # params dict — ADR-0001 rebind-not-mutate) is detected by `is` and the handle rebuilt (a warm
+        # ~2.7 ms XLA-cache hit, amortized over the version's forwards) — never a forward against a stale
+        # staged net (ADR-0002: a stale-net serve is a loud-failure class, here closed by rebuild-on-rebind).
+        # A non-default injected forward_fn (a test stub) bypasses staging: `_stages_params` is False and the
+        # injected fn is called directly, exactly as before (the pure run_microbatch seam is untouched).
+        self._stages_params = forward_fn is jit_forward_core
+        self._staged_fn: ForwardFn | None = None
+        self._staged_params_id: int | None = None
         self._owns_context = context is None
         self._ctx: zmq.Context[zmq.Socket[bytes]] = context if context is not None else zmq.Context()
         self._sock: zmq.Socket[bytes] = self._ctx.socket(zmq.ROUTER)
@@ -457,6 +555,34 @@ class InferenceServer:
         end. (The protocol carries no error frame, so the reject is a server-side drop + log.)"""
         print(f"[InferenceServer] rejecting malformed request: {exc}", flush=True)
 
+    def _effective_forward(self, params: dict[str, npt.NDArray[Any]],
+                           y_mean: float, y_std: float) -> ForwardFn:
+        """The forward `run_microbatch` should call for THIS set of live params — the params-staging seam.
+
+        When staging is on (the default `jit_forward_core` forward), return a `LowLatencyFn`-backed forward
+        whose weights are staged DEVICE-RESIDENT for this net version, REBUILDING it whenever the params
+        object identity has changed since it was last built. The version-gated reload rebinds a FRESH params
+        dict (ADR-0001 rebind-not-mutate; `RedisParamsSource.poll/current` return a new object on reload and
+        the same object between reloads), so `id(params) != self._staged_params_id` is exactly "the net
+        reloaded" — the trigger to re-stage. (Keying on the object identity is sound under the single-
+        threaded sequential serve: the prior version's dict is held live by the source as `self._params`
+        when the reload allocates the new one, so adjacent versions never collide on a reused id — the same
+        identity-coherence pattern ADR-0001 uses for the f32 inference cache.) This closes the
+        stale-staged-net hazard structurally (ADR-0002:
+        a forward never runs against a previous version's staged weights — the rebuild is wired into the
+        same call that fetches the live params). The rebuild compiles for the ONE fixed padded shape
+        `(max_batch, in_dim)` run_microbatch always pads to, so it is a warm XLA-cache hit (~2.7 ms), not a
+        cold compile; that cost is paid once per version and amortized over the version's many forwards.
+
+        When staging is off (a non-default injected forward_fn — a test stub), return that injected fn
+        unchanged: the pure run_microbatch seam is honored exactly as before, no staging interposed."""
+        if not self._stages_params:
+            return self._forward_fn
+        if self._staged_fn is None or self._staged_params_id != id(params):
+            self._staged_fn = build_staged_forward(params, y_mean, y_std, pad_to=self._max_batch)
+            self._staged_params_id = id(params)
+        return self._staged_fn
+
     def _serve_batch(self, drained: list[DrainedRequest]) -> None:
         """Run ONE microbatch over the drained requests and scatter each encoded response back to its
         identity, ECHOING that request's transport envelope verbatim (`[identity][envelope…][response]`).
@@ -468,9 +594,13 @@ class InferenceServer:
         published version changed (between-batch reload, design §3)."""
         reloaded = self._params_source.poll()
         params, y_mean, y_std = reloaded if reloaded is not None else self._params_source.current()
+        # Resolve the forward for THIS version's params, re-staging the device-resident weights iff the
+        # reload rebound a new params object (the stale-staged-net guard lives here, in the same call that
+        # fetched the live params — ADR-0002). Off staging this is just the injected forward_fn.
+        forward_fn = self._effective_forward(params, y_mean, y_std)
         rows = [(ident, X) for ident, _envelope, X in drained]
         for (ident, resp), (_ident, envelope, _X) in zip(
-                run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch),
+                run_microbatch(forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch),
                 drained):
             self._sock.send_multipart([ident, *envelope, resp])
 
@@ -503,6 +633,11 @@ class InferenceServer:
                 "InferenceServer.warmup: params has no 'W1' weight to derive in_dim from — cannot build a "
                 "dummy batch matching the forward's input shape (ADR-0002, refusing to guess the width).")
         in_dim = int(params["W1"].shape[0])
+        # Build (and cache) the staged forward for the current params BEFORE timing, so the ~170 ms cold
+        # AOT compile + the device params staging happen HERE at standup, off the first real request's path
+        # (with staging off this returns the injected forward_fn unchanged). The serve loop reuses this same
+        # staged handle (same params identity) until a reload rebinds new weights.
+        forward_fn = self._effective_forward(params, y_mean, y_std)
         for b in batch_sizes:
             b = int(b)
             if b < 1:
@@ -511,7 +646,7 @@ class InferenceServer:
             rows: list[BatchRow] = [(b"", np.zeros((b, in_dim), dtype=np.float32))]
             # run_microbatch returns encoded response frames built from np.asarray(forward outputs) — the
             # asarray blocks until XLA has actually compiled+run shape (max_batch, in_dim). Discard them.
-            run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch)
+            run_microbatch(forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch)
 
     def serve_forever(self) -> None:
         """The greedy-drain loop: block for ≥1 request, drain to the cap, run one forward, scatter,

@@ -302,6 +302,104 @@ def test_inference_server_rejects_unhonorable_floor():
 
 
 # ===========================================================================
+# JAX-GATED — the params-staging forward (build_staged_forward) equivalence + rebuild-on-reload.
+# Skips if jax is unimportable, so the default suite stays green without jax (the same opt-in gating
+# posture the server-parity tests use). No socket, no redis — the staging seam is exercised through the
+# pure run_microbatch, against the production jit_forward_core path on the SAME (params, X).
+# ===========================================================================
+def _jax_available() -> bool:
+    try:
+        import jax  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _jax_available(), reason="params-staging equivalence needs jax (the real forward)")
+@pytest.mark.parametrize("residual", [False, True])
+def test_staged_forward_matches_jit_forward_core(residual):
+    """The cross-DEVICE consolidation (ADR-0012 P7 / bench fb9cfbc) is BEHAVIOR-PRESERVING: the staged
+    forward — `build_staged_forward`, whose weights are staged device-resident once via the lowlatency
+    handle — computes the SAME `[v | logits]` block as the production `jit_forward_core` (host params
+    re-passed every call) on the same `(params, Xb)`, through the pure `run_microbatch`, within ABS_TOL=1e-4
+    (the project forward bar; ADR-0009 — in practice byte-identical, the staging only changes WHERE the
+    weights live, not the arithmetic). Several batch sizes B exercise the padded fixed-shape forward both
+    above and at the pad cap. residual ON and OFF (the optional block rides through the staged graph)."""
+    from chocofarm.az.inference_server import build_staged_forward, jit_forward_core, run_microbatch
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.az.transport import pack_net
+
+    in_dim, n_actions, max_batch = 12, 7, 16
+    net = ValueMLP(in_dim=in_dim, hidden=24, n_actions=n_actions, seed=11,
+                   y_mean=0.7, y_std=1.3, residual=residual)
+    params, y_mean, y_std = params_from_manifest_blob(*pack_net(net))
+    staged = build_staged_forward(params, y_mean, y_std, pad_to=max_batch)
+
+    rng = np.random.default_rng(2025 + int(residual))
+    max_d = 0.0
+    for B in (1, 2, 5, 8, 16):
+        req = [(b"x", rng.standard_normal((B, in_dim)).astype(np.float32))]
+        out_jit = run_microbatch(jit_forward_core, params, y_mean, y_std, req, pad_to=max_batch)
+        out_stg = run_microbatch(staged, params, y_mean, y_std, req, pad_to=max_batch)
+        for (ij, rj), (is_, rs) in zip(out_jit, out_stg):
+            assert ij == is_
+            vj, lj = wire.decode_response(rj)
+            vs, ls = wire.decode_response(rs)
+            max_d = max(max_d, float(np.max(np.abs(vj - vs))))
+            if lj is not None:
+                assert ls is not None
+                max_d = max(max_d, float(np.max(np.abs(lj - ls))))
+    assert max_d < 1e-4, f"residual={residual}: staged vs jit_forward_core max|Δ|={max_d:.3e} exceeds 1e-4"
+
+
+@pytest.mark.skipif(not _jax_available(), reason="staged-rebuild-on-reload needs jax (the real forward)")
+def test_staged_forward_rebuilds_on_version_reload():
+    """The RECONFIG guard (ADR-0002 — a stale-net serve is a loud-failure class): the staged handle is
+    REBUILT when the version-gated reload rebinds a fresh params dict, so a forward never runs against the
+    previous version's staged weights. Drives `InferenceServer._effective_forward` directly (no socket):
+    (1) same params object -> the SAME staged handle is reused (no rebuild); (2) a reload to a DIFFERENT
+    net -> the handle is rebuilt and serves the NEW net's forward (matching jit_forward_core on the new
+    params, NOT the stale net's)."""
+    from chocofarm.az.inference_server import InferenceServer, jit_forward_core, run_microbatch
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.az.transport import pack_net
+
+    in_dim, n_actions, max_batch = 12, 7, 16
+    net1 = ValueMLP(in_dim=in_dim, hidden=24, n_actions=n_actions, seed=1, y_mean=0.5, y_std=1.1, residual=True)
+    net2 = ValueMLP(in_dim=in_dim, hidden=24, n_actions=n_actions, seed=2, y_mean=-0.3, y_std=2.0, residual=True)
+    p1, ym1, ys1 = params_from_manifest_blob(*pack_net(net1))
+    p2, ym2, ys2 = params_from_manifest_blob(*pack_net(net2))
+
+    # Build the server WITHOUT binding a socket (the staging seam needs no zmq): construct via __new__ and
+    # set only the fields _effective_forward reads. (A full InferenceServer would bind a ROUTER; this test
+    # targets the staging logic in isolation, mirroring the pure run_microbatch always-on tests.)
+    srv = InferenceServer.__new__(InferenceServer)
+    srv._max_batch = max_batch
+    srv._stages_params = True
+    srv._staged_fn = None
+    srv._staged_params_id = None
+    srv._forward_fn = jit_forward_core
+
+    f1 = srv._effective_forward(p1, ym1, ys1)
+    assert srv._staged_fn is not None
+    f1_again = srv._effective_forward(p1, ym1, ys1)   # same params object -> reuse, no rebuild
+    assert f1_again is f1
+
+    f2 = srv._effective_forward(p2, ym2, ys2)          # reload to net2 -> rebuild
+    assert f2 is not f1
+
+    # The rebuilt handle must serve net2 (not the stale net1): equal to jit_forward_core on net2's params.
+    rng = np.random.default_rng(9)
+    req = [(b"x", rng.standard_normal((4, in_dim)).astype(np.float32))]
+    out_stg = run_microbatch(f2, p2, ym2, ys2, req, pad_to=max_batch)
+    out_ref = run_microbatch(jit_forward_core, p2, ym2, ys2, req, pad_to=max_batch)
+    vs, ls = wire.decode_response(out_stg[0][1])
+    vr, lr = wire.decode_response(out_ref[0][1])
+    d = max(float(np.max(np.abs(vs - vr))), float(np.max(np.abs(ls - lr))))
+    assert d < 1e-4, f"rebuilt staged handle disagrees with net2 jit_forward_core: max|Δ|={d:.3e}"
+
+
+# ===========================================================================
 # OPT-IN — the full server+client parity harness (needs a running server; NO redis)
 # ===========================================================================
 def _py_forward_f32(params, X, y_mean, y_std):
