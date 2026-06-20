@@ -85,10 +85,18 @@ CREATE TABLE IF NOT EXISTS lab_session (
     git_sha      text,
     host         text,
     reward_fn    text,
+    regime       text,
     net          jsonb,
     warm_pool    jsonb,
     notes        text
 );
+-- regime: the SERVER throughput REGIME this session was measured under — the partition key an offline-RL
+-- trainer filters on so it NEVER mixes throughputs across a forward-path change. git_sha records the repo
+-- HEAD, but a SHA alone does not say 'pre' vs 'post' a regime shift (and backfilled sessions have NULL
+-- git_sha), so the regime is its OWN explicit label. Today: 'pre-staging' (the un-staged forward, before
+-- b5df1e2) | 'post-staging' (the device-resident-staged forward, b5df1e2+/12b27bf). ADD COLUMN IF NOT
+-- EXISTS so a table that predates this column gains it idempotently (no destructive migration).
+ALTER TABLE lab_session ADD COLUMN IF NOT EXISTS regime text;
 
 CREATE TABLE IF NOT EXISTS lab_trial (
     trial_id      bigserial PRIMARY KEY,
@@ -164,6 +172,9 @@ class SessionRow:
     reward_fn: str | None
     net: Mapping[str, Any] | None
     warm_pool: Mapping[str, Any] | None
+    regime: str | None = None       # the server throughput regime ('pre-staging'|'post-staging'); the
+                                    # offline-RL partition key so trajectories from different forward paths
+                                    # are never mixed. None when a session predates the column (NULL).
     notes: str | None = None
 
 
@@ -209,12 +220,12 @@ def insert_session(conn: psycopg.Connection, row: SessionRow) -> None:
         cur.execute(
             """
             INSERT INTO lab_session
-                (session_id, started_at, git_sha, host, reward_fn, net, warm_pool, notes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (session_id, started_at, git_sha, host, reward_fn, regime, net, warm_pool, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (session_id) DO NOTHING
             """,
             (
-                row.session_id, row.started_at, row.git_sha, row.host, row.reward_fn,
+                row.session_id, row.started_at, row.git_sha, row.host, row.reward_fn, row.regime,
                 Jsonb(row.net) if row.net is not None else None,
                 Jsonb(row.warm_pool) if row.warm_pool is not None else None,
                 row.notes,
@@ -296,6 +307,26 @@ def session_exists(conn: psycopg.Connection, session_id: str) -> bool:
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM lab_session WHERE session_id = %s", (session_id,))
         return cur.fetchone() is not None
+
+
+# The staging-consolidation commit (b5df1e2: device-resident-staged inference forward). Every session
+# recorded BEFORE it was measured against the un-staged forward — the 'pre-staging' regime. Sessions from
+# b5df1e2+/12b27bf onward are 'post-staging'. The two MUST NOT be mixed in an offline-RL corpus.
+REGIME_PRE = "pre-staging"
+REGIME_POST = "post-staging"
+
+
+def backfill_regime(conn: psycopg.Connection, regime: str = REGIME_PRE) -> int:
+    """Stamp the regime on every lab_session whose regime is still NULL — the one-shot partition backfill
+    for sessions recorded before the regime column existed. ALL such sessions predate the staging
+    consolidation (b5df1e2), so they are the 'pre-staging' throughput regime by construction. Idempotent:
+    only NULL regimes are touched (a session already tagged keeps its tag — never re-stamp / clobber a
+    deliberate label). Returns the number of rows updated. Commits. A SQL error raises (ADR-0002)."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE lab_session SET regime = %s WHERE regime IS NULL", (regime,))
+        n = cur.rowcount
+    conn.commit()
+    return int(n)
 
 
 # ============================================================================================
@@ -380,6 +411,7 @@ def backfill(conn: psycopg.Connection, runs_dir: str = DEFAULT_RUNS_DIR) -> dict
             session_id=session_id, started_at=stamp_to_timestamp(sess.get("stamp")),
             git_sha=None, host=None, reward_fn=sess.get("reward_fn"),
             net=net_json, warm_pool=warm_pool_json,
+            regime=REGIME_PRE,   # a local-JSON session is an OLD artifact — pre-staging by construction
             notes=f"backfilled from {os.path.basename(sess_path)}",
         ))
         summary["sessions_loaded"] += 1
@@ -451,11 +483,15 @@ def main() -> int:
                     help="create the lab_session/lab_trial/lab_blob tables (idempotent) and exit")
     ap.add_argument("--backfill", action="store_true",
                     help="load existing local lab_session-*.json (+ timeseries) into the DB (idempotent)")
+    ap.add_argument("--backfill-regime", action="store_true",
+                    help="stamp regime='pre-staging' on every lab_session whose regime is still NULL "
+                         "(the one-shot partition backfill for sessions recorded before the column; "
+                         "all predate the staging consolidation b5df1e2). Idempotent — NULLs only.")
     ap.add_argument("--runs-dir", default=DEFAULT_RUNS_DIR,
                     help=f"the local artifact dir to backfill from (default {DEFAULT_RUNS_DIR})")
     a = ap.parse_args()
-    if not (a.ensure_schema or a.backfill):
-        ap.error("nothing to do: pass --ensure-schema and/or --backfill")
+    if not (a.ensure_schema or a.backfill or a.backfill_regime):
+        ap.error("nothing to do: pass --ensure-schema and/or --backfill and/or --backfill-regime")
     conn = connect()
     try:
         if a.ensure_schema:
@@ -464,6 +500,9 @@ def main() -> int:
         if a.backfill:
             summary = backfill(conn, a.runs_dir)
             print(f"[lab_store] backfill from {a.runs_dir}: {summary}")
+        if a.backfill_regime:
+            n = backfill_regime(conn, REGIME_PRE)
+            print(f"[lab_store] backfill_regime: stamped {n} NULL-regime session(s) as {REGIME_PRE!r}")
     finally:
         conn.close()
     return 0

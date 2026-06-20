@@ -469,10 +469,15 @@ def main() -> int:
                           "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms,
                           "server_core": SERVER_CORE, "producer_cores": PRODUCER_CORES,
                           "k_per_thread": ctx.k_per_thread, "s_min": ctx.s_min}
+        # regime: this lab measures against the device-resident-STAGED forward (lab_server delegates to the
+        # base staging seam, 12b27bf) — the 'post-staging' throughput regime. Stamped explicitly (NOT
+        # inferred from git_sha) so an offline-RL trainer filters by regime and never mixes the staged and
+        # un-staged throughputs (the pre-staging corpus stays separable). See lab_store.REGIME_POST.
         lab_store.insert_session(pg_conn, lab_store.SessionRow(
             session_id=run, started_at=lab_store.stamp_to_timestamp(stamp), git_sha=git_sha(),
-            host=socket.gethostname(), reward_fn="reward_forward_rows", net=net_json,
-            warm_pool=warm_pool_json, notes=f"trajectory={'on' if log_trajectory else 'off'}"))
+            host=socket.gethostname(), reward_fn="reward_forward_rows", regime=lab_store.REGIME_POST,
+            net=net_json, warm_pool=warm_pool_json,
+            notes=f"trajectory={'on' if log_trajectory else 'off'}"))
         print(f"[lab] postgres egress up: session {run} inserted into "
               f"{lab_store.lab_pg_params().get('dbname')} (trajectory {'ON' if log_trajectory else 'OFF'})",
               flush=True)
