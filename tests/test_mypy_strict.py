@@ -128,6 +128,14 @@ STRICT_CLEAN = [
     "chocofarm/az/net_port.py",         # the Net Protocol + local adapter; ValueMLP under TYPE_CHECKING
     "chocofarm/az/inference_server.py", # forward_core via typed ForwardFn; jax/zmq lazy in bodies
     "chocofarm/az/zmq_net_client.py",   # the remote Net impl; zmq lazy in bodies
+    # The phantom-typed low-overhead JAX dispatcher (the SSOT AOT-compile builder). It imports jax at
+    # TOP level (config for the XLA pin, then jax/jax.numpy/jax.tree_util) — but jax ships py.typed, so
+    # that is a typed third-party import like numpy, NOT the held-out numba/forward KERNEL boundary
+    # (it imports no forward_core/mlp/kernels). It annotates against jax's real stubs with a commented
+    # backend-`Any` at the `Compiled`/loaded-executable seam (a P8 use-site Any, the same posture
+    # mlp_jax rides — visible in the diff, not a blanket ignore), and is genuinely --strict-clean
+    # without pulling any deferred module into the enforced set.
+    "chocofarm/az/lowlatency.py",
     # NOTE on zmq typing: pyzmq (27.1) SHIPS py.typed + .pyi stubs, so it is NOT a stub-gap — there is
     # NO `zmq.*` ignore_missing_imports override (one would be a dishonest convenience-relaxation P8
     # forbids, and warn_unused_ignores would flag it). The modules annotate against the real stubs
