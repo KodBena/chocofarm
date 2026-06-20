@@ -250,6 +250,52 @@ pad-to-max + staged flip) remain forward work, tracked separately. The P3 split
 makes a *forward-dispatch* lint largely redundant (there is no second dispatch to
 drift), but the `cpp/`-coverage gap that hid this is worth closing on its own.
 
+## 10. Resolution — fix #4 (the lab-alignment flip) landed (appended 2026-06-20, ADR-0005 Rule 8)
+
+*Additive amendment; §1–9 stand unedited (§9's "fix #4 still open" is a
+point-in-time record). This records that the lab-alignment flip §6 named #4 — the
+"clean flip of that one flag" §9 anticipated — has now landed.*
+
+**Fix #4 (the lab-alignment pad-to-max + STAGED flip) landed.** The flip is the
+*property* §9 predicted: `LabServer` now OVERRIDES `_uses_fixed_pad` as a property
+that DERIVES `self._e_policy == "padmax"` (not the inherited `StageAServer` class
+attr `= False`, which the other Stage-A benches keep — the flip is LAB-SPECIFIC).
+`lab_harness.py` gained `--e-policy {padmax,bucket}` (DEFAULT `padmax`, the
+production-aligned regime) threaded into the server. So a `padmax` lab pads every
+forward to the ONE fixed `max_batch` shape `build_staged_forward` compiled for ⇒
+`_uses_fixed_pad` True ⇒ `_effective_forward` hands it production's device-resident
+STAGED forward (the post-staging regime production runs under); a `bucket` lab
+keeps the historical un-staged bench. **The §7 single-shape/bucket crash is gone in
+the aligned regime by construction:** padmax feeds the staged handle exactly its
+`[512,241]` shape, so the `TypeError: compiled with float32[512,241] and called
+with float32[64,241]` the interim re-align (12b27bf) hit cannot recur — confirmed
+by running the aligned lab end-to-end (it served clean, 0 malfunctions, the
+producer streamed `pipelined-bucket` with zero errors; output under
+`~/w/vdc/chocobo/runs/control_lab/staging-align-step3/`).
+
+**The regime stamp is now a DERIVED fact, fixing a data-integrity bug.** The
+harness used to hardcode `regime=REGIME_POST` citing 12b27bf — *which was reverted
+(5df7a45)* — so it mislabelled every UN-STAGED lab run as post-staging. The stamp
+is now `REGIME_POST if (server._uses_fixed_pad and server._stages_params) else
+REGIME_PRE`, read off the live server (one home: pad policy → fixed-pad → staging →
+regime), so it can never drift from what was actually measured. Verified live: the
+aligned `padmax` run egressed `post-staging`, a `bucket` run `pre-staging`. The
+existing postgres corpus was audited — the hardcoded bug was *latent* (no lab
+session had run since it was introduced until this flip), so zero mislabelled rows
+existed to correct (all historical sessions were already correctly `pre-staging`);
+no data was altered, only the go-forward derivation fixed.
+
+**Now offline RL can collect a clean post-staging corpus separable from the
+pre-staging one** (the §6 #4 goal): `lab_session.regime` is the trustworthy
+partition key — a trainer filters `post-staging` for the production-relevant
+(padmax+staged) trajectories and never mixes them with the un-staged bench.
+
+**Still open (unchanged scope):** fix #3 (extend the host-device lint + the mypy
+gate to `cpp/`) remains forward work — the standing mypy gate is still
+`files=["chocofarm"]`, so the lab's `cpp/` tree carries the same pre-existing
+bare-generic `list`/`dict` annotations it always had (untouched here; closing the
+`cpp/`-coverage gap is its own scoped task).
+
 ## License
 
 Public Domain (The Unlicense).

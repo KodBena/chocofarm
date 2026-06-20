@@ -40,9 +40,17 @@ on the server's forward boundary (lab_server appends the COMMITTED obs/action/re
 TrajectoryBuffer); the harness detaches + encodes that buffer between trials. `--no-postgres` -> local
 JSON only. Connection facts live in chocofarm/config.py (lab_pg_params, the redis-mirrored SSOT).
 
+THE THROUGHPUT REGIME (the offline-RL partition key, lab-staging-divergence-rca.md §6 #4). `--e-policy`
+sets the server pad policy, which IS the regime: `padmax` (the DEFAULT — production-aligned) pads every
+forward to max_batch so the lab adopts production's DEVICE-RESIDENT STAGED forward (the 'post-staging'
+regime production runs under); `bucket` keeps the historical UN-STAGED bench ('pre-staging'). The regime
+egressed to postgres (and the local JSON) is DERIVED from the server's ACTUAL staging state — pad policy ->
+fixed-pad -> staging -> regime, ONE home — so an offline-RL trainer separates the staged and un-staged
+corpora by `lab_session.regime` and never mixes throughputs across the forward-path change.
+
 Usage:
     python lab_harness.py [--methods all_allow,ready_threshold2,malfunctioning]
-                          [--secs 4.0 --hidden 256 --m 24 --n-sims 256 --max-batch 512
+                          [--secs 4.0 --hidden 256 --m 24 --n-sims 256 --max-batch 512 --e-policy padmax
                            --pool-batch 192 --producer-threads 3 --inflight-msgs 8 --pool-plies 24
                            --decision-deadline-ms 50 --sample-hz 20 --out <dir>]
 
@@ -109,7 +117,7 @@ PRODUCER_CORES = "1,2,3"
 #     { "schema_version": 1,
 #       "session": { run, stamp, secs, hidden, m, n_sims, pool_batch, producer_threads, inflight_msgs,
 #                    pool_plies, decision_deadline_ms, n_threads(T), server_core, producer_cores,
-#                    reward_fn, methods:[...] },
+#                    reward_fn, e_policy(padmax|bucket), regime(post-staging|pre-staging), methods:[...] },
 #       "trials": [ TRIAL_RECORD, ... ] }
 #
 #     TRIAL_RECORD (one per method, the structured score + the malfunction flags):
@@ -153,12 +161,20 @@ def build_and_publish(hidden: int, run: str, version: int):
     return StaticParamsSource(params, y_mean, y_std), in_dim, n_actions
 
 
-def start_server(src, endpoint: str, max_batch: int, decision_deadline_s: float):
-    """Stand up ONE LabServer (bucket-E + group-wakeup — the lab decision epoch) over `src`, warm every
-    bucket shape + the max so a partial-drain forward never pays a cold JIT in a window, and spin the
-    serve loop on a daemon thread. Returns (server, thread)."""
+def start_server(src, endpoint: str, max_batch: int, decision_deadline_s: float,
+                 e_policy: str = "padmax"):
+    """Stand up ONE LabServer (group-wakeup — the lab decision epoch) over `src` at the requested pad
+    policy, warm every bucket shape + the max so a partial-drain forward never pays a cold JIT in a window,
+    and spin the serve loop on a daemon thread. Returns (server, thread).
+
+    `e_policy` IS THE REGIME LEVER (lab-staging-divergence-rca.md §6 #4): `padmax` (the default — the
+    production-aligned regime) pads every forward to the ONE fixed max_batch shape, so LabServer's derived
+    `_uses_fixed_pad` is True and the server adopts production's DEVICE-RESIDENT STAGED forward (the
+    post-staging regime — what production runs); `bucket` keeps the historical un-staged bench (per-forward
+    width varies). The warmup compiles BOTH the bucket shapes and max_batch, so a `padmax` server is warm at
+    max_batch and a `bucket` server is warm at every bucket — neither pays a cold JIT in a window."""
     server = LabServer(src, bind=endpoint, max_batch=max_batch, forward_fn=jit_forward_core,
-                       e_policy="bucket", wakeup="group", decision_deadline_s=decision_deadline_s)
+                       e_policy=e_policy, wakeup="group", decision_deadline_s=decision_deadline_s)
     server.warmup(sorted(set(BUCKETS) | {max_batch}))
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -394,6 +410,12 @@ def main() -> int:
     ap.add_argument("--m", type=int, default=24)
     ap.add_argument("--n-sims", type=int, default=256)
     ap.add_argument("--max-batch", type=int, default=512)
+    ap.add_argument("--e-policy", choices=("padmax", "bucket"), default="padmax",
+                    help="server pad policy = the throughput REGIME (lab-staging-divergence-rca.md §6 #4). "
+                         "padmax (default): pad every forward to max_batch -> the lab adopts production's "
+                         "device-resident STAGED forward (the POST-staging, production-aligned regime). "
+                         "bucket: snap to {64,256,512} -> the historical UN-STAGED bench (PRE-staging). The "
+                         "regime is DERIVED from this (egressed to postgres as the offline-RL partition key).")
     ap.add_argument("--pool-batch", type=int, default=192)
     ap.add_argument("--producer-threads", type=int, default=3)
     ap.add_argument("--inflight-msgs", type=int, default=8)
@@ -435,9 +457,17 @@ def main() -> int:
           f"hidden={a.hidden} | server pinned core {SERVER_CORE} (affinity={affinity}); "
           f"producers -> taskset -c {PRODUCER_CORES}, threads={T}", flush=True)
 
-    server, server_thread = start_server(src, endpoint, a.max_batch, a.decision_deadline_ms / 1000.0)
-    print(f"[lab] LabServer up (bucket+group, per-forward decision) endpoint={endpoint} "
-          f"max_batch={a.max_batch} decision_deadline={a.decision_deadline_ms}ms", flush=True)
+    server, server_thread = start_server(src, endpoint, a.max_batch, a.decision_deadline_ms / 1000.0,
+                                         e_policy=a.e_policy)
+    # The throughput REGIME, DERIVED ONCE from the server's ACTUAL staging state (the data-integrity SSOT:
+    # pad policy -> fixed-pad -> staging -> regime, one home; lab-staging-divergence-rca.md §6 #4). Both the
+    # postgres egress and the local-JSON record read THIS one value, so the stamp can never drift from what
+    # the server actually ran (a padmax lab is staged = post-staging; a bucket lab is un-staged = pre-staging).
+    staged = bool(server._uses_fixed_pad and server._stages_params)
+    regime = lab_store.REGIME_POST if staged else lab_store.REGIME_PRE
+    print(f"[lab] LabServer up (e_policy={a.e_policy}+group, per-forward decision) endpoint={endpoint} "
+          f"max_batch={a.max_batch} decision_deadline={a.decision_deadline_ms}ms "
+          f"| staging={'ON (post-staging regime)' if staged else 'OFF (pre-staging regime)'}", flush=True)
 
     # The producer streams for the whole session: a budget large enough that it never self-terminates
     # before the harness has run every wall window. (The harness kills it at the end.)
@@ -469,18 +499,23 @@ def main() -> int:
                           "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms,
                           "server_core": SERVER_CORE, "producer_cores": PRODUCER_CORES,
                           "k_per_thread": ctx.k_per_thread, "s_min": ctx.s_min}
-        # regime: this lab measures against the device-resident-STAGED forward (lab_server delegates to the
-        # base staging seam, 12b27bf) — the 'post-staging' throughput regime. Stamped explicitly (NOT
-        # inferred from git_sha) so an offline-RL trainer filters by regime and never mixes the staged and
-        # un-staged throughputs (the pre-staging corpus stays separable). See lab_store.REGIME_POST.
+        # regime: the value DERIVED above from the server's ACTUAL staging state (the data-integrity SSOT —
+        # one home: pad policy -> fixed-pad -> staging -> regime). The interim re-align that claimed the lab
+        # was always 'post-staging' (12b27bf) was REVERTED (5df7a45), so the hardcoded REGIME_POST that used
+        # to sit here mislabelled every UN-STAGED run (the lab is staged ONLY when `_uses_fixed_pad` — i.e.
+        # e_policy=padmax — AND `_stages_params`, both True). Reading it off the live server means the stamp
+        # can NEVER drift from what was actually measured. Stamped explicitly (NOT inferred from git_sha) so
+        # an offline-RL trainer filters by regime and never mixes the staged and un-staged throughputs (the
+        # two corpora stay separable). See lab_store.REGIME_*.
         lab_store.insert_session(pg_conn, lab_store.SessionRow(
             session_id=run, started_at=lab_store.stamp_to_timestamp(stamp), git_sha=git_sha(),
-            host=socket.gethostname(), reward_fn="reward_forward_rows", regime=lab_store.REGIME_POST,
+            host=socket.gethostname(), reward_fn="reward_forward_rows", regime=regime,
             net=net_json, warm_pool=warm_pool_json,
-            notes=f"trajectory={'on' if log_trajectory else 'off'}"))
+            notes=f"trajectory={'on' if log_trajectory else 'off'} e_policy={a.e_policy} "
+                  f"staged={'on' if staged else 'off'}"))
         print(f"[lab] postgres egress up: session {run} inserted into "
-              f"{lab_store.lab_pg_params().get('dbname')} (trajectory {'ON' if log_trajectory else 'OFF'})",
-              flush=True)
+              f"{lab_store.lab_pg_params().get('dbname')} (regime={regime!r}, "
+              f"trajectory {'ON' if log_trajectory else 'OFF'})", flush=True)
 
     records: list[dict] = []
     rc = 0
@@ -557,6 +592,11 @@ def main() -> int:
         "pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
         "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms, "n_threads": T,
         "server_core": SERVER_CORE, "producer_cores": PRODUCER_CORES, "reward_fn": "reward_forward_rows",
+        # e_policy + regime: the local belt-and-suspenders record is self-describing about the throughput
+        # regime it was measured under (padmax->post-staging-staged, bucket->pre-staging-un-staged) — the
+        # SAME `regime` the postgres egress derived (one home; §6 #4 RCA), so a reader of the JSON sees the
+        # identical partition whether or not postgres was on.
+        "e_policy": a.e_policy, "regime": regime,
         "methods": specs,
     }
     out_json = os.path.join(a.out, f"lab_session-{stamp}.json")

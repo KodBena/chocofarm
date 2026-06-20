@@ -92,7 +92,32 @@ class LabServer(StageAServer):
     """The lab eval server: a StageAServer that runs the injected Controller on each forward boundary and
     rides the per-thread gate bit back on the reply envelope. Group-wakeup only (one forward over all
     drained rows — the lab measures coalesced forwards). The Controller + reward + watchdog deadline are
-    swapped per trial by the harness; the warm pool persists across the whole session."""
+    swapped per trial by the harness; the warm pool persists across the whole session.
+
+    REGIME FLIP (lab-staging-divergence-rca.md §6 fix #4 — the deliberate alignment the RCA named). Unlike
+    its StageAServer parent (which pins `_uses_fixed_pad = False` because the Stage-A throughput corpus is
+    ALWAYS the un-staged bench regime), the LAB chooses its forward regime FROM its pad policy: it OVERRIDES
+    `_uses_fixed_pad` as a PROPERTY that DERIVES `self._e_policy == "padmax"`. A `padmax` lab pads every
+    forward to the ONE fixed `max_batch` shape — exactly the shape `build_staged_forward`'s single-shape AOT
+    handle compiled for — so the fixed-pad predicate is True and `InferenceServer._effective_forward` hands
+    the lab production's DEVICE-RESIDENT STAGED forward (the post-staging regime production runs under). A
+    `bucket` lab keeps the historical un-staged bench (per-forward width varies — the single-shape handle
+    cannot serve it). ONE HOME (ADR-0012 P1): pad policy -> fixed-pad -> staging -> the regime stamp the
+    harness egresses; the lab adopts or refuses production's staging by the SAME flag, never a second knob.
+    (This shadows the inherited `_uses_fixed_pad = False` class attribute via the MRO; the only runtime
+    reader, `_effective_forward`, runs on a serve/warmup — long after `__init__` set `self._e_policy` — so
+    the property always sees a constructed policy. It is LAB-SPECIFIC: StageAServer's default is untouched,
+    so the other Stage-A benchmarks keep their un-staged regime.)"""
+
+    @property
+    def _uses_fixed_pad(self) -> bool:  # type: ignore[override]
+        """DERIVE the fixed-pad staging predicate from the lab's pad policy (the deliberate regime flip,
+        lab-staging-divergence-rca.md §6 #4): `padmax` => the lab pads every forward to the ONE fixed
+        max_batch shape the staged AOT handle compiled for => fixed-pad True => `_effective_forward` adopts
+        production's device-resident STAGED forward (post-staging regime). `bucket` => per-forward width
+        varies => fixed-pad False => the un-staged `self._forward_fn` (the historical bench regime), exactly
+        as the single-shape handle requires. One home: the pad policy decides the regime."""
+        return self._e_policy == "padmax"
 
     def __init__(self, *args: Any, controller: Controller | None = None,
                  reward_fn: RewardFn = reward_forward_rows,
