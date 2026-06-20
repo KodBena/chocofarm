@@ -48,6 +48,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -59,6 +60,7 @@
 #include "chocofarm/features.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/instance.hpp"
+#include "chocofarm/issue_controller.hpp"
 #include "chocofarm/runner.hpp"
 #include "chocofarm/runner_wire_batched.hpp"
 #include "chocofarm/transport.hpp"
@@ -107,7 +109,8 @@ int main(int argc, char** argv) {
                      "[--secs 8 --m 24 --n-sims 256 --max-depth 24 --c-outcome 2 --lam 0.1 --max-steps 40 "
                      "--pool-threads T --pool-batch B --inflight-msgs D --trees-per-thread N "
                      "--min-coalesce S_min --gen-chunk-floor <0|1> --measure-decisions M "
-                     "--settle-decisions S --pool-plies P --pool-seed K --parity-stats <path>]\n";
+                     "--settle-decisions S --pool-plies P --pool-seed K --sweep-configs cf:S:D,... "
+                     "--controller-cadence-ms ms --parity-stats <path>]\n";
         return 2;
     }
 
@@ -141,6 +144,12 @@ int main(int argc, char** argv) {
         ? static_cast<std::uint64_t>(std::atoll(std::string(*opt(args, "--pool-seed")).c_str())) : 20260620ull;
     const long settle_decisions =
         opt(args, "--settle-decisions") ? std::atol(std::string(*opt(args, "--settle-decisions")).c_str()) : 0;
+    // The online ISSUE CONTROLLER fixture (sweep only): >0 spins a per-config IssueController at this
+    // control-tick cadence (ms) with an IDENTITY policy (all-allow ⇒ byte-unchanged). 0 ⇒ no controller. The
+    // fixture's policy seam (boolean-per-thread / softmax regression over the marshalled features) is filled
+    // later; the controller's primitive action is per-thread issue allow/deny (overcommit is downstream).
+    const double controller_cadence_ms = opt(args, "--controller-cadence-ms")
+        ? to_double(*opt(args, "--controller-cadence-ms")) : 0.0;
 
     GumbelConfig gc;  // the Stage B operating point: m=24, n_sims=256 (overridable)
     gc.m = opt(args, "--m") ? to_int(*opt(args, "--m")) : 24;
@@ -240,9 +249,19 @@ int main(int argc, char** argv) {
             rc.run = std::string(*run); rc.phase = "gen"; rc.version = version;
             rc.episodes = 1'000'000'000; rc.lam = lam; rc.max_steps = max_steps;
             rc.seed = 7919ull; rc.res_token = std::string(*res_token) + "-m";
+            // The ONLINE ISSUE CONTROLLER fixture (--controller-cadence-ms > 0): a per-config IssueController
+            // told this config's D (a read-only feature) and given an IDENTITY policy (all-allow ⇒ the gate
+            // is byte-unchanged vs no controller). The seam where a real policy plugs in is the IssueController
+            // ctor's IssuePolicy argument (empty here). 0 ⇒ no controller (the production-shaped path).
+            std::unique_ptr<IssueController> ctl;
+            if (controller_cadence_ms > 0.0) {
+                ctl = std::make_unique<IssueController>(wcm.pool_threads, std::max(1, wcm.max_inflight_msgs),
+                                                        controller_cadence_ms);
+                ctl->start();
+            }
             std::ostringstream oss;
             auto w = run_episodes_wire_pipelined(env, fb, gc, *redis, rc, wcm, &oss, &pool,
-                                                 settle_decisions, nullptr);
+                                                 settle_decisions, nullptr, ctl.get());
             if (!w) { std::cerr << "wire-ab-bench: FATAL: sweep config " << tok << " failed: "
                                 << w.error().message << "\n"; return 1; }
             const std::string sm = oss.str();

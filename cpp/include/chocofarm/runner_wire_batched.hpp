@@ -44,6 +44,8 @@
 
 namespace chocofarm {
 
+class IssueController;   // the online overcommit controller fixture (issue_controller.hpp); injected by ptr
+
 // The runner's wire transport scheduling mode (the SELECTABLE arm — docs/design/cpp-eval-transport-adapter.md
 // §4 Stage B). This is a TRANSPORT-SCHEDULING knob only (it changes WHEN/HOW MANY leaf messages are
 // outstanding, never the wire frame / codec / wire_spec — ADR-0012 P7), so both modes produce
@@ -174,6 +176,6 @@ struct SlotSnapshot {
     const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc, RedisClient& redis,
     const RunnerConfig& cfg, const WireRunnerConfig& wcfg, std::ostream* stats_out = nullptr,
     const std::vector<SlotSnapshot>* warm_pool = nullptr, long settle_budget = 0,
-    std::vector<SlotSnapshot>* snapshot_out = nullptr);
+    std::vector<SlotSnapshot>* snapshot_out = nullptr, IssueController* controller = nullptr);
 
 }  // namespace chocofarm

@@ -25,6 +25,7 @@
 #include <zmq.h>
 
 #include "chocofarm/fiber_tree.hpp"
+#include "chocofarm/issue_controller.hpp"
 #include "chocofarm/runtime_config.hpp"
 #include "chocofarm/wire_leaf_pool.hpp"
 
@@ -429,7 +430,7 @@ std::expected<int, Error> run_episodes_wire_pipelined(
     const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc,
     [[maybe_unused]] RedisClient& redis, const RunnerConfig& cfg, const WireRunnerConfig& wcfg,
     std::ostream* stats_out, const std::vector<SlotSnapshot>* warm_pool, long settle_budget,
-    std::vector<SlotSnapshot>* snapshot_out) {
+    std::vector<SlotSnapshot>* snapshot_out, IssueController* controller) {
     const int n_slots = n_action_slots(env);
     const int feat_dim = fb.dim();
     const std::vector<uint32_t>& worlds = env.worlds();
@@ -737,7 +738,13 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         // here (see the function header).
         auto refill = [&]() {
             const bool stop = budget_done.load(std::memory_order_relaxed);   // bench budget: issue no more
-            while (!stop && inflight_msgs < D && !failed.load() && issue(/*force=*/false)) {}
+            // The non-forced ISSUE is gated by the controller's per-thread predicate (the IssueController
+            // fixture; null ⇒ always allow ⇒ byte-unchanged). `D` stays the runner's fixed SAFETY ceiling —
+            // the controller decides ISSUE allow/deny, NOT "overcommit" (depth>1 is the downstream emergent
+            // effect). The forced-flush below stays UNGATED — the liveness floor (a denied thread still
+            // drains at depth-1, never deadlocks).
+            const bool may_issue = controller == nullptr || controller->may_issue(tid);
+            while (!stop && inflight_msgs < D && may_issue && !failed.load() && issue(/*force=*/false)) {}
             if (!stop && inflight_msgs == 0 && !failed.load() && ready_count() > 0)
                 issue(/*force=*/true);  // forced flush: nothing outstanding ⇒ waiting gathers nothing more
         };
@@ -771,6 +778,10 @@ std::expected<int, Error> run_episodes_wire_pipelined(
                                                // an ended episode does not re-load a possibly-terminal snapshot)
             }
             refill();  // hold the floor: full messages back up to depth D, then the forced-flush backstop
+            // Marshal this thread's metrics to the controller (benchmark-only — null in production ⇒ zero
+            // cost; single-writer per tid ⇒ race-free). The ready_count() scan is paid only under a controller.
+            if (controller != nullptr)
+                controller->publish(tid, inflight_msgs, ready_count(), my_msgs, my_leaves);
         }
         // Capture this thread's slots' copyable episode state into the warm pool (snapshot_out) — the slots
         // sit at varied plies (the real staggered run), giving a faithful diverse population. The fiber is
