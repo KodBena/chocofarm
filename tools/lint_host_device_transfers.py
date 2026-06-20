@@ -102,6 +102,7 @@ EXCLUDE_RELPATH_PREFIXES = ("chocofarm/chocofarm/",)
 # - az/optimizer.py         : the optax hyperparam-injection seam (live lr/b1/b2/eps onto device state).
 # - az/forward.py           : the SSOT `forward_core` (the one jitted forward every path crosses into).
 # - az/bench/bench_lowlatency.py : the dispatch-cost micro-bench — transfers ARE the measured subject.
+# - az/bench/bench_mlp_lowlatency.py : the real-MLP dispatch decomposition bench — same, transfers ARE the subject.
 # ---------------------------------------------------------------------------------------------------
 BOUNDARY_MODULES: frozenset[str] = frozenset({
     "chocofarm/az/lowlatency.py",
@@ -110,6 +111,7 @@ BOUNDARY_MODULES: frozenset[str] = frozenset({
     "chocofarm/az/optimizer.py",
     "chocofarm/az/forward.py",
     "chocofarm/az/bench/bench_lowlatency.py",
+    "chocofarm/az/bench/bench_mlp_lowlatency.py",
 })
 
 # inline markers (checked against the source LINE the transfer call sits on).
