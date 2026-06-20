@@ -31,6 +31,15 @@ ARTIFACTS under ~/w/vdc (NEVER /tmp): a JSON session record (the cross-batch sch
 time-series the dashboard (a later batch) streams. The schema is DOCUMENTED in `SCHEMA_DOC` and is a
 CROSS-BATCH CONTRACT the dashboard + data-collection batches reuse.
 
+POSTGRES EGRESS (lab_store.py, the one-owner DB I/O): in addition to the local JSON/JSONL (kept as cheap
+belt-and-suspenders), each method-trial is flushed to the host control_research PostgreSQL at the
+BETWEEN-TRIAL seam (off the per-forward critical path) — a descriptive lab_trial row + a metrics_series
+blob (zstd-JSON of the per-sample time series) + the flag-gated (s,a,r) TRAJECTORY blob (trajectory_codec,
+the RL-loop data; ON by default, `--no-trajectory` for a pure-timing run). The (s,a,r) tuple is appended
+on the server's forward boundary (lab_server appends the COMMITTED obs/action/reward into a per-trial
+TrajectoryBuffer); the harness detaches + encodes that buffer between trials. `--no-postgres` -> local
+JSON only. Connection facts live in chocofarm/config.py (lab_pg_params, the redis-mirrored SSOT).
+
 Usage:
     python lab_harness.py [--methods all_allow,ready_threshold2,malfunctioning]
                           [--secs 4.0 --hidden 256 --m 24 --n-sims 256 --max-batch 512
@@ -44,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import statistics
 import subprocess
 import sys
@@ -72,8 +82,10 @@ from chocofarm.model.env import Environment  # noqa: E402
 
 from control_lab import reference_methods  # noqa: F401,E402 — registers the reference methods into REGISTRY
 from control_lab import methods as _lab_methods  # noqa: F401,E402 — the fan-out methods package (load_all below)
+from control_lab import lab_store  # noqa: E402 — the postgres egress (one-owner DB I/O; off the hot path)
 from control_lab.adapter import REGISTRY, Controller, Decimate, TrialContext  # noqa: E402
 from control_lab.lab_server import LabServer  # noqa: E402
+from control_lab.trajectory_codec import MAGIC as TRAJ_MAGIC, TrajectoryBuffer  # noqa: E402
 from stage_a_server import BUCKETS  # noqa: E402
 
 # Register the fan-out methods: import every methods/<name>.py so each self-registers into REGISTRY.
@@ -197,6 +209,17 @@ def agg(vals: "list[float]") -> dict:
     }
 
 
+def git_sha() -> "str | None":
+    """The repo's current short git sha for the session provenance row (lab_session.git_sha). Best-effort:
+    a non-repo / git-absent environment returns None (the column is nullable) — never fatal to a run."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO,
+                             capture_output=True, text=True, timeout=5.0)
+        return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+    except Exception:   # noqa: BLE001 — provenance is best-effort; git absence never blocks a lab run
+        return None
+
+
 def resolve_method(spec: str) -> "tuple[str, int]":
     """Parse a method spec into (registry_name, decimate_k). A `name` is k=1; `name@k` applies Decimate(k).
     The name must be in the REGISTRY (ADR-0002 — fail loud on an unknown method, never a silent skip)."""
@@ -223,14 +246,16 @@ def make_controller(name: str, k: int) -> "tuple[Controller, str, int]":
 
 
 def run_trial(server: LabServer, method_spec: str, ctx: TrialContext, secs: float, sample_hz: float,
-              ts_file: Any) -> dict:
+              ts_file: Any, traj: "TrajectoryBuffer | None") -> "tuple[dict, list[dict]]":
     """Run ONE method-trial over the persistent stream: swap the Controller (reset, NOT the fixture), box a
     `secs` wall window, sample the time series at ~sample_hz, score dps from the server cumulative-decision
-    delta. Returns the structured TRIAL_RECORD (the schema above). The fixture survives any method
-    malfunction (the watchdog lives in the server; this reads its flags)."""
+    delta. Returns (TRIAL_RECORD, per-sample-list) — the record is the schema above; the samples feed the
+    metrics_series blob the postgres egress writes between trials. `traj` is the per-trial TrajectoryBuffer
+    the server appends each forward's (obs, action, reward) into (None -> no (s,a,r) logging). The fixture
+    survives any method malfunction (the watchdog lives in the server; this reads its flags)."""
     name, k = resolve_method(method_spec)
     controller, family, k = make_controller(name, k)
-    server.set_trial(controller, ctx)
+    server.set_trial(controller, ctx, trajectory=traj)
 
     # Sample at the window edges + ~sample_hz between. The first sample is the window-start baseline (so the
     # first interval's dps is well-defined); the server counters are session-cumulative, so we delta them.
@@ -300,7 +325,64 @@ def run_trial(server: LabServer, method_spec: str, ctx: TrialContext, secs: floa
           f"dps_samp={rec['dps']['mean']:7.1f}+/-{rec['dps']['pstdev']:.1f} "
           f"rows/fwd={mfwd:6.1f} fwds={d_fwd} malfunctions={malfunctions} "
           f"flags={flags if flags else '-'}", flush=True)
-    return rec
+    return rec, samples
+
+
+def _egress_trial(conn: Any, session_id: str, ctx: TrialContext, a: Any, rec: dict,
+                  samples: "list[dict]", traj: "TrajectoryBuffer | None") -> None:
+    """The BETWEEN-TRIAL postgres flush (off the per-forward critical path): map this trial's TRIAL_RECORD
+    + the run geometry onto a lab_trial row, insert it, then insert the metrics_series blob (zstd-JSON of
+    this method's samples) and — when trajectory logging is on — the encoded (s,a,r) trajectory blob. The
+    lab_store owns the SQL; this helper owns ONLY the harness-record -> store-record mapping (P3). A DB/SQL
+    error propagates loud (ADR-0002)."""
+    dps = rec["dps"]
+    # Read the (quiesced) buffer's decision count ONCE — the trial row's n_decisions and the trajectory
+    # blob's n_decisions are the same number (the buffer is detached/frozen before this runs).
+    n_dec = traj.n_decisions if traj is not None else None
+    trow = lab_store.TrialRow(
+        session_id=session_id,
+        method=rec["method"],
+        family=rec["family"],
+        decimate_k=rec["decimate_k"],
+        n_threads=ctx.n_threads,
+        d_ceiling=ctx.d_ceiling,
+        k_per_thread=ctx.k_per_thread,
+        s_min=ctx.s_min,
+        chunk_floor=ctx.chunk_floor,
+        seed=ctx.seed,
+        inflight_msgs=a.inflight_msgs,
+        pool_batch=a.pool_batch,
+        secs=a.secs,
+        dps_window=rec["dps_window"],
+        dps_mean=dps["mean"],
+        dps_pstdev=dps["pstdev"],
+        dps_min=dps["min"],
+        dps_max=dps["max"],
+        rows_per_fwd=rec["mean_forward_rows"],
+        forwards=rec["forwards"],
+        n_decisions=n_dec,
+        malfunctions=rec["malfunctions"],
+        flags=rec["flags"],
+        ok=rec["ok"],
+        started_at=lab_store.stamp_to_timestamp(time.strftime("%Y%m%d-%H%M%S")),
+        duration_s=rec["window_s"],
+    )
+    trial_id = lab_store.insert_trial(conn, trow)
+    # metrics_series: the per-sample timeseries for this method (the dashboard's per-method state stream).
+    if samples:
+        payload, raw_n, comp_n = lab_store.compress_metrics_series(samples)
+        lab_store.insert_blob(conn, trial_id, kind="metrics_series", codec="zstd-json",
+                              payload=payload, raw_bytes=raw_n, compressed_bytes=comp_n, n_decisions=None)
+    # trajectory: encode the per-trial (quiesced) buffer (between trials, off the hot path) -> the CHTRAJ01
+    # blob. The codec's blob is ALREADY zstd'd; the store inserts it verbatim (STORAGE EXTERNAL, no
+    # re-compression). raw_est is a rough uncompressed footprint for the ratio column (the codec does not
+    # surface its own pre-zstd size; this is informational only).
+    if traj is not None and n_dec:
+        blob = traj.encode()
+        raw_est = n_dec * (ctx.n_threads * 5 + 3)
+        lab_store.insert_blob(conn, trial_id, kind="trajectory", codec=TRAJ_MAGIC.decode("ascii"),
+                              payload=blob, raw_bytes=raw_est, compressed_bytes=len(blob),
+                              n_decisions=n_dec)
 
 
 def main() -> int:
@@ -322,7 +404,14 @@ def main() -> int:
                     help="max wall to wait for the producer's pool build + first lab forwards")
     ap.add_argument("--out", default=os.path.join(os.path.expanduser("~"), "w", "vdc", "chocobo",
                                                   "runs", "control_lab"))
+    ap.add_argument("--no-trajectory", action="store_true",
+                    help="disable the (s,a,r) trajectory sink (a pure-timing run; trajectory is ON by "
+                         "default — the codec append is ~0.17%% at this config, effectively free)")
+    ap.add_argument("--no-postgres", action="store_true",
+                    help="skip the postgres egress (local-JSON only); by default the lab inserts each "
+                         "trial + its metrics_series/trajectory blobs into the control_research DB")
     a = ap.parse_args()
+    log_trajectory = not a.no_trajectory
 
     # M3 pinning: this harness process hosts the in-process JAX server thread -> pin to the server core
     # only; the C++ producer runs under taskset -c 1,2,3 (off core 0). The 1:3 split the stage-b harness uses.
@@ -365,6 +454,29 @@ def main() -> int:
     # never streams within the grace window (ADR-0002 — never a silent hang).
     ctx = TrialContext(n_threads=T, d_ceiling=a.inflight_msgs,
                        k_per_thread=max(1, -(-a.pool_batch // T)), s_min=1, chunk_floor=False, seed=7919)
+
+    # --- postgres egress: connect ONCE up front + ensure the schema + insert the session row, so a DB
+    # outage fails LOUD before a long run rather than mid-stream (ADR-0002). The per-trial inserts happen
+    # at the BETWEEN-TRIAL flush seam below (off the per-forward critical path). --no-postgres -> local
+    # JSON only. The session row carries provenance (git_sha/host) + the run config as net/warm_pool jsonb.
+    pg_conn = None
+    if not a.no_postgres:
+        pg_conn = lab_store.connect()
+        lab_store.ensure_schema(pg_conn)
+        net_json = {"in_dim": in_dim, "n_actions": n_actions, "hidden": a.hidden, "seed": 17,
+                    "residual": False, "m": a.m, "n_sims": a.n_sims}
+        warm_pool_json = {"pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
+                          "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms,
+                          "server_core": SERVER_CORE, "producer_cores": PRODUCER_CORES,
+                          "k_per_thread": ctx.k_per_thread, "s_min": ctx.s_min}
+        lab_store.insert_session(pg_conn, lab_store.SessionRow(
+            session_id=run, started_at=lab_store.stamp_to_timestamp(stamp), git_sha=git_sha(),
+            host=socket.gethostname(), reward_fn="reward_forward_rows", net=net_json,
+            warm_pool=warm_pool_json, notes=f"trajectory={'on' if log_trajectory else 'off'}"))
+        print(f"[lab] postgres egress up: session {run} inserted into "
+              f"{lab_store.lab_pg_params().get('dbname')} (trajectory {'ON' if log_trajectory else 'OFF'})",
+              flush=True)
+
     records: list[dict] = []
     rc = 0
     try:
@@ -390,8 +502,22 @@ def main() -> int:
         ts_path = os.path.join(a.out, f"lab_timeseries-{stamp}.jsonl")
         with open(ts_path, "w") as ts_file:
             for spec in specs:
-                rec = run_trial(server, spec, ctx, a.secs, a.sample_hz, ts_file)
+                # One fresh TrajectoryBuffer per trial when logging is on (the server appends each forward's
+                # (obs, action, reward) into it on the hot path; the encode below is between trials). None
+                # for a pure-timing run (--no-trajectory).
+                traj = TrajectoryBuffer(ctx) if log_trajectory else None
+                rec, samples = run_trial(server, spec, ctx, a.secs, a.sample_hz, ts_file, traj)
                 records.append(rec)
+                # DETACH the trajectory sink from the server BEFORE encoding it: the producer streams
+                # continuously, so the serve thread is still appending to `traj` until we swap it out. This
+                # quiesces the buffer (the codec's between-trials contract — encode() must not race a
+                # concurrent append/_grow). The returned object is the same buffer, now frozen.
+                traj_done = server.detach_trajectory() if traj is not None else None
+                # BETWEEN-TRIAL flush (off the per-forward critical path): insert the trial row + the
+                # metrics_series blob (zstd-JSON of this method's samples) + the trajectory blob (the codec
+                # encodes the quiesced buffer here, between trials). A DB/SQL error fails loud (ADR-0002).
+                if pg_conn is not None:
+                    _egress_trial(pg_conn, run, ctx, a, rec, samples, traj_done)
                 # Fail loud if the fixture died under a method (it must NOT) — the producer is the canary.
                 if producer.poll() is not None:
                     raise RuntimeError(f"producer DIED during method {spec!r} (rc={producer.returncode}) — "
@@ -413,8 +539,14 @@ def main() -> int:
             server.close()
         except Exception as exc:   # noqa: BLE001 — surface but do not mask the primary error
             print(f"[lab] WARNING: server teardown raised (non-fatal): {exc!r}", flush=True)
+        if pg_conn is not None:
+            try:
+                pg_conn.close()
+            except Exception as exc:   # noqa: BLE001 — a close hiccup must not mask the primary error
+                print(f"[lab] WARNING: postgres close raised (non-fatal): {exc!r}", flush=True)
 
-    # ---- the session record (the cross-batch schema) ----
+    # ---- the session record (the cross-batch schema; KEPT alongside the postgres egress — cheap belt-
+    # and-suspenders, the local artifact the dashboard already streams) ----
     session = {
         "run": run, "stamp": stamp, "secs": a.secs, "hidden": a.hidden, "m": a.m, "n_sims": a.n_sims,
         "pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
@@ -439,6 +571,10 @@ def main() -> int:
     print(f"\n[lab] wrote {out_json}", flush=True)
     print(f"[lab] wrote {os.path.join(a.out, f'lab_timeseries-{stamp}.jsonl')}", flush=True)
     print(f"[lab] producer log {prod_log}", flush=True)
+    if not a.no_postgres:
+        print(f"[lab] postgres: session {run} + {len(records)} trial row(s) "
+              f"(+ metrics_series{'/trajectory' if log_trajectory else ''} blobs) -> "
+              f"{lab_store.lab_pg_params().get('dbname')}@{lab_store.lab_pg_params().get('host')}", flush=True)
     return rc
 
 

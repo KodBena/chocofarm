@@ -25,6 +25,17 @@ Each role's connection facts are env-overridable independently, via DISTINCT env
 different instance without touching the other. The socket/connect timeouts are NOT role-specific (a
 stall is a stall on either instance), so they stay shared across both roles under one env contract.
 
+Beyond redis, the codebase has ONE other infrastructure dependency: the host PostgreSQL the issue-gate
+CONTROL LAB egresses to (`cpp/stage_a/control_lab/lab_store.py` — descriptive per-trial columns +
+compressed trajectory/metrics blobs, the RL-loop data store). Its connection facts live here too, the
+same single-owner pattern as redis:
+
+  * CONTROL-LAB POSTGRES (the lab's session/trial/blob store) → **192.168.122.1:5432 db control_research**,
+    reached over `pg_hba` TRUST from the VM subnet (no password). The user is the OS login by default
+    (psycopg3 derives it from the environment when `user` is omitted, matching the trust map). psycopg3
+    ONLY — this project never uses psycopg2. Env-overridable via the `CHOCO_LAB_PG_*` family, independent
+    of the redis families.
+
 Public Domain (Unlicense).
 """
 from __future__ import annotations
@@ -61,6 +72,15 @@ DEFAULT_REGISTRY_REDIS_DB = 0
 DEFAULT_REDIS_SOCKET_TIMEOUT = 60.0
 DEFAULT_REDIS_CONNECT_TIMEOUT = 10.0
 
+# Control-lab PostgreSQL — the host instance the issue-gate lab egresses to (TRUST from the VM subnet,
+# no password; psycopg3). The user is the OS login when unset (psycopg3 derives it, matching the trust
+# map), so DEFAULT_LAB_PG_USER is None -> the param is omitted and libpq fills it. Env vars override.
+DEFAULT_LAB_PG_HOST = "192.168.122.1"
+DEFAULT_LAB_PG_PORT = 5432
+DEFAULT_LAB_PG_DBNAME = "control_research"
+DEFAULT_LAB_PG_USER: str | None = None   # None -> omit; libpq/psycopg3 uses the OS login (trust map)
+DEFAULT_LAB_PG_CONNECT_TIMEOUT = 10.0
+
 
 def transport_redis_params() -> dict[str, str | int]:
     """Connection facts (host/port/db) for the TRANSPORT redis — the ephemeral allkeys-lru instance
@@ -95,3 +115,27 @@ def redis_socket_timeout() -> float:
 def redis_connect_timeout() -> float:
     """Connection-establish timeout for the redis client, shared across both roles."""
     return float(os.environ.get("CHOCO_REDIS_CONNECT_TIMEOUT", str(DEFAULT_REDIS_CONNECT_TIMEOUT)))
+
+
+def lab_pg_params() -> dict[str, str | int]:
+    """Connection facts (host/port/dbname[/user]) for the CONTROL-LAB PostgreSQL — the host instance at
+    192.168.122.1:5432 db control_research that holds the issue-gate lab's session/trial/blob store,
+    reached over `pg_hba` TRUST (no password). The `user` key is included ONLY when set (env or default):
+    when omitted, psycopg3/libpq uses the OS login, which is what the trust map keys on. Env-overridable
+    via `CHOCO_LAB_PG_HOST`/`CHOCO_LAB_PG_PORT`/`CHOCO_LAB_PG_DBNAME`/`CHOCO_LAB_PG_USER`, independent of
+    the redis families. The dict is the kwargs for `psycopg.connect(**lab_pg_params())`."""
+    params: dict[str, str | int] = dict(
+        host=os.environ.get("CHOCO_LAB_PG_HOST", DEFAULT_LAB_PG_HOST),
+        port=int(os.environ.get("CHOCO_LAB_PG_PORT", str(DEFAULT_LAB_PG_PORT))),
+        dbname=os.environ.get("CHOCO_LAB_PG_DBNAME", DEFAULT_LAB_PG_DBNAME),
+    )
+    user = os.environ.get("CHOCO_LAB_PG_USER", DEFAULT_LAB_PG_USER)
+    if user:   # omit when None/empty so libpq fills the OS login (the trust-map key)
+        params["user"] = user
+    return params
+
+
+def lab_pg_connect_timeout() -> float:
+    """Connection-establish timeout for the control-lab PostgreSQL client (ADR-0002: a stall on connect
+    becomes a loud error, not a silent hang). Env-overridable via `CHOCO_LAB_PG_CONNECT_TIMEOUT`."""
+    return float(os.environ.get("CHOCO_LAB_PG_CONNECT_TIMEOUT", str(DEFAULT_LAB_PG_CONNECT_TIMEOUT)))

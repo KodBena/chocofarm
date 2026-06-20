@@ -129,13 +129,23 @@ class LabServer(StageAServer):
         # persists across the session). Indexed by tid; grown lazily as threads appear.
         self._thread_decisions: dict[int, int] = {}
         self._lab_decisions_total = 0
+        # The optional (s,a,r) trajectory sink (the RL-loop data). When the harness sets a TrajectoryBuffer
+        # for a trial, each forward's COMMITTED decision (obs, action-actually-sent, reward) is appended on
+        # the hot path (the codec's cheap allocation-free append, ~0.17% at this config). None -> no logging
+        # (a pure-timing run). Encoded between trials by the harness; never on a forward. Read/written on the
+        # serve thread under self._lock at swap time only (the append itself is on the serve thread).
+        self._traj: Any | None = None
 
     # ---- trial lifecycle (the harness calls these between trials, over the SAME warm pool) ----
     def set_trial(self, controller: Controller, ctx: TrialContext,
-                  reward_fn: RewardFn | None = None, decision_deadline_s: float | None = None) -> None:
+                  reward_fn: RewardFn | None = None, decision_deadline_s: float | None = None,
+                  trajectory: Any | None = None) -> None:
         """Begin a fresh method-trial: reset the Controller, the gate vector, the per-trial telemetry, and
-        the malfunction record. Called between trials WITHOUT tearing down the server (warm pool persists).
-        A reset() that throws is the method's failure, surfaced loudly to the harness (ADR-0002)."""
+        the malfunction record. `trajectory` is an OPTIONAL fresh TrajectoryBuffer (trajectory_codec) the
+        server appends each forward's (obs, action, reward) into for this trial — None disables the sink
+        (a pure-timing run). The harness builds ONE buffer per trial and encodes it after the wall box.
+        Called between trials WITHOUT tearing down the server (warm pool persists). A reset() that throws is
+        the method's failure, surfaced loudly to the harness (ADR-0002)."""
         with self._lock:
             self._controller = controller
             self._trial_ctx = ctx
@@ -151,7 +161,18 @@ class LabServer(StageAServer):
             self._decisions = 0
             self._forward_rows_acc = 0
             self._forwards_in_trial = 0
+            self._traj = trajectory   # swap the per-trial sink (None -> no (s,a,r) logging this trial)
         controller.reset(ctx)   # outside the lock: the method's own reset (may be non-trivial)
+
+    def detach_trajectory(self) -> Any | None:
+        """Atomically detach the per-trial trajectory sink: swap self._traj to None under the lock and
+        return the old buffer (or None). The harness calls this AFTER the wall box ends and BEFORE it
+        encodes the buffer, so the serve thread stops appending first — encode() then runs on a quiesced
+        buffer (the codec's between-trials contract), never racing a concurrent append/_grow. Idempotent."""
+        with self._lock:
+            traj = self._traj
+            self._traj = None
+            return traj
 
     def snapshot(self) -> dict[str, Any]:
         """A thread-safe sample of the trial telemetry + the Controller's metrics() for the dashboard time
@@ -303,6 +324,7 @@ class LabServer(StageAServer):
                                            f"act() took {elapsed*1e3:.1f}ms > {deadline*1e3:.1f}ms deadline")
                     self._malfunction.slow += 1
                     self._gates = [1] * T
+                    self._append_traj(obs, self._gates, reward)   # the COMMITTED (fallback) action
                     self._pending_reward = reward
                     self._decisions += 1
                     self._forward_rows_acc += forward_rows
@@ -315,6 +337,7 @@ class LabServer(StageAServer):
                                            f"act() returned a non-length-{T}/non-binary vector: {new_gates!r}")
                     self._malfunction.malformed += 1
                     self._gates = [1] * T
+                    self._append_traj(obs, self._gates, reward)   # the COMMITTED (fallback) action
                     self._pending_reward = reward
                     self._decisions += 1
                     self._forward_rows_acc += forward_rows
@@ -322,6 +345,7 @@ class LabServer(StageAServer):
                 return
             with self._lock:
                 self._gates = gates
+                self._append_traj(obs, gates, reward)   # the COMMITTED policy action (the (s,a,r) RL tuple)
                 self._pending_reward = reward
                 self._decisions += 1
                 self._forward_rows_acc += forward_rows
@@ -331,10 +355,21 @@ class LabServer(StageAServer):
                 self._malfunction.note("act_raised", f"act()/observe() raised: {exc!r}")
                 self._malfunction.raised += 1
                 self._gates = [1] * T
+                self._append_traj(obs, self._gates, reward)   # the COMMITTED (fallback) action
                 self._pending_reward = reward
                 self._decisions += 1
                 self._forward_rows_acc += forward_rows
                 self._forwards_in_trial += 1
+
+    def _append_traj(self, obs: Observation, action: "Sequence[int]", reward: float) -> None:
+        """Append ONE committed decision (obs, action-actually-sent, reward) to the per-trial trajectory
+        sink, iff one is set. The codec's cheap allocation-free hot append (~0.17% at this config); a None
+        sink is a single branch (a pure-timing run pays nothing). MUST be called with self._lock held (the
+        four _run_controller commit branches already hold it) — the buffer is swapped under the lock at
+        set_trial, so this never races the encode (which the harness runs between trials)."""
+        traj = self._traj
+        if traj is not None:
+            traj.append(obs, action, reward)
 
 
 # ---- small pure helpers ----
