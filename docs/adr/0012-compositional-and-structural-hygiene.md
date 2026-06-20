@@ -1145,6 +1145,108 @@ prose.
   three deployment shapes the C++ section operationalizes; P7's concrete wire
   contract is `transport.py` cited against that design's Shape A.
 
+## Amendments
+
+*Per ADR-0005 Rule 8 (amend point-in-time records by append; never silently
+rewrite), each entry is dated and additive. The original Decision (the
+anti-pattern checklist table and the nine principles above) stands unedited;
+amendments extend it.*
+
+### 2026-06-20 — P7 lifted from the cross-LANGUAGE wire to the cross-DEVICE boundary: gratuitous host↔device (numpy↔jax) transfers
+
+**What fired this (ADR-0011 Rule 2 / this ADR's Revisit #4 — a review-only
+principle's enforcement recurring into a *measured* cost).** P7's
+"derive-don't-re-author across a boundary" was stated and enforced for the
+cross-*language* wire (`transport.py`, the C++ mirror, `tests/test_wire_drift.py`).
+The same compositional sin — a boundary crossing scattered across N sites
+instead of isolated at *one* auditable home — recurs at the cross-*device*
+(host↔device, numpy↔jax) boundary, and the recurrence is now **empirical, not
+hypothetical**: the just-merged low-overhead-JAX micro-lib bench (commit
+`feca4f2`; numbers under `~/w/vdc/chocobo/bench/lowlatency/`, ADR-0009 honesty —
+warm, R²>0.99 linear fits) found that a **~57 µs per-call cost was nothing but a
+repeated params host→device transfer** that `jax.jit(params, jnp.asarray(x))`
+redoes every call (the robust AOT handle stages params device-resident *once* at
+construction and drops it, intercept ≈121 µs → ≈64 µs, slope unchanged), and the
+inference server's `run_microbatch` pays an even larger **~85–135 µs on the
+input host→device hand-off plus a blocking device→host pull**. Scattered
+transfers *are* the cost; isolating + consolidating them is the lever. A
+recurrence with a measured cost is exactly the ADR-0011 Rule-2 trigger that
+converts a review-only principle to a mechanism.
+
+**New anti-pattern row (extends the §"anti-pattern checklist" table — appended,
+not edited into it):**
+
+| Audit cancer / boundary | The shape to never author | Preventing rule |
+| — | — | — |
+| **(new, cross-DEVICE)** — gratuitous host↔device (numpy↔jax) transfer | a host↔device crossing — `jnp.array`/`jnp.asarray`/`jax.device_put` (host→device), or a blocking `np.asarray(<jax>)` / `float(<jax>)` / `.block_until_ready()` / `.tolist()`/`.item()` pull (device→host) — scattered at an arbitrary call-site instead of isolated at one designated boundary, so a per-call params re-stage or a redundant device→host pull hides as a ~57–135 µs cost no one site owns (the `feca4f2` bench: ~57 µs params staging, ~85–135 µs `run_microbatch` input/output) | **P7** lifted from the cross-LANGUAGE wire to the cross-DEVICE boundary (composing with **P1** one-home/derive-don't-duplicate and **P2** seam/Port-ACL): a host↔device crossing has **one authoritative, auditable home** — a *designated boundary* — from which the hot path stages once and consolidates, never N scattered re-stages; mechanically enforced at the strongest feasible-and-proportionate level (an AST gate + ratcheting baseline, ADR-0011 Rule 1, mirroring the mypy `--strict` gate), so a NEW transfer outside a boundary fails CI |
+
+**The rule (the cross-DEVICE register of P7/P1/P2).** A host↔device transfer
+**CALL-SITE is allowed only at a designated boundary**; anywhere else is a
+violation. This is **P1** (the crossing has *one* home, not a literal re-typed
+at N sites), **P2** (the boundary is an *explicit* port — the jax backends'
+edges, the SSOT `lowlatency` dispatcher's `device_put` — not a reach scattered
+through the hot loop), and **P7** (a cross-boundary fact — here the *device*
+boundary, not the *language* wire — is isolated and derived-from-one-home, never
+re-authored ad hoc). Isolating the crossings is what makes the **consolidation**
+the bench proved out (stage params once; one pull per microbatch) a *local* edit
+at the boundary rather than a tree-wide hunt — the same way the SSOT wire makes
+"swap the worker for C++" a drop-in.
+
+**The mechanism (ADR-0011 Rule 1 — this principle's enforcement surface, now
+upgraded for the cross-device boundary from review-only to a test/CI gate).**
+`tools/lint_host_device_transfers.py` is a **pure-`ast`** walker (imports neither
+jax nor any analyzed module — the host is reserved for timing-sensitive
+benchmarks) that flags transfer call-sites by name pattern and asserts each is at
+a boundary or grandfathered:
+
+- **Boundary** = an inline `# host-device-boundary: <reason>` marker on the
+  transfer's own line, **or** membership in a small named `BOUNDARY_MODULES`
+  whitelist (the jax backends `az/{mlp_jax,mlp_jax_train,optimizer,forward,
+  lowlatency}.py` and the dispatch micro-bench, whose declared job *is* the
+  device edge).
+- **Ratcheting baseline** (`tools/host_device_baseline.json`, mirroring
+  `tests/test_mypy_strict.py`'s `STRICT_CLEAN` monotonic ratchet, ADR-0011
+  Rule 1): TODAY's non-boundary transfers are grandfathered (keyed structurally
+  by `relpath::scope::kind` — ADR-0011 Rule 4, over the class of crossings, not a
+  churning line number). A NEW transfer not at a boundary and not baselined
+  **fails**; removing a baselined one **shrinks** the baseline (a stale entry
+  also fails, so the file can only monotonically decrease).
+- **Heuristic + opt-out (ADR-0011 Rule 3 measure-first / ADR-0008 vocabulary
+  precision).** The host→device jax names and `.block_until_ready()` are
+  *unambiguous* (jax-only — no false positive). The device→host pulls
+  (`np.asarray`/`np.array`/`float`/`int`/`bool`/`.tolist`/`.item`) are
+  *name-ambiguous* (the same call constructs numpy from a list or casts a Python
+  scalar), so they are flagged **only when the argument carries a static jax/
+  device signal** (a `forward`/`predict`/`device_put` call, or a device-residence
+  name like `x_dev`) — the canonical `np.asarray(forward_fn(...))` *is* caught
+  while the ~514 host-only scalar casts in the tree are *not* swept (netting them
+  would be the cargo-cult net ADR-0011's "Negative" warns is worse than none). An
+  inline `# host-device-allow: <reason>` marker silences a heuristic
+  false positive at the site. **The pytest hook is `tests/test_no_gratuitous_
+  transfers.py`** (always-on, pure `ast`, no jax import), with a negative/mutation
+  self-check proving a synthetic new transfer fails and the boundary marker
+  passes (mirroring `test_wire_drift.py` leg 2). The checker joins the mypy
+  `--strict` gate's `STRICT_CLEAN` set (P8).
+
+**Baseline at adoption (2026-06-20):** **3** grandfathered non-boundary
+device→host pulls (all genuine, all device-signaled) — `inference_server.py::
+run_microbatch::np.asarray` (the canonical offender), `netvalue_ismcts.py::
+NetValueISMCTS._leaf_value::float`, `feature_response.py::partial_dependence::
+float` — plus **38** transfer sites already at a designated boundary (the jax
+backends + the dispatch bench). The rule **grandfathers today's** sites;
+*consolidating* the biggest offender (`run_microbatch`'s input/output crossing —
+keep the input device-resident across the drain and batch the device→host pull)
+is the queued follow-on, not this record's scope.
+
+**Scope (ADR-0004 no-retroactive-sweep, unchanged).** This amendment adds a
+mechanism and grandfathers the existing crossings; it sweeps *nothing*. The
+consolidation the bench motivates is separate forward work. The enforcement-
+surface declaration in §"Self-application" for **P7** is hereby extended: P7 is
+now mechanized at the **test/CI-gate** level for the **cross-DEVICE** boundary
+(the AST lint + ratcheting baseline above), in addition to its existing
+cross-LANGUAGE surfaces (the runtime manifest for the dynamic weight layout, the
+`test_wire_drift.py` parity backstop for the static result format).
+
 ## License
 
 Public Domain (The Unlicense).

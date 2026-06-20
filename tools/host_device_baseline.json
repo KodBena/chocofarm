@@ -1,0 +1,9 @@
+{
+  "_comment": "Grandfathered host<->device transfer sites (ADR-0012 / tools/lint_host_device_transfers.py). Monotonically DECREASING: removing a transfer shrinks this; a NEW one not here and not at a boundary FAILS the gate. Regenerate with `python -m tools.lint_host_device_transfers --update-baseline`. Keys are (relpath::scope::kind) \u2014 structural, not line numbers.",
+  "count": 3,
+  "sites": [
+    "chocofarm/az/feature_response.py::partial_dependence::float",
+    "chocofarm/az/inference_server.py::run_microbatch::np.asarray",
+    "chocofarm/az/netvalue_ismcts.py::NetValueISMCTS._leaf_value::float"
+  ]
+}

@@ -149,6 +149,13 @@ STRICT_CLEAN = [
     "chocofarm/eval/eval_faces.py",
     "chocofarm/eval/eval_decomp.py",
     "chocofarm/eval/tb_runner.py",
+    # --- tooling: the mechanized linters (pure stdlib, strict-clean by construction) ---
+    # The host<->device transfer lint (ADR-0012 hygiene gate; tools/lint_host_device_transfers.py +
+    # tests/test_no_gratuitous_transfers.py). It is stdlib-`ast`-only (no jax, no analyzed-module import),
+    # so it joins the gate cleanly as a typed, deferred-boundary-free module — the ADR-0011 Rule-2
+    # conversion that lands a new mechanism already typed (P8). The CLI parses path args, so explicit-file
+    # invocation checks it despite the config's `files = ["chocofarm"]` scope.
+    "tools/lint_host_device_transfers.py",
 ]
 
 
