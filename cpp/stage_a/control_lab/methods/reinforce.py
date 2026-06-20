@@ -14,6 +14,16 @@ is well-conditioned in a run that is only hundreds-to-thousands of forwards over
 challenge — convergence in the budget — is why the model is kept linear and the optax step is BATCHED, never
 a backward every forward).
 
+JAX FOR THE GRADIENT, NUMPY FOR THE HOT DECISION (the lab-server reality). This controller runs IN the
+eval-server process, alongside that process's own JAX inference server, under an XLA single-thread pin, and the
+gate decision is SYNCHRONOUS on the per-forward boundary with a hard 50ms watchdog. A jax forward on THAT path
+is the wrong tool: its first call cold-compiles (blowing the deadline), it re-traces on a changing T, and it
+shares the device with the inference server. So the per-forward act() POLICY FORWARD is done in NUMPY from a
+NUMPY MIRROR of the policy params (a cheap O(T*d) matvec, d=5) — no jax on the hot tick at all — while the
+LEARNING (the optax adam step) keeps jax, runs DECIMATED (once per N forwards, off the hot path), and the new
+params are EXPORTED back to the numpy mirror after each step. jax for the gradient; numpy for the decision.
+This is the same pure-numpy hot path every non-RL method in this package uses; only the gradient is jax.
+
 Mechanism (features -> stochastic gate). Each forward, per thread t, a 5-d feature row phi[t] is read off the
 wire (D = ctx.d_ceiling, K = ctx.k_per_thread — the capacity normalizers the feature wire omits):
 
@@ -27,8 +37,9 @@ The policy is the shared linear-logistic map (theta is a 5-vector, the bias weig
 
     logit[t] = theta · phi[t]            p[t] = sigmoid(logit[t])            a[t] ~ Bernoulli(p[t])
 
-so a[t]=1 means ALLOW. The forward (logit -> prob -> sampled action -> log-prob) is JIT-compiled and is the
-ONLY work on the per-forward critical path; it is O(T*d) with d=5, well inside the 50ms per-decision deadline.
+so a[t]=1 means ALLOW. The forward (logit -> prob -> sampled action) is a NUMPY matvec + a numpy Bernoulli draw
+and is the ONLY work on the per-forward critical path; it is O(T*d) with d=5, well inside the deadline, and
+NEVER touches jax (so it cannot cold-compile, re-trace, or contend the inference device).
 
 Cold start = allow-leaning baseline (the RL analog of the bandit's all-allow anchor arm). theta is zero EXCEPT
 the bias weight, initialized to `init_allow_logit` (>0), so the cold policy samples allow with high probability
@@ -59,7 +70,12 @@ so the gradient reinforces an action only insofar as its forward beat the averag
 baseline, which removes the reward's magnitude/scale from the gradient and sharply lowers its variance without
 biasing it. The optax step (the only backward) is JIT-compiled and runs once per N forwards on the small batch;
 the buffer is cleared after each step (Monte-Carlo on the recent trajectory, the appropriate horizon for a
-short non-stationary run). gradient ASCENT = descend the NEGATED objective (optax minimizes).
+short non-stationary run). gradient ASCENT = descend the NEGATED objective (optax minimizes). After each step
+the updated jax params are EXPORTED to the numpy mirror the hot path reads.
+
+JIT warmup (reset, off the timed path). The optax step is JIT-compiled on a DUMMY fixed-shape batch during
+reset() — BEFORE the wall box opens and BEFORE the first real update — so the first real learning step pays no
+cold-compile spike on the serve thread. The hot act() is numpy and never compiles at all.
 
 Wire subtlety (honored). coalesce_degree_inst first-differences the CUMULATIVE counters msgs and leaves.
 lab_server builds each length-T feature list fresh as [0]*T and fills ONLY the served tids, so a thread ABSENT
@@ -70,12 +86,21 @@ baseline is not touched. An un-baselined or quiet thread reads coalesce_degree_i
 message — the neutral "no coalescing measured yet" value). The other features are read from INSTANTANEOUS
 gauges (ready, inflight), never differenced, so a sentinel-0 there is a harmless zero, not a fabricated delta.
 
-RL family: reset() COLD-STARTS the learner (re-initializes theta + the adam moment state, clears the trajectory
-buffer, the pending transition, the running-mean baseline, and the first-difference baselines) — nothing
-survives a trial. observe() attaches the realized reward and, every N forwards, drives the optax ascent step.
-act() samples the gate from the CURRENT policy. metrics() exposes the mean allow probability, the last gradient
-norm, the baseline b, and the update count. Knobs: lr, update period N, hidden size (0 = linear; >0 = one
-hidden tanh layer of that width), the cold-start allow logit, and the optional advantage standardization.
+Live-T robustness (the lab server grows T past the trial ctx). The server LAZILY grows its gate-vector length
+when a served tid exceeds the reset-time n_threads (lab_server._serve_batch), and it calls reset() OUTSIDE its
+lock while the serve thread is already acting — so act() can be entered on a thread whose tid exceeds the
+per-thread arrays' current length, or even mid-reset. Every per-thread array is therefore GROWN-ON-DEMAND to
+the live T at the top of act() (and the numpy params mirror is always present, set in __init__), so the hot
+path is total under both a grown T and a concurrent reset (ADR-0002: the watchdog owns loudness; the hot path
+stays well-defined and never throws).
+
+RL family: reset() COLD-STARTS the learner (re-initializes theta + the adam moment state, refreshes the numpy
+mirror, JIT-warms the update step, clears the trajectory buffer, the pending transition, the running-mean
+baseline, and the first-difference baselines) — nothing survives a trial. observe() attaches the realized
+reward and, every N forwards, drives the optax ascent step. act() samples the gate from the CURRENT policy via
+the numpy mirror. metrics() exposes the mean allow probability, the last gradient norm, the baseline b, and the
+update count. Knobs: lr, update period N, hidden size (0 = linear; >0 = one hidden tanh layer of that width),
+the cold-start allow logit, and the optional advantage standardization.
 
 Run the unit gate pinned + bounded:
     PYTHONPATH=cpp/stage_a /home/bork/w/vdc/venvs/generic/bin/python -m pytest tests/test_method_reinforce.py -q
@@ -108,9 +133,10 @@ _D_IN = len(_FEATURES)  # 5; the policy's input dimension, derived from the layo
 
 
 # ----------------------------------------------------------------------------- JIT'd policy core (pure)
-# The hot path. These are module-level pure functions so JAX caches ONE compiled artifact across instances of
-# the same (hidden,) static shape, rather than re-tracing per controller. `hidden` is a static argument (it
-# changes the net's structure / parameter pytree), so a trace is keyed on it.
+# The LEARNING path only (jax.grad + optax). These are module-level pure functions so JAX caches ONE compiled
+# artifact across instances of the same (hidden,) static shape, rather than re-tracing per controller. `hidden`
+# is a static argument (it changes the net's structure / parameter pytree), so a trace is keyed on it. NB: NONE
+# of these run on the per-forward critical path — the hot decision is the numpy forward below.
 
 
 def _init_params(key: "jax.Array", hidden: int, init_allow_logit: float) -> dict[str, "jax.Array"]:
@@ -136,24 +162,11 @@ def _init_params(key: "jax.Array", hidden: int, init_allow_logit: float) -> dict
 
 def _logits(params: dict[str, "jax.Array"], phi: "jax.Array", hidden: int) -> "jax.Array":
     """Per-thread allow logit from the shared policy. phi is (T, d_in). Linear: phi @ w + b. Hidden: a single
-    tanh layer then a linear read-out. Returns (T,)."""
+    tanh layer then a linear read-out. Returns (T,). Used INSIDE the loss (the gradient path) only."""
     if hidden <= 0:
         return phi @ params["w"] + params["b"]
     h = jnp.tanh(phi @ params["w1"] + params["b1"])  # (T, hidden)
     return h @ params["w2"] + params["b2"]            # (T,)
-
-
-@partial(jax.jit, static_argnames=("hidden",))
-def _act_forward(
-    params: dict[str, "jax.Array"], phi: "jax.Array", key: "jax.Array", hidden: int
-) -> tuple["jax.Array", "jax.Array"]:
-    """JIT'd policy forward on the per-forward critical path: logits -> probs -> Bernoulli SAMPLE. Returns
-    (probs (T,), sampled_actions (T,) in {0,1}). Sampling here IS the exploration; the heavy optax step is the
-    separate periodic batch update, never on this path."""
-    p = jax.nn.sigmoid(_logits(params, phi, hidden))
-    u = jax.random.uniform(key, p.shape, dtype=p.dtype)
-    a = (u < p).astype(jnp.float32)  # Bernoulli(p): allow with probability p
-    return p, a
 
 
 def _neg_reinforce_loss(
@@ -185,7 +198,7 @@ def _make_update_step(tx: optax.GradientTransformation, hidden: int) -> Any:
     `tx.init` as an abstract array). The returned closure (params, opt_state, phi, act, mask, adv) ->
     (new_params, new_opt_state, grad_norm) takes the grad of the negated objective and applies one update; the
     global grad norm is surfaced as a learning-health metric. The whole step is the periodic batch update; it
-    is NOT on the per-forward critical path."""
+    is NOT on the per-forward critical path (it runs decimated, off the hot tick)."""
 
     @jax.jit
     def _step(
@@ -211,8 +224,9 @@ class ReinforceGate:
     sigmoid -> Bernoulli SAMPLE is the per-thread gate (sampling = exploration). Each forward is one (s, a, r)
     transition (parameter-sharing: T samples / forward); the realized PER-FORWARD reward (forward_rows, higher
     is better) drives an optax adam ASCENT step taken EVERY N forwards on the accumulated batch, maximizing
-    E[(R - b) * sum log pi] with a running-mean baseline b. The JIT'd policy forward is the only per-forward
-    work (O(T*d), d=5); the batched optax step is the periodic update. inflight==0 force-allows AND masks that
+    E[(R - b) * sum log pi] with a running-mean baseline b. The per-forward forward is a NUMPY matvec from a
+    numpy mirror of theta (O(T*d), d=5) — jax never touches the hot path; the batched optax step (jax) is the
+    periodic, decimated update and exports its result to the mirror. inflight==0 force-allows AND masks that
     thread's log-prob out of the gradient (a forced no-op carries no credit). Cold-started each trial."""
 
     family: Family = "rl"
@@ -258,6 +272,13 @@ class ReinforceGate:
         self._k = 1
         self._params: dict[str, "jax.Array"] = {}
         self._opt_state: optax.OptState = None  # type: ignore[assignment]
+        # NUMPY MIRROR of the policy params — the ONLY thing the hot path reads. Always present (set here AND
+        # at reset()/each update), so a concurrent reset never leaves act() reading a missing key. Cold-init
+        # to the allow-leaning constant logit (w=0, b=init_logit) so even a pre-reset act is the safety floor.
+        self._np_params: dict[str, np.ndarray] = _init_np_params(self._hidden, self._init_logit)
+        # the hot-path Bernoulli RNG is a plain numpy Generator (reseeded from ctx.seed in reset); the jax key
+        # below is used ONLY for the (off-hot-path) param init.
+        self._rng = np.random.default_rng(0)
         self._key = jax.random.PRNGKey(0)
         # trajectory buffer of COMPLETED transitions (reward attached), drained every N forwards.
         self._phi_buf: list[np.ndarray] = []     # each (T, d_in)
@@ -281,17 +302,35 @@ class ReinforceGate:
 
     def reset(self, ctx: TrialContext) -> None:
         """COLD-START a fresh trial: capture the geometry (T, D, K) the features need, RE-INITIALIZE the policy
-        params + the adam moment state (nothing learned survives a trial), and clear the trajectory buffer, the
-        pending transition, the baseline accumulator, and the first-difference baselines. The RNG is reseeded
-        from ctx.seed so a trial's sampling is reproducible per the lab's seed."""
+        params + the adam moment state (nothing learned survives a trial), refresh the NUMPY MIRROR the hot path
+        reads, JIT-WARM the optax step on a dummy batch (so the first real update pays no cold compile on the
+        serve thread), and clear the trajectory buffer, the pending transition, the baseline accumulator, and
+        the first-difference baselines. The RNG is reseeded from ctx.seed so a trial's sampling is reproducible
+        per the lab's seed.
+
+        Order note (ADR-0002, the lab-server race): set_trial calls this OUTSIDE its lock while the serve thread
+        may already be acting, so the per-thread arrays + the numpy mirror are published as the LAST writes,
+        each a single atomic rebind; an act() that interleaves reads either the prior trial's consistent state
+        or the freshly-published one, never a torn half. (act() also grows the arrays on demand, so even a
+        smaller prior length is safe.)"""
         self._t = int(ctx.n_threads)
         self._d_ceil = max(1, int(ctx.d_ceiling))
         self._k = max(1, int(ctx.k_per_thread))
-        # reseed the policy/sampling RNG from the trial seed (reproducible exploration).
-        self._key = jax.random.PRNGKey(int(ctx.seed) & 0x7FFFFFFF)
+        # reseed both RNGs from the trial seed (reproducible exploration + reproducible param init).
+        seed = int(ctx.seed) & 0x7FFFFFFF
+        self._key = jax.random.PRNGKey(seed)
         self._key, init_key = jax.random.split(self._key)
-        self._params = _init_params(init_key, self._hidden, self._init_logit)
-        self._opt_state = self._tx.init(self._params)
+        params = _init_params(init_key, self._hidden, self._init_logit)
+        opt_state = self._tx.init(params)
+        # PUBLISH the valid initialized params + an EMPTY buffer FIRST, BEFORE the (GIL-releasing) warmup
+        # compile below. set_trial calls reset() outside its lock while the serve thread runs observe()/act();
+        # observe() can fire _train_on_batch() which reads self._params — so self._params must be a valid pytree
+        # (never the stale {} or a torn half) the instant the trial goes active, and the buffer must be empty so
+        # no stale transition from the prior trial drives a step against the fresh params (ADR-0002: the learner
+        # stays well-defined under the concurrent reset).
+        self._params = params
+        self._opt_state = opt_state
+        self._rng = np.random.default_rng(seed)
         self._phi_buf = []
         self._act_buf = []
         self._mask_buf = []
@@ -299,12 +338,29 @@ class ReinforceGate:
         self._pending = None
         self._b_sum = 0.0
         self._b_cnt = 0
-        self._msgs_prev = np.zeros(self._t, dtype=np.int64)
-        self._leaves_prev = np.zeros(self._t, dtype=np.int64)
-        self._seen = np.zeros(self._t, dtype=bool)
         self._updates = 0
         self._last_grad_norm = 0.0
         self._last_mean_prob = float(_sigmoid(self._init_logit))
+        # JIT-warm the optax step at the EXACT (N, T, d_in) batch shape every real update uses (the batch is a
+        # FIXED window of the last N transitions — see _train_on_batch), off the timed path, so the first real
+        # update on the serve thread hits the cached executable instead of cold-compiling (the slow_act cause)
+        # or re-tracing on a changing B. A zero-advantage dummy yields a zero-gradient no-op step; its result is
+        # DISCARDED so the published params/opt_state stay pristine.
+        Tw = max(1, self._t)
+        Bw = self._n
+        _wp, _ws, _wg = self._update_step(
+            params, opt_state,
+            jnp.zeros((Bw, Tw, _D_IN), dtype=jnp.float32),
+            jnp.zeros((Bw, Tw), dtype=jnp.float32),
+            jnp.zeros((Bw, Tw), dtype=jnp.float32),
+            jnp.zeros((Bw,), dtype=jnp.float32),
+        )
+        jax.block_until_ready(_wg)   # force the compile to complete now, not lazily on the first real step.
+        # PUBLISH the numpy mirror + the sized per-thread arrays LAST (each an atomic single rebind).
+        self._np_params = _params_to_numpy(self._params, self._hidden)
+        self._msgs_prev = np.zeros(self._t, dtype=np.int64)
+        self._leaves_prev = np.zeros(self._t, dtype=np.int64)
+        self._seen = np.zeros(self._t, dtype=bool)
 
     def observe(self, reward: float, info: Mapping[str, Any]) -> None:
         """Attach the realized PER-FORWARD reward to the PENDING transition (the contract's reward-of-previous-
@@ -336,12 +392,15 @@ class ReinforceGate:
 
     def act(self, obs: Observation) -> Sequence[int]:
         """Advance the served-thread first-difference baselines, build the per-thread feature rows phi, run the
-        JIT'd policy forward (logits -> probs -> Bernoulli SAMPLE), apply the inflight==0 liveness override, and
-        STASH the sampled transition as pending (the next observe attaches its reward). Cheap: one JIT'd O(T*d)
-        forward, no gradient. Non-throwing — defaulted reads keep a malformed/short feature frame safe (the
-        watchdog owns loudness on the hot path, ADR-0002)."""
+        NUMPY policy forward (logits -> probs -> Bernoulli SAMPLE) from the numpy params mirror, apply the
+        inflight==0 liveness override, and STASH the sampled transition as pending (the next observe attaches its
+        reward). Cheap: one O(T*d) numpy matvec, NO jax, NO gradient. Non-throwing — the per-thread arrays are
+        grown to the live T on demand (the lab server can grow T past reset, and reset runs outside its lock),
+        and defaulted reads keep a malformed/short feature frame safe (the watchdog owns loudness on the hot
+        path, ADR-0002)."""
         T = self._t
         feats = obs.features
+        self._ensure_capacity(T)   # live-T robustness: grow the per-thread arrays before any indexed read.
         inflight = _fit(np.asarray(feats.get("inflight", ()), dtype=np.float64), T)
         ready = _fit(np.asarray(feats.get("ready", ()), dtype=np.float64), T)
         msgs = _fit(np.asarray(feats.get("msgs", ()), dtype=np.float64), T).astype(np.int64)
@@ -351,11 +410,12 @@ class ReinforceGate:
         coalesce = self._coalesce(msgs, leaves, served, T)
         phi = self._build_phi(inflight, ready, coalesce)  # (T, d_in) float32
 
-        # JIT'd policy forward: probabilities + a Bernoulli sample per thread (the exploration).
-        self._key, sub = jax.random.split(self._key)
-        probs, sampled = _act_forward(self._params, jnp.asarray(phi), sub, self._hidden)
-        sampled_np = np.asarray(sampled, dtype=np.float64)   # (T,) in {0,1}
-        self._last_mean_prob = float(np.asarray(probs, dtype=np.float64).mean()) if T else 0.0
+        # NUMPY policy forward: probabilities + a Bernoulli sample per thread (the exploration). The mirror is
+        # snapshotted by reference once (an atomic read) so a concurrent update/reset cannot tear it mid-matvec.
+        probs = _np_policy_probs(self._np_params, phi, self._hidden)   # (T,) float64
+        u = self._rng.random(T)
+        sampled_np = (u < probs).astype(np.float64)                    # Bernoulli(p): allow with probability p
+        self._last_mean_prob = float(probs.mean()) if T else 0.0
 
         # liveness override (DENY-ONLY semantics): inflight==0 is an UNGATED forced flush -> a deny is a no-op,
         # force allow. active[t] = the thread actually acted (inflight>0) -> only those carry credit (the
@@ -385,6 +445,19 @@ class ReinforceGate:
         }
 
     # ---------------------------------------------------------------- internals
+
+    def _ensure_capacity(self, T: int) -> None:
+        """Grow the per-thread first-difference baselines to at least length T (the lab server can serve a tid
+        beyond the reset-time n_threads, and calls reset() outside its lock so act() may run on a not-yet-sized
+        array). New slots are un-seen with zero baselines — exactly the cold first-difference state, so a
+        grown thread is treated as never-baselined (its first delta is the neutral 1.0). Idempotent + cheap
+        (a no-op once sized)."""
+        if self._seen.shape[0] >= T:
+            return
+        grow = T - self._seen.shape[0]
+        self._msgs_prev = np.concatenate([self._msgs_prev, np.zeros(grow, dtype=np.int64)])
+        self._leaves_prev = np.concatenate([self._leaves_prev, np.zeros(grow, dtype=np.int64)])
+        self._seen = np.concatenate([self._seen, np.zeros(grow, dtype=bool)])
 
     def _coalesce(self, msgs: np.ndarray, leaves: np.ndarray, served: list[int], T: int) -> np.ndarray:
         """Served-thread first-difference of the CUMULATIVE counters -> instantaneous coalescing degree
@@ -418,14 +491,23 @@ class ReinforceGate:
         return phi.astype(np.float32)                          # (T, d_in)
 
     def _train_on_batch(self) -> None:
-        """The PERIODIC optax (adam) ASCENT step: stack the buffered transitions, form the advantage
-        A_f = R_f - b (running-mean baseline; optionally standardized for scale-stability), run the JIT'd
-        update step, record the grad norm, and CLEAR the buffer (Monte-Carlo on the recent trajectory). Total
-        and defensive — a degenerate batch (all-zero advantage) yields a zero gradient, never a throw."""
-        phi = jnp.asarray(np.stack(self._phi_buf, axis=0))     # (B, T, d_in)
-        act = jnp.asarray(np.stack(self._act_buf, axis=0))     # (B, T)
-        mask = jnp.asarray(np.stack(self._mask_buf, axis=0))   # (B, T)
-        rew = np.asarray(self._rew_buf, dtype=np.float32)      # (B,)
+        """The PERIODIC (decimated) optax (adam) ASCENT step on a FIXED window of the last N transitions: stack
+        those N, form the advantage A_f = R_f - b (running-mean baseline; optionally standardized for
+        scale-stability), run the JIT'd update step (jax — off the per-forward hot path), record the grad norm,
+        EXPORT the new params to the numpy mirror the hot path reads, and CLEAR the buffer (Monte-Carlo on the
+        recent trajectory). The batch is pinned to EXACTLY N rows (the most recent N — the buffer is drained
+        each step so it holds ~N, but a concurrent-reset race could leave it short or long) so the jit'd step
+        sees ONE fixed (N, T, d_in) shape and never re-traces on the serve thread (the slow_act cause); the
+        reset() warmup compiles that exact shape. Total and defensive — too-few transitions to fill the window
+        is a no-op (the step needs its fixed batch); an all-zero advantage yields a zero gradient, never a
+        throw."""
+        N = self._n
+        if len(self._rew_buf) < N:
+            return   # not a full fixed-N window yet (a concurrent reset drained it) — skip; never a torn stack.
+        phi = jnp.asarray(np.stack(self._phi_buf[-N:], axis=0))     # (N, T, d_in)  fixed-N window
+        act = jnp.asarray(np.stack(self._act_buf[-N:], axis=0))     # (N, T)
+        mask = jnp.asarray(np.stack(self._mask_buf[-N:], axis=0))   # (N, T)
+        rew = np.asarray(self._rew_buf[-N:], dtype=np.float32)      # (N,)
         b = self._b_sum / self._b_cnt if self._b_cnt else 0.0
         adv = rew - np.float32(b)
         if self._standardize:
@@ -439,6 +521,8 @@ class ReinforceGate:
         )
         self._last_grad_norm = float(gnorm)
         self._updates += 1
+        # EXPORT to the numpy mirror (a single atomic rebind) so the next act() forward sees the new policy.
+        self._np_params = _params_to_numpy(self._params, self._hidden)
         # clear the buffer: REINFORCE is Monte-Carlo on the just-collected trajectory.
         self._phi_buf.clear()
         self._act_buf.clear()
@@ -457,6 +541,51 @@ class ReinforceGate:
 def _sigmoid(z: float) -> float:
     """Plain scalar sigmoid for the cold-start metric (no JAX round-trip needed for one float)."""
     return 1.0 / (1.0 + np.exp(-z))
+
+
+def _sigmoid_np(z: np.ndarray) -> np.ndarray:
+    """Vectorized numerically-stable sigmoid on the hot path (no jax). The branchless stable form avoids
+    overflow for large |z| (exp of a positive argument only)."""
+    out = np.empty_like(z)
+    pos = z >= 0.0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[~pos])
+    out[~pos] = ez / (1.0 + ez)
+    return out
+
+
+def _init_np_params(hidden: int, init_allow_logit: float) -> dict[str, np.ndarray]:
+    """The cold numpy mirror (matching _init_params' cold state) — present from __init__ so the hot path always
+    has params to read even before the first reset. Linear: w=0, b=init_logit. Hidden: zero output read-out so
+    the cold logit is the constant init_logit regardless of the (here zeroed) first layer."""
+    if hidden <= 0:
+        return {"w": np.zeros(_D_IN, dtype=np.float32),
+                "b": np.float32(init_allow_logit)}
+    return {"w1": np.zeros((_D_IN, hidden), dtype=np.float32), "b1": np.zeros(hidden, dtype=np.float32),
+            "w2": np.zeros(hidden, dtype=np.float32), "b2": np.float32(init_allow_logit)}
+
+
+def _params_to_numpy(params: dict[str, "jax.Array"], hidden: int) -> dict[str, np.ndarray]:
+    """Export the jax policy params to a fresh numpy dict (the hot-path mirror). One device->host copy per
+    optax step / reset — off the per-forward path. The matvec on these arrays is the per-forward forward."""
+    if hidden <= 0:
+        return {"w": np.asarray(params["w"], dtype=np.float32),
+                "b": np.float32(np.asarray(params["b"], dtype=np.float32))}
+    return {"w1": np.asarray(params["w1"], dtype=np.float32), "b1": np.asarray(params["b1"], dtype=np.float32),
+            "w2": np.asarray(params["w2"], dtype=np.float32), "b2": np.asarray(params["b2"], dtype=np.float32)}
+
+
+def _np_policy_probs(np_params: dict[str, np.ndarray], phi: np.ndarray, hidden: int) -> np.ndarray:
+    """The per-forward NUMPY policy forward: per-thread allow PROBABILITY p[t] = sigmoid(logit[t]) from the
+    numpy params mirror. phi is (T, d_in); returns (T,) float64. Linear: phi @ w + b. Hidden: one tanh layer
+    then a linear read-out — the numpy twin of _logits. O(T*d), no jax (so no cold compile, no re-trace, no
+    device contention on the synchronous per-forward path)."""
+    if hidden <= 0:
+        logit = phi.astype(np.float64) @ np_params["w"].astype(np.float64) + float(np_params["b"])
+    else:
+        h = np.tanh(phi.astype(np.float64) @ np_params["w1"].astype(np.float64) + np_params["b1"].astype(np.float64))
+        logit = h @ np_params["w2"].astype(np.float64) + float(np_params["b2"])
+    return _sigmoid_np(logit)
 
 
 def _fit(x: np.ndarray, t: int) -> np.ndarray:

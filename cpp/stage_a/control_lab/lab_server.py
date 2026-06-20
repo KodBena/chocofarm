@@ -145,9 +145,19 @@ class LabServer(StageAServer):
         server appends each forward's (obs, action, reward) into for this trial — None disables the sink
         (a pure-timing run). The harness builds ONE buffer per trial and encodes it after the wall box.
         Called between trials WITHOUT tearing down the server (warm pool persists). A reset() that throws is
-        the method's failure, surfaced loudly to the harness (ADR-0002)."""
+        the method's failure, surfaced loudly to the harness (ADR-0002).
+
+        ORDER (ADR-0002, the un-reset-controller race): the new controller is RESET FIRST — outside the lock,
+        while the PRIOR controller is still the active one serving forwards — and only then ATOMICALLY swapped
+        in + activated under the lock. The previous code activated (self._controller=…, self._trial_active=True)
+        BEFORE reset(), so the serve thread could grab the brand-new, UN-RESET instance and drive its raw
+        __init__ state (e.g. an RL learner's empty param pytree) for many forwards before reset() ran — a
+        per-decision malfunction storm (act_raised/slow_act) that was the method's only on-wire failure. Resetting
+        before activation keeps reset() off the lock (a non-trivial reset must not freeze the snapshot path) AND
+        guarantees the serve thread only ever sees a fully-reset controller."""
+        controller.reset(ctx)   # FIRST, outside the lock: the method's own reset (may be non-trivial / slow)
         with self._lock:
-            self._controller = controller
+            self._controller = controller   # swap in the now-RESET controller atomically
             self._trial_ctx = ctx
             self._trial_active = True
             self._n_threads = int(ctx.n_threads)
@@ -162,7 +172,6 @@ class LabServer(StageAServer):
             self._forward_rows_acc = 0
             self._forwards_in_trial = 0
             self._traj = trajectory   # swap the per-trial sink (None -> no (s,a,r) logging this trial)
-        controller.reset(ctx)   # outside the lock: the method's own reset (may be non-trivial)
 
     def detach_trajectory(self) -> Any | None:
         """Atomically detach the per-trial trajectory sink: swap self._traj to None under the lock and
