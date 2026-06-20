@@ -51,7 +51,7 @@ corpora by `lab_session.regime` and never mixes throughputs across the forward-p
 Usage:
     python lab_harness.py [--methods all_allow,ready_threshold2,malfunctioning]
                           [--secs 4.0 --hidden 256 --m 24 --n-sims 256 --max-batch 512 --e-policy padmax
-                           --pool-batch 192 --producer-threads 3 --inflight-msgs 8 --pool-plies 24
+                           --pool-batch 192 --trees-per-thread 1 --producer-threads 3 --inflight-msgs 8 --pool-plies 24
                            --decision-deadline-ms 50 --sample-hz 20 --out <dir>]
 
 Public Domain (The Unlicense).
@@ -115,7 +115,7 @@ PRODUCER_CORES = "1,2,3"
 #
 #   <out>/lab_session-<stamp>.json   — the session record:
 #     { "schema_version": 1,
-#       "session": { run, stamp, secs, hidden, m, n_sims, pool_batch, producer_threads, inflight_msgs,
+#       "session": { run, stamp, secs, hidden, m, n_sims, pool_batch, trees_per_thread, producer_threads, inflight_msgs,
 #                    pool_plies, decision_deadline_ms, n_threads(T), server_core, producer_cores,
 #                    reward_fn, e_policy(padmax|bucket), regime(post-staging|pre-staging), methods:[...] },
 #       "trials": [ TRIAL_RECORD, ... ] }
@@ -182,8 +182,9 @@ def start_server(src, endpoint: str, max_batch: int, decision_deadline_s: float,
 
 
 def launch_producer(endpoint: str, run: str, version: int, threads: int, pool_batch: int,
-                    inflight: int, gc_m: int, n_sims: int, pool_plies: int, total_decisions: int,
-                    log_path: str, producer_cores: str, chunk_floor: bool, s_min: int) -> subprocess.Popen:
+                    trees: int, inflight: int, gc_m: int, n_sims: int, pool_plies: int,
+                    total_decisions: int, log_path: str, producer_cores: str,
+                    chunk_floor: bool, s_min: int) -> subprocess.Popen:
     """Launch ONE CONTINUOUS C++ producer under taskset -c <producer_cores>. --sweep-configs with a single config is
     the path that builds the warm pool ONCE and wires the IssueController; --lab-decision 1 rides features
     + actuates the gate off the reply. --measure-decisions is set huge so the single config streams for the
@@ -206,13 +207,14 @@ def launch_producer(endpoint: str, run: str, version: int, threads: int, pool_ba
         "--wire-mode", "pipelined-bucket",
         "--m", str(gc_m), "--n-sims", str(n_sims),
         "--pool-threads", str(threads), "--pool-batch", str(pool_batch),
+        "--trees-per-thread", str(trees),
         "--inflight-msgs", str(inflight),
         "--sweep-configs", sweep,
         "--lab-decision", "1",
         "--measure-decisions", str(total_decisions),
         "--settle-decisions", "0",
         "--pool-plies", str(pool_plies),
-        "--warmup-decisions", str(max(2000, pool_batch * 4)),
+        "--warmup-decisions", str(max(2000, pool_batch * max(1, trees) * 4)),
     ]
     logf = open(log_path, "w")
     logf.write(f"# producer cmd: {' '.join(cmd)}\n")
@@ -416,14 +418,30 @@ def main() -> int:
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--m", type=int, default=24)
     ap.add_argument("--n-sims", type=int, default=256)
-    ap.add_argument("--max-batch", type=int, default=512)
+    ap.add_argument("--max-batch", type=int, default=512,
+                    help="the INFERENCE batch width — the server's MLP forward width cap, the THIRD geometry "
+                         "axis and the one correctly named 'batch' (distinct from the generator's --pool-batch "
+                         "concurrency knob). The serve fast region is B≈192 (cpp-eval-transport-adapter.md); "
+                         "padmax pads every forward to this. Default %(default)s.")
     ap.add_argument("--e-policy", choices=("padmax", "bucket"), default="padmax",
                     help="server pad policy = the throughput REGIME (lab-staging-divergence-rca.md §6 #4). "
                          "padmax (default): pad every forward to max_batch -> the lab adopts production's "
                          "device-resident STAGED forward (the POST-staging, production-aligned regime). "
                          "bucket: snap to {64,256,512} -> the historical UN-STAGED bench (PRE-staging). The "
                          "regime is DERIVED from this (egressed to postgres as the offline-RL partition key).")
-    ap.add_argument("--pool-batch", type=int, default=192)
+    ap.add_argument("--pool-batch", type=int, default=192,
+                    help="the GENERATOR fiber BASE B (NOT the inference batch — that is --max-batch). The "
+                         "per-thread base fiber count is ⌈B/threads⌉; the producer's TOTAL in-flight slots = "
+                         "threads × --trees-per-thread × ⌈B/threads⌉. Despite the name this is a CONCURRENCY "
+                         "knob, not a forward width — the two share the word 'batch' but are different axes. "
+                         "Default %(default)s.")
+    ap.add_argument("--trees-per-thread", type=int, default=1,
+                    help="the OVERCOMMIT MULTIPLIER N (producer --trees-per-thread): concurrent search trees "
+                         "per producer thread, each contributing ⌈--pool-batch/threads⌉ in-flight fibers, so "
+                         "total slots = threads × N × ⌈pool_batch/threads⌉. THIS is the lever that fills the "
+                         "serve fast region (overcommit_sweep found N≈9 ⇒ 594 slots ⇒ ~187 dps; N=1 ⇒ "
+                         "~baseline). Default 1 = NO overcommit (the historical lab default that left it "
+                         "slot-starved at ~192 slots).")
     ap.add_argument("--producer-threads", type=int, default=3)
     ap.add_argument("--inflight-msgs", type=int, default=8)
     ap.add_argument("--chunk-floor", action="store_true",
@@ -528,11 +546,16 @@ def main() -> int:
     est_session_s = len(specs) * a.secs + a.warmup_grace_s + 30.0
     huge_budget = 1_000_000_000
     prod_log = os.path.join(a.out, f"producer-{stamp}.log")
-    producer = launch_producer(endpoint, run, version, T, a.pool_batch, a.inflight_msgs, a.m,
-                               a.n_sims, a.pool_plies, huge_budget, prod_log, producer_cores_str,
-                               a.chunk_floor, a.s_min)
+    producer = launch_producer(endpoint, run, version, T, a.pool_batch, a.trees_per_thread,
+                               a.inflight_msgs, a.m, a.n_sims, a.pool_plies, huge_budget, prod_log,
+                               producer_cores_str, a.chunk_floor, a.s_min)
     print(f"[lab] producer launched (pid={producer.pid}) -> streaming continuously over ONE warm pool; "
           f"log={prod_log}", flush=True)
+    _kbase = max(1, -(-a.pool_batch // T))
+    _slots = T * max(1, a.trees_per_thread) * _kbase
+    print(f"[lab] geometry: {T} threads × trees={a.trees_per_thread} × K_base=⌈{a.pool_batch}/{T}⌉={_kbase} "
+          f"= {_slots} in-flight slots | max_batch={a.max_batch} inference width "
+          f"(serve fast region B≈192; overcommit_sweep N=9 ≡ 594 slots → ~187 dps)", flush=True)
 
     # Wait for the producer's pool build + the first LAB forwards to flow (warmup paid ONCE here). We detect
     # it by the server's cumulative-decision counter beginning to climb. Fail loud if the producer dies or
@@ -543,7 +566,7 @@ def main() -> int:
     # chunk_floor/s_min onto every lab_trial row (lab_store denormalizes ctx.chunk_floor/ctx.s_min) — a
     # depth>1 corpus is then cleanly separable from the depth-1 one by (regime, chunk_floor, s_min).
     ctx = TrialContext(n_threads=T, d_ceiling=a.inflight_msgs,
-                       k_per_thread=max(1, -(-a.pool_batch // T)), s_min=a.s_min,
+                       k_per_thread=max(1, a.trees_per_thread * (-(-a.pool_batch // T))), s_min=a.s_min,
                        chunk_floor=a.chunk_floor, seed=7919)
 
     # --- postgres egress: connect ONCE up front + ensure the schema + insert the session row, so a DB
@@ -556,7 +579,8 @@ def main() -> int:
         lab_store.ensure_schema(pg_conn)
         net_json = {"in_dim": in_dim, "n_actions": n_actions, "hidden": a.hidden, "seed": 17,
                     "residual": False, "m": a.m, "n_sims": a.n_sims}
-        warm_pool_json = {"pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
+        warm_pool_json = {"pool_batch": a.pool_batch, "trees_per_thread": a.trees_per_thread,
+                          "producer_threads": T, "inflight_msgs": a.inflight_msgs,
                           "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms,
                           "server_core": str(server_core), "producer_cores": producer_cores_str,
                           "k_per_thread": ctx.k_per_thread, "s_min": ctx.s_min,
@@ -661,7 +685,8 @@ def main() -> int:
     # and-suspenders, the local artifact the dashboard already streams) ----
     session = {
         "run": run, "stamp": stamp, "secs": a.secs, "hidden": a.hidden, "m": a.m, "n_sims": a.n_sims,
-        "pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
+        "pool_batch": a.pool_batch, "trees_per_thread": a.trees_per_thread,
+        "producer_threads": T, "inflight_msgs": a.inflight_msgs,
         "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms, "n_threads": T,
         "server_core": str(server_core), "producer_cores": producer_cores_str, "reward_fn": "reward_forward_rows",
         # The DEPTH regime this session ran (the depth>1 partition key alongside `regime`): chunk_floor +
