@@ -584,18 +584,28 @@ def main() -> int:
     try:
         t_wait0 = time.monotonic()
         last = 0
+        # The "warm + streaming" signal: the lab-decision counter is BOTH past a small CUMULATIVE floor (so
+        # real lab forwards are demonstrably flowing — the producer has built its pool and the measure config
+        # is streaming) AND still advancing between polls (not stalled). A pure per-poll DELTA threshold (the
+        # old `cur > last + 50`) silently assumed a FAST regime: under chunk_floor with a small S_min the
+        # per-message degree is ~S_min rows, so the DECISION rate is low (degree-1 at S_min=1 accrues only a
+        # few decisions per 0.25s poll) and a +50/poll gate NEVER fires though the counter climbs steadily —
+        # the warmup-grace timeout the depth>1/S_min=1 collection hit. A cumulative floor + a still-climbing
+        # check is regime-agnostic: "warm" == "enough lab forwards have flowed AND the stream is live".
+        warm_floor = 200
         while True:
             if producer.poll() is not None:
                 raise RuntimeError(f"producer exited early (rc={producer.returncode}) before streaming — "
                                    f"see {prod_log}")
             snap = server.snapshot()
             cur = int(snap["lab_decisions_total"])
-            if cur > 0 and cur > last + 50:   # streaming and climbing -> the pool is warm, lab forwards flow
+            if cur >= warm_floor and cur > last:   # past the warmup floor AND still climbing -> warm + streaming
                 break
             last = cur
             if time.monotonic() - t_wait0 > a.warmup_grace_s:
                 raise RuntimeError(f"producer did not start streaming lab forwards within "
-                                   f"{a.warmup_grace_s}s (lab_decisions_total={cur}) — see {prod_log}")
+                                   f"{a.warmup_grace_s}s (lab_decisions_total={cur}, warm_floor={warm_floor}) "
+                                   f"— see {prod_log}")
             time.sleep(0.25)
         warm_wall = time.monotonic() - t_wait0
         print(f"[lab] warm pool primed + lab forwards flowing after {warm_wall:.1f}s "
