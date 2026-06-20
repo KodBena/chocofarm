@@ -1247,6 +1247,23 @@ now mechanized at the **test/CI-gate** level for the **cross-DEVICE** boundary
 cross-LANGUAGE surfaces (the runtime manifest for the dynamic weight layout, the
 `test_wire_drift.py` parity backstop for the static result format).
 
+**Refinement (later same day — the real-MLP intercept decomposition, `fb9cfbc`).**
+The `~85–135 µs run_microbatch input/output` figure cited above was a rough
+pre-decomposition estimate. The standalone real-MLP benchmark
+(`chocofarm/az/bench/bench_mlp_lowlatency.py` — the production 241→256→65 forward,
+ADR-0009 rigor: warm, median + IQR over 9×2000 calls, R²≈0.998, four `allclose`-
+verified variants) decomposes the ~129 µs *fixed* per-call cost precisely:
+**params transfer ~45–53 µs** (the dominant consolidatable lever — staged
+device-resident *once* via the `lowlatency` handle, confirming the toy bench's
+~57 µs on the production net), **input + output transfer ~14.5 µs** (the
+*smaller* component the rough figure over-weighted — input host→device ~5.5 µs,
+batched device→host pull ~9 µs), and an **irreducible ~69 µs pjit/XLA dispatch
+floor** (~54 %, unremovable by staging — the "unsafe" direct-executable path was
+*refuted*, +103 µs worse). Net: consolidatable transfer ≈ 60 µs (~46 %), the
+floor ≈ 54 %. The rule, the new anti-pattern row, and the gate are
+**unchanged** — the refinement only sharpens *which* crossing is the lever:
+**params-staging**, not the input/output pull the rougher figure implied.
+
 ## License
 
 Public Domain (The Unlicense).
