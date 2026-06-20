@@ -183,15 +183,22 @@ def start_server(src, endpoint: str, max_batch: int, decision_deadline_s: float,
 
 def launch_producer(endpoint: str, run: str, version: int, threads: int, pool_batch: int,
                     inflight: int, gc_m: int, n_sims: int, pool_plies: int, total_decisions: int,
-                    log_path: str, producer_cores: str) -> subprocess.Popen:
+                    log_path: str, producer_cores: str, chunk_floor: bool, s_min: int) -> subprocess.Popen:
     """Launch ONE CONTINUOUS C++ producer under taskset -c <producer_cores>. --sweep-configs with a single config is
     the path that builds the warm pool ONCE and wires the IssueController; --lab-decision 1 rides features
     + actuates the gate off the reply. --measure-decisions is set huge so the single config streams for the
     whole session (the harness boxes by wall time on the server side and kills this at the end). Its stdout
-    goes to `log_path` for diagnosis; the harness does NOT parse it (it scores from server counters)."""
+    goes to `log_path` for diagnosis; the harness does NOT parse it (it scores from server counters).
+
+    `chunk_floor`/`s_min` select the producer's DEPTH regime via the sweep config `cf:S_min:D`
+    (wire_ab_bench.cpp parses this; runner_wire_batched.cpp:731 is the gather break that holds the chunk).
+    chunk_floor=False → `0:1:D` (drain-all, depth≈1, inflight collapses to 0 — the historical degenerate
+    path); chunk_floor=True → `1:S_min:D` (chunk-at-S_min, the producer holds floor(W/S_min) messages
+    outstanding up to D, inflight LIVE in [1,D] — the regime the controllers act on)."""
     tok = f"lab-{uuid.uuid4().hex[:8]}"
-    # One config: chunk_floor=0 (drain-all, the production depth-1 path), S_min=1, D=inflight.
-    sweep = f"0:1:{inflight}"
+    # The ONE producer config encodes the depth regime: chunk_floor:S_min:D (the cf:S:D grammar
+    # wire_ab_bench.cpp parses). OFF = drain-all depth-1 (0:1:D); ON = chunk-at-S_min depth>1 (1:S_min:D).
+    sweep = f"{1 if chunk_floor else 0}:{s_min}:{inflight}"
     cmd = [
         "taskset", "-c", producer_cores, AB_BENCH,
         "--instance", INSTANCE, "--faces", FACES, "--endpoint", endpoint,
@@ -419,6 +426,20 @@ def main() -> int:
     ap.add_argument("--pool-batch", type=int, default=192)
     ap.add_argument("--producer-threads", type=int, default=3)
     ap.add_argument("--inflight-msgs", type=int, default=8)
+    ap.add_argument("--chunk-floor", action="store_true",
+                    help="run the producer in the DEPTH>1 regime (chunk_floor=1): a non-forced message "
+                         "carries exactly --s-min ready rows and leaves the rest READY, so the refill loop "
+                         "holds floor(W/S_min) DISTINCT messages outstanding up to D (inflight goes LIVE in "
+                         "[1,D], the convoy the issue-gate controllers exist to tame). Wired to BOTH the "
+                         "producer's --sweep-configs (cf=1) AND the TrialContext (chunk_floor=True, so the "
+                         "controllers/store/egress see D live). Default OFF = the historical depth-1 drain-all "
+                         "path (chunk_floor=0, inflight collapses to 0 → gating is inert; back-compat).")
+    ap.add_argument("--s-min", type=int, default=1,
+                    help="the producer coalescing floor S_min (the per-message chunk size) when --chunk-floor "
+                         "is on: a non-forced gather carries exactly S_min ready rows, so the producer holds "
+                         "floor(W/S_min) messages outstanding (deeper overcommit at smaller S_min). Wired to "
+                         "BOTH the producer (--sweep-configs cf:S_min:D) AND the TrialContext.s_min (the codec "
+                         "bound + egress label). Inert when --chunk-floor is off. Default %(default)s.")
     ap.add_argument("--server-core", type=int, default=int(SERVER_CORE),
                     help="the core the in-process JAX eval SERVER thread is pinned to (the harness process "
                          "affinity, inherited by the daemon serve thread). Default %(default)s. On this "
@@ -508,15 +529,22 @@ def main() -> int:
     huge_budget = 1_000_000_000
     prod_log = os.path.join(a.out, f"producer-{stamp}.log")
     producer = launch_producer(endpoint, run, version, T, a.pool_batch, a.inflight_msgs, a.m,
-                               a.n_sims, a.pool_plies, huge_budget, prod_log, producer_cores_str)
+                               a.n_sims, a.pool_plies, huge_budget, prod_log, producer_cores_str,
+                               a.chunk_floor, a.s_min)
     print(f"[lab] producer launched (pid={producer.pid}) -> streaming continuously over ONE warm pool; "
           f"log={prod_log}", flush=True)
 
     # Wait for the producer's pool build + the first LAB forwards to flow (warmup paid ONCE here). We detect
     # it by the server's cumulative-decision counter beginning to climb. Fail loud if the producer dies or
     # never streams within the grace window (ADR-0002 — never a silent hang).
+    # The TrialContext the controllers/codec/egress see. s_min + chunk_floor are wired from the CLI (the
+    # SAME values passed to the producer's sweep config above) so the controllers act on the regime the
+    # producer actually runs, the codec bounds inflight at the live D, and the egress STAMPS the real
+    # chunk_floor/s_min onto every lab_trial row (lab_store denormalizes ctx.chunk_floor/ctx.s_min) — a
+    # depth>1 corpus is then cleanly separable from the depth-1 one by (regime, chunk_floor, s_min).
     ctx = TrialContext(n_threads=T, d_ceiling=a.inflight_msgs,
-                       k_per_thread=max(1, -(-a.pool_batch // T)), s_min=1, chunk_floor=False, seed=7919)
+                       k_per_thread=max(1, -(-a.pool_batch // T)), s_min=a.s_min,
+                       chunk_floor=a.chunk_floor, seed=7919)
 
     # --- postgres egress: connect ONCE up front + ensure the schema + insert the session row, so a DB
     # outage fails LOUD before a long run rather than mid-stream (ADR-0002). The per-trial inserts happen
@@ -531,7 +559,8 @@ def main() -> int:
         warm_pool_json = {"pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
                           "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms,
                           "server_core": str(server_core), "producer_cores": producer_cores_str,
-                          "k_per_thread": ctx.k_per_thread, "s_min": ctx.s_min}
+                          "k_per_thread": ctx.k_per_thread, "s_min": ctx.s_min,
+                          "chunk_floor": ctx.chunk_floor}
         # regime: the value DERIVED above from the server's ACTUAL staging state (the data-integrity SSOT —
         # one home: pad policy -> fixed-pad -> staging -> regime). The interim re-align that claimed the lab
         # was always 'post-staging' (12b27bf) was REVERTED (5df7a45), so the hardcoded REGIME_POST that used
@@ -625,6 +654,9 @@ def main() -> int:
         "pool_batch": a.pool_batch, "producer_threads": T, "inflight_msgs": a.inflight_msgs,
         "pool_plies": a.pool_plies, "decision_deadline_ms": a.decision_deadline_ms, "n_threads": T,
         "server_core": str(server_core), "producer_cores": producer_cores_str, "reward_fn": "reward_forward_rows",
+        # The DEPTH regime this session ran (the depth>1 partition key alongside `regime`): chunk_floor +
+        # s_min are the producer's sweep config (cf:S_min:D) AND the TrialContext — one value, both wires.
+        "chunk_floor": ctx.chunk_floor, "s_min": ctx.s_min,
         # e_policy + regime: the local belt-and-suspenders record is self-describing about the throughput
         # regime it was measured under (padmax->post-staging-staged, bucket->pre-staging-un-staged) — the
         # SAME `regime` the postgres egress derived (one home; §6 #4 RCA), so a reader of the JSON sees the
