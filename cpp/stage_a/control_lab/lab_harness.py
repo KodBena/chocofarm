@@ -71,9 +71,15 @@ from chocofarm.az.transport import RedisTransport, connect, pack_net  # noqa: E4
 from chocofarm.model.env import Environment  # noqa: E402
 
 from control_lab import reference_methods  # noqa: F401,E402 — registers the reference methods into REGISTRY
+from control_lab import methods as _lab_methods  # noqa: F401,E402 — the fan-out methods package (load_all below)
 from control_lab.adapter import REGISTRY, Controller, Decimate, TrialContext  # noqa: E402
 from control_lab.lab_server import LabServer  # noqa: E402
 from stage_a_server import BUCKETS  # noqa: E402
+
+# Register the fan-out methods: import every methods/<name>.py so each self-registers into REGISTRY.
+# Deferred from package import-time (see methods/__init__.py) so a per-method unit test importing one
+# submodule does not pull in half-written siblings during the parallel fan-out.
+_lab_methods.load_all()
 
 AB_BENCH = os.path.join(REPO, "cpp", "build", "chocofarm-wire-ab-bench")
 INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
