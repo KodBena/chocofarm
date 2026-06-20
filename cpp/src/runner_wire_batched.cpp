@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -382,10 +383,53 @@ std::expected<int, Error> run_episodes_wire_batched(
 // never the bottleneck; the lever is server-side rows/forward amortization. The wire frame / codec /
 // wire_spec are UNCHANGED (P7): submit_batch/recv_batch over the SAME corr-id transport.
 // ============================================================================================
+std::vector<SlotSnapshot> build_warm_pool(
+    const Environment& env, int n_slots, std::uint64_t pool_seed, int max_div_plies) {
+    const std::vector<uint32_t>& worlds = env.worlds();
+    std::vector<SlotSnapshot> pool;
+    if (worlds.empty() || n_slots <= 0) return pool;
+    pool.reserve(static_cast<size_t>(n_slots));
+    for (int s = 0; s < n_slots; ++s) {
+        SlotSnapshot snap;
+        snap.idx = s;
+        snap.rng.seed(fold_seed(pool_seed, s));
+        std::uniform_int_distribution<size_t> wpick(0, worlds.size() - 1);
+        snap.world = worlds[wpick(snap.rng)];
+        snap.loc = Loc{env.entry_point()};
+        snap.bw = env.full_belief();
+        snap.collected = CollectedSet{};
+        snap.bw0 = env.nb(snap.bw);
+        snap.ply = 0;
+        // Advance a varied (seeded) number of random NON-terminate legal actions so the pool spans a wide
+        // range of belief sizes / locations / plies (mirrors RandomPolicy's pick over env.legal_actions).
+        const int target = (max_div_plies > 0)
+            ? static_cast<int>(snap.rng() % static_cast<std::uint64_t>(max_div_plies + 1)) : 0;
+        for (int p = 0; p < target; ++p) {
+            std::vector<Action> acts = env.legal_actions(snap.bw, snap.collected);
+            int n_nonterm = 0;
+            for (const Action& a : acts) n_nonterm += (a.kind != ActionKind::Terminate) ? 1 : 0;
+            if (n_nonterm == 0) break;   // only terminate is legal — a valid late state, stop here
+            int pick = static_cast<int>(snap.rng() % static_cast<std::uint64_t>(n_nonterm));
+            Action chosen = terminate_action();
+            int seen = 0;
+            for (const Action& a : acts) {
+                if (a.kind == ActionKind::Terminate) continue;
+                if (seen++ == pick) { chosen = a; break; }
+            }
+            env.apply(snap.loc, snap.bw, snap.collected, chosen, snap.world);
+            ++snap.ply;
+            if (env.empty(snap.bw)) break;   // belief collapsed (episode would terminate) — stop
+        }
+        pool.push_back(std::move(snap));
+    }
+    return pool;
+}
+
 std::expected<int, Error> run_episodes_wire_pipelined(
     const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc,
     [[maybe_unused]] RedisClient& redis, const RunnerConfig& cfg, const WireRunnerConfig& wcfg,
-    std::ostream* stats_out) {
+    std::ostream* stats_out, const std::vector<SlotSnapshot>* warm_pool, long settle_budget,
+    std::vector<SlotSnapshot>* snapshot_out) {
     const int n_slots = n_action_slots(env);
     const int feat_dim = fb.dim();
     const std::vector<uint32_t>& worlds = env.worlds();
@@ -431,6 +475,21 @@ std::expected<int, Error> run_episodes_wire_pipelined(
     // are reported — the server's mean rows/forward is the in-flight depth the design's overcommit phase needs.
     std::atomic<long> total_leaves{0};
     std::atomic<long> total_msgs{0};
+    // BENCH fixed-decision measure (wcfg.decision_budget > 0): count recorded decisions across the pool and
+    // stop once the budget is reached (abandoning in-flight episodes). budget_done is a CLEAN stop (not an
+    // error like `failed`): the threads observe it and return, the count is reported in wire_summary.
+    const long decision_budget = wcfg.decision_budget;
+    // settle_budget decisions run UNCOUNTED first (pipeline desync), then decision_budget MEASURED — the
+    // window [t0,t1] excludes the settle ramp. total stop = settle + measure.
+    const long total_budget = (decision_budget > 0) ? settle_budget + decision_budget : 0;
+    std::atomic<long> total_decisions{0};
+    std::atomic<bool> budget_done{false};
+    std::atomic<long long> measure_t0_ns{0};   // captured when the settle phase completes (window opens)
+    std::atomic<long long> measure_t1_ns{0};   // captured when the measure budget is reached (window closes)
+    auto now_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
 
     auto set_error = [&](Error e) {
         failed.store(true);
@@ -500,6 +559,21 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         };
         auto apply_decision = [&](int s) -> bool {
             EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            // BENCH fixed-decision budget: every apply_decision is exactly one recorded decision (a
+            // completed Gumbel search — both the Terminate and the normal branch below record_decision). The
+            // first settle_budget run UNCOUNTED (pipeline desync); decision number settle_budget+1 opens the
+            // measured window; reaching settle+measure closes it and flips the clean stop (threads drain out,
+            // abandoning in-flight episodes). The exact-equality captures fire on a single thread each.
+            if (decision_budget > 0) {
+                const long v = total_decisions.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (v == settle_budget + 1)
+                    measure_t0_ns.store(now_ns(), std::memory_order_relaxed);
+                if (v >= total_budget) {
+                    long long zero = 0;
+                    measure_t1_ns.compare_exchange_strong(zero, now_ns(), std::memory_order_relaxed);
+                    budget_done.store(true, std::memory_order_relaxed);
+                }
+            }
             const GumbelAZPolicy::Decision& dec = sl.ts->decision;
             Action action = dec.action;
             std::vector<double> feat = rec_fb.build(sl.loc.pt, sl.bw, sl.collected);
@@ -525,7 +599,7 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         };
         auto advance = [&](int s) -> bool {
             EpisodeSlot& sl = slots[static_cast<size_t>(s)];
-            while (!failed.load()) {
+            while (!failed.load() && !budget_done.load(std::memory_order_relaxed)) {
                 if (!apply_decision(s)) return false;
                 spawn_ply(s);
                 if (sl.ts->running) return true;
@@ -534,7 +608,8 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         };
         auto fill = [&](int s) -> bool {
             EpisodeSlot& sl = slots[static_cast<size_t>(s)];
-            while (next_idx < cfg.episodes && !failed.load()) {
+            while (next_idx < cfg.episodes && !failed.load()
+                   && !budget_done.load(std::memory_order_relaxed)) {
                 const int idx = next_idx;
                 next_idx += T;
                 sl.idx = idx;
@@ -559,6 +634,35 @@ std::expected<int, Error> run_episodes_wire_pipelined(
                 if (failed.load()) return false;
             }
             return false;
+        };
+
+        // POOL prime (build_warm_pool): load a slot's copyable episode snapshot and RE-SPAWN the search (the
+        // fiber is non-copyable, so it is rebuilt, not copied). Thread `tid` owns the contiguous pool slice
+        // [tid*K, tid*K+K). Used ONLY for the INITIAL diverse prime — an ended episode refills via fill() (a
+        // fresh opener, real steady-state dynamics), never re-loading a possibly-terminal snapshot.
+        auto load_from_pool = [&](int s) -> bool {
+            EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+            const size_t pidx = static_cast<size_t>(tid) * static_cast<size_t>(K) + static_cast<size_t>(s);
+            if (warm_pool == nullptr || pidx >= warm_pool->size()) return false;
+            const SlotSnapshot& snap = (*warm_pool)[pidx];
+            sl.idx = snap.idx;
+            sl.rng = snap.rng;            // copy the rng STATE (reproducible search continuation)
+            sl.world = snap.world;
+            sl.loc = snap.loc;
+            sl.bw = snap.bw;              // Belief value-copy
+            sl.collected = snap.collected;
+            sl.bw0 = snap.bw0;
+            sl.ply = snap.ply;
+            sl.eb = EpisodeBuilder::create(sl.world, cfg.lam, feat_dim, n_slots, sl.bw0);  // fresh (rows unused)
+            sl.active = true;
+            if (env.empty(sl.bw)) { sl.active = false; return false; }
+            spawn_ply(s);
+            if (sl.ts->running) return true;
+            return advance(s);
+        };
+        // Prime/refill dispatch: warm-pool load when a pool is given, else the fresh ply-0 fill.
+        auto prime_slot = [&](int s) -> bool {
+            return warm_pool != nullptr ? load_from_pool(s) : fill(s);
         };
 
         // A slot is "ready" iff it is parked at a leaf AND not already outstanding to the server.
@@ -632,13 +736,14 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         // pipe). At depth-1 this backstop fires on every sub-threshold refill, which is why the floor is inert
         // here (see the function header).
         auto refill = [&]() {
-            while (inflight_msgs < D && !failed.load() && issue(/*force=*/false)) {}
-            if (inflight_msgs == 0 && !failed.load() && ready_count() > 0)
+            const bool stop = budget_done.load(std::memory_order_relaxed);   // bench budget: issue no more
+            while (!stop && inflight_msgs < D && !failed.load() && issue(/*force=*/false)) {}
+            if (!stop && inflight_msgs == 0 && !failed.load() && ready_count() > 0)
                 issue(/*force=*/true);  // forced flush: nothing outstanding ⇒ waiting gathers nothing more
         };
 
-        // prime K slots (each fill leaves the slot parked at a leaf, or finalizes a degenerate episode).
-        for (int s = 0; s < K && !failed.load(); ++s) fill(s);
+        // prime K slots (warm-pool load or fresh fill — each leaves the slot parked at a leaf).
+        for (int s = 0; s < K && !failed.load(); ++s) prime_slot(s);
 
         // ---- the PIPELINED drain: drain-all one message at a time (depth ≈ 1; D unused — SYNTHESIS §0) ----
         // Prime: issue the initial ready wave (forced-flush the remainder so the loop runs even if the whole
@@ -647,7 +752,7 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         // forced-flush backstop guarantees we never exit with inflight_msgs == 0 while ready slots remain (no
         // deadlock), so the loop runs exactly until every episode drains.
         refill();  // prime under the floor (with the forced-flush termination backstop)
-        while (inflight_msgs > 0 && !failed.load()) {
+        while (inflight_msgs > 0 && !failed.load() && !budget_done.load(std::memory_order_relaxed)) {
             auto reply = pool.recv_batch();
             if (!reply) { set_error(reply.error()); break; }  // recv/decode/corr-id/count: loud abort
             --inflight_msgs;  // this corr-id's message is resolved
@@ -661,13 +766,39 @@ std::expected<int, Error> run_episodes_wire_pipelined(
                 if (sl.ts->running) continue;  // re-parked at the next leaf — will be re-gathered on issue
                 if (advance(s)) continue;      // parked again down the chain — re-gathered on issue
                 if (failed.load()) break;
-                fill(s);                       // finalized — start the next episode in this slot (or idle)
+                fill(s);                       // finalized — start a FRESH episode (real steady-state refill;
+                                               // the warm pool only stages the INITIAL diverse population, so
+                                               // an ended episode does not re-load a possibly-terminal snapshot)
             }
             refill();  // hold the floor: full messages back up to depth D, then the forced-flush backstop
+        }
+        // Capture this thread's slots' copyable episode state into the warm pool (snapshot_out) — the slots
+        // sit at varied plies (the real staggered run), giving a faithful diverse population. The fiber is
+        // NOT captured (non-copyable); load_from_pool re-spawns the search. Disjoint slice → no lock.
+        if (snapshot_out != nullptr) {
+            for (int s = 0; s < K; ++s) {
+                const EpisodeSlot& sl = slots[static_cast<size_t>(s)];
+                SlotSnapshot& snap =
+                    (*snapshot_out)[static_cast<size_t>(tid) * static_cast<size_t>(K) + static_cast<size_t>(s)];
+                snap.idx = sl.idx;
+                snap.rng = sl.rng;
+                snap.world = sl.world;
+                snap.loc = sl.loc;
+                snap.bw = sl.bw;
+                snap.collected = sl.collected;
+                snap.bw0 = sl.bw0;
+                snap.ply = sl.ply;
+            }
         }
         total_leaves.fetch_add(my_leaves, std::memory_order_relaxed);
         total_msgs.fetch_add(my_msgs, std::memory_order_relaxed);
     };
+
+    // Warm-pool CAPTURE target (snapshot_out): pre-size to T*K so each worker writes its disjoint slice
+    // [tid*K, tid*K+K) lock-free at the budget. The slots are at varied plies (the real run staggers them),
+    // so the captured population is a faithful diverse warm pool to replay per HPO config.
+    if (snapshot_out != nullptr)
+        snapshot_out->assign(static_cast<size_t>(T) * static_cast<size_t>(K), SlotSnapshot{});
 
     std::vector<std::thread> threads;
     threads.reserve(static_cast<size_t>(T));
@@ -692,6 +823,9 @@ std::expected<int, Error> run_episodes_wire_pipelined(
         (*stats_out) << "{\"wire_summary\":1,\"leaves\":" << lv << ",\"msgs\":" << ms
                      << ",\"mean_rows_per_msg\":" << mean_s << ",\"inflight_cap_D\":" << D
                      << ",\"min_coalesce_Smin\":" << S_min
+                     << ",\"decisions\":" << total_decisions.load()   // total recorded (settle + measure)
+                     << ",\"measure_decisions\":" << decision_budget   // the MEASURED window (excl. settle)
+                     << ",\"measure_wall_ns\":" << (measure_t1_ns.load() - measure_t0_ns.load())
                      << ",\"threads\":" << T << ",\"fibers_per_thread\":" << K << "}\n";
     }
     return written.load();

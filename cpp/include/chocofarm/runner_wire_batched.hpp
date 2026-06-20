@@ -28,9 +28,12 @@
 // Public Domain (The Unlicense).
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <ostream>
+#include <random>
 #include <string>
+#include <vector>
 
 #include "chocofarm/env.hpp"
 #include "chocofarm/error.hpp"
@@ -104,7 +107,41 @@ struct WireRunnerConfig {
     int trees_per_thread = 1;
     int min_coalesce = 32;
     bool chunk_floor = false;   // gen-side depth>1 chunk-at-S_min (the runnable "final bolt"); default OFF
+    // BENCH-ONLY fixed-DECISION measure budget (PipelinedBucket only). 0 = unlimited (run cfg.episodes to
+    // completion — the production/default path, byte-unchanged). When > 0, the pipelined driver stops as
+    // soon as it has RECORDED this many decisions (completed Gumbel searches) ACROSS the pool and abandons
+    // the in-flight episodes — so the measured window is a fixed amount of real search work at full
+    // occupancy (dps = decisions / wall), not a full episode wave. The count is reported in the wire_summary
+    // (`decisions`); abandoned episodes are NOT written to redis, so the bench reads the count from there,
+    // not from result blocks. Keeps the LIVE Gumbel search + inference (unlike the synthetic transport bench).
+    long decision_budget = 0;
 };
+
+// A reproducible WARM-POOL snapshot of ONE slot's copyable episode state (everything EXCEPT the live
+// search fiber, which is non-copyable — TreeState deletes copy/move; the search is re-spawned on load).
+// `build_warm_pool` advances each slot a varied (seeded) number of random legal actions so the pool spans
+// a WIDE RANGE of search dynamics (belief sizes, locations, plies) — fixing the cold-start lockstep + the
+// all-openers sampling bias the naive decision-budget measure suffers (server-gen-floor-result.md follow-up).
+// Belief is a copyable value-variant, so the snapshot copies in-memory; the pool is regenerated bit-
+// identically per config from the same `pool_seed`, so every config measures the SAME population (comparable
+// numbers). Public Domain.
+struct SlotSnapshot {
+    int idx = -1;
+    std::mt19937_64 rng;
+    std::uint32_t world = 0;
+    Loc loc{};
+    Belief bw;
+    CollectedSet collected;
+    int bw0 = 0;
+    int ply = 0;
+};
+
+// Build a reproducible diverse warm pool of `n_slots` slot snapshots: each slot draws a world from
+// `pool_seed`+slot, then advances 0..`max_div_plies` random NON-terminate legal actions (env.apply,
+// filtering the belief by the drawn world) so beliefs/locations span the natural distribution. Deterministic
+// in `pool_seed` (the comparable-numbers guarantee). No search, no transport — cheap (sub-second).
+[[nodiscard]] std::vector<SlotSnapshot> build_warm_pool(
+    const Environment& env, int n_slots, std::uint64_t pool_seed, int max_div_plies);
 
 // Run cfg.episodes self-play episodes over the wire-batched driver, writing the four (X, PI, M, Y) result
 // blocks per non-empty episode to redis (idx-keyed, exactly as run_episodes). Returns the number of
@@ -127,8 +164,16 @@ struct WireRunnerConfig {
 // wire frame / codec / wire_spec are UNCHANGED (ADR-0012 P7 — transport scheduling, not a codec change).
 // run_episodes_wire_batched delegates here when wcfg.mode == WireMode::PipelinedBucket, so the production
 // StrictBarrier path stays byte-untouched and this arm is reachable only behind the mode flag.
+// `pool` (optional): a warm-pool prime (build_warm_pool) — when non-null, each slot loads its snapshot's
+// copyable episode state and re-spawns the search (instead of priming a fresh ply-0 opener), and an ended
+// episode reloads its snapshot (the population stays diverse). `settle_budget`: decisions to run UNCOUNTED
+// before the measured window opens (pipeline desync) — with `wcfg.decision_budget` the MEASURE budget, the
+// driver runs settle_budget + decision_budget decisions and reports the measured window's decisions +
+// wall (steady-state, excluding settle) in the wire_summary. Both default off (the legacy path is unchanged).
 [[nodiscard]] std::expected<int, Error> run_episodes_wire_pipelined(
     const Environment& env, const FeatureBuilder& fb, const GumbelConfig& gc, RedisClient& redis,
-    const RunnerConfig& cfg, const WireRunnerConfig& wcfg, std::ostream* stats_out = nullptr);
+    const RunnerConfig& cfg, const WireRunnerConfig& wcfg, std::ostream* stats_out = nullptr,
+    const std::vector<SlotSnapshot>* warm_pool = nullptr, long settle_budget = 0,
+    std::vector<SlotSnapshot>* snapshot_out = nullptr);
 
 }  // namespace chocofarm
