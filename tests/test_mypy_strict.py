@@ -156,6 +156,57 @@ STRICT_CLEAN = [
     # conversion that lands a new mechanism already typed (P8). The CLI parses path args, so explicit-file
     # invocation checks it despite the config's `files = ["chocofarm"]` scope.
     "tools/lint_host_device_transfers.py",
+    # --- Stage 4 — the jax/numba kernel boundary, now typed and gated ---
+    # The five held-out boundary modules (the docstring's "OUT, deliberately" list) are typed and
+    # join the gate. Honesty bar per ADR-0012 P8: jax ships py.typed so there is NO jax ignore — the
+    # backend-polymorphic `xp` (forward_core), the params pytree, and the optax/jax opt_state/Compiled
+    # seam are COMMENTED use-site `Any`s, visible in the diff; numba's @njit is a per-site
+    # `type: ignore[untyped-decorator]` tied to the existing `numba` stub-gap override; redis-8's
+    # kwargs use the explicit-decode precedent (host=str/port=int/db=int), not an ignore. The two
+    # genuine bugs P8 named are FIXED, not annotated around: AdamHParams `lr/b1/b2/eps: float |
+    # jax.Array` (the NamedTuple genuinely holds traced scalars) and `hp: AdamHParams | None = None`
+    # (the lying `= None` default). Membership verified EMPIRICALLY (mypy --strict, zero errors).
+    # C1 — JAX numerics core (forward_core root + MLP + optax trainer):
+    "chocofarm/az/forward.py",          # forward_core: the backend-polymorphic `xp` use-site Any seam
+    "chocofarm/az/mlp.py",              # ValueMLP; forward_core call now typed
+    "chocofarm/az/mlp_jax.py",          # MlpJaxForward; @jax.jit forwards, params pytree Any
+    "chocofarm/az/optimizer.py",        # Optimizer; optax GradientTransformation/opt_state use-site Any
+    "chocofarm/az/mlp_jax_train.py",    # JaxTrainer; the two genuine-bug fixes live here
+    # C2 — numba kernels + Gumbel search:
+    "chocofarm/az/kernels.py",          # @njit kernels; per-site untyped-decorator ignore (numba gap)
+    "chocofarm/az/gumbel_search.py",    # GumbelAZSearch/GumbelPolicy; MlpJaxForward call now typed
+    # C3 — episode generation + worker loop (the held-out boundary modules that hard-load mlp/worker):
+    "chocofarm/az/exit_loop.py",        # generate_episode/train_epochs; executor Union widened honestly
+    "chocofarm/az/worker.py",           # the worker loop; kernels.warmup call now typed
+    "chocofarm/az/train_value.py",      # Stage-1 value-gate driver
+    # C4 — C++ actor seam (executor + subprocess transport):
+    "chocofarm/az/cpp_actor_loop.py",   # redis explicit-kwarg decode (the registry.py precedent)
+    "chocofarm/az/cpp_executor.py",     # __exit__ -> None
+    "chocofarm/az/actor_transport.py",  # __exit__ -> None
+    # C5 — az/bench micro-benchmark harness (bench/__init__ already gated above):
+    "chocofarm/az/bench/bench_hotpath.py",
+    "chocofarm/az/bench/capture_states.py",
+    "chocofarm/az/bench/bench_value_target.py",
+    "chocofarm/az/bench/bench_equivalence.py",
+    # FREE RIDERS — 0-error today, held out ONLY because their call into worker/mlp was a
+    # no-untyped-call; with C1+C2+C3 typed that call is typed and they enter the gate with NO edit.
+    "chocofarm/az/parallel.py",         # top-level `import worker`
+    "chocofarm/az/value_target.py",     # top-level ValueMLP import + call
+    "chocofarm/az/feature_response.py",
+    "chocofarm/az/netvalue_ismcts.py",
+    "chocofarm/eval/eval_az.py",        # transitively, via NetValueISMCTS
+    # ADJACENT CLEAN LEAVES — 0-error real source the whole-package `mypy --strict chocofarm/` run
+    # already enforces (files=["chocofarm"]); added so the gate's enforced set matches that reality
+    # (a clean module left OUT of the ratchet is a hole: a future regression in it would pass the
+    # gate). Not made clean by this rollout — they were already clean; this just closes the gap.
+    # (Maintainer judgment: the two extra bench_*lowlatency scripts may instead be excluded as
+    # dev-only — but they are tracked source the whole-tree run checks, so they belong in or out
+    # together with the C5 bench set.)
+    "chocofarm/az/actor_config.py",
+    "chocofarm/az/control_spec.py",
+    "chocofarm/az/weights.py",          # WeightContainer/is_weight (mlp.py imports it; already clean)
+    "chocofarm/az/bench/bench_lowlatency.py",
+    "chocofarm/az/bench/bench_mlp_lowlatency.py",
 ]
 
 

@@ -238,6 +238,9 @@ class ValueMLP:
             x = x[None, :]
             lm = lm[None, :]
         v_std, logits = forward_core(self._f32_params(c), x, np)
+        # _f32_params always includes Wp/bp (this path requires n_actions, checked by caller) —
+        # logits is not None here; assert to narrow honestly (ADR-0002 fail-loud, not a None-deref).
+        assert logits is not None
         v = v_std * c["ys"] + c["ym"]
         legal = lm > 0
         masked = np.where(legal, logits, np.float32(-1e30))

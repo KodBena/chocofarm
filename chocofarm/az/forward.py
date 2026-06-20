@@ -32,8 +32,14 @@ numpy↔jit equivalence test (`tests/test_jax_equivalence.py`) now guards NUMERI
 """
 from __future__ import annotations
 
+from typing import Any
 
-def forward_core(params, X, xp):
+
+def forward_core(
+        params: dict[str, Any],
+        X: Any,
+        xp: Any,  # numpy or jax.numpy — the backend-polymorphic module seam (ADR-0012 P8 commented use-site Any)
+) -> tuple[Any, Any | None]:
     """Run the value+policy forward graph once, in whatever precision `X`/`params` carry.
 
     `params` is a flat dict keyed exactly like `ValueMLP._params()`: W1 b1 W2 b2 [Wr1 br1 Wr2 br2]

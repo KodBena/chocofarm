@@ -20,11 +20,16 @@ the detector block (the shared-client fast path — see env.marginals).
 from __future__ import annotations
 
 import numpy as np
+import numpy.typing as npt
 from numba import njit
 
 
-@njit(cache=True, fastmath=False)
-def belief_marg_cover(bw, cover, N):
+@njit(cache=True, fastmath=False)  # type: ignore[untyped-decorator]  # numba stub-gap: @njit has no py.typed stubs
+def belief_marg_cover(
+    bw: npt.NDArray[np.int64],
+    cover: npt.NDArray[np.int64],
+    N: int,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64]]:
     """Fused belief reduction. `bw`: (nb,) int64 world bitmasks; `cover`: (nD,) int64 detector
     cover masks; `N`: treasure count. Returns (marg float64[N], cnt int64[nD]) where
     `marg[t]` = fraction of worlds with treasure t present, `cnt[d]` = number of worlds the
@@ -51,8 +56,11 @@ def belief_marg_cover(bw, cover, N):
     return marg, cnt
 
 
-@njit(cache=True, fastmath=False)
-def marginals_kernel(bw, N):
+@njit(cache=True, fastmath=False)  # type: ignore[untyped-decorator]  # numba stub-gap: @njit has no py.typed stubs
+def marginals_kernel(
+    bw: npt.NDArray[np.int64],
+    N: int,
+) -> npt.NDArray[np.float64]:
     """Per-treasure marginals only (the `env.marginals` hot path). `bw`: (nb,) int64; returns
     float64[N]. Single pass, no (nb×N) temporary. Bit-exact with the numpy bit-extract reduction.
     Caller handles the empty-belief case (nb==0)."""
@@ -69,7 +77,7 @@ def marginals_kernel(bw, N):
     return marg
 
 
-def warmup(N=20, nD=44):
+def warmup(N: int = 20, nD: int = 44) -> None:
     """Trigger AOT-cached compilation of both kernels on tiny inputs (so the first real call
     isn't paying the JIT cost). Idempotent; safe to call at import-adjacent setup time."""
     bw = np.array([1, 3, 5], dtype=np.int64)

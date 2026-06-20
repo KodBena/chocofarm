@@ -29,25 +29,41 @@ Pinned + bounded:
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import Environment, TERMINATE
+from chocofarm.model.env import Collected, Environment, Loc, MoveAction, TERMINATE
 from chocofarm.az.features import FeatureBuilder
 from chocofarm.az.actions import legal_mask_from_features
 from chocofarm.az.mlp import ValueMLP
 from chocofarm.az.gumbel_search import GumbelAZSearch
 from chocofarm.az.value_target import blended_returns_to_go
 
+# Episode record: (feature_vecs, step_(r,dt)_pairs, bootstrap_values, exit_cost)
+_EpRecord = tuple[
+    list[npt.NDArray[Any]],      # feats per decision
+    list[tuple[float, float]],   # (r, dt) per executed step
+    list[float],                 # bootstrap value per decision
+    float,                       # exit_cost
+]
 
-def roll_episode_raw(env, search, fb, world, lam, rng, max_steps=None):
+
+def roll_episode_raw(env: Environment, search: GumbelAZSearch, fb: FeatureBuilder,
+                     world: int, lam: float, rng: np.random.Generator,
+                     max_steps: int | None = None) -> _EpRecord:
     """Roll ONE net-guided episode, returning (feats, step_rt, boots, exit_c) — everything the
     value-target rule needs, recorded ONCE so multiple blends reuse the identical trajectory.
     Mirrors generate_episode's recording but does NOT compute the target."""
     if max_steps is None:
         max_steps = env.max_steps              # the single episode-horizon home (env.py)
-    loc, bw, collected = ("w", env.entry), env.worlds, set()
-    feats, step_rt, boots = [], [], []
+    loc: Loc = ("w", env.entry)
+    bw = env.worlds
+    collected: Collected = set()
+    feats: list[npt.NDArray[Any]] = []
+    step_rt: list[tuple[float, float]] = []
+    boots: list[float] = []
     for _ in range(max_steps):
         if len(bw) == 0:
             break
@@ -57,14 +73,16 @@ def roll_episode_raw(env, search, fb, world, lam, rng, max_steps=None):
         boots.append(boot)
         if action == TERMINATE:
             break
-        r, loc, bw, collected, dt = env.apply(loc, bw, collected, action, world)
+        # action here is MoveAction (not TERMINATE, guarded above); env.apply requires MoveAction.
+        move: MoveAction = action  # type: ignore[assignment]  # narrowed from Action: TERMINATE branch above
+        r, loc, bw, collected, dt = env.apply(loc, bw, collected, move, world)
         step_rt.append((r, dt))
     exit_c = env.exit_cost(loc)
     n_dec = len(step_rt)
     return feats[:n_dec], step_rt, boots[:n_dec], exit_c
 
 
-def fit_r2(X, y):
+def fit_r2(X: npt.NDArray[Any], y: npt.NDArray[Any]) -> float:
     """R² of a ridge-fit linear probe (closed form) — a cheap 'is the target fittable' signal."""
     if X.shape[0] < 5:
         return float("nan")
@@ -78,7 +96,7 @@ def fit_r2(X, y):
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Part B value-target variance probe.")
     ap.add_argument("--net", required=True)
     ap.add_argument("--episodes", type=int, default=40)
@@ -96,14 +114,14 @@ def main():
     search = GumbelAZSearch(net, env, m=args.m, n_sims=args.n_sims)
     rng = np.random.default_rng(args.seed)
 
-    eps = []
+    eps: list[_EpRecord] = []
     for _ in range(args.episodes):
         w = int(rng.choice(env.worlds))
         eps.append(roll_episode_raw(env, search, fb, w, args.lam, rng))
     n_dec = sum(len(e[0]) for e in eps)
     print(f"rolled {args.episodes} episodes, {n_dec} step-decisions; λ={args.lam}", flush=True)
 
-    def parse_blend(tag):
+    def parse_blend(tag: str) -> tuple[str, dict[str, Any]]:
         if tag == "mc":
             return ("mc", dict(lam_blend=1.0, n_step=None))
         if tag.startswith("td"):
@@ -113,10 +131,11 @@ def main():
         raise ValueError(f"bad blend tag {tag!r}")
 
     blends = [parse_blend(t) for t in args.blends.split(",")]
-    mc_var = None
-    rows = []
+    mc_var: float | None = None
+    rows: list[tuple[str, float, float, float, float]] = []
     for tag, kw in blends:
-        Xs, Ys = [], []
+        Xs: list[npt.NDArray[Any]] = []
+        Ys: list[float] = []
         for feats, step_rt, boots, exit_c in eps:
             g = blended_returns_to_go(step_rt, boots, exit_c, args.lam, **kw)
             for f, gv in zip(feats, g):

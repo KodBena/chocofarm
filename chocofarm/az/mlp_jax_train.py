@@ -34,6 +34,7 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, Any
 
 # The XLA/OMP single-thread pin lives in ONE home now (chocofarm/config.py, ADR-0012 P1). Importing
 # config here — before the jax import below — applies it (config sets the env at its import).
@@ -48,6 +49,9 @@ from chocofarm.az.forward import forward_core
 from chocofarm.az.mlp import is_weight
 from chocofarm.az.optimizer import AdamHParams, Optimizer
 
+if TYPE_CHECKING:
+    from chocofarm.az.mlp import ValueMLP
+
 # The equivalence safeguard is a FLOAT32 contract (the inference precision the search runs at and
 # the precision the equivalence test pins). Train in float32 so the weights numpy inference reads
 # are exactly the weights the jit'd forward optimized — no f64→f32 truncation gap between training
@@ -59,7 +63,7 @@ _JDTYPE = jnp.float32 if np.dtype(DTYPE) == np.dtype(np.float32) else jnp.float6
 # ---------------------------------------------------------------------------
 # Functional forward (params pytree -> (value_standardized, policy_logits))
 # ---------------------------------------------------------------------------
-def _forward_jax(params, X):
+def _forward_jax(params: dict[str, Any], X: Any) -> tuple[Any, Any | None]:
     """The jax forward = the ONE `forward.forward_core` evaluated under `jax.numpy` (audit R11).
 
     Returns (v_std, logits) with `v_std` shape (B,) and `logits` shape (B, n_actions). `params` is
@@ -71,7 +75,7 @@ def _forward_jax(params, X):
     return forward_core(params, X, jnp)
 
 
-def _masked_softmax_jax(logits, legal_mask):
+def _masked_softmax_jax(logits: Any, legal_mask: Any) -> Any:
     """Mirror of `ValueMLP._masked_softmax`: softmax over legal slots only; illegal slots get
     exactly zero mass (masked with -1e30 in log-space, then zeroed). Numerically stable."""
     neg = jnp.asarray(-1e30, dtype=logits.dtype)
@@ -90,7 +94,7 @@ def _masked_softmax_jax(logits, legal_mask):
 forward_jax_jit = jax.jit(_forward_jax)
 
 
-def _l2_sumsq(params):
+def _l2_sumsq(params: dict[str, Any]) -> Any:
     """Σ‖W‖² over WEIGHT MATRICES only — the L2 scope is `mlp.is_weight` (audit R11: ONE definition,
     imported here, not a re-derived `name.startswith('W')`). The `l2` coefficient is applied by the
     loss as a TRACED ARGUMENT (audit R13: `l2` is a loss coefficient, read live per step like
@@ -109,7 +113,8 @@ def _l2_sumsq(params):
     return s
 
 
-def _az_loss(params, X, target_pi, legal_mask, y_std_target, alpha, beta, l2):
+def _az_loss(params: dict[str, Any], X: Any, target_pi: Any, legal_mask: Any,
+             y_std_target: Any, alpha: Any, beta: Any, l2: Any) -> tuple[Any, tuple[Any, Any]]:
     """The AlphaZero loss (design §6, Silver et al. 2017), the EXACT scalar the numpy train_step
     descends:
 
@@ -121,6 +126,9 @@ def _az_loss(params, X, target_pi, legal_mask, y_std_target, alpha, beta, l2):
     standardizes with the net's y_mean/y_std, matching the numpy path). Returns (loss, (ce, vmse))
     so `value_and_grad(..., has_aux=True)` reports the components for logging."""
     v_std, logits = _forward_jax(params, X)
+    # `_az_loss` is only called with a full-policy-head params dict (Wp/bp present); logits is not None
+    # here — assert to narrow honestly (ADR-0002 fail-loud, not a None-deref).
+    assert logits is not None
     resid = v_std - y_std_target
     vmse = jnp.mean(resid ** 2)
     p = _masked_softmax_jax(logits, legal_mask)
@@ -130,7 +138,8 @@ def _az_loss(params, X, target_pi, legal_mask, y_std_target, alpha, beta, l2):
     return loss, (ce, vmse)
 
 
-def _value_loss(params, X, y_std_target, l2):
+def _value_loss(params: dict[str, Any], X: Any, y_std_target: Any,
+                l2: Any) -> tuple[Any, Any]:
     """Value-only loss (MSE on the standardized target + L2), the scalar `train_step_value`
     descends — used by `train_value.py`'s Stage-1 Gate (value head, no policy head)."""
     v_std, _ = _forward_jax(params, X)
@@ -204,7 +213,8 @@ class JaxTrainer:
     self.W1`) sees fresh objects and rebuilds — no per-writer invalidation gate needed, the same
     invariant the numpy path relies on (see `ValueMLP._f32_weights`)."""
 
-    def __init__(self, net, lr, l2=0.0, betas=(0.9, 0.999), eps=1e-8):
+    def __init__(self, net: "ValueMLP", lr: float, l2: float = 0.0,
+                 betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8) -> None:
         self.net = net
         self.has_policy = net.n_actions is not None
         b1, b2 = betas
@@ -212,7 +222,7 @@ class JaxTrainer:
         # direct-construct callers; NOT an Optimizer-side baked copy — the Optimizer has no default).
         self._default_hp = AdamHParams(lr=float(lr), b1=float(b1), b2=float(b2), eps=float(eps))
         self._l2 = float(l2)
-        self.params = self._read_params()
+        self.params: dict[str, Any] = self._read_params()
         # DELEGATE the update: the Optimizer owns the optax transform + moments, typed to these params
         # (design §2.1 I4). The Trainer hands it the loss grad fns; the Optimizer fuses each into one
         # jit kernel whose required AdamHParams arg is the single writer of lr/b1/b2/eps.
@@ -220,12 +230,12 @@ class JaxTrainer:
         self._az_update = self.optimizer.make_update(_az_grad)
         self._value_update = self.optimizer.make_update(_value_grad)
 
-    def _read_params(self):
+    def _read_params(self) -> dict[str, Any]:
         """Read the net's numpy weights into a jax pytree (float32 = the training/inference
         precision). Keyed exactly like `ValueMLP._params()`."""
         return {k: jnp.asarray(v, dtype=_JDTYPE) for k, v in self.net._params().items()}
 
-    def _write_params(self):
+    def _write_params(self) -> None:
         """Write the jax params back into the net as numpy arrays — REBIND (new objects) so the
         f32 inference cache invalidates via its identity check. Stores at the net's float64 dtype
         for the params (the net's source-of-truth precision); the f32 inference cache re-casts.
@@ -238,7 +248,7 @@ class JaxTrainer:
             # direct rebind is shape-correct. setattr by the registry key.
             setattr(net, k, arr)
 
-    def sync_from_net(self):
+    def sync_from_net(self) -> None:
         """Re-read the net's weights into the jax params (e.g. after a load/warm-start replaced
         them outside the trainer) and RESET the optimizer — the moments no longer correspond to the
         new weights, exactly as `_init_adam()` reset them in the numpy path on load. `reset` is now
@@ -254,8 +264,9 @@ class JaxTrainer:
         return AdamHParams(lr=jnp.asarray(hp.lr, _JDTYPE), b1=jnp.asarray(hp.b1, _JDTYPE),
                            b2=jnp.asarray(hp.b2, _JDTYPE), eps=jnp.asarray(hp.eps, _JDTYPE))
 
-    def train_step(self, X, target_pi, legal_mask, target_v, *, alpha=1.0, beta=1.0,
-                   hp: AdamHParams | None = None, l2=None):
+    def train_step(self, X: Any, target_pi: Any, legal_mask: Any, target_v: Any,
+                   *, alpha: float = 1.0, beta: float = 1.0,
+                   hp: AdamHParams | None = None, l2: float | None = None) -> tuple[float, float]:
         """One Adam step on the AZ loss, DELEGATED to the Optimizer. X: (B, in_dim); target_pi:
         (B, n_actions) prob rows; legal_mask: (B, n_actions) {0,1}; target_v: (B,) RAW value targets
         (standardized here with the net's y_mean/y_std, matching the numpy path). Returns (ce, vmse)
@@ -285,7 +296,8 @@ class JaxTrainer:
         self._write_params()
         return float(ce), float(vmse)
 
-    def train_step_value(self, X, target_v, *, hp: AdamHParams | None = None, l2=None):
+    def train_step_value(self, X: Any, target_v: Any, *,
+                         hp: AdamHParams | None = None, l2: float | None = None) -> float:
         """One Adam step on the value-only loss (for the no-policy Stage-1 net), DELEGATED to the
         Optimizer. Returns vmse. `hp`/`l2` are LIVE (audit item M): `None` uses the construction-time
         `self._default_hp`/`self._l2` (back-compat)."""

@@ -37,7 +37,7 @@ import argparse
 import json
 import os
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     from chocofarm.az.optimizer import AdamHParams
     from chocofarm.az.mlp_jax_train import JaxTrainer
     from chocofarm.hp.schema import ExperimentConfig
+    from chocofarm.az.cpp_executor import CppActorExecutor
+    from chocofarm.az.parallel import ParallelExecutor
 
 # The per-decision training record the generation loop emits: (feature vector, improved-policy row,
 # legal mask, value target). The features/π/mask are numpy arrays; the value target is a float.
@@ -202,7 +204,9 @@ def train_epochs(trainer: "JaxTrainer", X: npt.NDArray[Any], PI: npt.NDArray[Any
             ce, vl = trainer.train_step(X[b], PI[b], M[b], Y[b],
                                         alpha=alpha, beta=beta, hp=hp, l2=l2)
             ce_tot += ce; v_tot += vl; cnt += 1
-    pv = net.predict_value(X.astype(np.float64))
+    # X is 2-D (B, in_dim), so predict_value returns the (B,) array arm of its union; the cast
+    # states the batch contract for r2_score (no runtime change — the body holds the array type).
+    pv = cast("npt.NDArray[Any]", net.predict_value(X.astype(np.float64)))
     return ce_tot / max(1, cnt), v_tot / max(1, cnt), r2_score(Y, pv)
 
 
@@ -346,7 +350,7 @@ def run(args: argparse.Namespace) -> None:
     #       else          -> the in-process serial path (the true serial A/B baseline).
     #     --cpp-runner takes precedence over --workers (it is a launch-time choice of actor, read off
     #     args like --resume/--init-weights, not a HOT registry field). ---
-    executor = None
+    executor: CppActorExecutor | ParallelExecutor | None = None
     if args.cpp_runner:
         from chocofarm.az.cpp_executor import CppActorExecutor
         executor = CppActorExecutor(args.cpp_runner, args.cpp_instance, args.cpp_faces, env,

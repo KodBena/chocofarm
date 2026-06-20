@@ -36,7 +36,7 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -81,23 +81,24 @@ class Optimizer:
     (built by `make_update`) that REQUIRES an `AdamHParams` argument and writes it into the state
     (`_with_hparams`) before `opt.update`. There is no code path that steps on the placeholders."""
 
-    def __init__(self, params):
+    def __init__(self, params: dict[str, Any]) -> None:
         # inject_hyperparams puts lr/b1/b2/eps in opt_state.hyperparams as traced values. The init
         # values are placeholders — immediately overwritten by the first step's AdamHParams (see
         # _with_hparams) and never authoritative on any real step. The moment pytree is typed to
         # `params` (design §5.2 I4: a different-shaped grads tree is a jax tree mismatch at step).
-        self._tx = optax.inject_hyperparams(optax.adam)(
+        # optax is a stub-gap (no py.typed); _tx and opt_state are typed `Any` at the seam (P8 use-site Any).
+        self._tx: Any = optax.inject_hyperparams(optax.adam)(
             learning_rate=1.0, b1=0.9, b2=0.999, eps=1e-8)
-        self.opt_state = self._tx.init(params)
+        self.opt_state: Any = self._tx.init(params)
 
     @staticmethod
-    def _with_hparams(opt_state, hp: AdamHParams):
+    def _with_hparams(opt_state: Any, hp: AdamHParams) -> Any:
         """Return a copy of `opt_state` whose injected hparams are exactly `hp`. The ONE place the
         live scalars enter the optax state — and it is reached only THROUGH a jit'd step that
         REQUIRES `hp`, so the injected dict is never read without first being set from the call's
         argument (the construction-enforced single-writer, design §2.1). `inject_hyperparams` keeps
         each hyperparameter as a jax array; cast to the slot's dtype so the assignment stays
-        traceable."""
+        traceable. `opt_state` is `Any` (optax stub-gap; P8 use-site Any at the optax/jax seam)."""
         hps = dict(opt_state.hyperparams)
         hps["learning_rate"] = jnp.asarray(hp.lr, dtype=hps["learning_rate"].dtype)
         hps["b1"] = jnp.asarray(hp.b1, dtype=hps["b1"].dtype)
@@ -105,7 +106,7 @@ class Optimizer:
         hps["eps"] = jnp.asarray(hp.eps, dtype=hps["eps"].dtype)
         return opt_state._replace(hyperparams=hps)
 
-    def make_update(self, grad_fn):
+    def make_update(self, grad_fn: Callable[..., Any]) -> Callable[..., Any]:
         """Build the jit'd update step fusing `grad_fn` (the Trainer's loss `value_and_grad`) with the
         injected-hparam write and the optax update — ONE compiled kernel (XLA fuses forward, backward,
         and the Adam step, the equivalence-test contract). `grad_fn(params, *loss_args)` must return
@@ -122,7 +123,8 @@ class Optimizer:
         tx = self._tx
 
         @jax.jit
-        def _update(params, opt_state, hp, *loss_args):
+        def _update(params: dict[str, Any], opt_state: Any, hp: AdamHParams,
+                    *loss_args: Any) -> tuple[Any, Any, Any]:
             (loss, aux), grads = grad_fn(params, *loss_args)
             opt_state = Optimizer._with_hparams(opt_state, hp)
             updates, opt_state = tx.update(grads, opt_state, params)
@@ -131,7 +133,7 @@ class Optimizer:
 
         return _update
 
-    def reset(self, params):
+    def reset(self, params: dict[str, Any]) -> None:
         """Re-init the moment + injected-hparam state against a (possibly replaced) params pytree —
         the `sync_from_net` semantics, now a method ON the optimizer (one responsibility resetting its
         own state), typed to the params it is given (design §5.2 I4 / S4)."""

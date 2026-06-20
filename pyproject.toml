@@ -5,6 +5,12 @@
 # never a convenience.
 python_version = "3.11"
 files = ["chocofarm"]
+# Drop the two UNTRACKED noise trees from the whole-package strict run (neither is in
+# `git ls-files`): `chocofarm/attic/` (quarantined dead code) and the stray `chocofarm/chocofarm/`
+# (a full nested re-clone of the package — its duplicate files inflate the raw count). mypy applies
+# this as an unanchored re.search against each path, so it DROPs those two and KEEPs chocofarm/az/*,
+# chocofarm/model/*, etc. (real source). Re-examine if either tree ever becomes tracked source.
+exclude = "chocofarm/(attic|chocofarm)/"
 strict = true                      # disallow_untyped_defs/calls/incomplete,
                                    # check_untyped_defs, no_implicit_optional,
                                    # warn_return_any, strict_equality, …

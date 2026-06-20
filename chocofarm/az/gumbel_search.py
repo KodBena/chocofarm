@@ -134,7 +134,11 @@ class GumbelAZSearch:
         self._mlp_fwd: Any
         if use_jax_mlp and net.n_actions is not None:
             from chocofarm.az.mlp_jax import MlpJaxForward
-            fwd = MlpJaxForward(net)
+            # mlp_jax is the held-hard Stage-4 module (C1); MlpJaxForward.__init__/__warmup are
+            # untyped until C1 merges. Cast to Any so the constructor + warmup calls are Any-typed
+            # (not no-untyped-call errors) — the honest escapes at this seam, matching _mlp_fwd: Any.
+            _fwd_cls: Any = MlpJaxForward  # Any-escape: mlp_jax stub-gap (resolved when C1 types mlp_jax.py)
+            fwd: Any = _fwd_cls(net)
             fwd.warmup(net.in_dim, net.n_actions)
             self._predict_both = fwd.predict_both
             self._mlp_fwd = fwd

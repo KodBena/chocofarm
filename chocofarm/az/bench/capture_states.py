@@ -18,13 +18,15 @@ Run (pinned + bounded), pointing at any policy+value npz:
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import Environment
+from chocofarm.model.env import Collected, Environment, Loc, WorldSet
 from chocofarm.az.features import FeatureBuilder
 from chocofarm.az.mlp import ValueMLP
-from chocofarm.az.gumbel_search import GumbelAZSearch
+from chocofarm.az.gumbel_search import GumbelAZSearch, _Node
 from chocofarm.az.exit_loop import generate_episode
 
 
@@ -32,38 +34,48 @@ from chocofarm.az.exit_loop import generate_episode
 # index into _KINDS and idx is the integer id (teleport keys are mapped to their position).
 _KINDS = ("w", "t", "d")
 
+# Snap: (loc_kind_code, loc_idx, collected_bitmask, bw_array)
+_Snap = tuple[int, int, int, npt.NDArray[np.int64]]
+# State: (loc, bw, collected_set) — the representation load_states returns
+_State = tuple[Loc, npt.NDArray[np.int64], set[int]]
 
-def _encode_loc(env, loc):
+
+def _encode_loc(env: Environment, loc: Loc) -> tuple[int, int]:
     kind, i = loc
     if kind == "w":
-        idx = list(env.teleports.keys()).index(i)
+        # In this branch Loc is tuple[Literal["w"], str], so i is str — the index() call is typed.
+        idx = list(env.teleports.keys()).index(i)  # type: ignore[arg-type]  # i is str|int at union; narrowed to str by kind=="w"
     else:
-        idx = int(i)
+        idx = int(i)  # i is int for "t"/"d" branches of Loc; int() is the safe coercion here
     return _KINDS.index(kind), idx
 
 
-def _decode_loc(env, code, idx):
+def _decode_loc(env: Environment, code: int, idx: int) -> Loc:
     kind = _KINDS[code]
     if kind == "w":
         return ("w", list(env.teleports.keys())[idx])
-    return (kind, int(idx))
+    return (kind, idx)  # type: ignore[return-value]  # kind is "t"|"d" and idx is int — valid Loc
 
 
-def capture(net_path, episodes=6, seed=2024, max_states=4000):
+def capture(net_path: str, episodes: int = 6, seed: int = 2024,
+            max_states: int = 4000) -> list[_Snap]:
     env = Environment()
     fb = FeatureBuilder(env)
     net = ValueMLP.load(net_path)
     search = GumbelAZSearch(net, env, m=12, n_sims=48)
     rng = np.random.default_rng(seed)
 
-    snaps = []   # (loc_code, loc_idx, collected_mask, bw_array)
-    seen = set()
+    snaps: list[_Snap] = []   # (loc_code, loc_idx, collected_mask, bw_array)
+    seen: set[tuple[Any, ...]] = set()
 
     import chocofarm.az.gumbel_search as gs
     orig = gs.GumbelAZSearch._evaluate
 
-    def patched(self, node, loc, bw, collected):
-        key = (loc, len(bw), int(bw[0]) if len(bw) else 0, int(bw[-1]) if len(bw) else 0)
+    def patched(self: GumbelAZSearch, node: _Node, loc: Loc, bw: WorldSet,
+                collected: Collected) -> float:
+        key: tuple[Any, ...] = (loc, len(bw),
+                                int(bw[0]) if len(bw) else 0,
+                                int(bw[-1]) if len(bw) else 0)
         if key not in seen and len(snaps) < max_states:
             seen.add(key)
             cmask = 0
@@ -73,13 +85,13 @@ def capture(net_path, episodes=6, seed=2024, max_states=4000):
             snaps.append((lc, li, cmask, np.asarray(bw, dtype=np.int64).copy()))
         return orig(self, node, loc, bw, collected)
 
-    gs.GumbelAZSearch._evaluate = patched
+    gs.GumbelAZSearch._evaluate = patched  # type: ignore[method-assign]  # bench-only monkeypatch; restored in `finally`
     try:
         for _ in range(episodes):
             w = int(rng.choice(env.worlds))
             generate_episode(env, search, fb, w, 0.0855, rng, 0)
     finally:
-        gs.GumbelAZSearch._evaluate = orig
+        gs.GumbelAZSearch._evaluate = orig  # type: ignore[method-assign]  # restoring original after bench capture
 
     # also include the full root belief explicitly (|bw| = 15504), the heaviest single state
     lc, li = _encode_loc(env, ("w", env.entry))
@@ -87,7 +99,7 @@ def capture(net_path, episodes=6, seed=2024, max_states=4000):
     return snaps
 
 
-def save_states(snaps, path):
+def save_states(snaps: list[_Snap], path: str) -> None:
     flat = np.concatenate([s[3] for s in snaps]) if snaps else np.zeros(0, np.int64)
     lens = np.array([len(s[3]) for s in snaps], dtype=np.int64)
     offsets = np.zeros(len(lens) + 1, dtype=np.int64)
@@ -99,23 +111,26 @@ def save_states(snaps, path):
              loc_idxs=loc_idxs, cmasks=cmasks)
 
 
-def load_states(path):
+def load_states(path: str) -> tuple[Environment, list[_State]]:
     """Returns (env, list of (loc, bw, collected_set))."""
     env = Environment()
     z = np.load(path)
-    flat, offsets = z["flat"], z["offsets"]
-    loc_codes, loc_idxs, cmasks = z["loc_codes"], z["loc_idxs"], z["cmasks"]
-    out = []
+    flat: npt.NDArray[np.int64] = z["flat"]
+    offsets: npt.NDArray[np.int64] = z["offsets"]
+    loc_codes: npt.NDArray[np.int64] = z["loc_codes"]
+    loc_idxs: npt.NDArray[np.int64] = z["loc_idxs"]
+    cmasks: npt.NDArray[np.int64] = z["cmasks"]
+    out: list[_State] = []
     for k in range(len(loc_codes)):
         bw = flat[offsets[k]:offsets[k + 1]].copy()
         loc = _decode_loc(env, int(loc_codes[k]), int(loc_idxs[k]))
         cmask = int(cmasks[k])
-        collected = {i for i in range(env.N) if (cmask >> i) & 1}
+        collected: set[int] = {i for i in range(env.N) if (cmask >> i) & 1}
         out.append((loc, bw, collected))
     return env, out
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Capture hot-path bench states.")
     ap.add_argument("--net", required=True, help="policy+value npz")
     ap.add_argument("--out", required=True)

@@ -28,10 +28,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
-from chocofarm.model.env import Environment
+from chocofarm.model.env import Environment, MoveAction, TERMINATE
 from chocofarm.az.features import feature_dim
 from chocofarm.az.actions import n_action_slots, action_to_slot
 from chocofarm.az.mlp import ValueMLP
@@ -39,32 +41,38 @@ from chocofarm.az.gumbel_search import GumbelPolicy
 from chocofarm.az.dtypes import DTYPE_NAME
 
 
-def rollout(env, pol, n_episodes, lam, seed):
+def rollout(env: Environment, pol: GumbelPolicy, n_episodes: int, lam: float,
+            seed: int) -> tuple[float, float, npt.NDArray[Any], npt.NDArray[np.int64]]:
     """Roll out `n_episodes` greedy episodes at fixed λ, recording R, T, and the executed-action
     slot histogram. Returns (sumR, sumT, Ts, action_counts dict slot->n)."""
     rng = np.random.default_rng(seed)
     n_slots = n_action_slots(env)
     sumR = sumT = 0.0
-    Ts = []
+    Ts: list[float] = []
     counts = np.zeros(n_slots, dtype=np.int64)
     for _ in range(n_episodes):
         w = int(rng.choice(env.worlds))
         # mirror env.simulate but tally the executed actions
-        loc, bw, collected, R, T = ("w", env.entry), env.worlds, set(), 0.0, 0.0
+        from chocofarm.model.env import Collected, Loc
+        loc: Loc = ("w", env.entry)
+        bw = env.worlds
+        collected: Collected = set()
+        R = T = 0.0
         for _step in range(env.max_steps):          # the single episode-horizon home (env.py)
             a = pol.decide(env, loc, bw, collected, lam, rng)
             counts[action_to_slot(env, a)] += 1
-            from chocofarm.model.env import TERMINATE
             if a == TERMINATE:
                 break
-            r, loc, bw, collected, dt = env.apply(loc, bw, collected, a, w)
+            # a is MoveAction here (TERMINATE branch handled above)
+            move: MoveAction = a  # type: ignore[assignment]  # narrowed from Action by TERMINATE guard
+            r, loc, bw, collected, dt = env.apply(loc, bw, collected, move, w)
             R += r; T += dt
         T += env.exit_cost(loc)
         sumR += R; sumT += T; Ts.append(T)
     return sumR, sumT, np.array(Ts), counts
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="AZ behavioral-equivalence rollout.")
     ap.add_argument("--net", required=True)
     ap.add_argument("--episodes", type=int, default=300)
@@ -81,16 +89,16 @@ def main():
     seeds = [int(s) for s in args.seeds.split(",")]
 
     sumR = sumT = 0.0
-    allTs = []
+    allTs_list: list[npt.NDArray[Any]] = []
     n_slots = n_action_slots(env)
     counts = np.zeros(n_slots, dtype=np.int64)
-    per_seed = []
+    per_seed: list[dict[str, Any]] = []
     for sd in seeds:
         r, t, ts, c = rollout(env, pol, args.episodes, args.lam, sd)
-        sumR += r; sumT += t; allTs.append(ts); counts += c
+        sumR += r; sumT += t; allTs_list.append(ts); counts += c
         per_seed.append({"seed": sd, "rate": r / t if t > 0 else 0.0,
                          "ET": float(ts.mean())})
-    allTs = np.concatenate(allTs)
+    allTs: npt.NDArray[Any] = np.concatenate(allTs_list)
     N = len(allTs)
     rate = sumR / sumT if sumT > 0 else 0.0
     ET = float(allTs.mean())
@@ -105,7 +113,7 @@ def main():
     term = int(counts[N_t + nD])
     tot_actions = collect + sense + term
 
-    out = {
+    out: dict[str, Any] = {
         "dtype": DTYPE_NAME, "episodes_per_seed": args.episodes, "seeds": seeds,
         "N_total": N, "rate": rate, "ET": ET, "ET_se": ET_se,
         "per_seed": per_seed,

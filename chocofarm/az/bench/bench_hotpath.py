@@ -29,8 +29,11 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from chocofarm.model.env import Environment, TERMINATE
 from chocofarm.az.features import FeatureBuilder
@@ -40,7 +43,7 @@ from chocofarm.az.actions import (n_action_slots, action_to_slot, slot_to_action
 from chocofarm.az.bench.capture_states import load_states
 
 
-def _time(fn, iters, repeat=5):
+def _time(fn: Callable[[], Any], iters: int, repeat: int = 5) -> float:
     """Median over `repeat` runs of the per-call time (seconds) of `fn` run `iters` times."""
     best = []
     for _ in range(repeat):
@@ -52,12 +55,12 @@ def _time(fn, iters, repeat=5):
     return best[len(best) // 2]
 
 
-def bench(net_path, states_path, repeat=5):
+def bench(net_path: str, states_path: str, repeat: int = 5) -> tuple[dict[str, float], int]:
     env, states = load_states(states_path)
     fb = FeatureBuilder(env)
     net = ValueMLP.load(net_path)
     N, nD = env.N, len(env.detectors)
-    results = {}
+    results: dict[str, float] = {}
 
     # representative working set: cycle through captured states (real |bw| distribution)
     locs = [s[0] for s in states]
@@ -75,7 +78,7 @@ def bench(net_path, states_path, repeat=5):
     # --- marginals ---
     i = {"k": 0}
 
-    def f_marg():
+    def f_marg() -> None:
         i["k"] = (i["k"] + 1) % S
         env.marginals(bws[i["k"]])
     results["env.marginals"] = _time(f_marg, S, repeat)
@@ -83,7 +86,7 @@ def bench(net_path, states_path, repeat=5):
     # --- features.build (the fused kernel derives marginals; isolates the build itself) ---
     i["k"] = 0
 
-    def f_build():
+    def f_build() -> None:
         i["k"] = (i["k"] + 1) % S
         k = i["k"]
         fb.build(locs[k], bws[k], colls[k])
@@ -93,7 +96,7 @@ def bench(net_path, states_path, repeat=5):
     cover = fb.cover
     i["k"] = 0
 
-    def f_belief_red():
+    def f_belief_red() -> None:
         i["k"] = (i["k"] + 1) % S
         bw = bws[i["k"]]
         if len(bw):
@@ -108,7 +111,7 @@ def bench(net_path, states_path, repeat=5):
     _kwarm(N, nD)
     i["k"] = 0
 
-    def f_belief_red_numba():
+    def f_belief_red_numba() -> None:
         i["k"] = (i["k"] + 1) % S
         bw = bws[i["k"]]
         if len(bw):
@@ -119,7 +122,7 @@ def bench(net_path, states_path, repeat=5):
     from chocofarm.az.kernels import marginals_kernel
     i["k"] = 0
 
-    def f_marg_numba():
+    def f_marg_numba() -> None:
         i["k"] = (i["k"] + 1) % S
         bw = bws[i["k"]]
         if len(bw):
@@ -130,7 +133,7 @@ def bench(net_path, states_path, repeat=5):
     #     fast path when CHOCO_AZ_DTYPE=float32 (default) and the float64 path otherwise. ---
     i["k"] = 0
 
-    def f_predict():
+    def f_predict() -> None:
         i["k"] = (i["k"] + 1) % S
         k = i["k"]
         net.predict_both(feats[k], masks[k])
@@ -139,12 +142,16 @@ def bench(net_path, states_path, repeat=5):
     # --- predict_both, EXPLICIT float64 path (the pre-opt baseline forward) ---
     i["k"] = 0
 
-    def f_predict_f64():
+    def f_predict_f64() -> None:
         i["k"] = (i["k"] + 1) % S
         k = i["k"]
         _, v_std, logits = net._forward(feats[k].astype(np.float64)[None, :])
         v = v_std * net.y_std + net.y_mean
+        # logits is NDArray | None from _forward; the policy head is always loaded in this bench
+        # (the net is the same one GumbelAZSearch uses, so n_actions is set). Assert loudly.
+        assert logits is not None, "net has no policy head — bench requires n_actions set"
         net._masked_softmax(logits, masks[k][None, :].astype(np.float64))
+        _ = v
     results["predict_both_f64"] = _time(f_predict_f64, S, repeat)
 
     # --- predict_both, JAX-jit single-eval (XLA float32). Compiled via warmup; the fresh-numpy
@@ -153,10 +160,12 @@ def bench(net_path, states_path, repeat=5):
     try:
         from chocofarm.az.mlp_jax import MlpJaxForward
         jfwd = MlpJaxForward(net)
+        # MlpJaxForward.__init__ raises if net.n_actions is None; after construction n_actions is int.
+        assert net.n_actions is not None, "MlpJaxForward requires n_actions — invariant from __init__"
         jfwd.warmup(net.in_dim, net.n_actions)
         i["k"] = 0
 
-        def f_predict_jax():
+        def f_predict_jax() -> None:
             i["k"] = (i["k"] + 1) % S
             k = i["k"]
             jfwd.predict_both(feats[k], masks[k])
@@ -169,7 +178,7 @@ def bench(net_path, states_path, repeat=5):
         Mb = np.stack([masks[k % S] for k in range(B)]).astype(np.float32)
         jfwd.predict_both(Xb, Mb)   # compile the batched signature
 
-        def f_predict_jax_batch():
+        def f_predict_jax_batch() -> None:
             jfwd.predict_both(Xb, Mb)
         results["predict_both_jax_batch48_peritem"] = _time(f_predict_jax_batch, 1, repeat) / B
     except Exception as e:  # pragma: no cover - jax optional
@@ -178,13 +187,14 @@ def bench(net_path, states_path, repeat=5):
         print(f"[bench] jax variants skipped: {e}")
 
     # --- slot conversions (round-trip per legal slot) ---
-    legal_lists = []
+    legal_lists: list[list[Any]] = []
     for f, m in zip(feats, masks):
-        legal = [slot_to_action(env, s) for s in np.nonzero(m)[0]]
+        # slot_to_action takes int; np.nonzero returns signedinteger — cast explicitly.
+        legal = [slot_to_action(env, int(s)) for s in np.nonzero(m)[0]]
         legal_lists.append(legal)
     i["k"] = 0
 
-    def f_slotconv():
+    def f_slotconv() -> None:
         i["k"] = (i["k"] + 1) % S
         legal = legal_lists[i["k"]]
         for a in legal:
@@ -197,7 +207,7 @@ def bench(net_path, states_path, repeat=5):
     # --- env.d / distance (per legal node from loc) ---
     i["k"] = 0
 
-    def f_dist():
+    def f_dist() -> None:
         i["k"] = (i["k"] + 1) % S
         loc = locs[i["k"]]
         for j in range(N):
@@ -207,7 +217,7 @@ def bench(net_path, states_path, repeat=5):
     # --- filter_treasure / filter_detector ---
     i["k"] = 0
 
-    def f_filt_t():
+    def f_filt_t() -> None:
         i["k"] = (i["k"] + 1) % S
         bw = bws[i["k"]]
         if len(bw):
@@ -216,7 +226,7 @@ def bench(net_path, states_path, repeat=5):
 
     i["k"] = 0
 
-    def f_filt_d():
+    def f_filt_d() -> None:
         i["k"] = (i["k"] + 1) % S
         bw = bws[i["k"]]
         if len(bw):
@@ -224,7 +234,7 @@ def bench(net_path, states_path, repeat=5):
     results["filter_detector"] = _time(f_filt_d, S, repeat)
 
     # --- _puct_select (build a node with a cached eval + some visits, then select) ---
-    nodes = []
+    nodes: list[_Node] = []
     for k in range(S):
         node = _Node()
         node.feat = feats[k]
@@ -239,7 +249,7 @@ def bench(net_path, states_path, repeat=5):
         nodes.append(node)
     i["k"] = 0
 
-    def f_puct():
+    def f_puct() -> None:
         i["k"] = (i["k"] + 1) % S
         node = nodes[i["k"]]
         if node.legal:
@@ -249,7 +259,7 @@ def bench(net_path, states_path, repeat=5):
     # --- _evaluate (the full leaf eval: marginals + build + mask + forward + legal) ---
     i["k"] = 0
 
-    def f_eval():
+    def f_eval() -> None:
         i["k"] = (i["k"] + 1) % S
         k = i["k"]
         node = _Node()
@@ -259,7 +269,7 @@ def bench(net_path, states_path, repeat=5):
     return results, S
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Hot-path micro-bench.")
     ap.add_argument("--net", required=True)
     ap.add_argument("--states", required=True)

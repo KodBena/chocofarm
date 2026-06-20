@@ -29,6 +29,7 @@ expected and acceptable (the brief's behavioral-equivalence bar, not bit-equival
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, Any
 
 # The XLA/OMP single-thread pin lives in ONE home now (chocofarm/config.py, ADR-0012 P1). Importing
 # config here — before the jax import below — applies it (config sets the env at its import).
@@ -41,17 +42,23 @@ import jax.numpy as jnp
 from chocofarm.az.dtypes import DTYPE
 from chocofarm.az.forward import forward_core
 
+if TYPE_CHECKING:
+    from chocofarm.az.mlp import ValueMLP
+
 _JDTYPE = jnp.float32 if np.dtype(DTYPE) == np.dtype(np.float32) else jnp.float64
 
 
 @jax.jit
-def _forward_both(params, x, lm, ym, ys):
+def _forward_both(params: dict[str, Any], x: Any, lm: Any, ym: Any, ys: Any) -> tuple[Any, Any]:
     """Value head (de-standardized) + masked-softmax policy over the ONE `forward.forward_core`
     (audit R11). `params` is the flat weight dict keyed like `ValueMLP._params()`, so the residual
     block is applied iff `"Wr1"` is present — exactly as in the numpy/jax-train forwards. There is
     NO separate residual-blind graph here anymore: this wrapper cannot drop the residual block (the
     R11 bug is structurally impossible). `x`: (B,in); `lm`: matching legal mask. Returns (v, p)."""
     v_std, logits = forward_core(params, x, jnp)
+    # MlpJaxForward.refresh always passes a params dict with Wp/bp (requires n_actions set); logits
+    # is therefore not None here — assert to narrow honestly (ADR-0002 fail-loud, not a None-deref).
+    assert logits is not None
     v = v_std * ys + ym
     neg = jnp.asarray(-1e30, dtype=logits.dtype)
     legal = lm > 0
@@ -72,23 +79,24 @@ class MlpJaxForward:
     for reuse). The forward is `forward.forward_core` (the same graph the numpy net and the jax
     trainer run), so it honors the net's residual block instead of silently dropping it."""
 
-    def __init__(self, net):
+    def __init__(self, net: "ValueMLP") -> None:
         if net.n_actions is None:
             raise ValueError("MlpJaxForward needs a net with a policy head (n_actions set)")
         self.net = net
         self.refresh()
 
-    def refresh(self):
+    def refresh(self) -> None:
         net = self.net
         d = _JDTYPE
         # the full params dict keyed like `_params()` — INCLUDING the residual block when the net
         # has it, so `forward_core` applies it (the residual-drop fix). Single source of which
         # params exist: the net's own `_params()`.
-        self.params = {k: jnp.asarray(v, dtype=d) for k, v in net._params().items()}
-        self.ym = jnp.asarray(net.y_mean, dtype=d)
-        self.ys = jnp.asarray(net.y_std, dtype=d)
+        self.params: dict[str, Any] = {k: jnp.asarray(v, dtype=d) for k, v in net._params().items()}
+        self.ym: Any = jnp.asarray(net.y_mean, dtype=d)
+        self.ys: Any = jnp.asarray(net.y_std, dtype=d)
 
-    def predict_both(self, X, legal_mask):
+    def predict_both(self, X: Any, legal_mask: Any) -> (
+            tuple[float, Any] | tuple[Any, Any]):
         """Match `ValueMLP.predict_both`: 1-D X -> (float value, (n_actions,) numpy policy);
         2-D X -> ((B,) numpy values, (B,n_actions) numpy policy)."""
         single = (X.ndim == 1)
@@ -104,7 +112,7 @@ class MlpJaxForward:
             return float(v[0]), p[0]
         return v, p
 
-    def warmup(self, in_dim, n_actions):
+    def warmup(self, in_dim: int, n_actions: int) -> None:
         """Compile the kernel on a representative single-row input so the first real leaf eval
         doesn't pay the trace+compile cost."""
         x = np.zeros(in_dim, dtype=np.float32)

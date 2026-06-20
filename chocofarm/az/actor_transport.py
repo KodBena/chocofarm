@@ -287,6 +287,5 @@ class SubprocessActorTransport:
     def __enter__(self) -> "SubprocessActorTransport":
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, *exc: Any) -> None:
         self.close()
-        return False

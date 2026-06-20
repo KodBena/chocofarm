@@ -39,6 +39,7 @@ import sys
 import time
 
 import numpy as np
+import numpy.typing as npt
 import redis
 
 from chocofarm.az.actions import n_action_slots
@@ -50,8 +51,13 @@ from chocofarm.az.transport import pack_net, result_keys, weight_keys
 from chocofarm.config import transport_redis_params
 from chocofarm.model.env import Environment
 
+# The redis client type is Any at this seam — redis is a documented ignore_missing_imports stub-gap.
+from typing import Any
 
-def _read_episode(conn, tok: str, idx: int, in_dim: int, ns: int):
+
+def _read_episode(
+    conn: Any, tok: str, idx: int, in_dim: int, ns: int
+) -> tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any]] | None:
     """Read one episode's (X, PI, M, Y) blocks the C++ actor wrote, deriving n from the Y block length
     (every block is contiguous little-endian float32 — result_spec). Returns None if the episode is
     absent (idx ran past the actor's output)."""
@@ -94,7 +100,16 @@ def main() -> int:
     net = ValueMLP(in_dim, hidden=args.hidden, n_actions=ns, seed=args.seed,
                    y_mean=0.0, y_std=1.0, residual=False)
     trainer = JaxTrainer(net, lr=args.lr, l2=args.l2)
-    conn = redis.Redis(**transport_redis_params())
+    # redis-py (8.x) ships py.typed, so Redis(**dict[str, str | int]) fails the precise kwarg types
+    # (host:str / port:int / db:int). Pass the three connection facts explicitly-typed — the params
+    # dict's runtime keys are exactly these (transport_redis_params()), no behavior change.
+    # (Same pattern as transport.py:connect() and hp/registry.py:_connect_redis().)
+    _tp = transport_redis_params()
+    conn = redis.Redis(
+        host=str(_tp["host"]),
+        port=int(_tp["port"]),
+        db=int(_tp["db"]),
+    )
 
     writer = None
     if args.tb_logdir:
