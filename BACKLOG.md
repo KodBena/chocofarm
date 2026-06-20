@@ -88,6 +88,33 @@ deferred on purpose:
   self-time); no OOM at the production search config (`n_sims=256 max_depth=24`). Feeds the per-nb
   dispatch decision in `docs/design/cpp-belief-dynamic-rep-selection.md`.
 
+## Belief/eval caches are EPHEMERAL — cross-search sharing was the intended semantics (deferred 2026-06-20)
+
+**The fact (record so it isn't lost):** the search's belief-keyed caches are **per-search / ephemeral** —
+the Gumbel transposition table (`gumbel.hpp` `children` keyed by `(action-slot, belief_key)`) and the
+within-search net-eval reuse (`gumbel.hpp:127` "prior/value/legal are the net's cached evaluation at this
+belief (one forward, reused)") are rebuilt **fresh every ply** (each decision is a new tree). The ISMCTS
+table is the same. So a belief evaluated in ply *k*'s search is **re-evaluated** in ply *k+1*'s search,
+even though the belief evolves slowly and consecutive plies' search trees overlap heavily.
+
+**This was never intended.** The intended semantics is **cache SHARING ACROSS SEARCHES** — a belief's
+(prior/value) evaluation, once paid, reused by every later ply's search that re-encounters that
+`belief_key` — so the net is evaluated once per distinct belief per *episode*, not once per distinct
+belief per *ply-search*. The current ephemeral form pays redundant remote leaf evals (the wire path's
+transport-per-decision = unique `belief_key`s in *that* search, not across the episode).
+
+**How it surfaced (2026-06-20):** the HPO warm-pool / decision-budget bench work. The measured throughput
+turned out to depend on the belief-size distribution precisely *because* transport-per-decision is the
+per-search unique-leaf count — a dependency a cross-search cache would dampen. (It also means a faithful
+HPO measure must reproduce the policy's belief distribution — the faithful-warm-pool + no-early-exit
+benchmark-search work this entry came out of.)
+
+**Deferred because:** it is a correctness-preserving *efficiency* change to the live search hot path
+(cross-search cache lifetime + invalidation on belief mutation) with its own parity obligation (bit-exact
+search output, P6) — out of scope for the HPO tooling that exposed it. **Acceptance when resumed:** the
+f64/f32/jax search-output parity stays green; a measured drop in remote leaf-evals per episode at the
+production config; cache coherence held on the rebind-not-mutate invariant (ADR-0001).
+
 ## Retired
 
 - **NMCS parity tests** marked `skip` in `tests/test_cpp_runner.py` (2026-06-16): validated repeatedly,
