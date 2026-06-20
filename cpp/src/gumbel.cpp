@@ -631,6 +631,38 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     assert(survivor != -1 && "gumbel: SH returned no survivor on a non-empty belief");
     out.survivor_slot = survivor;
     out.action = action_of_slot(env_, survivor);
+
+    // HPO/BENCHMARK-ONLY no-early-exit substitution (cfg_.no_early_exit, default false → this whole block
+    // is skipped and the decision is BYTE-UNCHANGED). The search above ran exactly as normal — Gumbel-Top-k,
+    // Sequential Halving, the Terminate edge SAMPLED and BACKPROPPED, and out.improved (the improved-π
+    // target) is the real, UNTOUCHED π. The ONLY change here: if the EXECUTED action came out Terminate and a
+    // non-terminate legal action still exists (the empty-belief case returned above, so legal_slots may hold
+    // Treasure/Detector slots besides term_slot_), substitute the executed action for the best non-terminate
+    // option so the benchmark episode CONTINUES instead of early-exiting. We pick the non-terminate legal slot
+    // with the highest out.improved (the search's own improved-π ranking, already computed) — the faithful
+    // "best non-terminate" per the flag's doc comment in gumbel.hpp. NOTE (deliberate, not a bug): out.improved
+    // still carries Terminate's weight while the executed action is the substitute. That is FINE — this path is
+    // benchmark-only (the wire runner abandons episodes and writes NO training data), so no PI target is
+    // corrupted; we intentionally leave out.improved and the backprop unchanged and substitute ONLY the
+    // executed action (+ survivor_slot, kept consistent with it).
+    if (cfg_.no_early_exit && out.action.kind == ActionKind::Terminate) {
+        int best_slot = -1;
+        double best_pi = -1.0;
+        for (int s : nodes[0].legal_slots) {
+            if (s == term_slot_) continue;  // skip the Terminate slot; want a non-terminate legal action
+            const double pi = out.improved[static_cast<size_t>(s)];
+            if (pi > best_pi) {  // strict `>` first-wins, mirroring the search's argmax tie-break
+                best_pi = pi;
+                best_slot = s;
+            }
+        }
+        if (best_slot != -1) {  // a non-terminate legal action exists → continue the episode on it
+            out.survivor_slot = best_slot;
+            out.action = action_of_slot(env_, best_slot);
+        }
+        // else: no non-terminate legal action (only term_slot_ legal) → leave Terminate; the episode
+        // correctly ends, exactly as the empty-belief guard above does (there is nothing to substitute).
+    }
     return out;
 }
 

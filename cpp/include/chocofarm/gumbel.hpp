@@ -84,6 +84,16 @@ struct GumbelConfig {
     double c_scale = 1.0;  // the Danihelka σ-transform scale
     int c_outcome = 2;     // immediate-outcome determinizations averaged per root-action sim
     int max_depth = 24;    // interior descent depth cap
+    // HPO/BENCHMARK-ONLY (default false → production search byte-unchanged). When true, the search runs
+    // EXACTLY as normal (Gumbel-Top-k, Sequential Halving, the early-exit Terminate edge SAMPLED and
+    // BACKPROPPED correctly) — but if the chosen EXECUTED action is Terminate AND a non-terminate legal
+    // action still exists (places still to visit), the executed action is substituted for the best
+    // non-terminate option so the episode CONTINUES. This keeps benchmark episodes on a faithful,
+    // non-early-exiting trajectory (the warm-pool/HPO population must span the real belief distribution,
+    // which early-exit otherwise truncates) while exercising the real search code paths + distributions.
+    // The forced-terminate-on-empty-belief case (no non-terminate option) is NOT substituted. Behavior
+    // implemented in gumbel.cpp's decide core (the executed-action substitution point).
+    bool no_early_exit = false;
 };
 
 // The information-set node identity: the (count, first, last) belief fingerprint (mirrors

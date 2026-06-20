@@ -192,6 +192,11 @@ int main(int argc, char** argv) {
     if (auto v = opt(args, "--c-scale")) cfg.c_scale = to_double(*v);
     if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = to_int(*v);
     if (auto v = opt(args, "--max-depth")) cfg.max_depth = to_int(*v);
+    // HPO/BENCHMARK-ONLY no-early-exit (default false). A presence flag (no value): when present the
+    // executed-action Terminate substitution in run_search is exercised, so the parity test can compare
+    // flag-off vs flag-on executed action on the SAME scripted input (gumbel.hpp GumbelConfig::no_early_exit).
+    for (const std::string_view& a : args)
+        if (a == "--no-early-exit") cfg.no_early_exit = true;
     double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
     // FINE leaf mode (1b): --leaf-logits-rows N>0 means line 2 is one value per leaf and line 4 carries
     // the full-precision per-slot logits table (N rows of n_slots doubles). Absent/0 = COARSE 1a mode.

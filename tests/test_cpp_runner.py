@@ -79,6 +79,7 @@ ISMCTS_PARITY = os.path.join(REPO, "cpp", "parity", "ismcts_parity.py")
 GUMBEL_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-gumbel-dump")
 GUMBEL_LOGIC = os.path.join(REPO, "cpp", "parity", "gumbel_logic.py")
 GUMBEL_PRECISION = os.path.join(REPO, "cpp", "parity", "gumbel_precision.py")
+GUMBEL_NO_EARLY_EXIT = os.path.join(REPO, "cpp", "parity", "gumbel_no_early_exit.py")
 SERIAL_CHECK_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-serial-runtime-check")
 BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-search-runtime-bench")
 WIRE_BENCH_BIN = os.path.join(REPO, "cpp", "build", "chocofarm-wire-bench")
@@ -356,6 +357,24 @@ def test_cpp_gumbel_precision_parity():
                          env={**os.environ, "PYTHONPATH": REPO},
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, f"Gumbel precision check FAILED:\n{out.stdout}\n{out.stderr}"
+    assert "RESULT: PASS" in out.stdout, out.stdout
+
+
+@pytest.mark.skipif(not (_RUN_CPP and os.path.exists(GUMBEL_BIN)), reason=_CPP_SKIP)
+def test_cpp_gumbel_no_early_exit_behavior():
+    """The GumbelConfig::no_early_exit HPO/BENCHMARK-ONLY substitution (cpp/parity/gumbel_no_early_exit.py):
+    driving chocofarm-gumbel-dump with the SAME scripted RNG-free seam the 1a logic check uses, toggling
+    ONLY the --no-early-exit flag on a leaf crafted so the unconstrained search picks Terminate. It asserts
+    the flag's contract: (a) flag OFF is byte-identical / executes Terminate (production default unchanged);
+    (b) flag ON, with a non-terminate legal action present, NEVER executes Terminate while leaving the
+    improved-pi argmax AND the sims spent UNCHANGED (the substitution touches only the executed action, not
+    the PI target or the search dynamics); (c) flag ON, with NO non-terminate legal action (all treasures
+    collected), STILL terminates (the `best_slot == -1` branch — nothing to substitute). NO redis (the
+    scripted leaf is in-process). RESULT: PASS gates all three."""
+    out = subprocess.run([sys.executable, GUMBEL_NO_EARLY_EXIT], cwd=REPO,
+                         env={**os.environ, "PYTHONPATH": REPO},
+                         capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, f"Gumbel no-early-exit check FAILED:\n{out.stdout}\n{out.stderr}"
     assert "RESULT: PASS" in out.stdout, out.stdout
 
 
