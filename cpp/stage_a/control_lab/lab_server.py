@@ -44,8 +44,6 @@ _STAGE_A = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _STAGE_A not in sys.path:
     sys.path.insert(0, _STAGE_A)
 
-from chocofarm.az.inference_server import run_microbatch  # noqa: E402
-
 from control_lab.adapter import AllAllow, Controller, Observation, TrialContext  # noqa: E402
 from control_lab.lab_wire import (  # noqa: E402
     LabFeature,
@@ -215,22 +213,26 @@ class LabServer(StageAServer):
     def malfunction_record(self) -> MalfunctionRecord:
         return self._malfunction
 
-    # ---- the decision boundary (override of StageAServer._serve_batch) ----
-    def _serve_batch(self, drained: list) -> None:  # type: ignore[override]
-        """Run ONE group forward over all drained rows (the lab decision epoch), then run the Controller and
-        tag each served reply with its thread's gate bit. The envelope is `[corr_id, feature_frame]`
-        (frames[1:-1]); the reply re-uses corr_id verbatim and REPLACES feature_frame with the gate frame.
-        A request with no/garbled FEATURE frame is served normally but contributes no observation + gets no
-        gate frame (its reply is the 2-frame non-lab envelope), so a mixed lab/non-lab stream is safe."""
-        params, y_mean, y_std = self._params_source.current()
-        # ONE group forward over the concatenated rows (the lab is group-wakeup; bucket-E for the pad shape).
-        rows = [(ident, X) for ident, _env, X in drained]
-        real = int(sum(int(X.shape[0]) for _i, X in rows))
-        pad_to = self._max_batch if self._e_policy == "padmax" else _bucket_for_server(self, real)
-        responses = run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=pad_to)
+    # ---- the decision boundary (override of the SEALED dispatch's _scatter hook, ADR-0012 P3) ----
+    def _scatter(self, drained: list, responses: list, forwards: list) -> None:  # type: ignore[override]
+        """The lab's serve/scatter BOUNDARY — run the Controller on the just-evaluated forward and tag each
+        served reply with its thread's gate bit. After the ADR-0012 P3 template-method split
+        (lab-staging-divergence-rca.md §6), this is an override of the OVERRIDABLE `_scatter` hook, NOT of the
+        welded `_serve_batch`/dispatch: the SEALED `InferenceServer._run_forward` already ran the ONE group
+        forward (the lab is group-wakeup; bucket-E via the inherited `_pad_shape`) and handed back the encoded
+        `responses` + the per-forward `(real, pad)` in `forwards` — so the lab's Controller call + gate-frame
+        tagging live ENTIRELY here, and the forward dispatch (`run_microbatch`) is the base's one home, never
+        a hand-copy that can silently diverge (the bug class this split removes). The envelope is
+        `[corr_id, feature_frame]` (frames[1:-1]); the reply re-uses corr_id verbatim and REPLACES
+        feature_frame with the gate frame. A request with no/garbled FEATURE frame is served normally but
+        contributes no observation + gets no gate frame (its reply is the 2-frame non-lab envelope), so a
+        mixed lab/non-lab stream is safe."""
+        # The lab is group-wakeup, so the sealed dispatch ran EXACTLY one forward (one `(real, pad)` entry);
+        # `real` is this forward's coalescing — the reward signal + the counters' basis.
+        real, pad = forwards[0]
         self.n_forwards += 1
         self.n_real_rows += real
-        self.n_padded_rows += max(0, pad_to - real)
+        self.n_padded_rows += max(0, pad - real)
 
         # Decode the served threads' FEATURE frames (envelope = frames[1:-1]; for a lab request the single
         # middle frame is the feature snapshot). Build the per-thread observation surface.
@@ -412,12 +414,3 @@ def _tid_of(envelope: "list[bytes]") -> "int | None":
         return decode_feature(envelope[1]).tid
     except Exception:   # noqa: BLE001 — a non-lab/garbled middle frame just means "no gate for this reply"
         return None
-
-
-def _bucket_for_server(server: StageAServer, real: int) -> int:
-    """Snap the real row count UP to the server's nearest AOT bucket (re-uses StageAServer's bucket set).
-    A drain above the top bucket is capped at max_batch upstream, so this only ever snaps up."""
-    for b in server._buckets:   # noqa: SLF001 — same-package bench reuse of the bucket set
-        if real <= b:
-            return b
-    return server._buckets[-1]

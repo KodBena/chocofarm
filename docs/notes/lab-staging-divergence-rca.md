@@ -187,6 +187,69 @@ The honest composite: an under-treated structural hazard, shipped as a band-aid,
 behind verification that could not see the failure. The corpus survived only
 because the lab turned out to be a separate bench — luck the process did not earn.
 
+## 9. Resolution — the P3 split landed (appended 2026-06-20, ADR-0005 Rule 8)
+
+*Additive amendment; §1–8 stand unedited. This records that the load-bearing fix
+§6.1 named — deferred in §7 — has now landed, with the iron-clad verification the
+band-aid lacked.*
+
+**Fix #1 (the P3 template-method split — unrepresentable-by-construction) landed.**
+`InferenceServer._serve_batch` is now a thin `final`: it calls a **SEALED**
+`_run_forward(drained) -> (responses, forwards)` that owns the *whole* forward
+dispatch (poll/current params, the fixed-pad-gated `_effective_forward`, the pad
+shape, `run_microbatch`), then an **OVERRIDABLE** `_scatter(drained, responses,
+forwards)` boundary hook. The two focused hooks the dispatch reads — `_pad_shape`
+(per-forward pad policy) and `_forward_groups` (the drained→forwards partition) —
+let a subclass vary the pad/grouping without touching the dispatch. `StageAServer`
+now overrides `_pad_shape` (bucket-E) + `_forward_groups` (group/leaf) + `_scatter`
+(counters); `LabServer` overrides `_scatter` (the Controller call + gate-frame
+tagging) and inherits the rest. **Neither overrides `_serve_batch`/`_run_forward`**,
+and the only `run_microbatch(...)` serve-path call-site is inside the sealed
+`_run_forward` — so the subclass *cannot* re-author (and silently diverge) the
+forward (the override-divergence bug class §3 named is now unrepresentable). The
+hand-copies in both subclasses (and the lab's dead `_bucket_for_server`) are gone.
+
+**The single-shape/bucket incompatibility (§7's crash) is confronted in the seam,
+not as a live crash.** The staged single-shape AOT handle is valid only for a
+*fixed* pad; the seam encodes this as an explicit `_uses_fixed_pad` predicate
+(`InferenceServer` True → staged pad-to-max; `StageAServer`/`LabServer` False →
+**un-staged** `self._forward_fn` at their bucket shapes), which
+`_effective_forward` checks. So a bucketing server can never feed the single-shape
+handle a non-max bucket — the lab serves its un-staged bucket-E forward exactly as
+before, and the lab-alignment step (mirror production's pad-to-max + staged regime)
+becomes a **clean flip** of that one flag (fixed-pad ⇒ auto-staged, no crash),
+tracked separately as fix #4. **Behaviour-preserving:** each server's current
+forward is byte-identical (InferenceServer staged pad-to-max; StageA/Lab un-staged
+bucket-E) — a pure structural refactor, no pad/staging policy changed here.
+
+**Fix #2 (the subclass parity test — the P6 backstop §5/§6.2 said was missing)
+landed.** `tests/test_zmq_inference.py::test_subclass_servers_parity_with_base`
+stands up a real `StageAServer` and a real `LabServer` (the latter driven over its
+lab FEATURE/GATE envelope) alongside the base and asserts each one's served
+`(value, logits)` is `allclose(1e-4)` to the base's on a matched `(params, X)` —
+the exact test that would have caught a subclass serving a different forward. It
+passes (max|Δ| ≈ 1.2e-7, residual ON/OFF).
+
+**The verification this time was iron-clad** (the §7/§8 lesson applied — not
+`py_compile`+import on the un-gated `cpp/` path): (a) a SHORT lab sweep was **run
+end-to-end** through `lab_harness.py` (`all_allow`, `ready_threshold2`, 2.0s
+windows, server pinned core 0 / producers 1,2,3) and **did not crash** — the warm
+pool primed, the C++ producer streamed `pipelined-bucket` with **zero** errors, the
+bucketed forwards (rows/fwd ≈ 44) served and gate bits rode back (`ready_threshold2`
+diverged from `all_allow`, `method_metrics{threshold:2.0}`), **0 malfunctions / 0
+flags** both trials (output under `~/w/vdc/chocobo/runs/control_lab/p3-split-verify-*`);
+(b) the subclass parity test above passes; (c) the full `tests/` suite + the opt-in
+`CHOCO_RUN_ZMQ=1` socket parity + `mypy --strict` (`inference_server.py` is in the
+gate's `STRICT_CLEAN` set) are green, and `tests/test_no_gratuitous_transfers.py`
+still holds (the grandfathered `run_microbatch::np.asarray` pull is untouched —
+`run_microbatch` itself was not edited).
+
+**Still open (unchanged scope):** fix #3 (extend the host-device lint + the mypy
+gate to `cpp/` — the blind spot the lab lives in) and fix #4 (the lab-alignment
+pad-to-max + staged flip) remain forward work, tracked separately. The P3 split
+makes a *forward-dispatch* lint largely redundant (there is no second dispatch to
+drift), but the `cpp/`-coverage gap that hid this is worth closing on its own.
+
 ## License
 
 Public Domain (The Unlicense).

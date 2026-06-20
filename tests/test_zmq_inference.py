@@ -550,6 +550,162 @@ def test_server_parity_holds_under_coalescing_floor():
     print(f"[zmq floor θ=8 delay=40ms] N={n_inputs} max|Δvalue|={max_dv:.3e} max|Δlogit|={max_dl:.3e}")
 
 
+# ===========================================================================
+# OPT-IN — the SUBCLASS PARITY harness (the P6 behavioural backstop the lab-staging-divergence RCA named:
+# §5/§6.2 — "the test that was missing"). Stands up the bench/lab InferenceServer SUBCLASSES alongside the
+# base and asserts each one's SERVED value+logits is allclose(1e-4) to the base's on a MATCHED (params, X)
+# request. This is the test that would have caught the params-staging divergence (a subclass serving a
+# different forward than the base) — and, after the ADR-0012 P3 template-method split, it pins that the
+# sealed `_run_forward` dispatch is the SAME for the base and every subclass (the subclasses now vary only
+# `_pad_shape`/`_forward_groups`/`_scatter`, never the forward), so no subclass can silently diverge.
+# Guarded like the other socket tests: needs CHOCO_RUN_ZMQ=1 + pyzmq, so the default suite stays green.
+# ===========================================================================
+def _stage_a_on_path() -> bool:
+    """Put the bench `cpp/stage_a` (+ its `control_lab`) on sys.path so the subclasses import, mirroring how
+    they bootstrap their own path. Returns False if the bench tree is absent (then the test skips), so this
+    test is robust to a checkout without the cpp bench."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stage_a = os.path.join(repo, "cpp", "stage_a")
+    control_lab = os.path.join(stage_a, "control_lab")
+    if not os.path.isdir(control_lab):
+        return False
+    for p in (stage_a, control_lab):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    return True
+
+
+@pytest.mark.skipif(not (_RUN_ZMQ and _pyzmq_available()),
+                    reason="opt-in subclass parity: set CHOCO_RUN_ZMQ=1 (and have pyzmq); servers spin in-process")
+@pytest.mark.parametrize("residual", [False, True])
+def test_subclass_servers_parity_with_base(residual):
+    """The SUBCLASS PARITY backstop (RCA §6.2): a real `StageAServer` and a real `LabServer` serve the SAME
+    `(value, logits)` as the base `InferenceServer` on a matched `(params, X)`, within 1e-4 (ADR-0012 P6).
+
+    The base is STAGED + pad-to-max (`_uses_fixed_pad=True`); the subclasses are UN-STAGED + bucket-E
+    (`_uses_fixed_pad=False`) — DELIBERATELY different forward *plumbing* (the divergence the consolidation
+    introduced and the RCA traced). The numerics must nonetheless agree to 1e-4 because all three run the
+    ONE `forward_core` via the sealed `_run_forward` — the staging changes only WHERE the weights live and
+    the bucket changes only the (zero) pad rows, neither the arithmetic of the real rows. A subclass that
+    re-authored (and drifted) the forward — the bug class the P3 split makes unrepresentable — would fail
+    THIS assertion. Several batch sizes B exercise the row-vs-single roundoff under each pad policy; the
+    LabServer is additionally driven over its lab FEATURE/GATE envelope (so the gate-tagging boundary is on
+    the wire), and the value it serves under that envelope is asserted equal to the base's."""
+    if not _pyzmq_available():
+        pytest.skip("pyzmq missing")
+    if not _stage_a_on_path():
+        pytest.skip("cpp/stage_a bench tree not present")
+    import struct
+
+    import zmq
+
+    from chocofarm.az.inference_server import InferenceServer, jit_forward_core
+    from chocofarm.az.mlp import ValueMLP
+    from chocofarm.az.transport import pack_net
+    from control_lab.lab_server import LabServer
+    from control_lab.lab_wire import LabFeature, decode_gate, encode_feature
+    from stage_a_server import StageAServer
+
+    in_dim, n_actions = 12, 7
+    rng = np.random.default_rng(4242 + int(residual))
+    net = ValueMLP(in_dim=in_dim, hidden=24, n_actions=n_actions, seed=11,
+                   y_mean=0.7, y_std=1.3, residual=residual)
+    params, y_mean, y_std = params_from_manifest_blob(*pack_net(net))
+
+    base_ep = f"tcp://127.0.0.1:{5720 + int(residual)}"
+    stage_ep = f"tcp://127.0.0.1:{5722 + int(residual)}"
+    lab_ep = f"tcp://127.0.0.1:{5724 + int(residual)}"
+
+    # max_batch=512 with the default BUCKETS (64,256,512): the StageA/Lab bucket-E pad is exercised on the
+    # small B forwards (a B=1/2/5 request snaps up to bucket 64), the base pads every forward to 512.
+    base = InferenceServer(StaticParamsSource(params, y_mean, y_std), bind=base_ep, max_batch=512)
+    stage = StageAServer(StaticParamsSource(params, y_mean, y_std), bind=stage_ep, max_batch=512,
+                         forward_fn=jit_forward_core, e_policy="bucket", wakeup="group")
+    lab = LabServer(StaticParamsSource(params, y_mean, y_std), bind=lab_ep, max_batch=512,
+                    forward_fn=jit_forward_core, e_policy="bucket", wakeup="group")
+    # The base is fixed-pad → STAGED; the subclasses bucket → UN-STAGED. Pin the predicate explicitly so a
+    # future regression of the flag is caught here, not silently (the divergence the RCA is about).
+    assert base._uses_fixed_pad is True and base._stages_params is True
+    assert stage._uses_fixed_pad is False and lab._uses_fixed_pad is False
+
+    threads = []
+    for srv in (base, stage, lab):
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        threads.append(t)
+
+    def _lab_predict(endpoint, x_row, tid):
+        """Drive the LabServer over its lab envelope `[corr][FEATURE][value]` and decode the reply
+        `[corr][GATE][value]`, returning the served (value, logits). Asserts the GATE frame came back for
+        the served tid (the producer STRICTLY requires a gate when it sent a feature)."""
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.DEALER)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, 10000)
+        sock.connect(endpoint)
+        try:
+            corr = struct.pack("<Q", 0xA1B2C3D4 + tid)
+            feat = encode_feature(LabFeature(tid=tid, inflight=0, ready=0, msgs=1, leaves=1, rtt_us=0,
+                                             decisions=0))
+            sock.send_multipart([corr, feat, wire.encode_request(x_row)])
+            frames = sock.recv_multipart()
+            assert len(frames) == 3, f"lab reply must be [corr][gate][resp], got {len(frames)} frames"
+            assert frames[0] == corr, "lab reply must echo the corr-id verbatim"
+            gt_tid, _allow = decode_gate(frames[1])
+            assert gt_tid == tid, f"gate frame tid {gt_tid} != requested {tid}"
+            v, l = wire.decode_response(frames[-1])
+            return v, l
+        finally:
+            sock.close(0)
+            ctx.term()
+
+    max_d = 0.0
+    try:
+        # A matched bank of feature vectors; for each, compare each subclass's served (value, logits) to the
+        # base's on the IDENTICAL row. Varied B (concurrent clients) exercises the row-vs-single roundoff
+        # under bucket-E (subclass) vs pad-to-max (base).
+        n_inputs = 60
+        X = rng.standard_normal((n_inputs, in_dim)).astype(np.float32)
+        i = 0
+        for B in (1, 2, 5, 8, 16):
+            if i >= n_inputs:
+                break
+            batch = X[i:i + B]
+            if batch.shape[0] == 0:
+                break
+            # base + StageA over the plain ZmqNetClient (REQ); concurrent so the drain stacks them.
+            base_v, base_l = _concurrent_predict(base_ep, batch)
+            stage_v, stage_l = _concurrent_predict(stage_ep, batch)
+            for j in range(batch.shape[0]):
+                max_d = max(max_d, abs(float(base_v[j]) - float(stage_v[j])))
+                if base_l is not None:
+                    assert stage_l[j] is not None
+                    max_d = max(max_d, float(np.max(np.abs(
+                        np.asarray(base_l[j], dtype=np.float64) - np.asarray(stage_l[j], dtype=np.float64)))))
+                # LabServer over its lab envelope (one row at a time, tagged by tid=j).
+                lab_v, lab_l = _lab_predict(lab_ep, batch[j], tid=j)
+                max_d = max(max_d, abs(float(base_v[j]) - float(lab_v[0])))
+                if base_l is not None:
+                    assert lab_l is not None
+                    max_d = max(max_d, float(np.max(np.abs(
+                        np.asarray(base_l[j], dtype=np.float64) - lab_l[0].astype(np.float64)))))
+            i += batch.shape[0]
+    finally:
+        for srv in (base, stage, lab):
+            srv.stop()
+        for t in threads:
+            t.join(timeout=5.0)
+        for srv in (base, stage, lab):
+            srv.close()
+
+    assert max_d < 1e-4, (
+        f"residual={residual}: subclass (StageA/Lab) served value/logits diverged from the base by "
+        f"max|Δ|={max_d:.3e} > 1e-4 — a subclass is serving a different forward than the base (the "
+        f"divergence the P3 split forbids; ADR-0012 P6 / lab-staging-divergence-rca.md)")
+    print(f"[subclass parity residual={'ON ' if residual else 'OFF'}] StageA+Lab vs base "
+          f"max|Δ(value,logits)|={max_d:.3e} (bar 1e-4)")
+
+
 def _concurrent_predict(endpoint, batch):
     """Fire `len(batch)` ZmqNetClient.predict RPCs CONCURRENTLY (one client/thread each) so the server
     drains them into ONE microbatch of size B — the row-vs-single roundoff exerciser. Returns

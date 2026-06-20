@@ -28,10 +28,13 @@ drain stays exactly as shipped):
   * counters: total forwards run + total rows forwarded (REAL rows, not padded) + total padded rows,
     so the harness can report forwards/s and mean REAL rows/forward, and confirm E decouples from S.
 
-The drain/serve overrides re-use the production `run_microbatch` (the one forward SSOT, P1/P7) — the
-E-policy only changes the `pad_to` argument, the wakeup only changes how many requests one forward
-covers. No second forward transcription, no codec edit, the corr-id stays a transport-envelope frame
-the base server round-trips opaquely (frames[1:-1]; ADR-0012 P7).
+After the ADR-0012 P3 template-method split (lab-staging-divergence-rca.md §6), the bench no longer
+overrides the welded `_serve_batch`/dispatch — it extends the base through the focused hooks the SEALED
+`InferenceServer._run_forward` dispatch reads: `_pad_shape` (the E-policy — only the `pad_to` argument),
+`_forward_groups` (the wakeup — only how many requests one forward covers), and the `_scatter` boundary
+(the per-forward counters + the verbatim-envelope send). The base's ONE `run_microbatch` is the forward
+SSOT (P1/P7) — there is NO second forward transcription to drift; no codec edit; the corr-id stays a
+transport-envelope frame the base server round-trips opaquely (frames[1:-1]; ADR-0012 P7).
 
 Public Domain (The Unlicense).
 """
@@ -58,7 +61,6 @@ from chocofarm.az.inference_server import (  # noqa: E402
     StaticParamsSource,
     jit_forward_core,
     params_from_manifest_blob,
-    run_microbatch,
 )
 from chocofarm.az.mlp import ValueMLP  # noqa: E402
 from chocofarm.az.transport import pack_net  # noqa: E402
@@ -78,8 +80,25 @@ def _bucket_for(n_rows: int, buckets: "tuple[int, ...]" = BUCKETS) -> int:
 
 class StageAServer(InferenceServer):
     """A bench-scoped InferenceServer: same greedy ROUTER drain, but the E-policy (pad shape) and the
-    wakeup granularity are knobs, and per-forward counters are kept. Production `_drain`/`_serve_batch`
-    are untouched on the base class; this overrides only for the bench."""
+    wakeup granularity are knobs, and per-forward counters are kept.
+
+    After the ADR-0012 P3 template-method split (lab-staging-divergence-rca.md §6), this NO LONGER overrides
+    the welded `_serve_batch` — it extends the base through the focused hooks the SEALED forward dispatch
+    (`InferenceServer._run_forward`) reads: `_pad_shape` (bucket-E vs pad-to-max), `_forward_groups` (the
+    group/leaf wakeup granularity), and the `_scatter` boundary hook (the per-forward counters + the
+    verbatim-envelope send). It re-uses the base's one `run_microbatch` dispatch verbatim — there is no
+    hand-copied forward to drift (the divergence the RCA traced).
+
+    FIXED-PAD predicate (`_uses_fixed_pad`): set False because the bench has ALWAYS measured the UN-STAGED
+    forward (its forward width varies per drain — bucket-E — and even in `padmax` mode the Stage-A throughput
+    corpus is the un-staged regime). With it False, `InferenceServer._effective_forward` returns the
+    un-staged `self._forward_fn`, byte-identical to the pre-split `run_microbatch(self._forward_fn, …)`. The
+    lab-alignment step that adopts production's pad-to-max + STAGED regime is a deliberate FLIP of this flag
+    (a clean, documented change of measurement regime), NOT this structural refactor."""
+
+    # The bench measures the un-staged forward (see the class docstring) — so it is NOT a fixed-pad server
+    # for the staging predicate, and `_effective_forward` hands it the un-staged `self._forward_fn`.
+    _uses_fixed_pad: bool = False
 
     def __init__(self, *args: Any, e_policy: str = "bucket", wakeup: str = "group",
                  buckets: "tuple[int, ...] | None" = None, **kwargs: Any) -> None:
@@ -100,30 +119,33 @@ class StageAServer(InferenceServer):
         self.n_real_rows = 0
         self.n_padded_rows = 0
 
-    def _serve_batch(self, drained: list) -> None:  # type: ignore[override]
-        """Run ONE microbatch per the wakeup granularity, choosing the pad shape per the E-policy.
+    def _pad_shape(self, real: int) -> int:  # type: ignore[override]
+        """The E-policy pad shape (overrides the base pad-to-max): `padmax` -> max_batch (the production
+        baseline); `bucket` -> the nearest AOT bucket of {64,256,512} (NEVER pad-to-max — the design's ADOPT
+        lever). Decided SERVER-SIDE from the forward's REAL row count, independent of S."""
+        if self._e_policy == "padmax":
+            return self._max_batch
+        return _bucket_for(real, self._buckets)
 
-        per-group: all drained requests -> ONE forward (concatenated rows, one pad/bucket).
-        per-leaf : EACH drained request -> its OWN forward (no cross-request coalescing).
+    def _forward_groups(self, drained: list) -> list:  # type: ignore[override]
+        """The wakeup granularity (overrides the base one-group): per-GROUP -> all drained requests in ONE
+        forward (the production greedy-drain — one wake per drained group); per-LEAF -> EACH drained request
+        its OWN forward (no cross-request coalescing — the per-leaf-condvar degenerate). A data partition the
+        sealed dispatch runs the identical forward over, byte-identical to the pre-split groups loop."""
+        return [drained] if self._wakeup == "group" else [[d] for d in drained]
 
-        The E-policy decides pad_to from the REAL row count of the forward: padmax -> 512; bucket ->
-        the nearest of {64,256,512}. run_microbatch is the one production forward (P1) — only its pad_to
-        and the requests it covers change here."""
-        params, y_mean, y_std = self._params_source.current()
-        groups: list[list] = [drained] if self._wakeup == "group" else [[d] for d in drained]
-        for group in groups:
-            rows = [(ident, X) for ident, _envelope, X in group]
-            real = int(sum(X.shape[0] for X in (X for _i, X in rows)))
-            if self._e_policy == "padmax":
-                pad_to = self._max_batch
-            else:
-                pad_to = _bucket_for(real, self._buckets)
-            responses = run_microbatch(self._forward_fn, params, y_mean, y_std, rows, pad_to=pad_to)
+    def _scatter(self, drained: list, responses: list, forwards: list) -> None:  # type: ignore[override]
+        """The bench boundary (overrides the base scatter): keep the per-forward counters (REAL rows,
+        padded rows, forward count — so the harness reports forwards/s + mean real rows/forward and confirms
+        E decouples from S), then scatter each response with its envelope echoed verbatim. `forwards` is the
+        per-forward `(real, pad)` the sealed dispatch already computed — the counters read it instead of
+        re-deriving the pad (P1: the pad has one home, `_pad_shape`, read once in the dispatch)."""
+        for real, pad in forwards:
             self.n_forwards += 1
             self.n_real_rows += real
-            self.n_padded_rows += max(0, pad_to - real)
-            for (ident, resp), (_ident, envelope, _X) in zip(responses, group):
-                self._sock.send_multipart([ident, *envelope, resp])
+            self.n_padded_rows += max(0, pad - real)
+        for (ident, resp), (_ident, envelope, _X) in zip(responses, drained):
+            self._sock.send_multipart([ident, *envelope, resp])
 
 
 def build(hidden: int, endpoint: str, max_batch: int, e_policy: str, wakeup: str,

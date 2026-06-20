@@ -417,6 +417,16 @@ class InferenceServer:
     amortized over the version's forwards. A non-default injected forward_fn (a test stub) bypasses staging
     and is called directly — the pure run_microbatch seam is untouched.
 
+    EXTENSION CONTRACT (the ADR-0012 P3 template-method split — lab-staging-divergence-rca.md §6). A serve
+    is `_serve_batch` = the SEALED `_run_forward` (the WHOLE forward dispatch — params, the fixed-pad-gated
+    `_effective_forward`, the pad shape, `run_microbatch`) then the OVERRIDABLE `_scatter` boundary hook. A
+    subclass (`StageAServer`, `LabServer`) extends behaviour through `_scatter` (the serve/scatter — counters,
+    the lab's Controller call + gate-frame tagging) and the two FOCUSED dispatch hooks `_pad_shape`
+    (per-forward pad policy) + `_forward_groups` (the drained→forwards partition); it does **NOT** override
+    `_serve_batch`/`_run_forward`. So a subclass never sees `run_microbatch` and CANNOT re-author (and
+    silently diverge) the forward — the override-divergence bug class that motivated this split is
+    unrepresentable by construction.
+
     `min_forward_rows` (θ) and `max_queue_delay_ms` arm the optional server-side coalescing FLOOR
     (server-floor-design.md — increment ii of cpp-eval-transport-adapter.md §6), DEFAULT OFF (θ=0): with
     θ>0 the drain accumulates across producer threads until ≥θ rows or the bounded delay, lifting
@@ -426,6 +436,20 @@ class InferenceServer:
     # The bounded first-request poll interval (ms): the wakeup cadence at which an idle loop re-checks
     # `_stop`. A wakeup-to-recheck, not a spin — an idle server still parks at ~0 CPU between wakeups.
     _POLL_INTERVAL_MS = 100
+
+    # The FIXED-PAD STAGING PREDICATE (the structural invariant the lab-staging-divergence RCA distilled).
+    # The staged single-shape AOT handle (`build_staged_forward`) is AOT-compiled for ONE fixed
+    # `(pad_to=max_batch, in_dim)` shape, so it is valid ONLY for a server that pads EVERY forward to that
+    # one fixed shape (pad-to-max). A server that snaps the pad per-forward to a bucket (StageAServer's
+    # bucket-E) feeds the handle `[64,…]`/`[256,…]` and the single-shape executable rejects it
+    # (`TypeError: compiled with float32[512,241] and called with float32[64,241]` — the interim re-align's
+    # crash, 12b27bf). This class flag encodes "you can only stage a FIXED-pad server" as a structural
+    # invariant `_effective_forward`/`_run_forward` check: True here (InferenceServer pads to max_batch),
+    # overridden False by a bucketing subclass. So the lab-alignment NEXT step is a CLEAN FLIP — a bucketing
+    # server that adopts pad-to-max sets this True and is auto-staged, no crash — and a bucketing server can
+    # never accidentally run the single-shape handle against a mismatched bucket (the divergence becomes
+    # unrepresentable by construction, not caught by a runtime crash).
+    _uses_fixed_pad: bool = True
 
     def __init__(self, params_source: ParamsSource, *, bind: str = "tcp://127.0.0.1:5599",
                  max_batch: int = 256, forward_fn: ForwardFn = jit_forward_core,
@@ -574,35 +598,111 @@ class InferenceServer:
         `(max_batch, in_dim)` run_microbatch always pads to, so it is a warm XLA-cache hit (~2.7 ms), not a
         cold compile; that cost is paid once per version and amortized over the version's many forwards.
 
-        When staging is off (a non-default injected forward_fn — a test stub), return that injected fn
-        unchanged: the pure run_microbatch seam is honored exactly as before, no staging interposed."""
-        if not self._stages_params:
+        When staging is off (a non-default injected forward_fn — a test stub) OR the server does NOT pad to
+        a FIXED shape (`_uses_fixed_pad` is False — a bucketing subclass, whose per-forward pad varies and so
+        cannot use the single-shape AOT handle), return the injected `self._forward_fn` unchanged: the pure
+        run_microbatch seam is honored exactly as before, no staging interposed. The `_uses_fixed_pad` clause
+        is the structural invariant the lab-staging-divergence RCA distilled — a bucketing server feeding the
+        single-shape staged handle a non-max bucket is the crash the interim re-align hit; gating staging on
+        the fixed-pad predicate makes that mismatch unrepresentable (the seam decides correctly by
+        construction, not by a runtime shape check)."""
+        if not (self._stages_params and self._uses_fixed_pad):
             return self._forward_fn
         if self._staged_fn is None or self._staged_params_id != id(params):
             self._staged_fn = build_staged_forward(params, y_mean, y_std, pad_to=self._max_batch)
             self._staged_params_id = id(params)
         return self._staged_fn
 
-    def _serve_batch(self, drained: list[DrainedRequest]) -> None:
-        """Run ONE microbatch over the drained requests and scatter each encoded response back to its
-        identity, ECHOING that request's transport envelope verbatim (`[identity][envelope…][response]`).
-        The envelope is opaque routing the server round-trips unchanged: for a REQ client it is the empty
-        delimiter (so the reply is byte-identical to the legacy `[identity][b""][resp]`), for a DEALER
-        client it carries the correlation id the C++ pool matches replies on. `run_microbatch` is the
-        VALUE core — it sees only `(identity, row)`, never the envelope — so the responses come back 1:1
-        in drained order and re-pair with their envelopes by position. Reloads params first if the
-        published version changed (between-batch reload, design §3)."""
+    # ---- the template-method split (ADR-0012 P3 / lab-staging-divergence-rca.md §6.1) ----
+    # `_serve_batch` formerly WELDED two orthogonal concerns into one overridable method: (a) the FORWARD
+    # DISPATCH (which params, staged-or-not, the pad shape, `run_microbatch`) and (b) the SERVE/SCATTER
+    # boundary (envelope echo; the lab's Controller call + gate-frame tagging). A subclass that legitimately
+    # needs to extend (b) was COMPELLED to override the whole method and HAND-COPY (a) — the divergence
+    # lineage the RCA traced (the consolidation upgraded the base's dispatch but not the two hand-copies).
+    # The split makes the dispatch a SEALED seam (`_run_forward`) no subclass overrides and the boundary an
+    # OVERRIDABLE hook (`_scatter`): a subclass extends (b) WITHOUT ever seeing `run_microbatch`, so the
+    # override-divergence bug class becomes UNREPRESENTABLE (there is no dispatch to re-author). The two
+    # focused hooks the dispatch reads — `_pad_shape` (the per-forward pad policy) and `_forward_groups`
+    # (how the drained batch partitions into forwards) — let a subclass vary the pad/grouping WITHOUT
+    # touching the dispatch. Confirm: the ONE remaining `run_microbatch(...)` call-site is inside
+    # `_run_forward` below.
+
+    def _pad_shape(self, real: int) -> int:
+        """The per-forward PAD shape: pad a forward of `real` concatenated rows up to this width before the
+        matmul (one fixed XLA shape so the executable is reused). The base server pads to `max_batch`
+        (pad-to-max — the production policy; with `_uses_fixed_pad` True this is the ONE fixed shape the
+        staged AOT handle compiles for). A FOCUSED hook: a bucketing subclass overrides ONLY this (snap up
+        to a compiled bucket), never the whole dispatch (ADR-0012 P3 — the pad policy is one axis, the
+        dispatch another)."""
+        return self._max_batch
+
+    def _forward_groups(self, drained: list[DrainedRequest]) -> list[list[DrainedRequest]]:
+        """How the drained batch PARTITIONS into forwards. The base (and the production path) runs ONE
+        forward over ALL drained rows — `[drained]`, a single group — so a drained burst self-clocks into one
+        matmul. A FOCUSED hook returning a PARTITION (data, not dispatch logic): a bench subclass that wants
+        per-leaf forwards overrides ONLY this to return `[[d] for d in drained]`, and the SEALED dispatch
+        runs the identical forward over each part — the subclass still cannot re-author which-forward /
+        staged-or-not / `run_microbatch` (the divergence the split forbids)."""
+        return [drained]
+
+    def _run_forward(
+        self, drained: list[DrainedRequest]
+    ) -> "tuple[list[tuple[bytes, bytes]], list[tuple[int, int]]]":
+        """The SEALED FORWARD-DISPATCH seam — the ONE owner of the whole forward dispatch, which NO subclass
+        overrides. It: (1) reloads params iff the published version changed, else reads the live params
+        (between-batch reload, design §3); (2) resolves the forward for THIS version's params via
+        `_effective_forward`, re-staging the device-resident weights iff the reload rebound a new params
+        object (the stale-staged-net guard, ADR-0002) AND the server pads to a fixed shape (the
+        `_uses_fixed_pad` invariant — a bucketing server gets the un-staged `self._forward_fn`, since the
+        single-shape AOT handle is valid only for the fixed pad); (3) for each forward group (`_forward_groups`)
+        runs ONE `run_microbatch` at that forward's pad shape (`_pad_shape`).
+
+        Returns `(responses, forwards)`: `responses` is the encoded `(identity, response_bytes)` list 1:1
+        with `drained` in drained order (so `_scatter` re-pairs each with its envelope by position — both the
+        one-group and the per-leaf partition preserve drained order); `forwards` is the per-forward
+        `(real_rows, pad)` metadata (one entry per group — a single entry for the production one-group path)
+        the boundary hook needs for its counters / reward / observe (the small metadata contract the RCA
+        §6.1 sanctions — a reason to SPLIT the dispatch from the boundary, not to keep them fused). The host
+        params/scale stay LOCAL to this seam (the lab reads them only through this return), so a subclass
+        never re-fetches them to hand-roll a forward."""
         reloaded = self._params_source.poll()
         params, y_mean, y_std = reloaded if reloaded is not None else self._params_source.current()
         # Resolve the forward for THIS version's params, re-staging the device-resident weights iff the
-        # reload rebound a new params object (the stale-staged-net guard lives here, in the same call that
-        # fetched the live params — ADR-0002). Off staging this is just the injected forward_fn.
+        # reload rebound a new params object AND this server pads to a fixed shape (the stale-staged-net guard
+        # + the fixed-pad invariant both live here, in the same call that fetched the live params — ADR-0002).
+        # Off staging (or on a bucketing server) this is just the injected forward_fn.
         forward_fn = self._effective_forward(params, y_mean, y_std)
-        rows = [(ident, X) for ident, _envelope, X in drained]
-        for (ident, resp), (_ident, envelope, _X) in zip(
-                run_microbatch(forward_fn, params, y_mean, y_std, rows, pad_to=self._max_batch),
-                drained):
+        responses: list[tuple[bytes, bytes]] = []
+        forwards: list[tuple[int, int]] = []
+        for group in self._forward_groups(drained):
+            rows = [(ident, X) for ident, _envelope, X in group]
+            real = int(sum(int(X.shape[0]) for _ident, X in rows))
+            pad = self._pad_shape(real)
+            responses.extend(run_microbatch(forward_fn, params, y_mean, y_std, rows, pad_to=pad))
+            forwards.append((real, pad))
+        return responses, forwards
+
+    def _scatter(self, drained: list[DrainedRequest], responses: "list[tuple[bytes, bytes]]",
+                 forwards: "list[tuple[int, int]]") -> None:
+        """The OVERRIDABLE SERVE/SCATTER boundary hook. The base scatters each encoded response back to its
+        identity, ECHOING that request's transport envelope verbatim (`[identity][envelope…][response]`). The
+        envelope is opaque routing the server round-trips unchanged: for a REQ client it is the empty
+        delimiter (so the reply is byte-identical to the legacy `[identity][b""][resp]`), for a DEALER client
+        it carries the correlation id the C++ pool matches replies on. `responses` come back 1:1 in drained
+        order and re-pair with their envelopes by position. A subclass OVERRIDES THIS (and only this) to
+        extend the boundary — bench counters, the lab's Controller call + gate-frame tagging — WITHOUT ever
+        touching the sealed forward dispatch (`forwards` carries the per-forward `(real, pad)` it needs)."""
+        for (ident, resp), (_ident, envelope, _X) in zip(responses, drained):
             self._sock.send_multipart([ident, *envelope, resp])
+
+    def _serve_batch(self, drained: list[DrainedRequest]) -> None:
+        """Serve ONE drained batch: run the SEALED forward dispatch, then the OVERRIDABLE scatter boundary.
+        FINAL by convention (ADR-0012 P3) — no subclass overrides `_serve_batch` or `_run_forward`; a
+        subclass extends behaviour through `_scatter` (+ `_pad_shape`/`_forward_groups`). This is the
+        structural fix the lab-staging-divergence RCA named: the forward dispatch has ONE home, so it cannot
+        be hand-copied (and silently diverge) into a subclass override."""
+        responses, forwards = self._run_forward(drained)
+        self._scatter(drained, responses, forwards)
 
     def warmup(self, batch_sizes: Iterable[int]) -> None:
         """PRE-COMPILE the XLA kernels for each batch size B the wire path can produce, BEFORE the loop
