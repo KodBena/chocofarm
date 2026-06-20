@@ -1294,6 +1294,36 @@ through `run_microbatch` plus the rebuild-on-reload guard. The **input/output
 crossing remains the open follow-on** (the grandfathered
 `run_microbatch::np.asarray` pull is untouched — the ~14.5 µs smaller lever).
 
+**Input/output crossing assessed — REFUTED as a local lever (2026-06-20).**
+The remaining `~14.5 µs` input+output crossing the params-staging follow-on left
+open was investigated in the **real `run_microbatch` path** (ADR-0009: warm,
+median+IQR over 7×3000 calls, fresh host `Xb` every forward, 3 reps incl. the
+isolated core; numbers under `~/w/vdc/chocobo/bench/run_microbatch_io/`) and is
+**not a cleanly-extractable local win** — the bench's 5.5 µs (input) and 9 µs
+(output) deltas were **counterfactuals**, not achievable per-call operations.
+**Input:** the staged path's implicit host→device inside `_compiled(params,
+x_host)` is already the cheapest achievable path — pulling it out to an eager
+`jax.device_put` is **+125–139 µs WORSE**, and `donate_x=True` is a measured
+no-op (≈0 µs; jax warns "buffers not usable" — donating a *host* numpy `x`
+cannot bite). The `staged_params_input` bench variant's 5.5 µs was the cost of
+an input transfer the bench amortized by placing `x` device-resident *once*
+outside the loop; in the server `Xb` is fresh host leaf-feature data every
+forward, so the transfer is **inherent**. **Output:** the grandfathered
+`run_microbatch::np.asarray` device→host pull is already the best local option —
+`jax.device_get` is **+56–60 µs WORSE**, `copy_to_host_async` is **+16–21 µs
+WORSE** (no overlap within a single sequential call), and
+`block_until_ready()`+`np.asarray` is a marginal ≈−3 µs (within IQR, and would
+*add* a flagged d2h call-site for sub-dispatch-noise). The ~9 µs is **inherent**
+to a blocking device→host of a result that must reach host for the wire; hiding
+it requires **pipelining the sequential serve loop** (overlap the pull with the
+next microbatch's compute — a structural rework of
+`_serve_batch`/`serve_forever`, gain capped at ~9 µs and only when
+forward-bound), recommended **deferred**. Net: the params-staging lever
+(~45–53 µs) was the whole of the consolidatable transfer; the input/output
+crossing is **inherent** in the real path. The grandfathered
+`run_microbatch::np.asarray` baseline entry and the lint gate are **unchanged** —
+no code landed, a substantiated negative (ADR-0009).
+
 ## License
 
 Public Domain (The Unlicense).
