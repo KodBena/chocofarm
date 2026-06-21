@@ -186,22 +186,30 @@ def _import_bench_module(module_path: str) -> Any:
     return importlib.import_module(module_path)
 
 
-def _seed_from_module(module_path: str, name: str) -> tuple[float, float, str]:
-    """Pull `(seed_mean, seed_sigma, units)` from a quantity's bench module `get_seed()`. The bench
-    module is the ONE owner of its seed (the v1 fallback), so the manifest never hard-codes a seed. A
-    module that does not expose `get_seed()` is a loud contract violation (ADR-0002: every registered
-    quantity's bench MUST expose its seed)."""
+def _seed_from_module(module_path: str, name: str) -> tuple[float, float, str, bool]:
+    """Pull `(seed_mean, seed_sigma, units, constant)` from a quantity's bench module `get_seed()`. The
+    bench module is the ONE owner of its seed (the v1 fallback), so the manifest never hard-codes a seed.
+    A module that does not expose `get_seed()` is a loud contract violation (ADR-0002: every registered
+    quantity's bench MUST expose its seed).
+
+    `constant` is the `Grounded.constant` flag (default False if the seed does not carry it — a tuple
+    seed, or an older `Grounded`): a TRUE CONSTANT (n_gen — a layout fact) seeds a `family=DEGENERATE`
+    Estimate (~0 bound contribution, §3), NOT a declared-spread `NORMAL` prior. Threading it here makes
+    the SEED path agree with the bench's `measure()` path (P1 single-home: the DEGENERATE classification
+    has ONE source, `Grounded.constant`, so n_gen cannot drop out of the bound on one path and floor it
+    on the other)."""
     mod = _import_bench_module(module_path)
     if not hasattr(mod, "get_seed"):
         raise AttributeError(
             f"manifest: bench module for {name!r} ({module_path!r}) exposes no get_seed() — "
             f"every quantity's bench module must expose its v1 seed (the DISTRUST fallback).")
     seed = mod.get_seed()
-    # get_seed() returns a Grounded-like with .mean/.sigma/.unit, or a (mean, sigma, unit) tuple.
+    # get_seed() returns a Grounded-like with .mean/.sigma/.unit/.constant, or a (mean, sigma, unit) tuple.
     if hasattr(seed, "mean"):
-        return float(seed.mean), float(getattr(seed, "sigma", 0.0)), str(getattr(seed, "unit", ""))
+        return (float(seed.mean), float(getattr(seed, "sigma", 0.0)),
+                str(getattr(seed, "unit", "")), bool(getattr(seed, "constant", False)))
     mean, sigma, *rest = seed
-    return float(mean), float(sigma), (str(rest[0]) if rest else "")
+    return float(mean), float(sigma), (str(rest[0]) if rest else ""), False
 
 
 # --------------------------------------------------------------------------- #
@@ -246,16 +254,27 @@ def _estimate_from_aggregate(name: str, mean: float, sigma: float, n: int, kind:
     )
 
 
-def _estimate_from_seed(name: str, mean: float, sigma: float, units: str) -> "_est.Estimate":
+def _estimate_from_seed(
+    name: str, mean: float, sigma: float, units: str, constant: bool = False
+) -> "_est.Estimate":
     """Build a `Fixed`-law k=1 `Estimate` from a bench's `get_seed()` Grounded (mean, sigma, units) —
     the SEED path (DISTRUST, or a TRUST read that fell back to the seed; spec §5/§6 Phase 1).
 
     A seed is a DECLARED 1-sigma spread (an engineering-judgement prior), un-shrinkable by sampling:
     the spread IS the variance, so `cov=[[sigma^2]]` directly (NOT divided by any n — a prior has no
     n). The shrink law is `Fixed()` (no finite budget reduces it; the §2.3 "drops out of allocation"
-    case). `support=POSITIVE`, `family=NORMAL` (the prior is a Normal as the models already treat
-    it — `Normal(mean, sigma)`); `kind='declared_spread'`. The projection of this Estimate is
-    `(mean, sigma, n=0)` — exactly today's seed 4-tuple (a seed carries n=0)."""
+    case). `support=POSITIVE`; the projection of this Estimate is `(mean, sigma, n=0)` — exactly
+    today's seed 4-tuple (a seed carries n=0).
+
+    `constant` (the `Grounded.constant` flag, threaded from `_seed_from_module`) selects the §3 PIN
+    flavor — the DEGENERATE-vs-declared-spread classification, single-homed on `Grounded.constant`:
+      * `constant=False` (the default — a DECLARED-SPREAD prior, e.g. R_gen/B_op/LPD): `family=NORMAL`,
+        `kind='declared_spread'` — the prior the models treat as `Normal(mean, sigma)`; it CONTRIBUTES
+        its `a_i` to the bound (the CI honestly rests on it — §2.3 / §7.D).
+      * `constant=True` (a TRUE CONSTANT — n_gen, a layout fact): `family=DEGENERATE`, `kind='pin'` —
+        the bound treats it as ~0 (`a_i ≈ 0`, §3), exactly as the bench's `pin_estimate(constant=True)`
+        `measure()` path does, so the SEED and MEASURE paths agree (P1; the σ is a display placeholder
+        on an integer/fixed value, never a CI-bearing spread)."""
     s = float(sigma)
     return _est.Estimate(
         theta_hat=np.array([float(mean)], dtype=np.float64),
@@ -263,8 +282,8 @@ def _estimate_from_seed(name: str, mean: float, sigma: float, units: str) -> "_e
         names=(name,),
         shrink=_est.Fixed(),
         support=(_est.Support.POSITIVE,),
-        family=(_est.CIFamily.NORMAL,),
-        kind="declared_spread",
+        family=(_est.CIFamily.DEGENERATE if constant else _est.CIFamily.NORMAL,),
+        kind=("pin" if constant else "declared_spread"),
     )
 
 
@@ -418,9 +437,12 @@ def quantity(
                 f"manifest: quantity {name!r} is not registered and no module_path was given — "
                 f"register it (a benchmark_definition row) or pass module_path=… (ADR-0002: an unknown "
                 f"quantity is a loud error, not a silent default).")
-        mean, sigma, units = _seed_from_module(mp, name)
+        mean, sigma, units, constant = _seed_from_module(mp, name)
         # SEED path -> a Fixed-law Estimate; its projection is (mean, sigma, n=0) = today's seed 4-tuple.
-        est = _estimate_from_seed(name, mean, sigma, units)
+        # `constant` (Grounded.constant) selects the §3 PIN flavor: a true constant -> DEGENERATE (~0 bound
+        # contribution), a declared spread -> NORMAL prior (contributes a_i) — single-homed, so the SEED
+        # path agrees with the bench's measure() path (n_gen drops out of the bound on BOTH).
+        est = _estimate_from_seed(name, mean, sigma, units, constant=constant)
         return _quantity_from_estimate(name, est, trusted=False, units=units, source=src)
 
     if not trust:

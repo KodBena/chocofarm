@@ -172,6 +172,17 @@ class Recommendation:
     kink_regime: bool = False            # a non-binding arm is within a plausible tie (§4.1)
     estimate_kink: Optional[float] = None  # Clark-1961 de-biased E[min] (None outside the kink regime)
     p_nonbinding_max: float = 0.0        # max Φ(−t) over non-binding arms (the convergence-guard quantity)
+    # §7.D — the irreducible-prior floor surfaced as its OWN line, DISTINCT from the shrinkable sampling
+    # variance. `var_floor` is the sum of the declared-spread `Fixed` inputs' `a_i` (an engineering-
+    # judgement prior no sampling reduces — `R_gen` σ=8, `B_op` σ=64, …); `var_shrinkable = var_estimate −
+    # var_floor` is the part sampling CAN tighten. When `var_floor > V_target` the loop CANNOT meet the CI
+    # target by sampling (the §2.3 honest edge) — `converged` correctly stays False (the CI honestly rests
+    # on the prior), and these two lines say WHY rather than letting the loop spin against an irreducible
+    # floor it cannot cross. A true-constant DEGENERATE pin is in NEITHER (it is ~0 in `var_estimate` —
+    # §3 / `_assemble_sigma`); only a NORMAL declared-spread `Fixed` floors the bound.
+    var_floor: float = 0.0               # Σ a_i over declared-spread Fixed inputs — the irreducible prior floor
+    var_shrinkable: float = 0.0          # var_estimate − var_floor — the part sampling can reduce
+    floor_blocks_target: bool = False    # var_floor > V_target: the CI target is unreachable by sampling (§2.3 edge)
 
     def where_to_spend(self) -> List[PrimitiveState]:
         """Primitives ranked by recommended additional samples (desc)."""
@@ -201,6 +212,19 @@ class Recommendation:
             f"shadow price lambda = {self.shadow_price:.4g}   "
             f"mult = {self.ci_multiplier:.4g} ({self.ci_multiplier_label})"
         )
+        # §7.D — the irreducible-prior floor on its OWN line, distinct from the shrinkable variance, shown
+        # only when a declared-spread `Fixed` prior actually floors the bound (an all-mean report is
+        # visually unchanged). When the floor alone exceeds the target the line says the CI rests on the
+        # prior — the honest "why it cannot converge by sampling" (§2.3 edge), not a silent spin.
+        if self.var_floor > 0.0:
+            floor_ci = self.ci_multiplier * math.sqrt(max(self.var_floor, 0.0))
+            shrink_ci = self.ci_multiplier * math.sqrt(max(self.var_shrinkable, 0.0))
+            note = ("  <- the CI rests on this prior; sampling cannot reach the target"
+                    if self.floor_blocks_target else "")
+            lines.append(
+                f"  irreducible prior floor: var={self.var_floor:.4g} (CI {floor_ci:.4g})   "
+                f"shrinkable: var={self.var_shrinkable:.4g} (CI {shrink_ci:.4g}){note}"
+            )
         header = (
             f"  {'primitive':<16}{'n':>8}{'sigma':>12}"
             f"{'|df/dx|':>12}{'a_i':>12}{'a_i/n_i':>12}{'+samples':>10}"
@@ -493,6 +517,32 @@ class NeymanDriver:
         # demanding a tighter variance — the honest small-n widening of §4.3, not a fixed z).
         V_target = (self.tolerance / ci_mult) ** 2 if ci_mult > 0 else float("inf")
 
+        # --- §7.D the irreducible-prior floor, SEPARATED from the shrinkable sampling variance --- #
+        # `var_floor` = Σ a_i over the DECLARED-SPREAD `Fixed` inputs (family=NORMAL — an engineering-
+        # judgement prior no sampling reduces: `R_gen` σ=8, `B_op` σ=64). It is the part of `gᵀΣg` that
+        # is structurally un-shrinkable, distinct from `var_shrinkable` (the means/medians/funded fits
+        # sampling CAN tighten). §7.D: surface it as its OWN line, not conflated into one number — the
+        # same conflation-of-quantities shape ADR-0012 forbids (don't merge two distinct quantities into
+        # one), one level up from the `len(pools)`-as-`n` fix. A true-constant DEGENERATE pin is ALREADY
+        # ~0 in `var_est` (Fix in `_assemble_sigma`), so it is in NEITHER bucket. Computed off `a_contrib`
+        # (the smooth-regime per-input `gᵀΣg` split); in the kink regime `var_est` is Clark's Var[min], a
+        # min-moment that is NOT a per-input sum, so the split does not apply there (the kink guard owns it).
+        if kink_regime:
+            var_floor = 0.0
+            var_shrinkable = float(var_est)
+        else:
+            var_floor = float(sum(
+                float(a_contrib[i]) for i in range(self.d)
+                if isinstance(ests[i].shrink, _est.Fixed)
+                and _est._family_tag(ests[i].family[0]) is _est.CIFamily.NORMAL))
+            var_shrinkable = float(var_est) - var_floor
+        # The §2.3 honest edge: the declared-prior floor ALONE exceeds the CI target, so NO amount of
+        # sampling meets it — the CI honestly rests on the prior. We do NOT fire `converged` on the
+        # shrinkable part alone (that would be the false-SAT §2.3 forbids — claiming a 1.0-dps CI while
+        # the R_gen prior alone is ±√var_floor); instead this flag SURFACES the unreachability so the
+        # report says why, and run()'s stall-stop terminates rather than spinning against it.
+        floor_blocks_target = bool(var_floor > V_target)
+
         # --- convergence: variance budget met AND the §4.1 guard (no live arg-min flip) passes --- #
         alpha = 1.0 - self.confidence  # the arg-min-flip tolerance (two-sided level's tail)
         guard_ok = (not kink_regime) or (p_nonbind <= alpha)
@@ -577,6 +627,7 @@ class NeymanDriver:
             shadow_price=shadow, primitives=prims,
             ci_multiplier=ci_mult, ci_multiplier_label=ci_mult_label,
             kink_regime=kink_regime, estimate_kink=estimate_kink, p_nonbinding_max=p_nonbind,
+            var_floor=var_floor, var_shrinkable=var_shrinkable, floor_blocks_target=floor_blocks_target,
         )
 
     # ------------------------------------------------------------------ #
@@ -652,11 +703,27 @@ class NeymanDriver:
         the slope/intercept pairing a Phase-3 bench populates). A declared cross term is symmetrized
         (and cross-checked when BOTH sides declare it — ADR-0002: two homes for one number that
         disagree is a loud fault). The diagonal-only case (every `cross == {}`) yields a diagonal Σ,
-        on which `gᵀΣg == Σ g_i² Σ_ii` is bit-for-bit the legacy `sum a_i/n_i` (the no-regression fact)."""
+        on which `gᵀΣg == Σ g_i² Σ_ii` is bit-for-bit the legacy `sum a_i/n_i` (the no-regression fact).
+
+        A `DEGENERATE`-family component is a TRUE CONSTANT (a deployment/layout fact — `n_gen` = 3 cores;
+        §3 PIN-true-constant row), NOT a quantity with CI-bearing uncertainty: the spec gives it `a_i ≈ 0`,
+        "~0 bound contribution", and §4.3 gives it "no sampling interval". So its diagonal `Σ_ii` (and any
+        cross row/column — a constant covaries with nothing) is ZEROED here: the bound must NOT rest on a
+        constant's frozen display σ (the ADR-0008 "a derived value frozen as a literal" slip — `n_gen`'s
+        σ=0.05 is a placeholder on an integer core count, not a real spread). This is the bound-side twin of
+        `_family_multiplier` already excluding DEGENERATE from the CI multiplier: the `family` field is the
+        contract's SSOT of how a component enters the CI (ADR-0012 P8), and the driver — the one home that
+        assembles the bound (P1) — honors it for the VARIANCE exactly as it does for the multiplier. A
+        DECLARED-SPREAD `Fixed` (family=NORMAL, e.g. `R_gen` σ=8) is UNAFFECTED: it still contributes its
+        `a_i` to the bound (the CI honestly rests on the prior — §2.3 / §7.D); only a true constant drops out.
+        All-mean models carry no DEGENERATE input, so Σ is unchanged → the §2.2 byte-for-byte fact holds."""
         d = self.d
         Sigma = np.zeros((d, d), dtype=float)
+        degenerate = [_est._family_tag(ests[i].family[0]) is _est.CIFamily.DEGENERATE for i in range(d)]
         for i in range(d):
-            Sigma[i, i] = float(ests[i].cov[0, 0])
+            # A true constant (DEGENERATE) contributes ZERO CI-bearing variance (§3 ~0 bound contribution);
+            # a NORMAL declared-spread prior contributes its declared σ² (the CI honestly rests on it).
+            Sigma[i, i] = 0.0 if degenerate[i] else float(ests[i].cov[0, 0])
         # Map a registry/component name -> input index, so a cross entry keyed by the OTHER input's
         # name resolves to a matrix position. (An input's own name maps to itself; a cross entry keyed
         # by an unknown name — a coupling to a quantity not in THIS model — is ignored, since it is not
@@ -665,9 +732,13 @@ class NeymanDriver:
         for i in range(d):
             name_to_idx.setdefault(self.names[i], i)
         for i in range(d):
+            # A true constant covaries with nothing — skip its declared cross entries (and below, any
+            # cross entry keyed TO it is dropped by the degenerate-j guard), so the row/column stays zero.
+            if degenerate[i]:
+                continue
             for other_name, cov_ij in dict(ests[i].cross).items():
                 j = name_to_idx.get(str(other_name))
-                if j is None or j == i:
+                if j is None or j == i or degenerate[j]:
                     continue
                 val = float(cov_ij)
                 # If the mirror side also declared it, the two MUST agree (one number, two homes).

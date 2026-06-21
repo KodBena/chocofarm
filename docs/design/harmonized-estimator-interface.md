@@ -46,6 +46,35 @@ Public Domain (The Unlicense).
   the honest conservative posture until a bench implements the weighted-LS SE that
   separates the shrinkable measurement-noise share, or the loop is given the
   x-design-widening knob that genuinely lowers `1/Sxx` (§4.3).
+- **The `R_gen` measurable-later flip has LANDED (2026-06-21, dated append per
+  ADR-0005 Rule 8; ADR-0008 Rule 3 — the reclassification surfaced, not silent):**
+  the §3 PIN-now/measurable-later row anticipated `R_gen`/`g_core` flipping
+  `Fixed` → `Poolwise`/`QuantileLaw` "once instrumented." For **`R_gen`** that is
+  now done: `benchmarks/bench_r_gen.py` **runs the live C++ gen-ceiling bench**
+  (`cpp/build/chocofarm-search-runtime-bench`, the eval-mocked sole-workload
+  `SerialRuntime` `serial_dps` at the gen-ceiling `sims256/m24` config) and returns
+  a **shrinkable `QuantileLaw` (median) Estimate** — a real bootstrap median SE,
+  `family=EMPIRICAL`, `kind='median'` — over a pool of per-rep decisions/s/core
+  readings, the budget (`reps`) sizing the pool. This is the ADR-0008 fix of a
+  **measured** quantity that had been mis-wired as an un-shrinkable `Fixed` pin
+  (the `_measure_raw()` returned the 152 seed and `_estimate_from_raw()` wrapped it
+  in `pin_estimate` → `marginal = 0` → un-fundable → the `untrusted_drive`
+  generation arm **stalled**). EXECUTED (ADR-0009): the bench reports `serial_dps`
+  ≈ **152.5** dps/core (6 invocations 152.4–153.2; the 4·10² distinct nodes/decision
+  cross-read `leaf_requests_total/n_tasks` ≈ **504**, matching the `LPD=500`
+  grounding); the produced Estimate's typed `QuantileLaw.marginal_dvar_deffort` ≈
+  **−2.4·10⁻²** (`< 0` ⇒ `A_i > 0` ⇒ **FUNDABLE**) where the old `Fixed`'s is `0`;
+  and a generation-arm `driver.run(measurers=…)` loop now **converges** (CI half
+  `47.0 → 1.6` dps as R_gen is measured) instead of spinning. `get_seed()` stays
+  the DISTRUST fallback (the seed/`trust=False` path is still a `Fixed` NORMAL
+  declared-spread prior — only the **measured** path is shrinkable), and the bench
+  **fail-loud RAISES** (ADR-0002) if the binary is absent/unbuilt rather than
+  silently seeding. **Still pinned (surfaced, not silent):** `g_core` (the SAME C++
+  measurement in leaf units) and `LPD` (the SAME bench's `leaf_requests_total`
+  distinct-node count) remain `Fixed` pins whose tool is the SAME built binary —
+  the same measured-but-punted class, queued, not yet flipped; `B_op`'s faithful
+  measurement is a separate, **un-built** saturated-server rows/forward histogram,
+  so it is honestly a declared-spread prior, not the same punt.
 - **Provenance:** Synthesis of four independent designs and their statistical
   critiques (the 1:N:N:1 fan-out for this task), grounded against the actual
   benches, models, store, and driver in `tools/analysis/OpenTURNS/`. Every

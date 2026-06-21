@@ -60,8 +60,11 @@ def _measure_raw() -> dict[str, Any]:
 def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     """Build this bench's harmonized `Estimate` — the SINGLE home of the Estimate construction (P1),
     called by BOTH `measure()` and `run()`. A k=1 `Fixed` Estimate recovering the declared spread
-    UN-DIVIDED (`cov=[[σ²]]`, the §5 store-bug fix). A pin has no sample n."""
-    return pin_estimate(get_seed().mean, get_seed().sigma, name=NAME, constant=True)
+    UN-DIVIDED (`cov=[[σ²]]`, the §5 store-bug fix). A pin has no sample n. `constant` is DERIVED from
+    the grounding SSOT (`Grounded.constant`, here True — n_gen is a layout fact), not hardcoded: a true
+    constant is `family=DEGENERATE` (~0 bound contribution, §3), matching the manifest's seed path (P1)."""
+    seed = get_seed()
+    return pin_estimate(seed.mean, seed.sigma, name=NAME, constant=seed.constant)
 
 
 def measure() -> "_est.Estimate":

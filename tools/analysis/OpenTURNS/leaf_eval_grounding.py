@@ -23,7 +23,17 @@ from dataclasses import dataclass
 class Grounded:
     """One grounded quantity: a mean, a 1-sigma spread, a relative per-sample benchmark
     cost, and whether it still needs a fresh SOLE-WORKLOAD measurement (the Neyman loop
-    ranks these). `provenance` is the file the number was read from."""
+    ranks these). `provenance` is the file the number was read from.
+
+    `constant` marks a TRUE CONSTANT — a deployment/layout fact (e.g. `n_gen` = 3 generator
+    cores, set by the 1:3 pinning), NOT a quantity with CI-bearing uncertainty. This is the
+    SSOT of the DEGENERATE-vs-declared-spread classification (the harmonized-estimator-interface
+    §3 PIN-true-constant vs PIN-declared-spread distinction; ADR-0012 P1 single-home): the bench's
+    `pin_estimate(constant=…)` and the manifest's seed Estimate (`family=DEGENERATE` vs `NORMAL`)
+    both DERIVE from this one flag, so a true constant cannot leak its frozen-display σ into the
+    bound on one path while dropping out on another. A `constant` quantity's `sigma` is a display/
+    seed artifact (a placeholder on an integer/fixed value), not a real spread — the bound treats
+    it as ~0 (the §3 'a_i ≈ 0, ~0 bound contribution' rule). Default False (a measured quantity)."""
     name: str
     mean: float
     sigma: float
@@ -31,6 +41,7 @@ class Grounded:
     unit: str
     provenance: str
     needs_measurement: bool = False
+    constant: bool = False
 
 
 # --- Server forward affine fit (the ONE measured serve cost model) -------------------
@@ -108,6 +119,9 @@ GEN_PER_CORE_DPS = Grounded(
 N_GEN_CORES = Grounded(
     name="n_gen", mean=3.0, sigma=0.05, cost=0.5, unit="cores",
     provenance="adapter.md §6 M3 1:3 pinning; CLAUDE.md host (4-vCPU, isolcpus 1-3)",
+    constant=True,   # a TRUE CONSTANT: 3 generator cores is a layout/pinning fact, not a measured
+                     # spread — DEGENERATE, ~0 bound contribution (§3). The σ=0.05 is a display
+                     # placeholder on an integer core count, never a CI-bearing uncertainty.
 )
 
 # --- The server's sustained FULL-bucket operating point (rows/forward) ----------------

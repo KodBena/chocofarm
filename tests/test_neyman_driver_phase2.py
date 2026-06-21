@@ -79,7 +79,8 @@ def _poolwise(name: str, mean: float, per_sample_var: float, n: int, cross=None)
 
 
 def _fixed(name: str, mean: float, sigma: float) -> E.Estimate:
-    """A k=1 Fixed (declared-spread) Estimate: cov = sigma² (un-divided, un-shrinkable)."""
+    """A k=1 Fixed (declared-spread) Estimate: cov = sigma² (un-divided, un-shrinkable). family=NORMAL —
+    a declared engineering-judgement prior the bound HONESTLY rests on (§2.3 / §7.D)."""
     return E.Estimate(
         theta_hat=np.array([mean], dtype=float),
         cov=np.array([[sigma * sigma]], dtype=float),
@@ -88,6 +89,21 @@ def _fixed(name: str, mean: float, sigma: float) -> E.Estimate:
         support=(E.Support.POSITIVE,),
         family=(E.CIFamily.NORMAL,),
         kind="declared_spread",
+    )
+
+
+def _degenerate(name: str, value: float, sigma: float) -> E.Estimate:
+    """A k=1 Fixed TRUE-CONSTANT Estimate (family=DEGENERATE; §3 PIN-true-constant row, e.g. `n_gen`).
+    Carries a (possibly nonzero, frozen-display) `sigma` in `cov` exactly as `bench_n_gen` does — the
+    point is that the DRIVER must treat it as ~0 CI-bearing variance regardless of that stored σ."""
+    return E.Estimate(
+        theta_hat=np.array([value], dtype=float),
+        cov=np.array([[sigma * sigma]], dtype=float),
+        names=(name,),
+        shrink=E.Fixed(),
+        support=(E.Support.POSITIVE,),
+        family=(E.CIFamily.DEGENERATE,),
+        kind="pin",
     )
 
 
@@ -315,6 +331,100 @@ def test_fixed_pin_drops_out_of_allocation() -> None:
     prims = {p.name: p for p in rec.primitives}
     assert prims["x1"].recommend == 0       # the pin is never funded
     assert prims["x1"].a > 0                 # but it DOES contribute to the bound (a_i > 0)
+
+
+# --------------------------------------------------------------------------- #
+# 3c. The DEGENERATE-vs-declared-spread distinction (§3 PIN rows) — a true constant contributes ~0
+# CI-bearing variance ("~0 bound contribution"), a declared-spread prior DOES contribute its a_i.
+# --------------------------------------------------------------------------- #
+def test_degenerate_true_constant_contributes_zero_to_the_bound() -> None:
+    """§3 PIN-true-constant row + §4.3: a DEGENERATE pin (a deployment/layout fact — `n_gen`=3 cores)
+    is "~0 bound contribution" REGARDLESS of any frozen display σ in its `cov` (σ=0.05 on an integer
+    core count is the ADR-0008 'derived value frozen as a literal' slip — not a real spread). The
+    driver's bound (`gᵀΣg`) must zero it: the DEGENERATE `var_contribution` is 0 even though `df/dx≠0`.
+    This is the bound-side twin of `_family_multiplier` already excluding DEGENERATE."""
+    f = ot.SymbolicFunction(["N_gen", "R_gen"], ["N_gen * R_gen"])  # both gradients nonzero (g=[R, N])
+    d = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
+    d.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))   # TRUE CONSTANT (DEGENERATE), df/dN = R = 152
+    d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))       # declared-spread prior (NORMAL), df/dR = N = 3
+    rec = d.step(second_order_check=False)
+    prims = {p.name: p for p in rec.primitives}
+    # The DEGENERATE pin has a NONZERO gradient (152) yet contributes ~0 to the BOUND (var_contribution),
+    # while the declared-spread R_gen contributes its full a_i = 3²·8² = 576.
+    assert prims["N_gen"].var_contribution == 0.0           # the true constant is OUT of the bound
+    assert math.isclose(prims["R_gen"].var_contribution, 576.0, rel_tol=1e-9)  # the prior is IN
+    # So the bound is the declared-spread floor ALONE: gᵀΣg = 576, not 576 + 57.76 = 633.76.
+    assert math.isclose(rec.var_estimate, 576.0, rel_tol=1e-9)
+    assert math.isclose(rec.ci_halfwidth, d.z * math.sqrt(576.0), rel_tol=1e-9)  # 47.04, not 49.34
+
+
+def test_degenerate_pin_removal_is_the_before_after_of_the_run_output_stall() -> None:
+    """The ~/run_output before/after, pinned exactly: with N_gen DEGENERATE the CI drops from the
+    conflated 49.34 (z·√(57.76+576)) to the honest 47.04 (z·√576) — the 57.76 DEGENERATE term is
+    removed; the 576 declared-spread R_gen floor (correctly) stays. If N_gen were instead a NORMAL
+    declared-spread it WOULD contribute (the contrast that proves it is the family, not the law)."""
+    f = ot.SymbolicFunction(["N_gen", "R_gen"], ["N_gen * R_gen"])
+    # DEGENERATE N_gen -> 47.04 (the fix)
+    d1 = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"])
+    d1.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))
+    d1.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
+    r1 = d1.step(second_order_check=False)
+    assert math.isclose(r1.ci_halfwidth, d1.z * math.sqrt(576.0), rel_tol=1e-9)
+    # If N_gen were a NORMAL declared-spread (a contrived contrast) it WOULD add 57.76 -> 49.34.
+    d2 = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"])
+    d2.set_estimate(0, _fixed("N_gen", 3.0, 0.05))       # NORMAL, not DEGENERATE
+    d2.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
+    r2 = d2.step(second_order_check=False)
+    assert math.isclose(r2.var_estimate, 633.76, rel_tol=1e-9)
+    assert math.isclose(r2.ci_halfwidth, d2.z * math.sqrt(633.76), rel_tol=1e-9)  # 49.34 (the old number)
+
+
+# --------------------------------------------------------------------------- #
+# 3d. The §7.D irreducible-prior floor — surfaced as its OWN line, distinct from shrinkable variance.
+# --------------------------------------------------------------------------- #
+def test_var_floor_separates_declared_prior_from_shrinkable_variance() -> None:
+    """§7.D: the driver surfaces the irreducible-prior floor (Σ a_i over declared-spread `Fixed` inputs)
+    DISTINCT from the shrinkable sampling variance. A model with one shrinkable mean + one declared-
+    spread pin splits `var_estimate` into `var_floor` (the pin) + `var_shrinkable` (the mean) exactly."""
+    f = ot.SymbolicFunction(["x0", "x1"], ["2*x0 + 3*x1"])
+    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
+    d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))   # shrinkable mean: a = 2²·(9/50) = 0.72
+    d.set_estimate(1, _fixed("x1", 5.0, 2.0))           # declared-spread pin: a = 3²·2² = 36
+    rec = d.step(second_order_check=False)
+    assert math.isclose(rec.var_floor, 36.0, rel_tol=1e-9)            # the pin's irreducible a_i
+    assert math.isclose(rec.var_shrinkable, 0.72, rel_tol=1e-9)       # the mean's shrinkable share
+    assert math.isclose(rec.var_floor + rec.var_shrinkable, rec.var_estimate, rel_tol=1e-12)
+    # §7.D: the floor appears on its OWN line in the report (distinct from the CI line).
+    assert "irreducible prior floor" in rec.report()
+
+
+def test_var_floor_blocks_target_when_prior_exceeds_tolerance() -> None:
+    """§2.3 honest edge: when the declared-prior floor ALONE exceeds V_target, `floor_blocks_target` is
+    True and `converged` stays False — the CI honestly rests on the prior; the driver does NOT falsely
+    converge on the shrinkable part alone (the false-SAT §2.3 forbids), it SURFACES why it cannot."""
+    f = ot.SymbolicFunction(["N_gen", "R_gen"], ["N_gen * R_gen"])
+    d = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
+    d.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))   # the true constant (out of the bound)
+    d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))       # the declared prior, floor = 576
+    rec = d.step(second_order_check=False)
+    assert math.isclose(rec.var_floor, 576.0, rel_tol=1e-9)
+    assert math.isclose(rec.var_shrinkable, 0.0, abs_tol=1e-12)       # nothing left to sample
+    assert rec.floor_blocks_target is True                            # 576 >> V_target=(1/z)²≈0.26
+    assert rec.converged is False                                     # NOT a false-SAT on shrinkable-only
+    assert "rests on this prior" in rec.report()
+
+
+def test_all_mean_report_has_no_floor_line_no_regression() -> None:
+    """No-regression: an all-mean model (no Fixed input) has var_floor=0 and its report shows NO floor
+    line — the §7.D surface is additive, visually inert on the case it does not apply to."""
+    f = ot.SymbolicFunction(["x0", "x1"], ["3*x0 - 1.5*x1"])
+    d = NeymanDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
+    d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))
+    d.set_estimate(1, _poolwise("x1", 20.0, 4.0, 50))
+    rec = d.step(second_order_check=False)
+    assert rec.var_floor == 0.0
+    assert math.isclose(rec.var_shrinkable, rec.var_estimate, rel_tol=1e-12)
+    assert "irreducible prior floor" not in rec.report()
 
 
 # --------------------------------------------------------------------------- #

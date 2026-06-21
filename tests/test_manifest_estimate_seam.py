@@ -174,6 +174,34 @@ def test_quantity_seed_path_via_module_path(name, mp, mean, sigma) -> None:
     assert M.estimate(name, trust=False, module_path=mp).theta_hat[0] == mean
 
 
+def test_seed_estimate_honors_the_constant_flag_degenerate_vs_declared_spread() -> None:
+    """The §3 PIN distinction on the SEED path: `_estimate_from_seed(constant=True)` builds a
+    DEGENERATE / kind='pin' Estimate (a true constant — ~0 bound contribution), while the default
+    `constant=False` is the NORMAL / 'declared_spread' prior. `cov` is the declared σ² on BOTH
+    (the projection's per-sample sigma is unchanged — only the bound's treatment of it changes)."""
+    deg = M._estimate_from_seed("n_gen", 3.0, 0.05, "cores", constant=True)
+    assert deg.family == (E.CIFamily.DEGENERATE,)
+    assert deg.kind == "pin"
+    assert deg.cov[0, 0] == 0.05 ** 2                      # σ preserved in cov (display/seed value)
+    assert M._project_estimate(deg) == (3.0, 0.05, 0)     # projection per-sample sigma unchanged
+    nrm = M._estimate_from_seed("R_gen", 152.0, 8.0, "dps", constant=False)
+    assert nrm.family == (E.CIFamily.NORMAL,)
+    assert nrm.kind == "declared_spread"
+
+
+def test_n_gen_seeds_degenerate_matching_its_measure_path() -> None:
+    """P1 single-home (the stall's root): `Grounded.constant` is the ONE source of the DEGENERATE-vs-
+    declared-spread call, so n_gen seeds DEGENERATE through the manifest EXACTLY as its bench's
+    `measure()` does — the bound drops it on BOTH paths (no leak on the trusted path while it drops on
+    the untrusted one). R_gen (a declared-spread prior) seeds NORMAL on both."""
+    q_ngen = M.quantity("n_gen", trust=False, module_path="benchmarks/bench_n_gen.py")
+    assert q_ngen.estimate.family == (E.CIFamily.DEGENERATE,)
+    assert q_ngen.estimate.kind == "pin"
+    q_rgen = M.quantity("R_gen", trust=False, module_path="benchmarks/bench_r_gen.py")
+    assert q_rgen.estimate.family == (E.CIFamily.NORMAL,)
+    assert q_rgen.estimate.kind == "declared_spread"
+
+
 # --------------------------------------------------------------------------- #
 # 3. A quantity that carries a STORED Estimate — the manifest reads it and projects.
 # --------------------------------------------------------------------------- #
