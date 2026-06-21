@@ -46,7 +46,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import collect_pool, logged_run, median_estimate  # noqa: E402
 
 NAME = "shm_spin_poll_wakeup_us"
 MODULE_PATH = "benchmarks.bench_shm_spin_poll_wakeup"
@@ -72,52 +72,65 @@ def register_self() -> Any:
 
 
 def _measure_raw(trials: int = 20000) -> dict[str, Any]:
-    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the spin-poll wakeup latency: a producer thread bumps an atomic counter (a numpy int64 in
-    shared memory) after a brief spin-delay; a server thread spin-polls it and records the observe time.
-    The wakeup is (observe_ns - bump_ns) over `trials`. NO syscall in the measured spin path. Returns
-    {'wakeup_us_median', 'per_trial_us', 'trials'}. Imports numpy + shared_memory lazily. Pin two cores
-    (taskset -c 0,1) for the faithful cross-core coherence read. `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the spin-poll wakeup
+    latency. A producer thread bumps an atomic counter (a numpy int64 in shared memory) after a brief
+    spin-delay; a server thread spin-polls it and records (observe_ns - bump_ns). NO syscall in the
+    measured spin path. The realized pool is a RACE count <= the bumps — the server COALESCES bumps it
+    polls past (it jumps to the latest counter value) and DROPS torn 64-bit stamp reads — so the per-batch
+    reading count is NOT promised by `trials`, and at a tiny allocator budget it can fall below
+    median_estimate's >= 2 floor (the ~/shm_spin_poll_fail crash: budget 6 -> 1 reading -> raise).
+    `bench_common.collect_pool` therefore owns the floor: it re-runs the producer/server batch at growing
+    effort until the accumulated pool reaches min_readings (RCA fix #2 — the READING COUNT is floored, not
+    the requested effort). Returns {'wakeup_us_median', 'per_trial_us', 'trials'}. Imports numpy +
+    shared_memory lazily. Pin two cores (taskset -c 0,1) for the faithful cross-core coherence read.
+    `measure()` wraps the pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw
+    provenance rows (ONE measurement, two consumers — P1)."""
     import numpy as np
     from multiprocessing import shared_memory
 
-    shm_ctr = shared_memory.SharedMemory(create=True, size=16)
-    try:
-        ctr = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf)     # the atomic tail counter
-        bump_ns = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf, offset=8)  # the producer's stamp
-        ctr[0] = 0
-        per_trial_us: list[float] = []
-        done = threading.Event()
+    def _collect(effort: int) -> list[float]:
+        """ONE producer/server spin batch of `effort` bumps -> the per-trial wakeup pool (a RACE count
+        <= effort; collect_pool re-runs this until the >= min_readings floor is met)."""
+        shm_ctr = shared_memory.SharedMemory(create=True, size=16)
+        try:
+            ctr = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf)     # the atomic tail counter
+            bump_ns = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf, offset=8)  # the producer's stamp
+            ctr[0] = 0
+            per_trial_us: list[float] = []
+            done = threading.Event()
 
-        def producer() -> None:
-            for k in range(1, trials + 1):
-                # brief randomized spacing so the server is mid-spin when the bump lands (a real wakeup),
-                # not synchronized to the loop edge.
-                spin = 200 + (k * 2654435761) % 800       # ~200-1000 busy iters between bumps
-                for _ in range(spin):
-                    pass
-                bump_ns[0] = time.perf_counter_ns()       # stamp, then publish
-                ctr[0] = k                                 # the bump the server spins for
-            done.set()
+            def producer() -> None:
+                for k in range(1, effort + 1):
+                    # brief randomized spacing so the server is mid-spin when the bump lands (a real wakeup),
+                    # not synchronized to the loop edge.
+                    spin = 200 + (k * 2654435761) % 800       # ~200-1000 busy iters between bumps
+                    for _ in range(spin):
+                        pass
+                    bump_ns[0] = time.perf_counter_ns()       # stamp, then publish
+                    ctr[0] = k                                 # the bump the server spins for
+                done.set()
 
-        prod = threading.Thread(target=producer, daemon=True)
-        prod.start()
-        last = 0
-        # SERVER spin: poll the counter; on each new value record (now - producer_stamp).
-        while last < trials:
-            if ctr[0] != last:
-                obs = time.perf_counter_ns()
-                last = int(ctr[0])
-                dt_us = (obs - int(bump_ns[0])) / 1000.0
-                if dt_us >= 0:                             # guard a torn read on the 64-bit stamp
-                    per_trial_us.append(dt_us)
-            if done.is_set() and last >= trials:
-                break
-        prod.join(timeout=5.0)
-        med = float(np.median(per_trial_us)) if per_trial_us else float("nan")
-        return {"wakeup_us_median": med, "per_trial_us": per_trial_us, "trials": len(per_trial_us)}
-    finally:
-        shm_ctr.close()
-        shm_ctr.unlink()
+            prod = threading.Thread(target=producer, daemon=True)
+            prod.start()
+            last = 0
+            # SERVER spin: poll the counter; on each new value record (now - producer_stamp).
+            while last < effort:
+                if ctr[0] != last:
+                    obs = time.perf_counter_ns()
+                    last = int(ctr[0])
+                    dt_us = (obs - int(bump_ns[0])) / 1000.0
+                    if dt_us >= 0:                             # guard a torn read on the 64-bit stamp
+                        per_trial_us.append(dt_us)
+                if done.is_set() and last >= effort:
+                    break
+            prod.join(timeout=5.0)
+            return per_trial_us
+        finally:
+            shm_ctr.close()
+            shm_ctr.unlink()
+
+    pool = collect_pool(_collect, name=NAME, budget=trials)   # floors the RACE count at min_readings (>= 2)
+    return {"wakeup_us_median": float(np.median(pool)), "per_trial_us": pool, "trials": len(pool)}
 
 
 def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":

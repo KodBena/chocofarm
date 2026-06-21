@@ -35,6 +35,13 @@ ONE k=1 `Fixed` `Estimate` — `cov=[[σ²]]` UN-DIVIDED (recovering e.g. B_op's
 declared-spread prior (§3). Both mirror `fit_estimate`'s shape: the bench computes its `Estimate` in
 `run()` from `measure()`'s pool/seed and passes it to `logged_run(..., estimate=…)`.
 
+`collect_pool` is the race-collector POOL FLOOR (RCA fix #2): a `len(pool) >= min_readings` guarantee for
+a producer/consumer bench whose realized reading count is DECOUPLED from the requested effort (it
+coalesces edges + drops torn reads, so a tiny allocator budget yields < 2 readings -> `median_estimate`
+RAISES — the ~/shm_spin_poll_fail wakeup crash). It re-runs the batch at growing effort until the floor is
+met (the floor binds on readings COLLECTED, not effort), then `median_estimate` consumes the floored pool;
+ONE home for the guarantee (P1) so a new race bench inherits it, never re-deriving a retry loop.
+
 FAIL LOUD (ADR-0002). A registration/insert error propagates as a typed psycopg error; a degenerate
 fit (too few / collinear design points) RAISES in `fit_estimate`, never a padded low-info estimate.
 The git_sha read is best-effort (a bench may run outside a checkout) and degrades to None, which is
@@ -193,6 +200,59 @@ def fit_estimate(
 
 
 # ============================================================================================
+# ============================================================================================
+# The race-collector POOL FLOOR (RCA fix #2, docs/notes/leaf-eval-estimator-pin-cascade-rca.md): a
+# SHARED `len(pool) >= min_readings` guarantee for a RACE-BASED collector whose realized reading count
+# is DECOUPLED from the requested effort. A producer/consumer wakeup bench (shm_spin_poll, futex_wake,
+# lockfree_mpsc, cpp_inproc_port) coalesces edges it polls past and drops torn reads, so a batch returns
+# FEWER readings than the effort asked — and at a small allocator budget can return < 2, which
+# `median_estimate` then RAISES on (the shm_spin_poll wakeup crash: budget 6 -> 1 reading -> raise). The
+# floor binds on READINGS COLLECTED, not on the requested effort: re-run the batch at growing effort
+# until the accumulated pool reaches the floor. ONE home for the guarantee (ADR-0012 P1) so a new race
+# bench inherits it by calling this, not by re-deriving a retry loop (ADR-0011 Rule 4: a structural net
+# over the class, not a per-bench patch). It NEVER fabricates a reading (ADR-0002): an un-yielding
+# collector RAISES at the attempt cap.
+# ============================================================================================
+def collect_pool(
+    collect_batch: Callable[[int], Sequence[float]],
+    *,
+    name: str,
+    budget: int,
+    min_readings: int = 8,
+    max_attempts: int = 12,
+) -> list[float]:
+    """Accumulate a latency/cost pool to a floor of `min_readings` readings from a RACE-BASED collector.
+    `collect_batch(effort) -> Sequence[float]` runs ONE batch at the given effort and returns its
+    (possibly short) pool; `collect_pool` runs it at `effort = max(min_readings, budget)` and, while the
+    accumulated pool is under the floor, RE-RUNS it at doubled effort — so the floor binds on readings
+    COLLECTED, not on the requested effort (the count a race collector cannot promise). Returns the
+    accumulated pool (`len >= min_readings`).
+
+    `min_readings` defaults to 8 — comfortably above `median_estimate`'s HARD minimum of 2 so the bootstrap
+    median SE is non-degenerate (2 readings risk a zero-spread pool, the OTHER median_estimate raise). The
+    normal path (a real allocator budget) yields hundreds in the first batch and never retries, so the
+    floor binds only at the pathological tiny budget that produced the crash.
+
+    FAIL LOUD (ADR-0002): if `max_attempts` batches (effort up to `budget·2^(max_attempts-1)`) still
+    under-yield, RAISE — a collector that cannot reach `min_readings` is a real fault (a wedged producer, a
+    pathological over-coalescing), never a sub-floor pool padded into a fake median."""
+    if min_readings < 2:
+        raise ValueError(
+            f"collect_pool({name!r}): min_readings must be >= 2 (a bootstrap median SE needs >= 2 "
+            f"readings); got {min_readings} (ADR-0002).")
+    pool: list[float] = []
+    effort = max(int(min_readings), int(budget))
+    for _ in range(int(max_attempts)):
+        pool.extend(float(x) for x in collect_batch(effort))
+        if len(pool) >= min_readings:
+            return pool
+        effort *= 2
+    raise ValueError(
+        f"collect_pool({name!r}): only {len(pool)} reading(s) after {max_attempts} batches (final effort "
+        f"{effort}) — the race collector under-yields below the floor {min_readings}; a real fault (a "
+        f"wedged/over-coalescing producer), not a sub-floor pool to pad (ADR-0002).")
+
+
 # The §6 Phase-3 MEDIAN/LATENCY slice: turn a raw pool of per-cycle/per-trial/per-window readings
 # (whose headline is `np.median(pool)`) into ONE k=1 harmonized `Estimate`
 # (docs/design/harmonized-estimator-interface.md §3 MEDIAN/QUANTILE row, §7.A).
