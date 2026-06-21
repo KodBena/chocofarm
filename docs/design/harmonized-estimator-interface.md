@@ -963,9 +963,16 @@ survive):**
 carrying the deserialized `Estimate` (reading `instance.estimate` when present,
 **falling back** to reconstructing a `Poolwise`/`median` `Estimate` from
 `latest_aggregate` for legacy instances — so old data still resolves). The
-existing `.mean/.sigma/.n/.trusted` stay as a projection (`mean = theta_hat[0]`,
-`sigma = sqrt(cov[0,0])`) so every downstream `.mean`/`.sigma` reader is
-unchanged. The seed path returns a `Fixed`-law `Estimate` built from the bench's
+existing `.mean/.sigma/.n/.trusted` stay as a projection of the `Estimate` so
+every downstream `.mean`/`.sigma` reader is unchanged: `mean = theta_hat[0]`, and
+`sigma` is the **per-sample** spread the 4-tuple has always carried
+(`stddev_samp`), recovered from the shrink law — `sqrt(Poolwise.per_sample_var[0])`
+for a reconstructed mean (with `n = round(per_sample_var[0]/cov[0,0])`), and
+`sqrt(cov[0,0])` only for a `Fixed` seed (where `cov = sigma²`, un-divided).
+**(Corrected during Phase-1 implementation: the mean's per-sample `sigma` is *not*
+`sqrt(cov[0,0])` — that is the already-divided SE `sigma/√n`; projecting the SE
+would make the loop reconstruct `sigma²/n²` and shift every `Normal(mean, sigma)`
+consumer. `reconstruct ∘ project = id` on the aggregate is asserted at the seam.)** The seed path returns a `Fixed`-law `Estimate` built from the bench's
 `get_seed()` `Grounded` (mean → `theta_hat`, `sigma` → `cov` diagonal, support
 from units, `family=NORMAL` as a prior).
 
