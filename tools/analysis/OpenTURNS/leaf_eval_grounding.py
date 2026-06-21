@@ -53,13 +53,38 @@ class Grounded:
 # point; see model docstrings). The 'current' (un-staged) intercept is 173.9us — using it
 # would only LOWER the serve stage, the more pessimistic alt; the staged number is the
 # right one for the optimized boundary.
+#
+# needs_measurement=True on BOTH (MEASURED quantities, NOT true constants — `constant` stays
+# its default False): iota (the intercept) and slope/t_row are the SAME k=2 staged-forward
+# OLS fit that bench_iota.py / bench_t_row.py now RUN LIVE (bench_common.fit_estimate over the
+# production `run_microbatch` forward at a width sweep -> a SHRINKABLE RegressionLaw Estimate
+# with the −0.81 slope/intercept off-diagonal, the SE from resid_var + the x-design — NOT the
+# 12.0us/0.5us hand-literals below, and NOT the stored JSON, which carries only intercept/slope/
+# r2 with NO covariance). These mean/sigma are the v1 SEED — the DISTRUST/trust=False fallback
+# prior (declared spread, NORMAL) bench_iota/bench_t_row.get_seed() return; the LIVE measure()
+# path is the RegressionLaw whose variance authority is its own cov. So this is the same
+# measured-but-punted reclassification the R_gen / g_core / LPD / tmsg flips landed (the design's
+# §3 REGRESSION-fit row + the needs_measurement/manifest-trusted distinction): the flag now
+# SINGLE-HOMES the "needs a sole-workload run" semantics across BOTH paths — the static models
+# (model_capacity/model_cycletime, which read Grounded.needs_measurement) and the manifest models
+# (model_zmq_baseline/model_cpp_inproc_port, which derive needs_measurement = not trusted) now
+# both classify iota/slope as NEEDS-SOLE-WORKLOAD, instead of the prior path-dependent split that
+# told the static-path operator NOT to measure a runnable fit (ADR-0008 classification; ADR-0012
+# P1 derive-don't-duplicate / P8 typed-signature-is-SSOT). NB it is a RegressionLaw, NOT the
+# QuantileLaw the R_gen flip used: a fit is leverage-floored (its marginal is ~0 absent a
+# per_point_var weighted-LS SE — the design's §4.3/§7.E conservative posture), so funding it means
+# WIDENING the x-design / RUNNING its bench to flip it trusted, not pouring iters into the median.
 SERVE_INTERCEPT_US = Grounded(
     name="iota_us", mean=94.58, sigma=12.0, cost=6.0, unit="us",
-    provenance="run_microbatch_staging/results_nopad.json fits.staged.intercept_us",
+    provenance="run_microbatch_staging/results_nopad.json fits.staged.intercept_us "
+               "(v1 seed; MEASURED live by bench_iota as the k=2 staged-fit intercept)",
+    needs_measurement=True,
 )
 SERVE_SLOPE_US = Grounded(
     name="slope_us", mean=4.317, sigma=0.5, cost=6.0, unit="us/row",
-    provenance="run_microbatch_staging/results_nopad.json fits.staged.slope_us_per_row",
+    provenance="run_microbatch_staging/results_nopad.json fits.staged.slope_us_per_row "
+               "(v1 seed; MEASURED live by bench_t_row as the k=2 staged-fit slope)",
+    needs_measurement=True,
 )
 
 # Decomposition of the JAX-forward fixed cost (mlp_lowlatency/results.json decomposition):
@@ -142,12 +167,20 @@ SERVE_FULL_BUCKET = Grounded(
 # cpp/include/chocofarm/inference_wire.hpp: pure-memcpy [ver][B][in_dim][f32xB*in_dim]
 # codec (no parse-copy); request ~968B (241 f32), response ~264B (66 f32) per leaf. Over
 # a coalesced S-leaf frame the per-leaf framing share is ~us, far below the per-forward
-# budget, so transport never binds. Placeholder 1.0us/leaf is a deliberate over-charge
-# (still leaves transport >> the binding stages). Provably non-binding by a wide margin,
-# so it ranks LAST for the Neyman allocator.
+# budget, so transport never binds. The 1.0us/leaf here is the v1 SEED — a deliberate
+# over-charge (still leaves transport >> the binding stages) on the DISTRUST/trust=False
+# seed path. It is provably non-binding by a wide margin, so it ranks LAST for the Neyman
+# allocator. needs_measurement=True (a MEASURED quantity, NOT a true constant — `constant`
+# stays its default False): bench_tmsg.py / bench_zmq_baseline_tmsg_us_leaf.py now RUN the
+# live inference_wire codec (encode_request + decode_response over a coalesced S-leaf frame,
+# /S, windowed) and return a SHRINKABLE median QuantileLaw — the ADR-0008/ADR-0012 P8
+# reclassification mirroring R_gen (this seed stays the seed-path fallback only; the
+# same-quantity-class non-binding sibling bench_cpp_inproc_port_tmsg_us_leaf is constructed
+# shrinkable too, so non-binding is a RANKING fact, not an un-measurability fact).
 MSG_PER_LEAF_US = Grounded(
     name="tmsg_us_leaf", mean=1.0, sigma=0.5, cost=2.0, unit="us/leaf",
-    provenance="inference_wire.hpp pure-memcpy codec (deliberate over-charge; non-binding)",
+    provenance="inference_wire codec per-leaf framing (v1 seed 1.0us deliberate over-charge; "
+               "MEASURED by bench_tmsg over the live codec; non-binding, ranks LAST)",
     needs_measurement=True,
 )
 

@@ -17,10 +17,24 @@ is its transport-slug-prefixed twin so the design sweep is UNIFORM (every varian
 `G.MSG_PER_LEAF_US`, 1.0us/leaf — a deliberate over-charge that still leaves transport non-
 binding) — this module DELEGATES to it (ADR-0012 P1 single-home), never a second literal.
 
-WHAT run() MEASURES (1:1 with the model input). Time `encode_request` over an S-row feature matrix
-+ `decode_response` over the matching reply, divide by S — the per-leaf framing share of the ZMQ
-codec. NO socket (the framing COST is the codec memcpy; the multipart send/recv cost is in
+WHAT run()/measure() MEASURES (1:1 with the model input). Time `encode_request` over an S-row
+feature matrix + `decode_response` over the matching reply, divide by S — the per-leaf framing
+share of the ZMQ codec — in N windows, pooling a per-leaf reading per window so the headline is the
+pool MEDIAN. NO socket (the framing COST is the codec memcpy; the multipart send/recv cost is in
 `zmq_baseline_tau_io_us`, the serve-side I/O term — keeping the two terms one-home each).
+
+WHY SHRINKABLE NOW (the ADR-0008 reclassification, mirroring the v1 bench_tmsg / R_gen fix; ADR-0012
+P8 the typed signature IS the contract). `tmsg_us_leaf` is a MEASURED quantity
+(`G.MSG_PER_LEAF_US.needs_measurement=True`, NOT a true constant — `Grounded.constant` defaults
+False), not a config pin. The prior version PUNTED — it DID a real codec measurement but wrapped the
+SEED (1.0us) in `pin_estimate(...)` → an un-shrinkable `Fixed`, discarding the live number. The
+SAME-quantity-class sibling bench_cpp_inproc_port_tmsg_us_leaf (ALSO NON-BINDING / ranks-LAST) is
+constructed SHRINKABLE — so non-binding is a RANKING fact, not an un-measurability fact. This module
+now RUNS the codec and returns a SHRINKABLE `QuantileLaw` (median) Estimate over a per-leaf pool (a
+real bootstrap median SE — docs/design/harmonized-estimator-interface.md §7.A, §3 the MEDIAN row +
+the PIN-now/measurable-later row). `get_seed()` stays the DISTRUST fallback (the v1 1.0us/leaf prior
+on the SEED path only). FAIL LOUD (ADR-0002): an import/codec failure propagates — never the
+seed-as-if-measured.
 
 TIMING-SENSITIVE — DO NOT run() during the parallel fan-out. Pin: `taskset -c 0`, sole-workload.
 
@@ -40,22 +54,26 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run, pin_estimate  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "zmq_baseline_tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_zmq_baseline_tmsg_us_leaf"
 _DESC = ("ZMQ BASELINE per-leaf-amortized message-passing cost (us/leaf): inference_wire request encode + "
-         "reply decode (pure-memcpy codec) over a coalesced S-leaf frame, /S. Transport stage; NON-BINDING "
-         "by a wide margin (ranks LAST for Neyman). Seed delegates to v1 G.MSG_PER_LEAF_US (1.0us/leaf).")
+         "reply decode (pure-memcpy codec) over a coalesced S-leaf frame, /S (the pool MEDIAN over "
+         "windows). Transport stage; NON-BINDING by a wide margin (ranks LAST for Neyman). Seed delegates "
+         "to v1 G.MSG_PER_LEAF_US (1.0us/leaf).")
 
 _IN_DIM = 241
 _N_ACTIONS = 65
+_S_LEAVES = 256        # the coalesced frame width (rows per encode_request / decode_response)
+_FRAMES_PER_WINDOW = 200  # coalesced frames timed per window (a single-frame perf_counter call is clock-dominated)
 
 
 def get_seed() -> G.Grounded:
     """The v1 seed (DISTRUST fallback) — DELEGATED to the single home (ADR-0012 P1): `G.MSG_PER_LEAF_US`
     (1.0us/leaf, a deliberate over-charge; provably non-binding). zmq_baseline's tmsg IS the v1 grounding
-    seed (it moves nothing off the reference codec)."""
+    seed (it moves nothing off the reference codec). Used by the SEED path (manifest `trust=False`); the
+    MEASURED path is the shrinkable `QuantileLaw`."""
     return G.MSG_PER_LEAF_US
 
 
@@ -65,63 +83,102 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def _measure_raw(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
-    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the ZMQ-baseline
-    tmsg_us_leaf: time encode_request(S x in_dim) + decode_response(reply) over `iters`, /S — the per-leaf
-    framing share of the inference_wire memcpy codec. Returns {'tmsg_us_leaf', 'encode_us', 'decode_us',
-    's_leaves'}. Imports the codec + numpy lazily. Pin (taskset -c 0). `measure()` wraps the seed into a
-    `Fixed` Estimate; `run()` uses this dict for the raw provenance row."""
+def _measure_raw(budget: int = 64, s_leaves: int = _S_LEAVES) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): RUN the live inference-wire
+    codec sized by `budget`, and return the per-leaf ZMQ-baseline framing-cost pool plus provenance.
+    Over `budget` windows, time `encode_request(S x in_dim) + decode_response(reply)` for
+    `_FRAMES_PER_WINDOW` coalesced frames and record ONE per-leaf reading per window (dt/frames/S — the
+    per-leaf framing share of the inference_wire memcpy codec), mirroring the v1 bench_tmsg /
+    bench_cpp_inproc_port_tmsg_us_leaf window loop so the SAME quantity-class is constructed the SAME
+    way. `budget` IS the shrink budget — more windows → a tighter median SE. Returns
+    {'tmsg_us_leaf_median' (the pool MEDIAN), 'per_leaf_us' (the pool the Estimate is built over),
+    'encode_us', 'decode_us' (informational split), 's_leaves', 'budget'}. Imports the codec + numpy
+    lazily. `measure()`/`run()` both consume this ONE measurement (P1).
+
+    FAIL LOUD (ADR-0002): an import/codec failure propagates — never the seed-as-if-measured (the punt
+    this module removes). The seed is the DISTRUST fallback path (get_seed()), not a measured-result
+    substitute."""
     import numpy as np
     from chocofarm.az.inference_wire import encode_request, encode_response, decode_response
 
+    n_windows = max(2, int(budget))   # >= 2 readings so the bootstrap median SE is defined
     feats = np.zeros((s_leaves, _IN_DIM), dtype=np.float32)
     reply = encode_response(np.zeros((s_leaves,), dtype=np.float32),
                             np.zeros((s_leaves, _N_ACTIONS), dtype=np.float32))
     # Warm.
-    for _ in range(min(200, iters)):
+    for _ in range(min(200, _FRAMES_PER_WINDOW)):
         encode_request(feats); decode_response(reply)
+
+    per_leaf_us: list[float] = []
+    for _w in range(n_windows):
+        t0 = time.perf_counter_ns()
+        for _ in range(_FRAMES_PER_WINDOW):
+            encode_request(feats)               # the request encode (S x in_dim -> frame)
+            decode_response(reply)              # the reply decode (frame -> S values + logits)
+        dt = time.perf_counter_ns() - t0
+        per_leaf_us.append(dt / 1000.0 / _FRAMES_PER_WINDOW / s_leaves)
+    # A per-frame enc/dec split (informational provenance only — the headline + the pool above are the
+    # codec's full per-leaf framing share; this attributes it to encode vs decode at the same point).
     t0 = time.perf_counter_ns()
-    for _ in range(iters):
+    for _ in range(_FRAMES_PER_WINDOW):
         encode_request(feats)
-    enc_us = (time.perf_counter_ns() - t0) / 1000.0 / iters
+    enc_us = (time.perf_counter_ns() - t0) / 1000.0 / _FRAMES_PER_WINDOW
     t0 = time.perf_counter_ns()
-    for _ in range(iters):
+    for _ in range(_FRAMES_PER_WINDOW):
         decode_response(reply)
-    dec_us = (time.perf_counter_ns() - t0) / 1000.0 / iters
-    per_leaf = (enc_us + dec_us) / s_leaves
-    return {"tmsg_us_leaf": per_leaf, "encode_us": enc_us, "decode_us": dec_us, "s_leaves": s_leaves}
+    dec_us = (time.perf_counter_ns() - t0) / 1000.0 / _FRAMES_PER_WINDOW
+    return {
+        "tmsg_us_leaf_median": float(np.median(per_leaf_us)),
+        "per_leaf_us": per_leaf_us,
+        "encode_us": enc_us,
+        "decode_us": dec_us,
+        "s_leaves": s_leaves,
+        "budget": n_windows,
+    }
 
 
 def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
-    """Build this bench's harmonized `Estimate` — the SINGLE home of the Estimate construction (P1),
-    called by BOTH `measure()` and `run()`. A k=1 `Fixed` Estimate recovering the declared spread
-    UN-DIVIDED (`cov=[[σ²]]`, the §5 store-bug fix). A pin has no sample n."""
-    return pin_estimate(get_seed().mean, get_seed().sigma, name=NAME)
+    """Build this bench's harmonized SHRINKABLE `Estimate` — the SINGLE home of the Estimate
+    construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)` with a
+    BOOTSTRAP median SE over the per-leaf ZMQ-baseline framing-cost pool (§7.A — a real order-statistic
+    SE, NOT a `Fixed` pin), `family=EMPIRICAL`, `kind='median'`, POSITIVE support. The ADR-0008
+    reclassification (mirroring the v1 bench_tmsg / R_gen fix): the median's `marginal_dvar_deffort` is
+    `−cov/n < 0`, so the Neyman loop can FUND it, where the prior `Fixed` pin (marginal=0) made it
+    un-fundable. SAME construction as the same-quantity-class sibling bench_cpp_inproc_port_tmsg_us_leaf
+    (ADR-0012 P8: one quantity-class, one typed shrink signature)."""
+    return median_estimate(res["per_leaf_us"], name=NAME)   # bootstrap median SE over the per-leaf pool
 
 
-def measure(s_leaves: int = 256, iters: int = 5000) -> "_est.Estimate":
-    """Measure zmq_baseline_tmsg_us_leaf and return its harmonized k=1 `Fixed` `Estimate` (§6 Phase 4:
-    `measure()` returns the `Estimate` the bench DECLARES — a pin is a `Fixed`/declared-spread Estimate,
-    NOT a faked pool, consumed directly by the driver/untrusted_drive). The raw dict is the bench's internal
-    `_measure_raw()` provenance."""
-    return _estimate_from_raw(_measure_raw(s_leaves=s_leaves, iters=iters))
+def measure(budget: int = 64, s_leaves: int = _S_LEAVES) -> "_est.Estimate":
+    """Measure zmq_baseline_tmsg_us_leaf (RUN the live inference-wire codec) and return its harmonized
+    k=1 SHRINKABLE median `Estimate` (§6 Phase 4: `measure()` returns the `Estimate` the bench DECLARES —
+    the driver/untrusted_drive consume it directly). `budget` sizes the measurement pool (the Neyman
+    loop's lever — more windows tightens the SE). TIMING-SENSITIVE — pinned (taskset -c 0); never during
+    the fan-out."""
+    return _estimate_from_raw(_measure_raw(budget=budget, s_leaves=s_leaves))
 
 
-def run(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
-    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided, alongside the live measurement. TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
-    res = _measure_raw(s_leaves=s_leaves, iters=iters)  # the raw provenance dict
+def run(budget: int = 64, s_leaves: int = _S_LEAVES) -> dict[str, Any]:
+    """Measure zmq_baseline_tmsg_us_leaf (RUN the live inference-wire codec) and LOG it as a harmonized
+    k=1 SHRINKABLE median Estimate (QuantileLaw p=0.5, bootstrap median SE, §6 Phase 3, §5.2 de-dup).
+    Returns the raw provenance dict. TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER
+    during the fan-out."""
+    res = _measure_raw(budget=budget, s_leaves=s_leaves)  # ONE measurement (Estimate + provenance)
     est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"s_leaves": s_leaves, "iters": iters, "encode_us": res["encode_us"],
-           "decode_us": res["decode_us"], "codec": "inference_wire_memcpy", "transport": "zmq_baseline"}
+    cfg = {"kind": "inference_wire_codec_measured", "codec": "inference_wire_memcpy",
+           "transport": "zmq_baseline", "s_leaves": res["s_leaves"], "budget": res["budget"],
+           "frames_per_window": _FRAMES_PER_WINDOW, "encode_us": res["encode_us"],
+           "decode_us": res["decode_us"], "tmsg_us_leaf_median": res["tmsg_us_leaf_median"]}
     with logged_run(NAME, quantity="transport_msg_cost_per_leaf", units=get_seed().unit, description=_DESC,
                     module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        log(res["tmsg_us_leaf"], sample_size=iters)
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
+        log(res["per_leaf_us"], sample_size=1)
     return res
 
 
 if __name__ == "__main__":
     print(f"[bench_zmq_baseline_tmsg_us_leaf] seed: {get_seed().mean} {get_seed().unit} "
-          f"(provenance: {get_seed().provenance}; delegated to v1 G.MSG_PER_LEAF_US)")
+          f"(DISTRUST fallback; provenance: {get_seed().provenance}; delegated to v1 G.MSG_PER_LEAF_US)")
     register_self()
-    print("[bench_zmq_baseline_tmsg_us_leaf] registered. NOT running the live measurement (timing-"
-          "sensitive); invoke run() pinned and sole-workload. NON-BINDING — ranks LAST for Neyman.")
+    print("[bench_zmq_baseline_tmsg_us_leaf] registered. measure()/run() RUN the live inference-wire "
+          "codec (taskset -c 0) -> a SHRINKABLE median Estimate. NON-BINDING — ranks LAST for Neyman.")

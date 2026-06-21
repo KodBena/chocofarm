@@ -17,7 +17,11 @@
 //
 //   Protocol:  search-runtime-bench --instance <p> --faces <p>
 //                  [--tasks N --n-sims N --m N --max-depth N --c-outcome N --lam f --workers N --reps N]
-//   Output:    a header line of the config, then per-rep timings, then a summary:
+//   Output:    a header line of the config, then per-rep timings, then a per-decision leaf-count line
+//              "leaf_requests_per_task=<n0> <n1> ..." (one int per task — each task is ONE decision, so
+//              this is the per-decision leaf-count pool / LPD readings the leaf-eval bench_lpd.py grounds
+//              its shrinkable median Estimate on), then the aggregate "leaf_requests_total=<sum> ...",
+//              then a summary:
 //              "RESULT: PASS speedup=<x> serial_dps=<n> parallel_dps=<n>" + exit 0, or
 //              "RESULT: FAIL (<m> mismatches between serial and parallel)" + exit 3.
 //
@@ -140,11 +144,21 @@ int main(int argc, char** argv) {
     }
     int mismatches = 0;
     long leaf_total = 0;
+    // Per-task net-forward (leaf-request) counts: each task is ONE independent Gumbel-AZ decision, so
+    // s.leaf_requests IS that decision's leaf-evaluation count — the per-decision leaf-count sample
+    // (LPD, leaves/decision). Collected here so a sole-workload run yields a POOL of >=2 per-decision
+    // readings (a real distribution, not one aggregate), the shrinkable measurement bench_lpd.py builds
+    // a median Estimate over. The aggregate leaf_requests_total is kept unchanged below for the R_gen /
+    // g_core cross-read. Serial and pool agree per task (the mismatch check above), so the serial counts
+    // are the canonical per-decision readings.
+    std::vector<int> leaf_per_task;
+    leaf_per_task.reserve(tasks.size());
     for (size_t i = 0; i < tasks.size(); ++i) {
         const chocofarm::Decision& s = (*serial_ref)[i];
         const chocofarm::Decision& p = (*pool_ref)[i];
         if (!(s.executed == p.executed) || s.leaf_requests != p.leaf_requests) ++mismatches;
         leaf_total += s.leaf_requests;
+        leaf_per_task.push_back(s.leaf_requests);
     }
     if (mismatches != 0) {
         std::cout << "RESULT: FAIL (" << mismatches << " mismatches between serial and parallel)\n";
@@ -171,6 +185,13 @@ int main(int argc, char** argv) {
     const double parallel_dps = static_cast<double>(n_tasks) / best_pool;
     const double speedup = best_serial / best_pool;
     std::cout.precision(4);
+    // The per-decision leaf-count pool (one int per task) — the LPD readings bench_lpd.py pools into a
+    // shrinkable median Estimate. Printed space-separated on its own line; leaf_requests_total (the sum)
+    // follows unchanged for the R_gen/g_core cross-read.
+    std::cout << "leaf_requests_per_task=";
+    for (size_t i = 0; i < leaf_per_task.size(); ++i)
+        std::cout << (i ? " " : "") << leaf_per_task[i];
+    std::cout << "\n";
     std::cout << "leaf_requests_total=" << leaf_total
               << " best_serial=" << best_serial << "s best_parallel=" << best_pool << "s\n";
     std::cout << "RESULT: PASS speedup=" << speedup << " serial_dps=" << serial_dps

@@ -113,9 +113,16 @@ _T_DISP = G.Grounded(
     name="T_disp", mean=G.DISPATCH_FLOOR_US, sigma=2.0, cost=1.0, unit="us",
     provenance="mlp_lowlatency/results.json decomposition.dispatch_floor_us (68.84, R2~0.997)",
 )
+# t_row IS the staged-fit slope (G.SERVE_SLOPE_US): its mean AND its needs_measurement DERIVE
+# from that one SSOT (P1 single-home / ADR-0008), so the slope classifies IDENTICALLY here and on
+# model_capacity (which reads G.SERVE_SLOPE_US directly). Re-homing it as a fresh Grounded with a
+# defaulted needs_measurement=False would re-open the path-dependent split the iota/slope fix closes
+# — the slope is a runnable RegressionLaw fit (bench_t_row), so it is NEEDS-SOLE-WORKLOAD on every
+# path. (sigma/cost stay this model's own engineering-judgement seed-path spread for the cycle term.)
 _T_ROW = G.Grounded(
     name="t_row", mean=G.SERVE_SLOPE_US.mean, sigma=0.15, cost=1.0, unit="us/row",
     provenance="run_microbatch_staging/results_nopad.json fits.staged.slope_us_per_row (4.316)",
+    needs_measurement=G.SERVE_SLOPE_US.needs_measurement,
 )
 _INPUTS: list[G.Grounded] = [
     G.N_GEN_CORES,            # N_gen

@@ -75,6 +75,185 @@ Public Domain (The Unlicense).
   the same measured-but-punted class, queued, not yet flipped; `B_op`'s faithful
   measurement is a separate, **un-built** saturated-server rows/forward histogram,
   so it is honestly a declared-spread prior, not the same punt.
+- **The `g_core` measurable-later flip has LANDED too (2026-06-21, dated append per
+  ADR-0005 Rule 8 — this SUPERSEDES the immediately-preceding bullet's "Still
+  pinned … `g_core` … queued, not yet flipped" line *for `g_core`*; that
+  point-in-time line is preserved, not rewritten, and `LPD`/`B_op` remain pinned as
+  it states):** `g_core` is now the leaf-unit TWIN of the `R_gen` flip, off the
+  IDENTICAL binary/config/run. `benchmarks/bench_g_core.py` runs the SAME live C++
+  gen-ceiling bench and returns a **shrinkable `QuantileLaw` (median) Estimate**
+  (`family=EMPIRICAL`, `kind='median'`, a real bootstrap median SE) over a pool of
+  per-rep **leaves/s/core** readings — `g_core = leaf_requests_total / serial` per
+  rep (the n_tasks cancels: `(n_tasks/serial)·(leaf_total/n_tasks) =
+  leaf_total/serial = per_rep_dps · LPD`), the budget (`reps`) sizing the pool. The
+  same ADR-0008 fix of a **measured** quantity mis-wired as an un-shrinkable `Fixed`
+  pin (the old `_measure_raw()` returned the 76000 seed while labelling itself
+  `is_cpp_bench=True` though it ran NO bench — the lying signature, ADR-0012 P8/P1;
+  `_estimate_from_raw()` wrapped it in `pin_estimate` → `marginal = 0` →
+  un-fundable → the generation arm **stalled**). EXECUTED (ADR-0009): `measure()`
+  reports ≈ **76.4k** leaves/s/core (per-rep pool ~75.5k–76.5k; LPD cross-read
+  `leaf_requests_total/n_tasks` ≈ **503.8**), the typed
+  `QuantileLaw.marginal_dvar_deffort` ≈ **−5.9·10³** (`< 0` ⇒ `A_i > 0` ⇒
+  **FUNDABLE**) where the old `Fixed`'s is `0`; the live ≈76.4k sits a hair below the
+  76000 seed, exactly what flipping a pin to a live-measured median is meant to
+  surface. `get_seed()` stays the DISTRUST fallback (a `Fixed` NORMAL declared-spread
+  prior on the seed path), and the bench **fail-loud RAISES** (ADR-0002) if the
+  binary is absent/unbuilt, exits non-zero, is non-PASS, yields no per-rep readings,
+  or reports no `leaf_requests_total` (g_core is a LEAF rate — no leaf numerator, no
+  measurement). Implemented as a standalone mirror of `bench_r_gen` (ADR-0004
+  minimal-touch; ADR-0012 P1 notes the single `_run_cpp_bench` parse *could* be
+  factored into a shared helper both benches derive from — a follow-up, not done
+  here, to keep the already-landed `bench_r_gen` untouched). **Still pinned:** `LPD`
+  (the SAME bench's distinct-node count) and `B_op` (the separate un-built histogram).
+- **The `LPD` measurable-later flip has LANDED too (2026-06-21, dated append per
+  ADR-0005 Rule 8 — this SUPERSEDES the immediately-preceding bullet's "Still
+  pinned … `LPD` … " line *for `LPD`*; that point-in-time line is preserved, not
+  rewritten, and `B_op` remains pinned as it states):** `LPD` is now the third
+  rate off the IDENTICAL gen-ceiling binary/config/run that grounds `R_gen` and
+  `g_core` (ADR-0012 P1: one instrumented run grounds all three).
+  `benchmarks/bench_lpd.py` runs the SAME live C++ gen-ceiling bench and returns a
+  **shrinkable `QuantileLaw` (median) Estimate** (`family=EMPIRICAL`,
+  `kind='median'`, a real bootstrap median SE) over the **per-decision leaf-count
+  pool** — each task the bench runs is ONE Gumbel-AZ decision, so its
+  `leaf_requests` IS that decision's LPD reading. The C++ bench gained one
+  **additive** output line (`leaf_requests_per_task=<n0> <n1> …`, the per-task
+  counts that were already summed into `leaf_requests_total`) so a sole-workload
+  run yields a ≥2-reading per-decision pool — **no search edit** (the per-task
+  `s.leaf_requests` already existed at the correctness-check loop); the budget
+  (`trials`) sizes the pool. Same ADR-0008 fix of a **measured** quantity mis-wired
+  as an un-shrinkable `Fixed` pin (the old `_measure_raw()` returned the 500 design
+  pin and `_estimate_from_raw()` wrapped it in `pin_estimate` → `marginal = 0` →
+  un-fundable → the generation arm **stalled**); the bench's own v1 docstring
+  conceded the measurement was "a per-decision leaf-count HISTOGRAM from an
+  instrumented search run … a C++/search-harness artifact" — naming the runnable
+  harness while still recording the pin. EXECUTED (ADR-0009): `measure()` reports
+  LPD ≈ **503.5** leaves/decision (per-decision pool
+  `[504,500,503,500,505,502,508,506]`, non-degenerate — 7 distinct, the aggregate
+  cross-read `leaf_requests_total/n_tasks` ≈ **503.5** matching R_gen/g_core), the
+  typed `QuantileLaw.marginal_dvar_deffort` ≈ **−0.21** (`< 0` ⇒ `A_i ≈ 13.7 > 0`
+  ⇒ **FUNDABLE**) where the old `Fixed`'s is `0`, and a bigger `trials` budget
+  tightens the SE (`1.31 → 0.47` at 8 → 64 decisions). The model consumes LPD as a
+  pure **scalar** divisor (`model_capacity.py:99-102` `n_gen*g_core/LPD`,
+  `serve/LPD`, `1/(LPD*tmsg)`), so a shrinkable median is sufficient — the
+  "histogram" framing is a strictly-higher bar than the scalar contract needs.
+  **ADR-0008 classification (surfaced, not silent):** LPD is a **MEDIAN** (a
+  measured quantity whose variance responds to effort), **not** a true constant —
+  it is deliberately **not** marked `constant=True` (a DEGENERATE constant is
+  `a_i≈0`, un-fundable — that would re-introduce the stall; LPD is not a
+  layout/pinning fact like `n_gen`, it is a measured per-decision count that varies
+  tree-to-tree). `get_seed()` stays the DISTRUST fallback (a `Fixed` NORMAL
+  declared-spread prior on the seed path — `Grounded.constant` stays `False`,
+  `needs_measurement` stays `True`; only the **measured** path is shrinkable), and
+  the bench **fail-loud RAISES** (ADR-0002) if the binary is absent/unbuilt, exits
+  non-zero, is non-PASS, or yields no per-decision readings. **Still pinned:**
+  `B_op` (the separate un-built saturated-rows/forward histogram — honestly a
+  declared-spread prior, not the same punt).
+- **The `tmsg_us_leaf` measurable-later flip has LANDED too (2026-06-21, dated
+  append per ADR-0005 Rule 8 — this repoints the §3 case-table row for `tmsg`,
+  moved above from "PIN — declared spread" to "PIN-now / measurable-later"):**
+  `tmsg_us_leaf` (the per-leaf-amortized message-passing cost, the TRANSPORT arm of
+  the model's `min()`) is now measured off the **live `inference_wire` codec** —
+  NOT a C++ rate (the C++ `chocofarm-wire-bench` is a SERVER-COUPLED round-trip =
+  RTT + serve forward, not the pure-codec framing share), but the in-process codec
+  itself (`chocofarm/az/inference_wire.py` `encode_request`/`decode_response`) the
+  bench ALREADY timed and DISCARDED. `benchmarks/bench_tmsg.py` (and its
+  slug-prefixed twin `bench_zmq_baseline_tmsg_us_leaf.py`) now window the codec
+  timing into a per-leaf pool (the `bench_cpp_inproc_port_tmsg_us_leaf` window-loop
+  idiom — encode+decode over a coalesced S=256 frame, `/S`, one reading per window)
+  and return a **shrinkable `QuantileLaw` (median) Estimate** (`family=EMPIRICAL`,
+  `kind='median'`, a real bootstrap median SE) via `median_estimate(per_leaf_us)`;
+  the budget (`budget` = #windows) sizes the pool. Same ADR-0008 fix of a
+  **measured** quantity mis-wired as an un-shrinkable `Fixed` pin (the old
+  `_measure_raw()` did a REAL codec measurement but `_estimate_from_raw()` wrapped
+  the **seed** 1.0us in `pin_estimate` → `marginal = 0` → un-fundable, logging the
+  live number only "alongside"). EXECUTED (ADR-0009): `measure()` reports `tmsg` ≈
+  **0.166** us/leaf (windowed interleaved per-leaf pool, std ≈ 0.0028 over 64
+  windows — non-degenerate), the typed `QuantileLaw.marginal_dvar_deffort` ≈
+  **−9.4e-09** (`< 0` ⇒ `A_i > 0` ⇒ **FUNDABLE**) where the old `Fixed`'s is `0`,
+  and a bigger `budget` tightens the SE. **ADR-0008 classification (surfaced, not
+  silent):** `tmsg` is a **MEDIAN** (a measured quantity whose variance responds to
+  effort), **not** a true constant — deliberately **not** marked `constant=True`
+  (that DEGENERATE `a_i≈0` would re-introduce the un-fundable pin); `get_seed()`
+  stays the DISTRUST fallback (`Grounded.constant` stays `False`,
+  `needs_measurement` stays `True`; only the **measured** path is shrinkable). The
+  same-quantity-class sibling `bench_cpp_inproc_port_tmsg_us_leaf` — ALSO
+  NON-BINDING / ranks-LAST — was ALREADY shrinkable, so **non-binding is a RANKING
+  fact, not an un-measurability fact** (the only available defense for the pin).
+  Severity below `R_gen`: `tmsg` is the NON-BINDING `min()` arm, funded only under
+  the §4.1 kink regime, so it never hard-stalled the binding stage as `R_gen`'s gen
+  arm did.
+- **The `futex_wake_tmsg_us_leaf` transport-variant joined the same flip
+  (2026-06-21, dated append per ADR-0005 Rule 8 — the same §3 case-table move,
+  "PIN — declared spread" → "PIN-now / measurable-later", for the per-transport
+  slug `futex_wake_tmsg_us_leaf` / registered quantity
+  `transport_msg_cost_per_leaf_futex_wake`):** unlike the generic `tmsg`
+  (live `inference_wire` codec), this variant's quantity is the bare in-RING
+  memcpy of one request row in + one reply row out (no frame envelope, no
+  syscall — the FUTEX-WAKE transport's per-leaf ring traffic; the futex
+  WAIT/WAKE handoff is the separate `futex_wake_wakeup_us` term, not per-leaf).
+  `benchmarks/bench_futex_wake_tmsg_us_leaf.py` ALREADY timed that ring memcpy in
+  `_measure_raw()` but `_estimate_from_raw()` DISCARDED it for
+  `pin_estimate(get_seed())` (the v1 ~0.15 us/leaf seed → `Fixed` → `marginal=0`
+  → un-fundable; the R_gen punt), so the manifest TRUST path held a re-declared
+  seed the bench's own read contradicts. The fix WINDOWS the ring memcpy into a
+  per-window per-leaf pool (the `bench_cpp_inproc_port_tmsg_us_leaf` window-loop,
+  `_WINDOW=1000`) and returns `median_estimate(per_leaf_us)` — a shrinkable
+  `QuantileLaw` (`family=EMPIRICAL`, `kind='median'`, a real bootstrap median SE);
+  the `iters` budget sizes the pool. EXECUTED (ADR-0009, in-process — numpy +
+  `multiprocessing.shared_memory`, NO external binary, run `taskset -c 0`):
+  `measure(iters=40000)` reports ≈ **0.527** us/leaf (40-window pool,
+  non-degenerate — note this is ~3.4× the **0.1535** seed the pin trusted, so the
+  flip moves the value too, the manifest was trusting a number the bench's own
+  measurement contradicts), the typed `QuantileLaw.marginal_dvar_deffort` ≈
+  **−5.0e-08** (`< 0` ⇒ `A_i > 0` ⇒ **FUNDABLE**) where the old `Fixed`'s is `0`,
+  and a bigger `iters` tightens the SE. Same ADR-0008 classification (a MEASURED
+  median, deliberately **not** `constant=True`; `get_seed()` stays the DISTRUST
+  fallback, `Grounded.constant`/`needs_measurement` unchanged); same severity
+  caveat (NON-BINDING, ranks LAST — non-binding is a RANKING fact, not an
+  un-measurability one). Test: `tests/test_bench_futex_wake_tmsg_reclassification.py`.
+  SCOPE: only `futex_wake` was audited + fixed end to end here; the OTHER two
+  ring-copy transport-variant `tmsg` slugs that share the line-for-line
+  measure-then-pin structure (`shm_spin_poll_tmsg_us_leaf`,
+  `lockfree_mpsc_tmsg_us_leaf`) are NOT yet reclassified — corroborating context,
+  not separately-audited verdicts (`bench_zmq_baseline_tmsg_us_leaf` is already
+  covered by the codec-framing flip above).
+- **The `iota_us` / `slope_us` (= `t_row`) grounding-LABEL correction has LANDED
+  (2026-06-21, dated append per ADR-0005 Rule 8 — the §3 REGRESSION-fit row, line
+  ~653, is UNCHANGED: this is NOT a `Fixed`→shrinkable flip but the *labelling*
+  sub-register of the same ADR-0008 measured-but-punted class):** unlike the
+  `R_gen`/`g_core`/`LPD`/`tmsg` flips above, `bench_iota.py`/`bench_t_row.py` were
+  ALREADY a live shrinkable `RegressionLaw` (the staged `run_microbatch` k=2 OLS
+  fit, `bench_common.fit_estimate`, the −0.81 off-diagonal — the Phase-3 fit slice;
+  shape pinned by `tests/test_bench_fit_estimate_phase3.py`). The defect was NOT in
+  the bench but in the STATIC-path grounding LABEL: `leaf_eval_grounding`'s
+  `SERVE_INTERCEPT_US`/`SERVE_SLOPE_US` set NEITHER `needs_measurement` (defaulting
+  `False`), so the static models (`model_capacity`/`model_cycletime`, which read
+  `Grounded.needs_measurement`) printed iota/slope `grounded` — telling the operator
+  NOT to measure a runnable fit — while the manifest models
+  (`model_zmq_baseline`/`model_cpp_inproc_port`, which derive `needs_measurement =
+  not trusted`) printed the SAME physics `NEEDS-SOLE-WORKLOAD`. A path-dependent
+  classification of one quantity (ADR-0008) and an ADR-0012 P1/P8 DOUBLE-HOME of the
+  `needs_measurement` semantics (literal-on-`Grounded` vs `not-trusted`-on-manifest).
+  THE FIX single-homes the flag: `SERVE_INTERCEPT_US`/`SERVE_SLOPE_US` now carry
+  `needs_measurement=True` (staying `constant=False` — a measured fit, NOT a true
+  constant), and `model_cycletime._T_ROW` (the slope re-homed for the cycle term)
+  DERIVES `needs_measurement` from the `G.SERVE_SLOPE_US` SSOT instead of defaulting
+  it `False` (closing the second P1 leak — the slope now classifies identically on
+  BOTH static models). EXECUTED (ADR-0009): the runner now prints iota/slope/t_row
+  `NEEDS-SOLE-WORKLOAD` on every path, and **E[f] is UNCHANGED** (Design-A 419.8,
+  Design-B 428.8 dps; the `a_i` shares identical) — the flag is a display annotation
+  the `a_i = (df/dx)²·σ²` allocator does not read, so this corrects an operator-facing
+  mislabel without moving the numeric bound (severity below the stalls — it never
+  hard-stalled an arm). CLASSIFICATION (surfaced, not silent): iota/slope are a
+  `RegressionLaw`, NOT the `QuantileLaw` the R_gen flip used — a fit absent a
+  weighted-LS `per_point_var` is leverage-FLOORED (`marginal ≈ 0`, the §4.3/§7.E
+  conservative posture: funded by WIDENING the x-design / RUNNING the bench to flip
+  it trusted, not by pouring iters in), which is the intended honest floor, NOT the
+  un-shrinkable `Fixed`-pin punt. The seed's 12.0us/0.5us-per-row σ stay the
+  `trust=False` declared-spread fallback prior (the stored JSON carries only
+  intercept/slope/r2 — NO covariance — so the LIVE SE comes from the fit `cov`, not
+  the literals; the literals were never the measured variance). Test:
+  `tests/test_bench_iota_t_row_grounding_classification.py`.
 - **Provenance:** Synthesis of four independent designs and their statistical
   critiques (the 1:N:N:1 fan-out for this task), grounded against the actual
   benches, models, store, and driver in `tools/analysis/OpenTURNS/`. Every
@@ -510,8 +689,8 @@ in the field set. The driver's view is identical for every row.
 | **MEDIAN / QUANTILE** (`tau_io`, `wakeup`; any p99; the p50 headline today) | `[q_p]`, `[[p(1−p)/(n·f̂(q)²)]]` | `QuantileLaw(p, f̂(q), n)` | POSITIVE (latency) or UNIT (fraction) / EMPIRICAL or NORMAL-asymptotic | Var is the **order-statistic** law, **not** s²/n; `f̂(q)` is a kernel density the bench estimates (or a bootstrap). The median is `p=0.5`. **This is what the latency benches actually are** (they report `np.median`); the contract matches the bench, the sketch's `V/n` does not (§7.A). |
 | **REGRESSION fit** (`t_row`+`iota` from one staged fit; `t_row_bare`+`T_disp` from the cpp fit) | `[intercept, slope]` (k=2), `cov = s_resid²·(AᵀA)⁻¹` (full 2×2, off-diagonal carried) | `RegressionLaw(s_resid², (AᵀA)⁻¹, design, per_point_var)` | POSITIVE / STUDENT_T(dof=n_pts−2) | One fit → one `Estimate` with two components and the **−0.81** off-diagonal. The `n` ambiguity dissolves (neither 7 nor 200 is in `cov`; the SE comes from `resid_var` and the x-design). **Beats the sketch:** no single `n` gives `Var=V/n` for a slope. The two registry names map to the two **components** of one estimate (§4.2). |
 | **PIN — true constant** (`n_gen`) | `[3]`, `[[σ²]]` (σ tiny, the declared layout spread) | `Fixed()` | POSITIVE / DEGENERATE | `a_i ≈ 0`: no allocation, ~0 bound contribution. |
-| **PIN — declared spread** (`T_disp` σ=2, `B_op` σ=64, `LPD` σ=25, `tmsg` σ=0.5) | `[value]`, `[[σ_declared²]]` | `Fixed()` | POSITIVE / NORMAL (a prior) | **Contributes** `a_i` to the bound (the bound honestly rests on the prior) but **un-shrinkable** by sampling (no bench reduces an engineering-judgement prior; the manifest seeds it, a sole-workload run only confirms). Fixes the latent store bug where `stddev_samp` over one logged value returns NULL→0, **discarding** the declared σ (§5). |
-| **PIN-now / measurable-later** (`B_op` as a saturated-rows histogram, `LPD` as a leaf-count histogram, `R_gen`/`g_core` as a C++ rate) | `Fixed()` **today** → `QuantileLaw`/`Poolwise` once instrumented | the definition's registered `kind` flips when the bench gains a real `run()` | per the upgraded estimator | Keeps **"cannot be reduced"** (a true `Fixed`) distinct from **"not yet measured"** (a pin awaiting its bench). This is exactly the `Grounded.needs_measurement` / manifest `trusted` distinction the code already tracks, now typed in the shrink law. |
+| **PIN — declared spread** (`T_disp` σ=2, `B_op` σ=64, `LPD` σ=25) | `[value]`, `[[σ_declared²]]` | `Fixed()` | POSITIVE / NORMAL (a prior) | **Contributes** `a_i` to the bound (the bound honestly rests on the prior) but **un-shrinkable** by sampling (no bench reduces an engineering-judgement prior; the manifest seeds it, a sole-workload run only confirms). Fixes the latent store bug where `stddev_samp` over one logged value returns NULL→0, **discarding** the declared σ (§5). _(2026-06-21 amend, ADR-0005 Rule 8/3: `tmsg` σ=0.5 MOVED from this row to the PIN-now/measurable-later row below — its grounding carries `needs_measurement=True` and `bench_tmsg._measure_raw` already times the live `inference_wire` codec, so by this very table's needs_measurement criterion it is measured-but-punted (the R_gen shape), not an irreducible engineering-judgement prior; the same-quantity-class non-binding sibling `bench_cpp_inproc_port_tmsg_us_leaf` is constructed shrinkable, so non-binding is a RANKING fact not an un-measurability one.)_ |
+| **PIN-now / measurable-later** (`B_op` as a saturated-rows histogram, `LPD` as a leaf-count histogram, `R_gen`/`g_core` as a C++ rate, `tmsg` as the live `inference_wire` codec framing share) | `Fixed()` **today** → `QuantileLaw`/`Poolwise` once instrumented | the definition's registered `kind` flips when the bench gains a real `run()` | per the upgraded estimator | Keeps **"cannot be reduced"** (a true `Fixed`) distinct from **"not yet measured"** (a pin awaiting its bench). This is exactly the `Grounded.needs_measurement` / manifest `trusted` distinction the code already tracks, now typed in the shrink law. _(2026-06-21: `tmsg_us_leaf` joined this row — `bench_tmsg` / `bench_zmq_baseline_tmsg_us_leaf` now RUN the codec and return a SHRINKABLE median; the v1 1.0us seed stays the trust=False seed-path fallback.)_ |
 | **RATIO / composite** (a quantity defined as `h(constituents)` — e.g. an aggregate `N_gen·R_gen` were it ever registered as one input) | `[h(θ̂s)]`, `cov = J·Σ_constituents·Jᵀ` (J = h's Jacobian) | `Composed(parts)` — recurse to the steepest constituent | inherited / family of the dominant constituent | The `Estimate` of a composition **is** a delta-method output, so the contract is **closed under composition**: a model output can feed a higher model. Carries `cross` to **every** shared constituent (the §3 invariant) so `g^T Σ g` does not double-count. `dps` itself is `f` and is **not** registered (confirmed: no `dps` definition row), so this row is for completeness + the producer-cap aggregate; the contract survives such a thing appearing as an input. |
 | **NON-ASYMPTOTIC small-n** (the 7-point fit; a few-replicate C++ `R_gen`; an `n=1` pin) | as the case above | as the case above | family carries `STUDENT_T(dof)` or an `EMPIRICAL` small-n flag | Not a separate row — an **attribute** any case carries through `family`. The driver uses the family's multiplier and **gates convergence** on it (§4.3). |
 | **NON-SMOOTH `f`** (the `min()` kink) | — | — | — | **Not an `Estimate` field** — it is a property of `f`, not of any input estimator. Resolved at the driver by the **Clark-1961 closed form** (§4.1): deterministic min-moments + `P(arg-min flips)=Φ(−t)`, no MC, no temperature. The contract's role is to carry each input's full `cov` so the driver can propagate each arm's capacity variance and feed Clark. |
