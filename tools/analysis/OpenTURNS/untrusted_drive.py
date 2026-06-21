@@ -59,7 +59,8 @@ import importlib
 import inspect
 import os
 import sys
-from typing import Any, Callable
+import time
+from typing import Any, Callable, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -69,6 +70,7 @@ import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the
 import manifest  # noqa: E402  — the SSOT registry: name -> bench module_path
 sys.path.insert(0, os.path.join(_HERE, "benchmarks"))
 import bench_common  # noqa: E402  — the harness warmup phase (warm())
+import leaf_eval_grounding as _G  # noqa: E402  — seed iota/t_row, to predict the slow JAX-fit ETAs
 
 # Candidate "how many samples" keyword on a bench's measure()/run() — the loop sizes the batch to
 # the allocator's k by passing this. Benches name it differently (cycles/trials/...); we introspect.
@@ -88,6 +90,62 @@ def _bench_module(qname: str) -> Any:
             f"untrusted_drive: quantity {qname!r} is not registered — cannot feed the loop from a "
             f"bench that does not exist. (Is postgres up + the bench definition inserted?)")
     return manifest._import_bench_module(d["module_path"])  # noqa: SLF001 — the documented resolver
+
+
+# --------------------------------------------------------------------------- #
+# Progress + ETA. A loop step can be a long, mostly-silent wait — a JAX-fit bench at a big budget is
+# MINUTES — so every measurement announces WHERE it is and, when it can, an expected duration. The
+# estimate's source (in preference order): (1) EMPIRICAL — this bench's own prior wall-clock, scaled
+# by the budget (the honest one, used once a bench has run); (2) for a slow fit bench's FIRST run, the
+# current iota/t_row estimates × the fit's work shape (iters × repeat × Σ_widths(iota + t_row·width) —
+# the "sourced from the quantities themselves" estimate); (3) none — a fast median/pin, timed live in ms.
+# --------------------------------------------------------------------------- #
+_FIT_QUANTITIES = frozenset({"t_row_us", "iota_us", "T_disp_us", "cpp_inproc_port_t_row_bare_us"})
+_FIT_REPEAT = 30                                   # bench_t_row/iota/t_disp measure() default `repeat`
+_FIT_WIDTHS = (32, 64, 128, 192, 256, 384, 512)    # the staged-forward batch sweep each fit times
+
+_TIMINGS: dict[str, tuple[int, float]] = {}        # qname -> (last budget, last wall-clock seconds)
+_T0 = 0.0                                           # the loop wall-clock origin (set at the start of main())
+
+
+def _fmt_dur(s: float) -> str:
+    if s < 1.0:
+        return f"{s * 1000:.0f}ms"
+    if s < 90.0:
+        return f"{s:.1f}s"
+    if s < 5400.0:
+        return f"{s / 60:.1f}min"
+    return f"{s / 3600:.1f}h"
+
+
+def _eta_seconds(qname: str, budget: int) -> Optional[float]:
+    """Predicted seconds for one `measure(budget)` call (None if a fast bench with no prior — just
+    timed live). Empirical (a prior timing scaled by the budget) is preferred; for a slow JAX-fit
+    bench's first run it falls back to the current iota/t_row estimates × the fit's work shape."""
+    prior = _TIMINGS.get(qname)
+    if prior is not None:
+        pb, pt = prior
+        return pt * (budget / pb) if pb > 0 else pt
+    if qname in _FIT_QUANTITIES:
+        try:
+            iota = float(_G.SERVE_INTERCEPT_US.mean)
+            trow = float(_G.SERVE_SLOPE_US.mean)
+        except Exception:                          # grounding unavailable -> the v1 seed fit
+            iota, trow = 94.58, 4.317
+        per_iter_us = _FIT_REPEAT * sum(iota + trow * w for w in _FIT_WIDTHS)
+        return budget * per_iter_us / 1e6
+
+
+def _announce(qname: str, n: int, unit: Optional[str], eta: Optional[float]) -> None:
+    slow = "  [SLOW — JAX fit]" if qname in _FIT_QUANTITIES else ""
+    est = f" — est ~{_fmt_dur(eta)}" if eta is not None else " — timing live (fast)"
+    print(f"  > benchmarking {qname} [{n} {unit or 'calls'}]{slow}{est} …", flush=True)
+
+
+def _done(qname: str, n: int, dt: float) -> None:
+    _TIMINGS[qname] = (n, dt)
+    total = (time.perf_counter() - _T0) if _T0 else dt
+    print(f"    done: {qname} in {_fmt_dur(dt)}   ·   total elapsed {_fmt_dur(total)}", flush=True)
 
 
 def _make_measurer(qname: str, iters_cap: int) -> Callable[[int], "_est.Estimate"]:
@@ -113,7 +171,10 @@ def _make_measurer(qname: str, iters_cap: int) -> Callable[[int], "_est.Estimate
     def measure(budget: int) -> "_est.Estimate":
         n = max(2, min(int(budget), iters_cap))
         kwargs = {iters_kw: n} if iters_kw else {}
-        est = fn(**kwargs)
+        _announce(qname, n, iters_kw, _eta_seconds(qname, n))
+        _t0 = time.perf_counter()
+        est = fn(**kwargs)        # the (possibly long) live measurement — the WHERE was announced above
+        _done(qname, n, time.perf_counter() - _t0)
         if not isinstance(est, _est.Estimate):
             raise TypeError(
                 f"untrusted_drive: bench {qname!r} measure() returned {type(est).__name__}, not an "
@@ -171,7 +232,20 @@ def main() -> int:
         print(f"  {nm:<8}{q:<26}{str(itk):<12}")
     print()
 
+    global _T0
+    _T0 = time.perf_counter()
+    _fe = _eta_seconds("t_row_us", max(2, min(pilot, iters_cap)))
+    print("  PROGRESS — each measurement announces below as it runs. The JAX-fit benches are the slow")
+    print(f"  ones (~{_fmt_dur(_fe) if _fe else '?'} each at this budget, ∝ iters); the conflation fix measures a floored")
+    print("  fit ONCE (in the pilot) then de-funds it, so the rounds are the fast median benches.\n")
+
     final = driver.run(measurers=measurers, pilot=pilot, max_rounds=rounds, verbose=True)
+
+    if _TIMINGS:
+        print(f"\n  TIMING — total {_fmt_dur(time.perf_counter() - _T0)} across {len(_TIMINGS)} benches this run "
+              "(slowest first):")
+        for _q, (_b, _t) in sorted(_TIMINGS.items(), key=lambda kv: -kv[1][1]):
+            print(f"    {_q:<30} {_fmt_dur(_t):>9}   ({_b} units)")
 
     print("=" * 88)
     print(f"FINAL  E[f] = {final.estimate:.1f} dps   CI half-width = {final.ci_halfwidth:.2f} dps "
