@@ -29,6 +29,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
 from bench_common import fit_estimate, logged_run  # noqa: E402
 
@@ -66,11 +67,11 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure T_disp: the intercept of the `fully_device` variant fit. Delegates to the bench's full
+def _measure_raw(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): Measure T_disp: the intercept of the `fully_device` variant fit. Delegates to the bench's full
     decomposition (bench_mlp_lowlatency.bench), which fits each variant and reports
     decomposition.dispatch_floor_us. Returns {'t_disp_us', 'r2', 'decomposition': {...}}. Imports jax
-    lazily; pin the process (taskset -c 0)."""
+    lazily; pin the process (taskset -c 0). `measure()` wraps it into the fit Estimate; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     from chocofarm.az.bench.bench_mlp_lowlatency import bench
 
     batches = batches or [32, 64, 128, 192, 256, 384, 512]
@@ -98,17 +99,33 @@ def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int =
             "per_width_median_us": median_us, "batches": batches, "decomposition": decomp}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. The k2 staged/fully_device-fit
+    Estimate with this bench's OWN quantity as component 0 (§4.2), the partner carrying the off-diagonal."""
+    batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
+    medians = [res["per_width_median_us"][B] for B in batches_used]
+    return fit_estimate(batches_used, medians, own_name=NAME, own_role="intercept", partner_name=PARTNER_NAME)
+
+
+def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> "_est.Estimate":
+    """Measure T_disp and return its harmonized k=2 fit `Estimate` (§6 Phase 4: `measure()` returns
+    the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly). The raw
+    design-point dict is the bench's internal `_measure_raw()` provenance. TIMING-SENSITIVE — pin (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(batches=batches, iters=iters, repeat=repeat))
+
+
 def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
     """Measure T_disp and LOG it as a harmonized k=2 fit `Estimate` (§6 Phase 3): the fully_device-fit
     intercept/slope with their −0.81 off-diagonal, T_disp's INTERCEPT (== dispatch floor) as component 0.
     The fully_device per-width medians are logged as raw-design-point PROVENANCE — the variance authority
     is now `estimate.cov`, so the headline dispatch-floor scalar is NO LONGER double-logged as a sample row
     (the §5.2 de-dup obligation). TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
-    res = measure(batches=batches, iters=iters, repeat=repeat)
+    res = _measure_raw(batches=batches, iters=iters, repeat=repeat)  # ONE measurement (Estimate + provenance)
     batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
     medians = [res["per_width_median_us"][B] for B in batches_used]
     # The k=2 fit Estimate, T_disp (the intercept) as component 0; the bare-forward slope the partner.
-    est = fit_estimate(batches_used, medians, own_name=NAME, own_role="intercept", partner_name=PARTNER_NAME)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"iters": iters, "repeat": repeat, "batches": batches_used, "fit_r2": res["r2"],
            "fit_intercept_us": res["intercept_us"], "fit_slope_us_per_row": res["slope_us_per_row"],
            "decomposition": res["decomposition"], "variant": "fully_device", "bench": "mlp_lowlatency"}

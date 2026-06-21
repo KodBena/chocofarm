@@ -52,6 +52,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "futex_wake_tau_io_us"
@@ -105,15 +106,15 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> dict[str, Any]:
-    """Measure futex_wake tau_io: time ONE drain+reply cycle over `n_msgs` coalesced producer messages of
+def _measure_raw(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure futex_wake tau_io: time ONE drain+reply cycle over `n_msgs` coalesced producer messages of
     `rows_per_msg` rows each (forward sees n_msgs*rows_per_msg rows). NO JAX forward — the forward is
     iota+t_row*B (separate). Uses a shared-memory RING (a numpy-backed `multiprocessing.shared_memory`
     buffer) + a tail counter; at saturation the ring is nonempty when the drain starts (so NO futex wait in
     this measured path — the futex wakeup is the separate futex_wake_wakeup_us term). Drains the request rows
     ZERO-COPY (a numpy view over the ring slice) and memcpy's the reply block into a reply ring. Returns
     {'tau_io_us_median', 'tau_io_copyboth_us_median', 'per_cycle_us', ...}. Imports numpy + shared_memory
-    lazily. Pin the process (taskset -c 0)."""
+    lazily. Pin the process (taskset -c 0). `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     import numpy as np
     from multiprocessing import shared_memory
 
@@ -184,12 +185,28 @@ def measure(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> dict
             shm.unlink()
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)`
+    with a BOOTSTRAP median SE over the pool (§7.A — the order-statistic variance, NOT s²/n),
+    family=EMPIRICAL, kind='median'."""
+    return median_estimate(res["per_cycle_us"], name=NAME)   # bootstrap median SE over the per-cycle pool
+
+
+def measure(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> "_est.Estimate":
+    """Measure futex_wake tau_io and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
+    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
+    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
+    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles))
+
+
 def run(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> dict[str, Any]:
     """Measure futex_wake tau_io and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5, bootstrap
     median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER
     during the fan-out."""
-    res = measure(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)
-    est = median_estimate(res["per_cycle_us"], name=NAME)
+    res = _measure_raw(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)  # ONE measurement (Estimate + provenance)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"n_msgs": res["n_msgs"], "rows_per_msg": res["rows_per_msg"],
            "rows_per_forward": res["rows_per_forward"], "cycles": cycles,
            "transport": "shm_ring_futex_wake", "request_drain": "zero_copy_view",

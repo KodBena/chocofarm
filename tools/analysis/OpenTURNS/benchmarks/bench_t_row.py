@@ -31,6 +31,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
 from bench_common import fit_estimate, logged_run  # noqa: E402
 
@@ -64,10 +65,13 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure t_row: time the staged production forward across `batches` widths, fit the slope. Returns
-    {'slope_us_per_row', 'intercept_us', 'r2', 'per_width_median_us': {B: us}}. Imports jax lazily (so
-    importing this module for get_seed() stays jax-free). Pin the process to one core (taskset -c 0)."""
+def _measure_raw(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): time the staged production forward
+    across `batches` widths, fit the slope, and return the design-point dict
+    {'slope_us_per_row', 'intercept_us', 'r2', 'per_width_median_us': {B: us}, 'batches'}. This is the
+    TIMING-SENSITIVE measurement body; `measure()` wraps it into the harmonized `Estimate` and `run()` uses it
+    for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1). Imports jax lazily
+    (so importing this module for get_seed() stays jax-free). Pin the process to one core (taskset -c 0)."""
     import numpy as np
     from chocofarm.az.bench.bench_mlp_lowlatency import (
         _median_iqr_us, _prod_forward, _prod_params, _fit_line,
@@ -87,6 +91,24 @@ def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int =
             "per_width_median_us": dict(zip(batches, med_us)), "batches": batches}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build THIS bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()` so they cannot disagree. The k=2
+    staged-fit Estimate with t_row's SLOPE as component 0 (the marginal `manifest.value("t_row_us")`
+    projects — 8 live consumers) and iota_us the partner carrying the −0.81 off-diagonal (§4.2)."""
+    batches_used = res["batches"]
+    medians = [res["per_width_median_us"][B] for B in batches_used]
+    return fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
+
+
+def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> "_est.Estimate":
+    """Measure t_row and return its harmonized k=2 fit `Estimate` (§6 Phase 4: `measure()` returns the
+    `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no guessing which list
+    is the estimate). The raw design-point dict is the bench's internal `_measure_raw()` provenance (read by
+    `run()` for the audit rows). TIMING-SENSITIVE — pin the process to one core (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(batches=batches, iters=iters, repeat=repeat))
+
+
 def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
     """Measure t_row and LOG it to postgres as a harmonized k=2 fit `Estimate` (§6 Phase 3): the staged-fit
     slope/intercept with their −0.81 off-diagonal, t_row's SLOPE as component 0. The per-width medians are
@@ -95,11 +117,11 @@ def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30)
     (the §5.2 de-dup obligation: that double-log corrupts `latest_aggregate`'s count + averages a slope
     with seven 4-digit medians). Returns the measurement dict. TIMING-SENSITIVE — operator-invoked, pinned,
     never during the fan-out."""
-    res = measure(batches=batches, iters=iters, repeat=repeat)
+    res = _measure_raw(batches=batches, iters=iters, repeat=repeat)   # ONE measurement (Estimate + provenance)
     batches_used = res["batches"]
     medians = [res["per_width_median_us"][B] for B in batches_used]
-    # The k=2 fit Estimate, t_row (the slope) as component 0; iota_us the partner with the off-diagonal.
-    est = fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
+    # The k=2 fit Estimate, built by the SAME helper measure() returns (P1 single-home).
+    est = _estimate_from_raw(res)
     cfg = {"batches": batches_used, "iters": iters, "repeat": repeat,
            "fit_slope_us_per_row": res["slope_us_per_row"], "fit_intercept_us": res["intercept_us"],
            "fit_r2": res["r2"], "bench": "run_microbatch_staged"}

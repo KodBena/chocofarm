@@ -474,8 +474,9 @@ def test_run_measurers_form_converges() -> None:
 
 
 def test_run_legacy_samplers_form_still_works() -> None:
-    """Backward compat: the legacy `samplers[i](k) -> array` form (which untrusted_drive uses) still
-    drives the loop — Phase 2 is additive, not a breaking change."""
+    """Backward compat: the legacy `samplers[i](k) -> array` form (which untrusted_drive used pre-Phase-4,
+    before it moved to `measurers` -> Estimate) still drives the loop — Phase 2 is additive, the
+    `add_samples` shim is kept, not a breaking change."""
     f = ot.SymbolicFunction(["x0", "x1"], ["x0 + 2*x1"])
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=2.0, names=["x0", "x1"], confidence=0.95)
     rng = np.random.default_rng(0)

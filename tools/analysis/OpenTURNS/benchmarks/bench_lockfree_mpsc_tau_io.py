@@ -71,6 +71,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "lockfree_mpsc_tau_io_us"
@@ -128,15 +129,15 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(n_nodes: int = 8, rows_per_node: int = 32, cycles: int = 5000) -> dict[str, Any]:
-    """Measure lockfree_mpsc tau_io: time ONE batch-dequeue+gather+reply cycle over `n_nodes` enqueued
+def _measure_raw(n_nodes: int = 8, rows_per_node: int = 32, cycles: int = 5000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure lockfree_mpsc tau_io: time ONE batch-dequeue+gather+reply cycle over `n_nodes` enqueued
     nodes of `rows_per_node` rows each (forward sees n_nodes*rows_per_node rows). NO JAX forward — the
     forward is iota+t_row*B (separate). Models the MPSC mechanism: producer rows live at SCATTERED
     offsets in a backing slab (independent enqueues are NOT contiguous), a node-index queue (a numpy
     int array the consumer pops) carries the enqueue order, and the consumer GATHERS the B rows out of
     the scattered slab into one contiguous input + memcpy's a B-row reply block into a reply slab.
     Returns {'tau_io_us_median', 'tau_io_gather_elided_us_median', 'per_cycle_us', ...}. Imports numpy +
-    shared_memory lazily. Pin the process (taskset -c 0)."""
+    shared_memory lazily. Pin the process (taskset -c 0). `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     import numpy as np
     from multiprocessing import shared_memory
 
@@ -199,12 +200,28 @@ def measure(n_nodes: int = 8, rows_per_node: int = 32, cycles: int = 5000) -> di
             shm.unlink()
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)`
+    with a BOOTSTRAP median SE over the pool (§7.A — the order-statistic variance, NOT s²/n),
+    family=EMPIRICAL, kind='median'."""
+    return median_estimate(res["per_cycle_us"], name=NAME)   # bootstrap median SE over the per-cycle pool
+
+
+def measure(n_nodes: int = 8, rows_per_node: int = 32, cycles: int = 5000) -> "_est.Estimate":
+    """Measure lockfree_mpsc tau_io and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
+    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
+    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
+    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(n_nodes=n_nodes, rows_per_node=rows_per_node, cycles=cycles))
+
+
 def run(n_nodes: int = 8, rows_per_node: int = 32, cycles: int = 5000) -> dict[str, Any]:
     """Measure lockfree_mpsc tau_io and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5, bootstrap
     median SE, §6 Phase 3, §5.2 de-dup); the gather-elided arm is logged as a config note + supporting readings.
     TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
-    res = measure(n_nodes=n_nodes, rows_per_node=rows_per_node, cycles=cycles)
-    est = median_estimate(res["per_cycle_us"], name=NAME)
+    res = _measure_raw(n_nodes=n_nodes, rows_per_node=rows_per_node, cycles=cycles)  # ONE measurement (Estimate + provenance)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"n_nodes": res["n_nodes"], "rows_per_node": res["rows_per_node"],
            "rows_per_forward": res["rows_per_forward"], "cycles": cycles,
            "transport": "lockfree_mpsc_queue", "gather": "charged_contiguous_materialize",

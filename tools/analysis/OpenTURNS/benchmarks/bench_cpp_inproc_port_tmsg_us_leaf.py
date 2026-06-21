@@ -38,6 +38,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "cpp_inproc_port_tmsg_us_leaf"
@@ -67,11 +68,11 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(leaves: int = 200000) -> dict[str, Any]:
-    """Measure the per-leaf inproc enqueue: over `leaves` iterations, write one feature row into an arena
+def _measure_raw(leaves: int = 200000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the per-leaf inproc enqueue: over `leaves` iterations, write one feature row into an arena
     stripe + push a slot index onto a ready ring (an index advance standing for the relaxed-atomic push).
     Returns {'tmsg_us_leaf_median', 'per_leaf_us' (a sampled subset), 'leaves'}. Imports numpy lazily. Pin
-    the process (taskset -c 0)."""
+    the process (taskset -c 0). `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     import numpy as np
 
     arena = np.zeros((1024, _IN_DIM), dtype=np.float32)
@@ -99,12 +100,28 @@ def measure(leaves: int = 200000) -> dict[str, Any]:
     return {"tmsg_us_leaf_median": float(np.median(per_leaf_us)), "per_leaf_us": per_leaf_us, "leaves": leaves}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)`
+    with a BOOTSTRAP median SE over the pool (§7.A — the order-statistic variance, NOT s²/n),
+    family=EMPIRICAL, kind='median'."""
+    return median_estimate(res["per_leaf_us"], name=NAME)   # bootstrap median SE over the per-leaf pool
+
+
+def measure(leaves: int = 200000) -> "_est.Estimate":
+    """Measure the per-leaf inproc enqueue and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
+    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
+    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
+    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(leaves=leaves))
+
+
 def run(leaves: int = 200000) -> dict[str, Any]:
     """Measure the per-leaf inproc enqueue and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
     bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
     NEVER during the fan-out."""
-    res = measure(leaves=leaves)
-    est = median_estimate(res["per_leaf_us"], name=NAME)
+    res = _measure_raw(leaves=leaves)  # ONE measurement (Estimate + provenance)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"leaves": res["leaves"], "transport": "cpp_inproc_port_direct_call",
            "tmsg_us_leaf_median": res["tmsg_us_leaf_median"],
            "note": "per-leaf enqueue handoff (arena row write + ready-queue slot-index push); NON-BINDING"}

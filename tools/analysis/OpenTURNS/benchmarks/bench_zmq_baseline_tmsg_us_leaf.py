@@ -38,6 +38,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
 from bench_common import logged_run, pin_estimate  # noqa: E402
 
@@ -64,10 +65,12 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
-    """Measure the ZMQ-baseline tmsg_us_leaf: time encode_request(S x in_dim) + decode_response(reply) over
-    `iters`, /S — the per-leaf framing share of the inference_wire memcpy codec. Returns {'tmsg_us_leaf',
-    'encode_us', 'decode_us', 's_leaves'}. Imports the codec + numpy lazily. Pin (taskset -c 0)."""
+def _measure_raw(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the ZMQ-baseline
+    tmsg_us_leaf: time encode_request(S x in_dim) + decode_response(reply) over `iters`, /S — the per-leaf
+    framing share of the inference_wire memcpy codec. Returns {'tmsg_us_leaf', 'encode_us', 'decode_us',
+    's_leaves'}. Imports the codec + numpy lazily. Pin (taskset -c 0). `measure()` wraps the seed into a
+    `Fixed` Estimate; `run()` uses this dict for the raw provenance row."""
     import numpy as np
     from chocofarm.az.inference_wire import encode_request, encode_response, decode_response
 
@@ -89,10 +92,25 @@ def measure(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
     return {"tmsg_us_leaf": per_leaf, "encode_us": enc_us, "decode_us": dec_us, "s_leaves": s_leaves}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` — the SINGLE home of the Estimate construction (P1),
+    called by BOTH `measure()` and `run()`. A k=1 `Fixed` Estimate recovering the declared spread
+    UN-DIVIDED (`cov=[[σ²]]`, the §5 store-bug fix). A pin has no sample n."""
+    return pin_estimate(get_seed().mean, get_seed().sigma, name=NAME)
+
+
+def measure(s_leaves: int = 256, iters: int = 5000) -> "_est.Estimate":
+    """Measure zmq_baseline_tmsg_us_leaf and return its harmonized k=1 `Fixed` `Estimate` (§6 Phase 4:
+    `measure()` returns the `Estimate` the bench DECLARES — a pin is a `Fixed`/declared-spread Estimate,
+    NOT a faked pool, consumed directly by the driver/untrusted_drive). The raw dict is the bench's internal
+    `_measure_raw()` provenance."""
+    return _estimate_from_raw(_measure_raw(s_leaves=s_leaves, iters=iters))
+
+
 def run(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
     """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided, alongside the live measurement. TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
-    res = measure(s_leaves=s_leaves, iters=iters)
-    est = pin_estimate(get_seed().mean, get_seed().sigma, name=NAME)
+    res = _measure_raw(s_leaves=s_leaves, iters=iters)  # the raw provenance dict
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"s_leaves": s_leaves, "iters": iters, "encode_us": res["encode_us"],
            "decode_us": res["decode_us"], "codec": "inference_wire_memcpy", "transport": "zmq_baseline"}
     with logged_run(NAME, quantity="transport_msg_cost_per_leaf", units=get_seed().unit, description=_DESC,

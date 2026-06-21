@@ -39,6 +39,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from bench_common import logged_run, pin_estimate  # noqa: E402
 
 NAME = "lockfree_mpsc_tmsg_us_leaf"
@@ -71,11 +72,13 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(iters: int = 200000) -> dict[str, Any]:
-    """Measure lockfree_mpsc_tmsg_us_leaf: time one leaf's queue traffic — an atomic tail bump (the enqueue
-    publish, a numpy int64 increment standing for the CAS) + write one request row into its slot + read one
-    reply row out of the reply slab — over `iters`. NO envelope, NO syscall, NO codec. Returns
-    {'tmsg_us_leaf', 'iters'}. Imports numpy + shared_memory lazily."""
+def _measure_raw(iters: int = 200000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure lockfree_mpsc_tmsg_us_leaf:
+    time one leaf's queue traffic — an atomic tail bump (the enqueue publish, a numpy int64 increment standing
+    for the CAS) + write one request row into its slot + read one reply row out of the reply slab — over
+    `iters`. NO envelope, NO syscall, NO codec. Returns {'tmsg_us_leaf', 'iters'}. Imports numpy +
+    shared_memory lazily. `measure()` wraps the seed into a `Fixed` Estimate; `run()` uses this dict for the
+    raw provenance row."""
     import numpy as np
     from multiprocessing import shared_memory
 
@@ -106,12 +109,27 @@ def measure(iters: int = 200000) -> dict[str, Any]:
             shm.unlink()
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` — the SINGLE home of the Estimate construction (P1),
+    called by BOTH `measure()` and `run()`. A k=1 `Fixed` Estimate recovering the declared spread
+    UN-DIVIDED (`cov=[[σ²]]`, the §5 store-bug fix). A pin has no sample n."""
+    _sm, _ss, _ = get_seed()
+    return pin_estimate(_sm, _ss, name=NAME)
+
+
+def measure(iters: int = 200000) -> "_est.Estimate":
+    """Measure lockfree_mpsc_tmsg_us_leaf and return its harmonized k=1 `Fixed` `Estimate` (§6 Phase 4:
+    `measure()` returns the `Estimate` the bench DECLARES — a pin is a `Fixed`/declared-spread Estimate,
+    NOT a faked pool, consumed directly by the driver/untrusted_drive). The raw dict is the bench's internal
+    `_measure_raw()` provenance."""
+    return _estimate_from_raw(_measure_raw(iters=iters))
+
+
 def run(iters: int = 200000) -> dict[str, Any]:
     """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided, alongside the live measurement. TIMING-SENSITIVE — operator-invoked, pinned, never
     during the fan-out."""
-    res = measure(iters=iters)
-    _sm, _ss, _ = get_seed()
-    est = pin_estimate(_sm, _ss, name=NAME)
+    res = _measure_raw(iters=iters)  # the raw provenance dict
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"iters": iters, "transport": "lockfree_mpsc_queue", "codec": "cas_enqueue_slot_write",
            "note": "tail-CAS enqueue + slot write of one request row + reply-slot read; no envelope, no syscall"}
     with logged_run(NAME, quantity="transport_msg_cost_per_leaf_lockfree_mpsc", units="us", description=_DESC,

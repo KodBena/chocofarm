@@ -69,6 +69,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "futex_wake_wakeup_us"
@@ -99,13 +100,14 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(trials: int = 20000) -> dict[str, Any]:
-    """Measure the futex-wake edge handoff: a consumer thread FUTEX_WAITs on a shared 4-byte word; a producer
+def _measure_raw(trials: int = 20000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the futex-wake edge handoff: a consumer thread FUTEX_WAITs on a shared 4-byte word; a producer
     thread (after a brief spacing so the consumer is genuinely parked) stamps perf_counter_ns, stores the new
     value, and FUTEX_WAKEs one waiter; the consumer returns from FUTEX_WAIT and stamps the observe time. The
     wakeup is (observe_ns - wake_ns) over `trials`. The futex syscalls are the bare kernel `futex(2)` via
     ctypes (no pthread/condvar wrapper). Returns {'wakeup_us_median', 'per_trial_us', 'trials'}. Imports
-    numpy + ctypes + shared_memory lazily. Pin two cores (taskset -c 0,1) for the faithful cross-core read."""
+    numpy + ctypes + shared_memory lazily. Pin two cores (taskset -c 0,1) for the faithful cross-core read.
+    `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     import ctypes
     import threading
     import time
@@ -192,12 +194,28 @@ def measure(trials: int = 20000) -> dict[str, Any]:
         shm.unlink()
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)`
+    with a BOOTSTRAP median SE over the pool (§7.A — the order-statistic variance, NOT s²/n),
+    family=EMPIRICAL, kind='median'."""
+    return median_estimate(res["per_trial_us"], name=NAME)   # bootstrap median SE over the per-trial pool
+
+
+def measure(trials: int = 20000) -> "_est.Estimate":
+    """Measure the futex-wake edge handoff and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
+    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
+    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
+    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(trials=trials))
+
+
 def run(trials: int = 20000) -> dict[str, Any]:
     """Measure the futex-wake edge handoff and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
     bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0,1,
     two cores), NEVER during the fan-out."""
-    res = measure(trials=trials)
-    est = median_estimate(res["per_trial_us"], name=NAME)
+    res = _measure_raw(trials=trials)  # ONE measurement (Estimate + provenance)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"trials": res["trials"], "transport": "shm_ring_futex_wake", "kind": "wakeup_latency",
            "mechanism": "bare_kernel_FUTEX_WAKE_one_waiter + scheduler_context_switch",
            "regime": "per_edge_handoff",

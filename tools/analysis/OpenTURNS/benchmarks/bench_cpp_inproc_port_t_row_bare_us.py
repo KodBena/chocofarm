@@ -46,6 +46,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from bench_common import fit_estimate, logged_run  # noqa: E402
 
 NAME = "cpp_inproc_port_t_row_bare_us"
@@ -86,11 +87,11 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure the bare-forward slope: run the lowlatency decomposition (`bench_mlp_lowlatency.bench`) across
+def _measure_raw(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): Measure the bare-forward slope: run the lowlatency decomposition (`bench_mlp_lowlatency.bench`) across
     `batches` widths and read the `fully_device` variant's fitted slope. Returns
     {'slope_us_per_row', 'intercept_us', 'r2', 'decomposition': {...}}. Imports jax lazily (so importing this
-    module for get_seed() stays jax-free). Pin the process to one core (taskset -c 0)."""
+    module for get_seed() stays jax-free). Pin the process to one core (taskset -c 0). `measure()` wraps it into the fit Estimate; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     from chocofarm.az.bench.bench_mlp_lowlatency import bench
 
     batches = batches or [32, 64, 128, 192, 256, 384, 512]
@@ -111,17 +112,33 @@ def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int =
             "decomposition": out.get("decomposition", {})}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. The k2 staged/fully_device-fit
+    Estimate with this bench's OWN quantity as component 0 (§4.2), the partner carrying the off-diagonal."""
+    batches_used = res["batches"]
+    medians = [res["per_width_median_us"][B] for B in batches_used]
+    return fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
+
+
+def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> "_est.Estimate":
+    """Measure cpp_inproc_port_t_row_bare_us and return its harmonized k=2 fit `Estimate` (§6 Phase 4: `measure()` returns
+    the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly). The raw
+    design-point dict is the bench's internal `_measure_raw()` provenance. TIMING-SENSITIVE — pin (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(batches=batches, iters=iters, repeat=repeat))
+
+
 def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
     """Measure the bare-forward slope and LOG it to postgres (the fully_device slope as the headline reading,
     sample_size = the fit's #widths). Records the fully_device intercept (== T_disp, for cross-consistency)
     and the decomposition in the run config. TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
     NEVER during the fan-out."""
-    res = measure(batches=batches, iters=iters, repeat=repeat)
+    res = _measure_raw(batches=batches, iters=iters, repeat=repeat)  # ONE measurement (Estimate + provenance)
     batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
     medians = [res["per_width_median_us"][B] for B in batches_used]
     # The k=2 fit Estimate, the bare-forward slope as component 0; T_disp_us the partner with the
     # off-diagonal. SAME fully_device fit T_disp logs, only the component order differs (§4.2).
-    est = fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"batches": batches_used, "iters": iters, "repeat": repeat, "variant": "fully_device",
            "fully_device_intercept_us": res["intercept_us"], "fit_slope_us_per_row": res["slope_us_per_row"],
            "fit_r2": res["r2"], "decomposition": res["decomposition"], "bench": "mlp_lowlatency",

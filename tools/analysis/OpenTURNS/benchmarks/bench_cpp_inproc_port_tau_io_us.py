@@ -72,6 +72,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "cpp_inproc_port_tau_io_us"
@@ -125,8 +126,8 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> dict[str, Any]:
-    """Measure cpp_inproc_port tau_io: time ONE per-forward staging cycle for a forward of `b_rows` rows
+def _measure_raw(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure cpp_inproc_port tau_io: time ONE per-forward staging cycle for a forward of `b_rows` rows
     assembled from `n_producers` row stripes. NO JAX forward — the forward is T_disp+t_row*B (separate).
     Models the inproc-port mechanism:
       * HEADLINE (gather ELIDED): the B rows already live CONTIGUOUS in a staging arena (one address space,
@@ -135,7 +136,7 @@ def measure(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> dict
       * GATHER-CHARGED (pessimistic): the B rows live at SCATTERED arena offsets (producers wrote
         non-contiguous); time the same-RAM gather into a contiguous buffer THEN the device_put.
     Returns {'tau_io_us_median', 'tau_io_gather_charged_us_median', 'per_cycle_us', ...}. Imports jax + numpy
-    lazily. Pin the process (taskset -c 0)."""
+    lazily. Pin the process (taskset -c 0). `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     import numpy as np
     import jax
 
@@ -180,12 +181,28 @@ def measure(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> dict
             "b_rows": B, "n_producers": n_producers}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)`
+    with a BOOTSTRAP median SE over the pool (§7.A — the order-statistic variance, NOT s²/n),
+    family=EMPIRICAL, kind='median'."""
+    return median_estimate(res["per_cycle_us"], name=NAME)   # bootstrap median SE over the per-cycle pool
+
+
+def measure(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> "_est.Estimate":
+    """Measure cpp_inproc_port tau_io and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
+    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
+    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
+    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(b_rows=b_rows, n_producers=n_producers, cycles=cycles))
+
+
 def run(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> dict[str, Any]:
     """Measure cpp_inproc_port tau_io and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
     bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
     NEVER during the fan-out."""
-    res = measure(b_rows=b_rows, n_producers=n_producers, cycles=cycles)
-    est = median_estimate(res["per_cycle_us"], name=NAME)
+    res = _measure_raw(b_rows=b_rows, n_producers=n_producers, cycles=cycles)  # ONE measurement (Estimate + provenance)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"b_rows": res["b_rows"], "n_producers": res["n_producers"], "cycles": cycles,
            "transport": "cpp_inproc_port_direct_call", "gather": "elided_contiguous_arena",
            "tau_io_gather_charged_us_median": res["tau_io_gather_charged_us_median"],

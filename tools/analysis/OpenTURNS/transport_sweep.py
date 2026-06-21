@@ -269,20 +269,17 @@ def _conservative_bound(model: Any, variant: TransportVariant,
 
 
 def _ci_via_driver(model: Any) -> tuple[float, str]:
-    """The delta-method CI half-width on E[f] via the model's `build_driver()` + a DETERMINISTIC
-    symmetric 2-point pilot {mean-sigma, mean+sigma} per input (the v1 throughput_bound recipe: each
-    pool's sample-mean is EXACTLY the grounded mean, std EXACTLY the grounded sigma, anchoring the
-    allocation gradient at the true grounded point — important because the min() kink makes the binding
-    stage's gradient point-sensitive). Returns (ci_halfwidth, 'openturns'). Falls back to a numpy
-    delta-method CI loudly (never silently) if the openturns path raises (ADR-0002)."""
+    """The delta-method CI half-width on E[f] via the model's `build_driver()` + each input fed as its
+    harmonized `Estimate` (§6 Phase 4 — `driver.set_estimates_by_name`, REPLACING the fabricated 2-point
+    `{mean±sigma}` pilot). The grounded inputs are `Fixed`/declared-spread Estimates (`cov=[[sigma^2]]`),
+    so `g^T Σ g` is byte-for-byte the old pilot's bound (the `{mean±sigma}` set's std is √2·sigma, so
+    a_i/n_i = grad^2·sigma^2 either way — no `/2` bug) and the grounded mean still anchors the gradient at
+    the binding stage (the min() kink makes it point-sensitive). Returns (ci_halfwidth, 'openturns'). Falls
+    back to a numpy delta-method CI loudly (never silently) if the openturns path raises (ADR-0002)."""
     if _HAS_OT:
         try:
             driver, x0 = model.build_driver(tolerance=0.1, trust=True)
-            names = model.INPUT_NAMES
-            sig = _model_sigmas(model)
-            pilot = {i: np.array([x0[nm] - max(sig[nm], 1e-9), x0[nm] + max(sig[nm], 1e-9)])
-                     for i, nm in enumerate(names)}
-            driver.add_samples(pilot)
+            driver.set_estimates_by_name(_model_estimates(model))
             rec = driver.step(second_order_check=False)
             return rec.ci_halfwidth, "openturns"
         except Exception as exc:  # noqa: BLE001 — fall back loudly (ADR-0002), never silently
@@ -299,17 +296,17 @@ def _ci_via_driver(model: Any) -> tuple[float, str]:
 
 def _variance_targets(model: Any, top: int = 6) -> list[tuple[str, float, int]]:
     """The allocator's VARIANCE-CONTRIBUTION ranking (which input most tightens E[f]'s CI): (model-input
-    name, a_i=(df/dx)^2*sigma^2, recommended +samples), ranked desc. Via the openturns driver step when
-    present, else a numpy delta-method a_i ranking. This funds whatever BINDS (compute when serve-bound,
-    producer when generation-bound)."""
+    name, a_i=(df/dx)^2*sigma^2, recommended +samples), ranked desc. Via the openturns driver step (§6
+    Phase 4 — each input fed as its harmonized `Estimate` via `set_estimates_by_name`, REPLACING the
+    fabricated 2-point `{mean±sigma}` pilot) when present, else a numpy delta-method a_i ranking. The
+    ranking reads a_i, which `g^T Σ g` over the grounded `Fixed`/declared-spread Estimates reproduces
+    byte-for-byte from the old pilot; `+samples` is 0 for a declared-spread prior (un-shrinkable — the
+    §2.3 allocator funds none, matching the numpy fallback's 0). This funds whatever BINDS (compute when
+    serve-bound, producer when generation-bound)."""
     if _HAS_OT:
         try:
             driver, x0 = model.build_driver(tolerance=0.1, trust=True)
-            names = model.INPUT_NAMES
-            sig = _model_sigmas(model)
-            pilot = {i: np.array([x0[nm] - max(sig[nm], 1e-9), x0[nm] + max(sig[nm], 1e-9)])
-                     for i, nm in enumerate(names)}
-            driver.add_samples(pilot)
+            driver.set_estimates_by_name(_model_estimates(model))
             rec = driver.step(second_order_check=False)
             ranked = sorted(rec.primitives, key=lambda p: p.a, reverse=True)
             return [(p.name, float(p.a), int(p.recommend)) for p in ranked[:top]]
@@ -349,6 +346,29 @@ def _model_sigmas(model: Any) -> dict[str, float]:
     if hasattr(model, "sigmas"):
         return model.sigmas(trust=True)
     return dict(model.SIGMAS)
+
+
+def _registry_qname(model: Any, nm: str) -> str:
+    """The REGISTRY quantity name a model input `nm` pulls from. The v1-style `model_zmq_baseline` exposes
+    `INPUT_QUANTITIES[nm] = (qname, cost)`; the other variants expose `_MANIFEST_NAME[nm] = qname`. Accept
+    either (uniform across the family — the model's ONE coupling to the registry)."""
+    iq = getattr(model, "INPUT_QUANTITIES", None)
+    if iq is not None:
+        return iq[nm][0]
+    return model._MANIFEST_NAME[nm]  # noqa: SLF001 — the variant model's registry map
+
+
+def _model_estimates(model: Any) -> dict[str, "Any"]:
+    """The §6 Phase-4 input feed: `{model_input_name: manifest.Estimate}` for `driver.set_estimates_by_name`,
+    REPLACING the fabricated 2-point `{mean±sigma}` pilot. Each input is resolved to its harmonized
+    `Estimate` straight from the manifest (`manifest.estimate(qname, trust=True)`) — a `Fixed`/declared-spread
+    seed today (the bound rests on the grounded prior, `cov=[[sigma^2]]` un-divided), automatically the real
+    measured Estimate (Poolwise/QuantileLaw/fit) once a sole-workload bench flips the quantity to trusted (no
+    code change). `g^T Σ g` over these is byte-for-byte the old 2-point pilot's `sum a_i/n_i` (the `{mean±sigma}`
+    set's sample-std is √2·sigma, so a_i/n_i = grad^2·sigma^2 either way — the spec REFUTED a claimed `/2`
+    bug). A declared-spread prior is un-shrinkable, so the §2.3 allocator funds none; the design-priority /
+    variance rankings (which read a_i) are unchanged."""
+    return {nm: manifest.estimate(_registry_qname(model, nm), trust=True) for nm in model.INPUT_NAMES}
 
 
 def _untrusted(model: Any) -> tuple[bool, list[str]]:

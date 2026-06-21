@@ -48,6 +48,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
 from bench_common import logged_run, median_estimate  # noqa: E402
 
@@ -79,12 +80,13 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(cycles: int = 20000) -> dict[str, Any]:
-    """Measure the ZMQ-baseline saturation wakeup: prime the ROUTER with a queued frame, then time
+def _measure_raw(cycles: int = 20000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the ZMQ-baseline saturation wakeup: prime the ROUTER with a queued frame, then time
     `poller.poll(0)` returning POLLIN (the ready-poll cost the saturated _drain pays), draining the frame
     each cycle to re-prime. Also records the BLOCKING-poll tail (poll that waits for the frame to arrive)
     as a supporting reading. NO forward, NO codec beyond a 1-row frame. Returns {'wakeup_us_median',
-    'ready_poll_us': [...], 'blocking_poll_us_median'}. Imports zmq + numpy lazily. Pin (taskset -c 0)."""
+    'ready_poll_us': [...], 'blocking_poll_us_median'}. Imports zmq + numpy lazily. Pin (taskset -c 0).
+    `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and the raw provenance rows (ONE measurement, two consumers — P1)."""
     import numpy as np
     import zmq
     from chocofarm.az.inference_wire import encode_request
@@ -133,12 +135,28 @@ def measure(cycles: int = 20000) -> dict[str, Any]:
             "cycles": cycles}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)`
+    with a BOOTSTRAP median SE over the pool (§7.A — the order-statistic variance, NOT s²/n),
+    family=EMPIRICAL, kind='median'."""
+    return median_estimate(res["ready_poll_us"], name=NAME)   # bootstrap median SE over the ready_poll pool
+
+
+def measure(cycles: int = 20000) -> "_est.Estimate":
+    """Measure the ZMQ-baseline saturation wakeup and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
+    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
+    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
+    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(cycles=cycles))
+
+
 def run(cycles: int = 20000) -> dict[str, Any]:
     """Measure the ZMQ-baseline wakeup and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
     bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never
     during the fan-out."""
-    res = measure(cycles=cycles)
-    est = median_estimate(res["ready_poll_us"], name=NAME)
+    res = _measure_raw(cycles=cycles)  # ONE measurement (Estimate + provenance)
+    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
     cfg = {"cycles": res["cycles"], "transport": "zmq_baseline_router_dealer_inproc",
            "mechanism": "poll(2)+libzmq_signaler_readiness", "regime": "saturation_ready_poll",
            "blocking_poll_us_median": res["blocking_poll_us_median"],

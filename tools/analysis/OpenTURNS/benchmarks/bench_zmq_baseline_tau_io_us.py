@@ -53,6 +53,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
 from bench_common import logged_run, median_estimate  # noqa: E402
 
@@ -82,13 +83,15 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 2000) -> dict[str, Any]:
-    """Measure the ZMQ-baseline tau_io: time one drain+decode+encode+scatter cycle over `n_msgs` coalesced
-    producer messages of `rows_per_msg` rows each (a forward sees n_msgs*rows_per_msg rows). NO JAX forward
-    (the forward is iota+t_row*B, separate). Uses inproc ZMQ (the multipart + codec cost without a NIC,
-    isolating the serial serve I/O the production loop pays). Mirrors `inference_server._drain` (greedy
-    NOBLOCK drain) + `_scatter` (send_multipart per drained request). Returns {'tau_io_us_median',
-    'per_cycle_us': [...], ...}. Imports zmq + numpy lazily. Pin the process (taskset -c 0)."""
+def _measure_raw(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 2000) -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): measure the ZMQ-baseline tau_io —
+    time one drain+decode+encode+scatter cycle over `n_msgs` coalesced producer messages of `rows_per_msg`
+    rows each (a forward sees n_msgs*rows_per_msg rows). NO JAX forward (the forward is iota+t_row*B,
+    separate). Uses inproc ZMQ (the multipart + codec cost without a NIC, isolating the serial serve I/O the
+    production loop pays). Mirrors `inference_server._drain` (greedy NOBLOCK drain) + `_scatter`
+    (send_multipart per drained request). Returns {'tau_io_us_median', 'per_cycle_us': [...], ...}.
+    `measure()` wraps the per-cycle pool into a median `Estimate`; `run()` uses it for BOTH the Estimate and
+    the raw provenance rows (ONE measurement, two consumers — P1). Imports zmq + numpy lazily. Pin (taskset -c 0)."""
     import numpy as np
     import zmq
     from chocofarm.az.inference_wire import encode_request, decode_request  # the batched codec SSOT
@@ -152,12 +155,28 @@ def _encode_reply(b: int) -> bytes:
         return bytes(1 + 8 + b * (1 + _N_ACTIONS) * 4)
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build this bench's harmonized `Estimate` from a `_measure_raw()` dict — the SINGLE home of the
+    Estimate construction (P1), called by BOTH `measure()` and `run()`. A k=1 median `QuantileLaw(p=0.5)`
+    with a BOOTSTRAP median SE over the per-cycle pool (§7.A — the order-statistic variance, NOT s²/n),
+    family=EMPIRICAL, kind='median'."""
+    return median_estimate(res["per_cycle_us"], name=NAME)
+
+
+def measure(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 2000) -> "_est.Estimate":
+    """Measure the ZMQ-baseline tau_io and return its harmonized k=1 median `Estimate` (§6 Phase 4:
+    `measure()` returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly,
+    no guessing which list is the pool). The raw per-cycle pool is the bench's internal `_measure_raw()`
+    provenance. TIMING-SENSITIVE — pin the process (taskset -c 0)."""
+    return _estimate_from_raw(_measure_raw(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles))
+
+
 def run(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 2000) -> dict[str, Any]:
     """Measure the ZMQ-baseline tau_io and LOG it to postgres as a harmonized k=1 median Estimate (QuantileLaw
     p=0.5, bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never
     during the fan-out."""
-    res = measure(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)
-    est = median_estimate(res["per_cycle_us"], name=NAME)
+    res = _measure_raw(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)  # ONE measurement (Est + prov)
+    est = _estimate_from_raw(res)                          # the SAME Estimate measure() returns (P1)
     cfg = {"n_msgs": res["n_msgs"], "rows_per_msg": res["rows_per_msg"],
            "rows_per_forward": res["rows_per_forward"], "cycles": cycles,
            "transport": "zmq_baseline_router_dealer_inproc", "mechanism": "poll+recv_multipart(NOBLOCK)+send_multipart",

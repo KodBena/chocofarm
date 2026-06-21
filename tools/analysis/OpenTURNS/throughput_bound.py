@@ -10,10 +10,18 @@ generic `NeymanDriver` are the transport (ADR-0012 P2 separation).
 
 Two paths, both producing the bound:
   * openturns present: the full `NeymanDriver` loop (delta-method CI on E[f]; Neyman
-    optimal allocation n_i* proportional to sqrt(a_i/c_i)). The pilot pools are drawn
-    from each input's GROUNDED Normal(mean, sigma) — so the allocation reflects the
-    grounded uncertainty (we are estimating E[f] over the inputs' uncertainty, not
-    sampling a live system here).
+    optimal allocation). §6 Phase 4 — each input is fed as its harmonized `Estimate`
+    (`driver.set_estimate`), NOT a fabricated 2-point `{mean±sigma}` pool. Each grounded
+    input is a `Fixed`/declared-spread `Estimate` (`cov=[[sigma^2]]` un-divided — built
+    via the manifest's OWN seed->Estimate SSOT `manifest._estimate_from_seed`), so the
+    allocation reflects the grounded uncertainty exactly: `g^T Σ g` is byte-for-byte the
+    old 2-point pilot's bound (the `{mean±sigma}` set's sample-std is √2·sigma, and that
+    √2 cancels the /n=/2, so a_i/n_i = grad^2·sigma^2 either way — the spec EXECUTED and
+    REFUTED a claimed `/2` bug). A declared-spread prior is un-shrinkable by sampling, so
+    it gets NO allocation (the §2.3 "a Fixed pin drops out, for the right reason" branch);
+    the report ranks the next-benchmark targets by a_i = (df/dx)^2·sigma^2 (the
+    bound-tightening potential), and tightening one means RUNNING its bench (flipping it to
+    trusted=True), not drawing more samples of a fixed prior.
   * openturns absent: a numpy-only fallback computes f(mu_hat) and a first-order
     delta-method CI (central finite-difference gradient), and ranks the inputs by the
     same Neyman quantity sqrt(a_i/c_i). The bound is still computed; the report says so.
@@ -33,6 +41,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import leaf_eval_grounding as G  # noqa: E402
+import manifest  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
 import model_capacity  # noqa: E402
 import model_cycletime  # noqa: E402
 
@@ -78,26 +87,29 @@ def _print_neyman_table(names, sigmas, costs, grad, a, weight, needs_meas):
 
 
 def _ot_bound(model):
-    """openturns path: a MINIMAL 2-sample pilot then one `step()`, so the Recommendation's
-    Neyman allocation is LIVE and its PROPORTIONS rank which quantity to benchmark next
-    (the deliverable). We deliberately do NOT run the convergence top-up loop — that would
-    drive +samples to 0 and hide the ranking; the per-input `a_i` and the recommended
-    proportions at the minimal pilot are the "where to spend" answer. The pilot pools are
-    drawn from each input's GROUNDED Normal(mean, sigma) so a_i reflects the grounded
-    uncertainty. A tight tolerance keeps the step un-converged so it allocates."""
+    """openturns path: feed each input as its GROUNDED `Estimate` then one `step()`, so the
+    Recommendation's per-input a_i ranks which quantity to benchmark next (the deliverable).
+
+    §6 Phase 4 — the fabricated 2-point `{mean±sigma}` pilot is REPLACED by a `Fixed`/declared-
+    spread `Estimate` per input (`cov=[[sigma^2]]` un-divided), built via the manifest's OWN
+    seed->Estimate SSOT (`manifest._estimate_from_seed`) from the model's grounded (mean, sigma).
+    This is byte-for-byte the old bound (`g^T Σ g` reproduces the 2-point pilot's `sum a_i/n_i`
+    exactly: the `{mean±sigma}` set's sample-std is √2·sigma, so a_i/n_i = grad^2·sigma^2 either
+    way — no `/2` bug; the spec EXECUTED and REFUTED that claim). It is also HONEST about what the
+    inputs are: declared-spread priors, un-shrinkable by sampling — so the §2.3 allocator gives
+    them NO allocation (a Fixed pin drops out, for the right reason). The per-input `a_i =
+    (df/dx)^2·sigma^2` is the next-benchmark ranking (tightening one means RUNNING its bench to
+    flip it to trusted, not drawing more samples of a fixed prior); the grounded mean anchors the
+    gradient at the binding stage (important because the min() kink makes it point-sensitive). We
+    deliberately do NOT loop to convergence — these are seeds, not a live system."""
     import openturns as ot
     driver, x0 = model.build_driver(tolerance=0.1)
     names = model.INPUT_NAMES
     sig = model.SIGMAS
-    # A DETERMINISTIC symmetric 2-point pilot {mean - sigma, mean + sigma} per input, so
-    # each pool's sample-mean is EXACTLY the grounded mean and its sample-std EXACTLY the
-    # grounded sigma. This anchors the allocation gradient at the true grounded mean (not a
-    # noisy random draw) — important because the min() kink makes the binding stage, and
-    # hence the gradient, sensitive to the exact evaluation point. The allocation then
-    # reflects the stage that binds AT THE GROUNDED MEAN.
-    pilot = {i: np.array([x0[nm] - max(sig[nm], 1e-9), x0[nm] + max(sig[nm], 1e-9)])
-             for i, nm in enumerate(names)}
-    driver.add_samples(pilot)
+    # One Fixed/declared-spread Estimate per input, from the model's grounded (mean, sigma), via the
+    # manifest's seed->Estimate SSOT (the SAME object the manifest's SEED path produces — single home).
+    ests = {nm: manifest._estimate_from_seed(nm, x0[nm], sig[nm], "") for nm in names}
+    driver.set_estimates_by_name(ests)
     rec = driver.step(second_order_check=False)
     f_mu = float(model.build_symbolic_function()(ot.Point([x0[nm] for nm in names]))[0])
     return driver, rec, f_mu, x0
@@ -150,13 +162,19 @@ def run_model(title, model):
             print(f"[openturns] delta-method CI half-width on E[f] at the minimal pilot "
                   f"= {rec.ci_halfwidth:.1f} dps (the grounded-uncertainty spread of the "
                   f"bound)")
-            print("[openturns] Neyman allocation (where to spend the next bench budget — "
-                  "min() zeros the non-binding stage's inputs, by design):")
-            tot = sum(p.recommend for p in rec.primitives) or 1
-            for p in rec.where_to_spend():
+            print("[openturns] Neyman ranking (which quantity to benchmark next — ranked by a_i = "
+                  "(df/dx)^2*sigma^2, the bound-tightening potential; min() zeros the non-binding")
+            print("            stage's inputs by design; the grounded inputs are declared-spread "
+                  "priors, so the allocator funds none — tightening one means RUNNING its bench):")
+            # Rank by a_i (the per-input share of Var(E[f])), NOT by +samples: every input is a Fixed
+            # declared-spread prior here, so the allocator funds none (a prior is un-shrinkable by
+            # sampling — the §2.3 branch); a_i is the honest "which most tightens the bound" signal.
+            ranked = sorted(rec.primitives, key=lambda p: p.a, reverse=True)
+            tot_a = sum(p.a for p in rec.primitives) or 1.0
+            for p in ranked:
                 flag = "NEEDS-SOLE-WORKLOAD" if needs_meas.get(p.name) else "grounded"
                 print(f"  {p.name:<14} a_i={p.a:>11.4g}  cost={p.cost:>5.3g}  "
-                      f"+samples={p.recommend:>7d} ({100*p.recommend/tot:4.1f}%)  {flag}")
+                      f"share={100*p.a/tot_a:>5.1f}%  {flag}")
         except Exception as exc:   # fall back loudly, never silently (ADR-0002)
             print(f"\n[openturns path raised: {exc!r} — using numpy fallback below]")
             _print_numpy_summary(names, sigmas, costs, f0, ci, grad, a, weight, needs_meas)

@@ -193,8 +193,10 @@ def _db_available() -> bool:
 
 @pytest.mark.skipif(not _db_available(), reason="control_research postgres not reachable")
 def test_run_logs_fit_estimate_and_manifest_reads_it_back() -> None:
-    """End-to-end through the real store, WITHOUT the live timed measurement (measure() monkeypatched to
-    return the recorded fit shape): each fit bench's run() logs a k=2 fit Estimate via set_estimate, and
+    """End-to-end through the real store, WITHOUT the live timed measurement (`_measure_raw()` — the §6
+    Phase-4 dict provenance producer `run()` consumes — monkeypatched to return the recorded fit shape;
+    run() then builds the real k=2 fit Estimate from it via the un-patched `_estimate_from_raw`): each fit
+    bench's run() logs a k=2 fit Estimate via set_estimate, and
     `manifest.estimate(name)` reads it back through the TRUST stored-estimate path (source
     'postgres(estimate)', NOT the Phase-1 legacy reconstruction) — with the −0.8114 cov and the OWN
     quantity as component 0. The §5.2 DE-DUP is asserted: the instance carries exactly the 7 per-width
@@ -215,16 +217,18 @@ def test_run_logs_fit_estimate_and_manifest_reads_it_back() -> None:
     staged = {B: v + float(rng.normal(0, 2.0)) for B, v in staged.items()}
     fulldev = {B: v + float(rng.normal(0, 2.0)) for B, v in fulldev.items()}
 
-    saved = (bench_t_row.measure, bench_iota.measure, bench_t_disp.measure, bcpp.measure)
-    bench_t_row.measure = lambda **k: {
+    # Patch each bench's `_measure_raw` (the §6 Phase-4 dict producer run() consumes); run() then builds the
+    # real fit Estimate from it via the un-patched `_estimate_from_raw` (the path under test).
+    saved = (bench_t_row._measure_raw, bench_iota._measure_raw, bench_t_disp._measure_raw, bcpp._measure_raw)
+    bench_t_row._measure_raw = lambda **k: {
         "slope_us_per_row": 4.317, "intercept_us": 94.58, "r2": 0.998,
         "per_width_median_us": dict(staged), "batches": list(DESIGN)}
-    bench_iota.measure = lambda **k: bench_t_row.measure(**k)
-    bench_t_disp.measure = lambda **k: {
+    bench_iota._measure_raw = lambda **k: bench_t_row._measure_raw(**k)
+    bench_t_disp._measure_raw = lambda **k: {
         "t_disp_us": 68.84, "intercept_us": 68.84, "slope_us_per_row": 3.092, "r2": 0.997,
         "per_width_median_us": dict(fulldev), "batches": list(DESIGN),
         "decomposition": {"dispatch_floor_us": 68.84}}
-    bcpp.measure = lambda **k: {
+    bcpp._measure_raw = lambda **k: {
         "slope_us_per_row": 3.092, "intercept_us": 68.84, "r2": 0.997,
         "per_width_median_us": dict(fulldev), "batches": list(DESIGN), "decomposition": {}}
 
@@ -260,8 +264,8 @@ def test_run_logs_fit_estimate_and_manifest_reads_it_back() -> None:
             assert nsamp == len(DESIGN)        # only the design points, not the design points + the scalar
             assert vmin > 50.0                 # a slope (~3-4) would leak in as a tiny sample value
     finally:
-        # restore the patched measures and delete the synthetic instances (keep the definitions).
-        (bench_t_row.measure, bench_iota.measure, bench_t_disp.measure, bcpp.measure) = saved
+        # restore the patched `_measure_raw`s and delete the synthetic instances (keep the definitions).
+        (bench_t_row._measure_raw, bench_iota._measure_raw, bench_t_disp._measure_raw, bcpp._measure_raw) = saved
         try:
             import bench_store as _bs
             with _bs.connect() as c:

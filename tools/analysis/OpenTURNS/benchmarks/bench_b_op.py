@@ -31,6 +31,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
 from bench_common import logged_run, pin_estimate  # noqa: E402
 
@@ -52,18 +53,35 @@ def register_self() -> Any:
                              description=_DESC, module_path=MODULE_PATH)
 
 
-def measure() -> dict[str, Any]:
-    """The current B_op estimate (full-bucket rows/forward). A faithful measure is the saturated
-    end-to-end rows/forward histogram (the server's per-forward batch-size counter under a fed producer
-    set), an e2e harness artifact. Returns {'b_op_rows', 'note'}."""
+def _measure_raw() -> dict[str, Any]:
+    """The raw-pool PROVENANCE producer (the §6 Phase-4 internal helper): the current B_op estimate
+    (full-bucket rows/forward). A faithful measure is the saturated end-to-end rows/forward histogram (the
+    server's per-forward batch-size counter under a fed producer set), an e2e harness artifact. Returns
+    {'b_op_rows', 'note'}. `measure()` wraps the seed into a `Fixed` Estimate; `run()` uses this dict for the
+    raw provenance row."""
     return {"b_op_rows": get_seed().mean,
             "note": "full-bucket operating point; saturated end-to-end rows/forward histogram outstanding"}
 
 
+def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
+    """Build B_op's harmonized `Estimate` — the SINGLE home of the Estimate construction (P1), called by
+    BOTH `measure()` and `run()`. A k=1 `Fixed` declared-spread Estimate recovering the declared spread
+    UN-DIVIDED (`cov=[[σ²]]`, the §5 store-bug fix — B_op's σ=64 reaches the instance variance). The value
+    is the seed pin (`res['b_op_rows']`); the spread is the declared σ (a pin has no sample n)."""
+    return pin_estimate(res["b_op_rows"], get_seed().sigma, name=NAME)
+
+
+def measure() -> "_est.Estimate":
+    """Measure B_op and return its harmonized k=1 `Fixed` `Estimate` (§6 Phase 4: `measure()` returns the
+    `Estimate` the bench DECLARES — a pin is a `Fixed`/declared-spread Estimate, NOT a faked pool, consumed
+    directly by the driver/untrusted_drive). The raw dict is the bench's internal `_measure_raw()` provenance."""
+    return _estimate_from_raw(_measure_raw())
+
+
 def run() -> dict[str, Any]:
-    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided. Returns the estimate dict."""
-    res = measure()
-    est = pin_estimate(get_seed().mean, get_seed().sigma, name=NAME)
+    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided. Returns the raw provenance dict."""
+    res = _measure_raw()                          # the raw provenance dict
+    est = _estimate_from_raw(res)                 # the SAME Estimate measure() returns (P1)
     cfg = {"kind": "operating_point",
            "needs_measurement": "saturated end-to-end rows/forward histogram (server batch-size counter)",
            "note": res["note"]}

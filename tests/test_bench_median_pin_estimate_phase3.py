@@ -229,14 +229,15 @@ def test_median_bench_run_logs_only_the_pool_not_the_headline(monkeypatch) -> No
     """§5.2 de-dup: a migrated median bench (`bench_tau_io`) logs the harmonized `QuantileLaw` Estimate
     via `logged_run(estimate=…)` and the raw per-cycle pool as the SOLE provenance — the headline median
     scalar is NOT re-logged as a sample row (which would corrupt `latest_aggregate`'s count). Verified
-    DB-free by capturing the logged_run calls; measure() is monkeypatched to a synthesized pool (no live
-    timing)."""
+    DB-free by capturing the logged_run calls; the bench's `_measure_raw()` (the §6 Phase-4 dict provenance
+    producer `run()` consumes for BOTH the Estimate and the raw rows) is monkeypatched to a synthesized pool
+    (no live timing)."""
     import contextlib
     import bench_tau_io as B
 
     pool = _skewed_pool()
     med = float(np.median(pool))
-    monkeypatch.setattr(B, "measure", lambda *a, **k: {
+    monkeypatch.setattr(B, "_measure_raw", lambda *a, **k: {
         "tau_io_us_median": med, "per_cycle_us": pool,
         "n_msgs": 8, "rows_per_msg": 32, "rows_per_forward": 256})
 
@@ -327,12 +328,13 @@ def _db_available() -> bool:
 
 @pytest.mark.skipif(not _db_available(), reason="control_research postgres not reachable")
 def test_run_logs_median_and_pin_estimates_and_manifest_reads_them_back(monkeypatch) -> None:
-    """End-to-end through the real store, WITHOUT a live timed measurement (measure() monkeypatched to a
-    synthesized pool / the recorded seed): a MEDIAN bench's run() logs a `QuantileLaw` Estimate and a PIN
-    bench's run() a `Fixed` Estimate via set_estimate, and `manifest.estimate(name)` reads each back
-    through the TRUST stored-estimate path (source 'postgres(estimate)', NOT the Phase-1 legacy Poolwise
-    reconstruction). The median's de-dup is asserted (only the pool as provenance rows). The pin recovers
-    σ=64 in the stored cov. Self-cleaning of its synthetic instances."""
+    """End-to-end through the real store, WITHOUT a live timed measurement (`_measure_raw()` — the §6
+    Phase-4 dict provenance producer `run()` consumes — monkeypatched to a synthesized pool / the recorded
+    seed): a MEDIAN bench's run() logs a `QuantileLaw` Estimate and a PIN bench's run() a `Fixed` Estimate
+    via set_estimate, and `manifest.estimate(name)` reads each back through the TRUST stored-estimate path
+    (source 'postgres(estimate)', NOT the Phase-1 legacy Poolwise reconstruction). The median's de-dup is
+    asserted (only the pool as provenance rows). The pin recovers σ=64 in the stored cov. Self-cleaning of
+    its synthetic instances."""
     import bench_store
     import manifest as M
     import bench_tau_io
@@ -341,11 +343,12 @@ def test_run_logs_median_and_pin_estimates_and_manifest_reads_them_back(monkeypa
     bench_store.ensure_schema()
     pool = _skewed_pool()
     med = float(np.median(pool))
-    # MEDIAN bench: a synthesized per-cycle pool (no live timing).
-    monkeypatch.setattr(bench_tau_io, "measure", lambda *a, **k: {
+    # MEDIAN bench: a synthesized per-cycle pool (no live timing). Patch `_measure_raw` (the dict producer
+    # run() consumes); run() then builds the real QuantileLaw Estimate from it via the un-patched helper.
+    monkeypatch.setattr(bench_tau_io, "_measure_raw", lambda *a, **k: {
         "tau_io_us_median": med, "per_cycle_us": pool,
         "n_msgs": 8, "rows_per_msg": 32, "rows_per_forward": 256})
-    # PIN bench: its measure() already returns the seed (256, σ=64 via get_seed()); no patch needed.
+    # PIN bench: its `_measure_raw()` already returns the seed (256, σ=64 via get_seed()); no patch needed.
 
     try:
         bench_tau_io.run()
