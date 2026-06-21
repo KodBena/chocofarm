@@ -376,6 +376,18 @@ def logged_run(
     yield log
 
 
+# The recognized "how many units of work" keyword a bench's measure()/run() may expose so a caller can
+# SIZE one call: the Neyman drive's _make_measurer passes the allocated budget through it, warm() below
+# passes the burn-in count. A bench names its sizing knob ONE of these; the caller introspects measure()'s
+# signature and uses the first match (None => no sizing knob, e.g. a pin). SINGLE HOME (ADR-0012 P1):
+# untrusted_drive._ITERS_KW ALIASES this — the names are NOT re-listed anywhere else. `budget` is the
+# drive's own canonical term for the lever (its measurer wrapper is `def measure(budget)`); `leaves` is the
+# cpp-inproc tmsg bench's honest per-leaf-count knob. Both size a SHRINKABLE quantity; omitting them left
+# those benches showing budget-kw "None" in the drive (shrinkable-but-un-sizable — silently de-funded).
+SIZING_KWARGS = ("cycles", "trials", "iters", "n_trials", "reps", "rounds", "samples", "n",
+                 "budget", "leaves")
+
+
 def warm(mod: Any, **kwargs: Any) -> None:
     """The harness WARMUP PHASE for a registered bench, run ONCE before the measured phase so a cold
     transient (a first cold JAX forward at ~hundreds of us/row vs the ~few-us/row steady state; a cache
@@ -392,6 +404,5 @@ def warm(mod: Any, **kwargs: Any) -> None:
     if n > 0 and hasattr(mod, "measure"):
         import inspect
         params = inspect.signature(mod.measure).parameters
-        iters_kw = next((k for k in ("cycles", "trials", "iters", "n_trials", "reps", "rounds",
-                                     "samples", "n") if k in params), None)
+        iters_kw = next((k for k in SIZING_KWARGS if k in params), None)
         mod.measure(**({iters_kw: n} if iters_kw else {}))  # discarded — the generic burn-in

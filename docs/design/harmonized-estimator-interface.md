@@ -304,6 +304,26 @@ Public Domain (The Unlicense).
   nonconvexity is real but thin, in the small-`σ₁` corner — a naive whole-box chord
   search misses it; §8(c)). The Clark, correlation, smoothness, ρ-concavity,
   disjointness, and 2-point-pilot numbers all **reproduced** unchanged.
+- **The `tmsg` drive-sizing wiring gap is closed (2026-06-21, dated append per
+  ADR-0005 Rule 8 — completes the `tmsg`/`futex_wake` flips above; the §3 table is
+  UNCHANGED):** those flips made each tmsg bench's `measure()` return a shrinkable
+  `QuantileLaw` whose `budget` (= #windows) sizes the pool — true at the BENCH, but
+  the live `untrusted_drive` still showed `tmsg … None` in the budget-kw column and
+  could NOT size it. `_make_measurer` introspects `measure()` for a recognized sizing
+  kwarg, and `budget` (generic / `zmq_baseline`) and `leaves` (`cpp_inproc_port`)
+  were ABSENT from the recognized set → it detected `None` and ran tmsg at a fixed
+  default, ignoring the allocation (shrinkable-but-un-sizable — the silent-de-fund
+  shape one layer over, at the driver's introspection seam rather than the bench's
+  `_estimate_from_raw`). `budget` is the driver's OWN canonical lever name (its
+  measurer wrapper is `def measure(budget)`), so the omission was the driver's; the
+  recognized list was ALSO duplicated (ADR-0012 P1 — `untrusted_drive._ITERS_KW` and
+  an inline tuple in `bench_common.warm()`). Fix: single-home it as
+  `bench_common.SIZING_KWARGS` (`_ITERS_KW` aliases it, `warm()` uses it), add
+  `budget` + `leaves`. EXECUTED: tmsg resolves budget-kw `budget` live, every other
+  input unchanged (pins still `None`). SIZABILITY, not RANKING — tmsg stays
+  NON-BINDING (`df/dtmsg=0`), funded by nothing; a BINDING `budget`-named input would
+  have hit the same trap. Test: `tests/test_untrusted_drive_phase4.py` (the 6-bench
+  tmsg family each exposes a recognized kwarg; the single-home alias + membership).
 - **What it governs:** the **single contract** every measurable quantity (a
   *benchmark*) exposes so the Neyman driver
   (`tools/analysis/OpenTURNS/neyman_driver.py`) consumes them **uniformly**,

@@ -230,6 +230,41 @@ def test_registry_qname_bridges_both_model_map_shapes() -> None:
         assert all(isinstance(q, str) and q for q in qs), f"{slug}: an input resolved to an empty qname"
 
 
+def test_sizing_kwargs_single_home_includes_budget_and_leaves() -> None:
+    """ADR-0012 P1 (single home): the recognized sizing-kwarg list lives ONCE, in
+    `bench_common.SIZING_KWARGS`; `untrusted_drive._ITERS_KW` ALIASES it. The `is` check proves there is no
+    second literal — the duplicate (untrusted_drive._ITERS_KW vs the inline tuple in bench_common.warm)
+    that let `budget`/`leaves` go unrecognized in one path. It must cover `budget` (the drive's own
+    canonical lever name — its measurer wrapper is `def measure(budget)`) and `leaves` (the cpp-inproc tmsg
+    knob), else a SHRINKABLE tmsg bench shows budget-kw None and the loop cannot size it."""
+    import untrusted_drive as U
+    import bench_common as BC
+    assert U._ITERS_KW is BC.SIZING_KWARGS, "ADR-0012 P1: _ITERS_KW must ALIAS the single home, not re-list"
+    assert "budget" in BC.SIZING_KWARGS, "the drive's own lever name `budget` must be a recognized knob"
+    assert "leaves" in BC.SIZING_KWARGS, "the cpp-inproc tmsg `leaves` knob must be a recognized knob"
+
+
+def test_reclassified_tmsg_benches_expose_a_recognized_sizing_kwarg() -> None:
+    """REGRESSION (the budget-kw "None" bug): the audit flipped the tmsg quantity-class Fixed -> QuantileLaw
+    (SHRINKABLE — its framing-cost median tightens with more windows), so the drive MUST be able to SIZE
+    each: measure() must expose a kwarg the drive recognizes. The bug was that the reclassified benches
+    named the knob `budget` (bench_tmsg / zmq_baseline) and `leaves` (cpp-inproc), absent from the
+    recognized set, so `_make_measurer` detected None and ran them at a fixed default — shrinkable but
+    un-fundable. Signature-only (no live timed measurement); mirrors `_make_measurer`'s detection exactly."""
+    import importlib
+    import inspect
+    import bench_common as BC
+    for modname in ("bench_tmsg", "bench_zmq_baseline_tmsg_us_leaf", "bench_futex_wake_tmsg_us_leaf",
+                    "bench_lockfree_mpsc_tmsg", "bench_shm_spin_poll_tmsg",
+                    "bench_cpp_inproc_port_tmsg_us_leaf"):
+        mod = importlib.import_module(modname)
+        params = inspect.signature(mod.measure).parameters
+        kw = next((k for k in BC.SIZING_KWARGS if k in params), None)
+        assert kw is not None, (
+            f"{modname}.measure({list(params)}) exposes no recognized sizing kwarg — a SHRINKABLE tmsg "
+            f"bench the drive cannot size (budget-kw None). Name the knob a SIZING_KWARGS member.")
+
+
 def test_make_measurer_returns_estimate_and_rejects_non_estimate(monkeypatch) -> None:
     """§6 Phase-4 deliverable 2: `_make_measurer(qname)(budget)` returns the bench's `Estimate` directly
     (P2). A bench whose measure() returns a non-Estimate (a bespoke dict — exactly the old failure) is a

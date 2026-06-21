@@ -72,9 +72,10 @@ sys.path.insert(0, os.path.join(_HERE, "benchmarks"))
 import bench_common  # noqa: E402  — the harness warmup phase (warm())
 import leaf_eval_grounding as _G  # noqa: E402  — seed iota/t_row, to predict the slow JAX-fit ETAs
 
-# Candidate "how many samples" keyword on a bench's measure()/run() — the loop sizes the batch to
-# the allocator's k by passing this. Benches name it differently (cycles/trials/...); we introspect.
-_ITERS_KW = ("cycles", "trials", "iters", "n_trials", "reps", "rounds", "samples", "n")
+# The recognized "how many units" keyword a bench's measure() exposes so the loop can size the batch to
+# the allocator's k by passing it. SINGLE HOME (ADR-0012 P1) is bench_common.SIZING_KWARGS — aliased here,
+# never re-listed (the duplicate that left `budget`/`leaves`-named tmsg benches showing budget-kw "None").
+_ITERS_KW = bench_common.SIZING_KWARGS
 
 _VARIANTS = ("zmq_baseline", "shm_spin_poll", "futex_wake", "lockfree_mpsc", "cpp_inproc_port")
 
