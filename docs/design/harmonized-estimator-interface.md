@@ -216,7 +216,17 @@ Public Domain (The Unlicense).
   measure-then-pin structure (`shm_spin_poll_tmsg_us_leaf`,
   `lockfree_mpsc_tmsg_us_leaf`) are NOT yet reclassified — corroborating context,
   not separately-audited verdicts (`bench_zmq_baseline_tmsg_us_leaf` is already
-  covered by the codec-framing flip above).
+  covered by the codec-framing flip above). _(2026-06-21 later amend, ADR-0005
+  Rule 8 — the two deferred slugs HAVE since been reclassified: the audit commit
+  `b60b29a` flipped `bench_shm_spin_poll_tmsg` and `bench_lockfree_mpsc_tmsg`
+  Fixed → shrinkable `QuantileLaw` (each `_estimate_from_raw` now returns
+  `median_estimate(per_leaf_us)` over the same per-window per-leaf pool). The SCOPE
+  sentence above is left intact per Rule 8 as the point-in-time record of when only
+  `futex_wake` was done; this clause records the later completion. This is the tmsg
+  CLASSIFICATION only — a DISTINCT, still-open `shm_spin_poll` defect remains: the
+  driver crashes funding `shm_spin_poll_wakeup_us` at an allocator budget so small
+  the bootstrap pool falls below the `median_estimate` ≥2-reading floor (ADR-0002),
+  a sizing-kwarg↔pool-size contract gap tracked separately.)_
 - **The `iota_us` / `slope_us` (= `t_row`) grounding-LABEL correction has LANDED
   (2026-06-21, dated append per ADR-0005 Rule 8 — the §3 REGRESSION-fit row, line
   ~653, is UNCHANGED: this is NOT a `Fixed`→shrinkable flip but the *labelling*
