@@ -588,3 +588,61 @@ still open.
   wall-clock of discovery.
 - This note is a point-in-time RCA (ADR-0005 Rule 8): it is not retro-edited; a
   later fix that closes guard (c) should append, not rewrite.
+
+---
+
+## Addendum — 2026-06-22: recommendation #5 + guard (c) landed (ADR-0005 Rule 8 append)
+
+The fixes the original RCA recommended have since landed on `feat/issue-control-lab`;
+recorded here by dated append (not a rewrite of the point-in-time analysis above). Two
+arcs, both implementing §5.1's structural move ("factor the duplicated idioms" + a shared
+pool builder that owns `len(pool) >= 2`):
+
+- **The race family (the CRASH half of guard (c)) — `4f81bac`, `eb760ad`.** `bench_common.collect_pool`
+  floors the 4 race-based wakeup collectors (shm_spin_poll, futex_wake, lockfree_mpsc,
+  cpp_inproc_port) at `>= min_readings` by RE-RUNNING the batch at growing effort (the floor
+  binds on readings COLLECTED, the count a race collector cannot promise — §4). This closes
+  the open `~/shm_spin_poll_fail` tail (§4, §6) for the whole race sub-family at once, and the
+  class-level discovery guard `test_every_race_based_collector_bench_uses_the_pool_floor`
+  (keyed on the `Thread`-in-`_measure_raw` predicate, ADR-0011 Rule 4) is the structural net.
+
+- **The deterministic family (recommendation #5, the DRY half) — `453411f`, `ee9cfe0`.**
+  `bench_common.window_pool(measure_window, *, name, count, min_windows=2)` is the deterministic
+  COUNTERPART to `collect_pool` (§5.1's `window_pool` proposal, materialized): the
+  `for _ in range(N): pool.append(measure_one_window())` idiom — the audit's cancer D — now has
+  ONE home, the per-window measurement injected as a closure. Because a window loop's reading
+  count is KNOWN (= the budget, one deterministic reading per window), there is nothing to
+  retry; the helper instead owns the `>= 2` floor STRUCTURALLY (`len(pool) >= min_windows` by
+  construction), making each deterministic bench explicitly safe at a tiny budget rather than
+  leaning on the driver's `max(2,..)` (untrusted_drive `_make_measurer`). 12 deterministic
+  window benches were migrated: the single-counter loops (tau_io, cpp_inproc_port_gather,
+  futex_wake/lockfree_mpsc/shm_spin_poll req_drain/gather, zmq_baseline_tau_io,
+  zmq_baseline_wakeup) and 5 of the 6 tmsg loops (tmsg, zmq_baseline/futex_wake/lockfree_mpsc/
+  shm_spin_poll tmsg). At `count >= 2` the migration is a pure refactor (ADR-0009 behavioral
+  equivalence: same closure body, same dict); the only change is the floor at a tiny budget.
+
+- **What §5.1's "six window loops" list did NOT fully cover (honest scope).** Two
+  deterministic benches were deliberately left un-migrated, each a documented quirk (not a
+  silent skip): (1) the **4 two-pool tau_io benches** (cpp_inproc_port/futex_wake/lockfree_mpsc/
+  shm_spin_poll `_tau_io`) time TWO arms in lockstep per cycle (>1 reading/window sharing one
+  cache state) — `window_pool` returns one list, and forcing it would break the lockstep or
+  distort the contract; (2) **`bench_cpp_inproc_port_tmsg_us_leaf`** indexes its per-window
+  body by the window number (`slot = (w*window+j) % 1024`) and uses `max(1,..)` not `max(2,..)`,
+  so it does not fit the no-arg `measure_window` closure without mutable state. These keep their
+  own loops; they floor via their own `max(2,..)`/`max(1,..)` or the driver's `max(2,..)`.
+
+- **The guards (§5.2), as landed.** Guard (b) shrinkable⇒sizable over the corpus is
+  `test_every_shrinkable_bench_is_sizable_by_the_driver` (`ceb233b`, superseding the tmsg
+  hand-list). Guard (a)/§5.1's single-home is RCA fix #1 (`0cfae7c`): `leaf_eval_grounding.Estimability`
+  (CONSTANT/MEASURED/PRIOR) is the single home, `test_grounded_estimability_agrees_with_the_bench_body`
+  the net — re-keyed from `needs_measurement` to the MEASURED-vs-PRIOR split exactly as §5.3
+  prescribed (so it does not over-fire on `B_op`). Guard (c)'s STRUCTURAL form (a shared pool
+  builder guaranteeing `len(pool) >= 2`) is now realized for BOTH families (`collect_pool` for
+  the race sub-family, `window_pool` for the deterministic sub-family), each with a run-free
+  unit test (`test_bench_common_collect_pool`, `test_bench_common_window_pool`). A separate
+  "every deterministic window bench must call `window_pool`" discovery guard was deliberately
+  NOT minted: the 2 legitimately-un-migrated deterministic benches above have no clean
+  structural predicate separating them from the migrated ones, so such a guard would require an
+  exemption ENUMERATION — the very ADR-0011 Rule 4 fail-open this RCA names as the smoking gun.
+  The honest ADR-0011 Rule 1 level there is the helper-owns-the-floor structural guarantee plus
+  its unit test, not a decaying enumeration.
