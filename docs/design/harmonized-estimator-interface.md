@@ -23,6 +23,29 @@ Public Domain (The Unlicense).
 - **Status:** Design proposal (the requirements/spec the suite never had). Not
   implemented; implementation is a later phase. No code is committed by this
   note.
+- **Implementation status (2026-06-21, dated append per ADR-0005 Rule 8 — the
+  point-in-time "Not implemented" line above is preserved, not rewritten):** the
+  §6 migration has since landed end to end (Phase 0 `estimate.py` contract +
+  store; Phase 1 the manifest `Estimate` seam; Phase 2 the driver's `gᵀΣg` +
+  SOCP + Clark kink; Phases 3–4 the fit/median/pin benches + the runner feeds).
+  This append records one further closure: the **D2 `marginal`** the §1/§2.3 loop
+  is meant to ask — described here as the hook the `ShrinkLaw` variants were
+  *typed for* — is now **implemented on each variant** (`Poolwise` `−V/n²`,
+  `QuantileLaw` `−cov/n` with an effort→readings ratio, `RegressionLaw` the
+  leverage/misfit **floor** ~0, `Fixed` 0, `Composed` the steepest constituent)
+  and **consulted by `neyman_driver._socp_allocation` / the forward-progress
+  nudge** in place of the prior `A_i = Σ_ii · len(self.pools[i])` conflation
+  (which funded a fit as if `1/n` pool-shrinkage applied regardless of its
+  `ShrinkLaw` type — the ADR-0008 "derived value frozen as a literal" /
+  ADR-0012 P1/P2 violation §2.3 names). The `Poolwise` mean reduces byte-for-byte
+  (`A_i = −marginal·n_eff² = Σ_ii·n_eff` exactly); a leverage-floored fit
+  de-funds (`marginal ≈ 0`); the median is funded by its order-statistic law.
+  Note (ADR-0008 Rule 3, surfaced not silent): a fit currently carries **no
+  `per_point_var`** (the bench computes only `resid_var`, §4.3/§7.E), so by the
+  §4.3 lower-bound rule it is treated as **at its floor** and de-funded by iters —
+  the honest conservative posture until a bench implements the weighted-LS SE that
+  separates the shrinkable measurement-noise share, or the loop is given the
+  x-design-widening knob that genuinely lowers `1/Sxx` (§4.3).
 - **Provenance:** Synthesis of four independent designs and their statistical
   critiques (the 1:N:N:1 fan-out for this task), grounded against the actual
   benches, models, store, and driver in `tools/analysis/OpenTURNS/`. Every

@@ -70,6 +70,14 @@ all-mean / diagonal model is unchanged (the no-regression fixed point):
     SOCP chokes on), and on a NON-diagonal Σ hits `gᵀΣ(n*)g = V*` exactly with a
     fail-loud `gᵀΣ(n*)g ≈ V*` assertion (a solver `optimal` status does NOT catch
     a mixed-sign sign-fold — the §8 correction-3 trap, which `model_capacity` has).
+    FUNDABILITY is the typed D2 marginal (`ShrinkLaw.marginal_dvar_deffort`, §1 D2),
+    NOT `A_i = Σ_ii·len(self.pools[i])` (the prior conflation that funded a fit as
+    if 1/n pool-shrinkage applied regardless of its `ShrinkLaw`): the per-sample
+    `A_i = −marginal·n_eff²` recovers `Σ_ii·n_eff` byte-for-byte for a 1/n law
+    (Poolwise mean, QuantileLaw median — the mean case unchanged), while a Fixed
+    pin (marginal=0) AND a leverage/misfit-floored `RegressionLaw` fit (marginal≈0,
+    more iters never cross `1/Sxx`) are un-fundable and drop out (`_fundability`,
+    the one home the §2.3 SOCP and the forward-progress nudge share).
   * THE min()-KINK (§4.1). When a model exposes its min() arms (via `self.arms_fn`)
     and a non-binding arm is within a plausible tie, the driver enters `kink_regime`:
     it replaces `gᵀΣg` with the Clark-1961 closed-form `E[min]`/`Var[min]`
@@ -491,10 +499,13 @@ class NeymanDriver:
         converged = (var_est <= V_target) and guard_ok
 
         # --- §2.3 the allocation: the cost-constrained c-optimal SOCP (sign-safe Q-form, CLARABEL) --- #
-        # The SOCP's per-component A_i = Σ_ii·n_i is built from the ALLOCATION gradient (the Φ(±t)-weighted
-        # one in the kink regime, the analytic one otherwise) and Σ. On a diagonal Σ this reproduces the
-        # closed-form n_i* ∝ √(a_i/c_i) (rel diff ~1e-5; §8(b)). A Fixed/un-shrinkable input drops out
-        # (its variance is irreducible — §2.3), passed via `ests` so the SOCP does not try to fund a pin.
+        # The SOCP's per-component A_i is DERIVED from each input's typed D2 marginal (`_fundability`,
+        # `A_i = −marginal·n_eff²`), NOT the `Σ_ii·len(pools)`-as-`n` conflation — built from the ALLOCATION
+        # gradient (the Φ(±t)-weighted one in the kink regime, the analytic one otherwise) and Σ. On a
+        # diagonal Σ this reproduces the closed-form n_i* ∝ √(a_i/c_i) (rel diff ~1e-5; §8(b)). An input
+        # whose variance does NOT respond to effort drops out (passed via `ests`): a Fixed pin (marginal=0,
+        # irreducible) AND a leverage/misfit-floored fit (RegressionLaw marginal≈0 — more iters never cross
+        # 1/Sxx, §4.3) — both keep their current n and contribute their a_i to the bound, but get no funding.
         n_star = self._socp_allocation(grad_alloc, Sigma, self.costs, V_target, n_current=n, ests=ests)
 
         # Incremental top-up toward the optimal totals. UNCHANGED from the legacy driver: damp the
@@ -520,10 +531,20 @@ class NeymanDriver:
                 if np.any(over):
                     scale = min(scale, float(self.max_batch) / float(topup.max()))
             topup = np.floor(topup * scale)
-            # Forward progress if rounding zeroed the vector.
+            # Forward progress if rounding zeroed the vector — but ONLY onto a FUNDABLE input (one whose
+            # variance actually responds to effort, the same `_fundability` mask the allocation uses). A
+            # floored fit / a pin is the WORST variance contributor yet un-fundable: nudging IT makes no
+            # progress (its variance does not move, so it stays worst and the loop pours the whole — often
+            # expensive — fit/pin budget into it every round, the very over-funding the conflation removal
+            # forbids, §4.1/§4.3). Restricting the nudge to fundable inputs closes that leak; if NOTHING
+            # is fundable the variance is irreducible and no nudge can help (the loop will not converge —
+            # the §2.3 honest-edge the convergence/guard surfaces, not papered over by a futile nudge).
             if topup.sum() == 0:
-                worst = int(np.argmax(np.where(np.isfinite(var_contrib), var_contrib, -np.inf)))
-                topup[worst] = max(1.0, math.ceil(0.5 * n[worst]))
+                _m, _A, fundable_nudge = self._fundability(grad_alloc, Sigma, n, ests)
+                cand = np.where(fundable_nudge & np.isfinite(var_contrib), var_contrib, -np.inf)
+                if np.any(np.isfinite(cand)):
+                    worst = int(np.argmax(cand))
+                    topup[worst] = max(1.0, math.ceil(0.5 * n[worst]))
         else:
             topup[:] = 0.0
         topup = topup.astype(int)
@@ -575,6 +596,53 @@ class NeymanDriver:
         if isinstance(shrink, _est.QuantileLaw):
             return float(shrink.n)
         return float(max(len(self.pools[i]), 1))
+
+    def _marginal_for(
+        self, i: int, ests: Optional[Sequence["_est.Estimate"]], sigma_ii: float, n_eff: float
+    ) -> float:
+        """The typed D2 marginal `dΣ_ii/d(effort)` (≤ 0) for input `i` — the local rate at which one more
+        unit of THIS input's bench effort lowers its sampling variance, read from its `ShrinkLaw` (the SSOT
+        of the shrink law, P1/P8 — §1 D2). This is the quantity the §2.3 allocator equalizes per unit cost,
+        and it is what REPLACES the `A = Σ_ii·len(pools)`-as-`n` conflation (`_socp_allocation`): the law
+        owns the form of the derivative; the driver supplies only the live operating point (`sigma_ii`, the
+        already-divided `cov[0,0]` the driver holds; `n_eff`, the effective count from `_effective_n`).
+
+        When no Estimate is available for the input (a pure raw-pool path that did not wrap), fall back to
+        the Poolwise 1/n marginal `−Σ_ii/n_eff` — the legacy behavior for a mean, so a pool-fed and an
+        Estimate-fed driver agree (the confirmed fixed point). A `RegressionLaw`/`QuantileLaw` carries its
+        own currency-conversion default (iters_per_point=n_eff for the fit's floor; readings_per_effort=1.0
+        for the median's one-reading-per-tick) — the honest least-bad until a bench wires its real ratio."""
+        if ests is None or ests[i] is None:
+            n = float(n_eff)
+            return -float(sigma_ii) / n if n > 0.0 else 0.0
+        return float(ests[i].shrink.marginal_dvar_deffort(float(sigma_ii), float(n_eff)))
+
+    def _fundability(
+        self, grad: np.ndarray, Sigma: np.ndarray, n_eff: np.ndarray,
+        ests: Optional[Sequence["_est.Estimate"]],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The ONE home (P1) of "which inputs the allocation can fund, and at what per-sample variance" —
+        consulted by BOTH `_socp_allocation` (the SOCP/closed-form target) AND `step()`'s forward-progress
+        nudge, so the conflation removal is consistent across the two (a floored fit / a pin the allocator
+        de-funds is also one the nudge will not fund). Returns `(marginal, A, fundable)`:
+
+          * `marginal_i = dΣ_ii/d(effort)` (≤ 0), the typed D2 from input i's `ShrinkLaw` (§1 D2). REPLACES
+            the `A = Σ_ii·len(pools)`-as-`n` uniform-1/n conflation: the law decides its own shrink rate.
+          * `A_i = −marginal_i · n_eff²` — the per-sample variance s.t. `Σ_ii(n)=A_i/n` at the law's true
+            rate. For a 1/n law (Poolwise/QuantileLaw, marginal=−Σ_ii/n) this is `Σ_ii·n_eff` BYTE-FOR-BYTE
+            (the mean/median case unchanged); for a floored fit / a pin (marginal≈0) it is ≈0.
+          * `fundable_i = (g_i≠0) AND (A_i>0)` — moves f AND its variance responds to effort. A pin or a
+            leverage/misfit-floored fit (marginal≈0) is NOT fundable: no finite iter budget reduces it
+            (§2.3/§4.3); it keeps its current n and still contributes its a_i to the bound via gᵀΣg."""
+        d = self.d
+        g = np.asarray(grad, dtype=float)
+        Sigma_diag = np.array([float(Sigma[i, i]) for i in range(d)])
+        ne = np.maximum(n_eff, 1.0)
+        marg = np.array([self._marginal_for(i, ests, float(Sigma_diag[i]), float(ne[i]))
+                         for i in range(d)])
+        A = -marg * (ne ** 2)
+        fundable = (np.abs(g) > 0.0) & (A > 0.0) & np.isfinite(A)
+        return marg, A, fundable
 
     def _assemble_sigma(self, ests: Sequence["_est.Estimate"]) -> np.ndarray:
         """The joint input covariance Σ (d×d) the §2.2 `gᵀΣg` consumes. BLOCK-DIAGONAL across inputs
@@ -773,30 +841,27 @@ class NeymanDriver:
         the solve, ADR-0002 REQUIRES `gᵀΣ(n*)g ≈ V*` on the returned `n*` (the solver's `optimal`
         status does NOT catch a sign-fold) — a violation raises.
 
-        Only inputs with a nonzero gradient AND a shrinkable (nonzero) per-sample variance are funded;
-        a pin (`Σ_ii` irreducible) or a zero-gradient input keeps its current n (`a≤0 ⇒ n*=n` — the
-        legacy "don't sample dead inputs" branch, now for the right reason: irreducible/uninvolved).
+        FUNDABILITY IS THE TYPED D2 MARGINAL, NOT `len(pools)`-as-`n` (the conflation removal, §1 D2/
+        §2.3/§4.3). The per-component shrink-rate is read from each input's `ShrinkLaw.marginal_dvar_deffort`
+        (the SSOT of HOW its variance responds to effort — P1/P8), NOT by assuming `Σ_ii(n) = Σ_ii·n_cur/n`
+        uniformly. An input is fundable iff it moves `f` (g≠0) AND its variance actually RESPONDS to effort
+        (`marginal < 0`). A pin (`marginal = 0`, irreducible) OR a leverage/misfit-FLOORED fit
+        (`RegressionLaw.marginal ≈ 0` — more iters never cross `1/Sxx`) drops out: it keeps its current n
+        and still contributes its `a_i` to the bound (via `gᵀΣg` upstream), but gets NO allocation. The
+        per-sample variance `A_i` the closed form / SOCP consume is then DERIVED from the marginal —
+        `A_i = −marginal_i · n_eff²` — which for a 1/n law (`marginal = −Σ_ii/n`) recovers `Σ_ii·n_eff`
+        BYTE-FOR-BYTE (the mean/median case is unchanged), while a floored fit is simply un-fundable.
         Falls back to the closed-form ratio when cvxpy is unavailable AND Σ is diagonal (the special
         case that needs no solver); a non-diagonal Σ with cvxpy absent is a loud ADR-0002 error."""
         d = self.d
         g = np.asarray(grad, dtype=float)
-        # Per-component per-sample variance A_i such that Σ_ii(n_i) = A_i / n_i. From the current Σ_ii
-        # and n_i: A_i = Σ_ii · n_i (the shrink law's per-sample variance). A pin's n_i is its base and
-        # its Σ_ii is irreducible — but its gradient×variance still must NOT be funded (handled below).
-        Sigma_diag = np.array([float(Sigma[i, i]) for i in range(d)])
-        A = Sigma_diag * np.maximum(n_current, 1.0)        # per-sample variance contribution (A_i = Σ_ii·n_i)
-
-        # Fundable iff the input both moves f (g≠0) and has a REDUCIBLE variance (A>0 AND its shrink law
-        # is not Fixed). A Fixed/declared-spread pin has `d Σ_ii/d effort = 0` (no finite budget reduces
-        # it — §2.3), so it must NOT enter the SOCP: it keeps its current n and still contributes its
-        # a_i to the bound (handled by gᵀΣg upstream), but gets no allocation. Everything un-fundable
-        # keeps its current n (don't sample a pin or an uninvolved input).
-        reducible = np.ones(d, dtype=bool)
-        if ests is not None:
-            reducible = np.array([not isinstance(ests[i].shrink, _est.Fixed) for i in range(d)])
-        fundable = (np.abs(g) > 0.0) & (A > 0.0) & np.isfinite(A) & reducible
+        # The typed D2 marginal, derived A_i, and the fundable mask — the ONE home (P1, `_fundability`)
+        # the nudge in step() shares, so the conflation removal is consistent: `A_i = −marginal·n_eff²`
+        # (the law's true shrink rate, NOT `Σ_ii·len(pools)`-as-`n`), and a pin / a floored fit (marginal
+        # ≈0) is un-fundable here exactly as it is in the nudge.
+        _marg, A, fundable = self._fundability(g, Sigma, n_current, ests)
         if not np.any(fundable) or not (V_target > 0 and math.isfinite(V_target)):
-            # Nothing to fund (all pins / converged target) -> keep current n.
+            # Nothing to fund (all pins / floored fits / converged target) -> keep current n.
             return n_current.astype(float).copy()
 
         # The off-diagonal coupling of the FUNDABLE block (a pin's off-diagonals are irrelevant — it is

@@ -51,7 +51,7 @@ from __future__ import annotations
 import enum
 import math
 from dataclasses import dataclass, field
-from typing import Mapping, Union
+from typing import Mapping, Optional, Union
 
 import numpy as np
 
@@ -129,10 +129,17 @@ def _family_tag(f: FamilySpec) -> CIFamily:
 
 # ============================================================================================
 # ShrinkLaw — the sum type that replaces the scalar `n` (§1 D2). Each variant carries the data
-# its estimator's variance-reduction law needs; the driver asks the law for the local marginal
-# (a LATER phase — Phase 0 only stores the data, no `.marginal()` is consumed yet). The
-# variants are frozen dataclasses; `ShrinkLaw` is their union. Validation here is structural
-# (shapes/sign) per ADR-0002 — the math (the marginal) is the driver's, deferred.
+# its estimator's variance-reduction law needs AND owns the typed D2 marginal — the local
+# `dΣ_ii/d(effort)` (≤ 0) that the Neyman allocator equalizes per unit cost (§2.3). The
+# `ShrinkLaw` TYPE is the single home (P1) and SSOT (P8) for HOW each estimator's variance
+# responds to effort, so the marginal FORM lives here, on the law, not re-derived at the
+# allocator: a `Poolwise` mean shrinks `−V/n²`, a `QuantileLaw` median by its order-statistic
+# law, a `RegressionLaw` fit is FLOORED by x-leverage (more iters never cross `1/Sxx`; ~0 at the
+# floor), a `Fixed` pin is 0. The driver supplies the live operating point (Σ_ii, n_eff — P4
+# live-not-frozen) and the law returns the derivative's form; the allocator NEVER substitutes a
+# uniform `Σ_ii·len(pools)`-as-`n` for the type (the ADR-0008 "derived value frozen as a literal"
+# / ADR-0012 P1/P2 conflation this closes). The variants are frozen dataclasses; `ShrinkLaw` is
+# their union. Structural validation (shapes/sign) is per ADR-0002; the marginal is pure math.
 # ============================================================================================
 @dataclass(frozen=True)
 class Poolwise:
@@ -150,6 +157,17 @@ class Poolwise:
         if np.any(v < 0.0):
             raise ValueError("Poolwise.per_sample_var must be non-negative (a variance)")
         object.__setattr__(self, "per_sample_var", v)
+
+    def marginal_dvar_deffort(self, sigma_ii: float, n_eff: float, component: int = 0) -> float:
+        """The typed D2 marginal `dΣ_ii/dn` for the MEAN at its current operating point (§1 D2/§2.3).
+        `cov(n) = s²/n`, so `dΣ_ii/dn = −s²/n² = −Σ_ii/n` (one more sample). This is the EXACT
+        derivative the closed-form Neyman `n_i* ∝ √(a_i/c_i)` is the KKT solution of — so equalizing
+        `g_i²·|marginal_i|/c_i` reproduces today's allocation byte-for-byte on the mean case. `sigma_ii`
+        is the already-divided sampling variance `s²/n` the driver holds; `n_eff` the pool size."""
+        n = float(n_eff)
+        if n <= 0.0:
+            return 0.0
+        return -float(sigma_ii) / n
 
 
 @dataclass(frozen=True)
@@ -175,6 +193,21 @@ class QuantileLaw:
         object.__setattr__(self, "p", p)
         object.__setattr__(self, "f_at_q", fq)
         object.__setattr__(self, "n", int(self.n))
+
+    def marginal_dvar_deffort(
+        self, sigma_ii: float, n_eff: float, component: int = 0, readings_per_effort: float = 1.0
+    ) -> float:
+        """The typed D2 marginal `dΣ_ii/d(effort)` for the MEDIAN/QUANTILE at its current operating
+        point (§1 D2/§2.3). The order-statistic law is `cov(n) = p(1−p)/(n·f̂²)`, so `dcov/dn = −cov/n`
+        PER READING. Where one unit of the bench's effort (a `trials` tick) yields only a FRACTION of a
+        pool reading — the producer/consumer benches catch ~0.1% of `trials` as readings — the
+        chain rule scales it by `readings_per_effort = dn/d(effort)`: `dcov/d(effort) = (−cov/n)·(dn/d effort)`
+        (default 1.0 = one reading per effort unit, the latency microbenches). `sigma_ii` is the shipped
+        `cov[0,0]` the driver holds; `n_eff` the reading count (= `self.n` projected by the driver)."""
+        n = float(n_eff)
+        if n <= 0.0:
+            return 0.0
+        return -(float(sigma_ii) / n) * float(readings_per_effort)
 
 
 @dataclass(frozen=True)
@@ -226,6 +259,45 @@ class RegressionLaw:
         object.__setattr__(self, "design", dsg)
         object.__setattr__(self, "per_point_var", ppv)
 
+    def marginal_dvar_deffort(
+        self, sigma_ii: float, n_eff: float, component: int = 0, iters_per_point: Optional[float] = None
+    ) -> float:
+        """The typed D2 marginal `dΣ_ii/d(effort)` for a FIT coefficient — the LEVERAGE FLOOR that
+        DISSOLVES the conflation (§1 D2/§2.3/§4.3). The coefficient variance is
+        `Σ_cc = resid_var · XtX_inv[c,c]`. More iters shrink ONLY the per-design-point MEASUREMENT-noise
+        share of `resid_var`; the LACK-OF-FIT share is a fixed bias, and the x-leverage `XtX_inv[c,c]`
+        (∝ 1/Sxx for the slope) is FIXED unless the bench WIDENS the x-design — a different knob the
+        iter budget does not buy. So `Σ_cc` is FLOORED: it does NOT shrink as `A/n` (the false
+        assumption the allocator's `Σ_ii·len(pools)`-as-`n` makes — the conflation).
+
+          * `per_point_var` PRESENT (a weighted-LS bench): the measurement-noise share is KNOWN —
+            `resid_var ≈ lack_of_fit + mean(per_point_var)`, the second term shrinking ~`1/iters`. The
+            marginal is the derivative of that shrinkable share only: at `iters_per_point` iters/point,
+            `d resid_var/d(iters) ≈ −mean(per_point_var)/iters²`, scaled by `XtX_inv[c,c]`. If
+            lack-of-fit dominates (the measurement-noise share is a small fraction of `resid_var`), this
+            is correctly ~0. The default `iters_per_point` is `n_eff` (the design-point count the driver
+            holds) when not given — a conservative unit step.
+          * `per_point_var` ABSENT (the common case — the bench computes only `resid_var`): we CANNOT
+            split measurement noise from lack-of-fit, so the honest, ADR-0008-disciplined answer is the
+            FLOOR — `~0` (un-fundable by iters). We REFUSE to assume `resid_var` is all-shrinkable
+            (that re-introduces the 1/n conflation); the spec's lever for lowering `Σ_cc` is widening the
+            x-design (§4.3), not an iter budget. `plain resid_var/Sxx` is a LOWER BOUND on the true slope
+            variance and the marginal must not promise variance the iter-work cannot buy (§4.3)."""
+        ppv = self.per_point_var
+        if ppv is None:
+            # Floor: an unknown measurement-noise/lack-of-fit split is treated as at-its-floor. The
+            # allocator must not pour iter budget into a fit it cannot shrink (the conflation removal).
+            return 0.0
+        c = int(component)
+        leverage = float(self.XtX_inv[c, c])  # XtX_inv[c,c] (∝ 1/Sxx for the slope) — FIXED by the design
+        meas_noise = float(np.mean(ppv))      # the per-point sampling-variance share that DOES shrink
+        iters = float(iters_per_point) if iters_per_point is not None else float(n_eff)
+        if iters <= 0.0 or leverage <= 0.0 or meas_noise <= 0.0:
+            return 0.0
+        # d resid_var/d(iters) for the shrinkable share ≈ −meas_noise/iters² (the share ~ meas_noise/iters
+        # at the current iters), times the FIXED leverage XtX_inv[c,c]. Lack-of-fit contributes 0.
+        return -leverage * meas_noise / (iters * iters)
+
 
 @dataclass(frozen=True)
 class Fixed:
@@ -233,6 +305,13 @@ class Fixed:
     A true constant (σ tiny) drops out of allocation (a_i≈0); a declared-spread prior (B_op's
     σ=64) still CONTRIBUTES a_i to the bound (the CI honestly rests on the prior) but gets no
     allocation (§2.3). Carries no parameters — the irreducible variance is `Estimate.cov`."""
+
+    def marginal_dvar_deffort(self, sigma_ii: float, n_eff: float, component: int = 0) -> float:
+        """The typed D2 marginal for a PIN: `dΣ_ii/d(effort) = 0` — irreducible (§2.3). No finite budget
+        reduces a declared-spread prior or a deployment-fact constant, so the pin drops out of allocation
+        (it still contributes its `a_i` to the bound via `gᵀΣg`, but gets no funding). This is the right
+        reason the legacy `a<=0 ⇒ n*=n` branch fired — irreducible, not merely `a==0`."""
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -251,6 +330,23 @@ class Composed:
             if not isinstance(p, _SHRINK_VARIANTS):
                 raise TypeError(
                     f"Composed.parts[{i}] is not a ShrinkLaw; got {type(p).__name__}")
+
+    def marginal_dvar_deffort(self, sigma_ii: float, n_eff: float, component: int = 0) -> float:
+        """The typed D2 marginal for a RATIO/composite: recurse to the STEEPEST constituent (§1 D2) —
+        the part whose variance responds MOST to effort (the most-negative `dΣ/d effort`), since funding
+        the composite's effort flows to its steepest-shrinking constituent.
+
+        APPROXIMATION (surfaced per ADR-0008 Rule 3 — a misfit named, not silent): `Composed` carries
+        only the constituents' LAWS, not each constituent's own `(Σ_ii, n)` operating point, so this
+        evaluates every part at the SHARED `(sigma_ii, n_eff)` the driver passes for the composite. That
+        is exact only when the constituents share that operating point; for genuinely heterogeneous
+        constituents it is a least-bad estimate. No current bench registers a `Composed` law (the §3
+        ratio row is 'for completeness' — `dps` itself is `f`, not a registered input), so this path is
+        untriggered today; a future composite-input bench should pass each constituent's own point (extend
+        the signature) rather than rely on the shared-point fallback. Until then this keeps the recursion
+        total and honest about its own limit."""
+        marginals = [p.marginal_dvar_deffort(sigma_ii, n_eff, component) for p in self.parts]
+        return min(marginals) if marginals else 0.0
 
 
 # The ShrinkLaw sum type (§1 D2). A union, not a base class — the variants are independent

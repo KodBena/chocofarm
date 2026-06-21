@@ -91,6 +91,19 @@ def _fixed(name: str, mean: float, sigma: float) -> E.Estimate:
     )
 
 
+def _median(pool, name: str) -> E.Estimate:
+    """A k=1 QuantileLaw (median) Estimate from a raw pool — a SHRINKABLE input whose typed marginal is
+    `−cov/n < 0` (the order-statistic 1/n law), so the allocator funds it. Built via the Phase-3
+    `bench_common.median_estimate` (the real bootstrap-SE path)."""
+    import os as _os
+    import sys as _sys
+    _bench = _os.path.join(_OT, "benchmarks")
+    if _bench not in _sys.path:
+        _sys.path.insert(0, _bench)
+    import bench_common as _bc
+    return _bc.median_estimate(list(pool), name=name)
+
+
 def _legacy_diagonal_step(f, costs, tol, names, pools, z=1.959963984540054):
     """The EXACT pre-Phase-2 step() math, recomputed standalone for the no-regression comparison."""
     n = np.array([len(p) for p in pools], dtype=float)
@@ -305,6 +318,115 @@ def test_fixed_pin_drops_out_of_allocation() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 3b. The conflation removal (the typed D2 marginal vs `Σ_ii·len(pools)`-as-`n`) — §1 D2/§2.3/§4.3.
+# A leverage/misfit-FLOORED RegressionLaw fit is DE-FUNDED (its variance does not respond to iters),
+# while a residual-limited fit and the mean/median are funded by their true laws; the mean allocation
+# is BYTE-FOR-BYTE the pre-fix `Σ_ii·n_eff` (the no-regression fixed point asserted directly on A).
+# --------------------------------------------------------------------------- #
+DESIGN = [32, 64, 128, 192, 256, 384, 512]
+
+
+def _fit(intercept: float, slope: float, *, lack_of_fit: bool, name="slope_us", partner="iota_us"):
+    """The real k=2 staged fit Estimate ordered slope-first (what `manifest.estimate('t_row_us')`
+    returns and `transport_sweep`/`throughput_bound` feed a scalar input). `lack_of_fit=True` makes the
+    truth CURVED (fit by a line) so the residual is a fixed BIAS — a leverage+misfit-FLOORED fit whose
+    `Var(slope)` does not shrink with iters (no per_point_var). `lack_of_fit=False` is a clean line."""
+    import os as _os
+    import sys as _sys
+    _bench = _os.path.join(_OT, "benchmarks")
+    if _bench not in _sys.path:
+        _sys.path.insert(0, _bench)
+    import bench_common as _bc
+    x = np.asarray(DESIGN, dtype=float)
+    if lack_of_fit:
+        med = [float(v) for v in (intercept + slope * x + 0.0009 * x ** 2)]  # quadratic truth, line fit
+    else:
+        rng = np.random.default_rng(11)
+        med = [float(v) for v in (intercept + slope * x + rng.normal(0.0, 2.5, x.shape))]
+    return _bc.fit_estimate(DESIGN, med, own_name=name, own_role="slope", partner_name=partner)
+
+
+def test_floored_fit_is_defunded_by_the_allocator_and_the_nudge() -> None:
+    """§4.3 (the conflation's core): a leverage+misfit-floored fit that is the DOMINANT variance
+    contributor is DE-FUNDED — the typed `RegressionLaw.marginal` is ~0, so the allocator's `n_star`
+    equals its current n (no topup) AND the forward-progress nudge (gated on the same fundability) does
+    not fund it either. Pre-fix the allocator targeted n_star≫n_cur (1/n shrinkage on `Σ_ii·len(pools)`)
+    and the nudge funded the worst contributor — the over-funding this removes."""
+    names = ["slope_us", "tau_io_us", "T_disp_us", "B_op"]
+    f = ot.SymbolicFunction(names, ["1000000.0 / (T_disp_us + tau_io_us + B_op * slope_us)"])
+    d = NeymanDriver(f, costs=[50.0, 5.0, 1.0, 1.0], tolerance=5.0, names=names)
+    d.set_estimate(0, _fit(94.58, 4.317, lack_of_fit=True))      # the floored fit (dominant contributor)
+    # near-certain pins so the fit is the dominant variance source.
+    d.set_estimate(1, _fixed("tau_io_us", 3.2, 0.001))
+    d.set_estimate(2, _fixed("T_disp_us", 68.84, 0.001))
+    d.set_estimate(3, _fixed("B_op", 64.0, 0.001))
+
+    ests = [d._estimate_for(i) for i in range(4)]
+    Sigma = d._assemble_sigma(ests)
+    mu = np.array([float(e.theta_hat[0]) for e in ests])
+    grad = d._gradient(mu)
+    ncur = np.array([d._effective_n(i, ests[i]) for i in range(4)], dtype=float)
+    marg, A, fundable = d._fundability(grad, Sigma, ncur, ests)
+    assert marg[0] == 0.0                       # the floored fit's typed marginal is ~0 (the leverage floor)
+    assert not fundable[0]                       # so it is NOT fundable (de-funded)
+    V = (5.0 / d.z) ** 2
+    n_star = d._socp_allocation(grad, Sigma, d.costs, V, ncur, ests=ests)
+    assert n_star[0] == ncur[0]                  # the allocator gives the floored fit NO topup
+
+    rec = d.step(second_order_check=False)
+    assert {p.name: p.recommend for p in rec.primitives}["slope_us"] == 0   # the nudge does not fund it
+
+
+def test_residual_limited_fit_is_funded() -> None:
+    """The dual case: a fit WITH a per_point_var (residual-limited, not at its floor) DOES respond to
+    iters, so its marginal is < 0 and it is fundable — the fix de-funds ONLY the floored fit, not every
+    fit. Built directly so the per_point_var is present (the weighted-LS branch §4.3)."""
+    xs = np.asarray(DESIGN, dtype=float)
+    design = np.column_stack([np.ones_like(xs), xs])
+    XtX_inv = np.linalg.inv(design.T @ design)
+    reg = E.RegressionLaw(resid_var=10.0, XtX_inv=XtX_inv, design=design, per_point_var=np.array([2.0]*7))
+    est = E.Estimate(
+        theta_hat=np.array([4.317, 94.58]), cov=reg.resid_var * XtX_inv[::-1, ::-1],
+        names=("slope_us", "iota_us"),
+        shrink=E.RegressionLaw(resid_var=10.0, XtX_inv=XtX_inv[::-1, ::-1],
+                               design=design[:, ::-1], per_point_var=np.array([2.0]*7)),
+        support=(E.Support.POSITIVE, E.Support.POSITIVE),
+        family=(E.StudentT(dof=5), E.StudentT(dof=5)), kind="ols_fit")
+    f = ot.SymbolicFunction(["slope_us", "p"], ["1000000.0 / (100.0 + 64.0 * slope_us) + 0*p"])
+    d = NeymanDriver(f, costs=[50.0, 1.0], tolerance=5.0, names=["slope_us", "p"])
+    d.set_estimate(0, est)
+    d.set_estimate(1, _fixed("p", 1.0, 0.001))
+    ests = [d._estimate_for(i) for i in range(2)]
+    Sigma = d._assemble_sigma(ests)
+    grad = d._gradient(np.array([float(e.theta_hat[0]) for e in ests]))
+    ncur = np.array([d._effective_n(i, ests[i]) for i in range(2)], dtype=float)
+    marg, A, fundable = d._fundability(grad, Sigma, ncur, ests)
+    assert marg[0] < 0.0          # a residual-limited fit's variance DOES respond to iters
+    assert fundable[0]            # so it is fundable (the fix de-funds only the FLOORED fit)
+
+
+def test_mean_allocation_A_is_byte_for_byte_the_pre_fix_sigma_times_n() -> None:
+    """The no-regression fixed point asserted DIRECTLY on the conflation site: for an all-Poolwise model
+    the marginal-derived `A_i = −marginal·n_eff²` equals the pre-fix `A_i = Σ_ii·n_eff` to ZERO (not just
+    machine epsilon) — so the closed-form / SOCP target the mean case produces is identical. This is the
+    'keep the Poolwise mean case byte-for-byte' assertion the fix is required to preserve."""
+    f = ot.SymbolicFunction(["x0", "x1", "x2"], ["3*x0 - 1.5*x1 + 0.7*x2"])
+    d = NeymanDriver(f, costs=[1.0, 2.5, 0.8], tolerance=0.5, names=["x0", "x1", "x2"])
+    rng = np.random.default_rng(7)
+    for i, (mu, s2, n) in enumerate([(10.0, 9.0, 60), (20.0, 4.0, 45), (5.0, 16.0, 80)]):
+        d.set_estimate(i, _poolwise(["x0", "x1", "x2"][i], mu, s2, n))
+    ests = [d._estimate_for(i) for i in range(3)]
+    Sigma = d._assemble_sigma(ests)
+    grad = d._gradient(np.array([float(e.theta_hat[0]) for e in ests]))
+    ncur = np.array([d._effective_n(i, ests[i]) for i in range(3)], dtype=float)
+    _marg, A_fixed, fundable = d._fundability(grad, Sigma, ncur, ests)
+    Sigma_diag = np.array([Sigma[i, i] for i in range(3)])
+    A_legacy = Sigma_diag * np.maximum(ncur, 1.0)        # the PRE-FIX conflation expression
+    assert np.array_equal(A_fixed, A_legacy)             # byte-for-byte (exact equality, not allclose)
+    assert np.all(fundable)                              # every mean responds to effort -> all fundable
+
+
+# --------------------------------------------------------------------------- #
 # 4. The Clark min()-kink path (§4.1) — the §8 reproduction targets.
 # --------------------------------------------------------------------------- #
 def _kink_driver(sigma_R: float) -> NeymanDriver:
@@ -356,18 +478,52 @@ def test_clark_kink_reproduces_operating_sigma1_25() -> None:
     assert rec.p_nonbinding_max == pytest.approx(0.136, abs=0.002)
 
 
-def test_clark_kink_funds_both_arms_and_guard_refuses_convergence() -> None:
-    """§4.1 mechanisms 1+3: in the kink regime BOTH contending arms' inputs get funded (the Φ(±t)-weighted
-    gradient cures the dead-gradient on the non-binding arm), and convergence is REFUSED while the
-    arg-min-flip probability Φ(−t) exceeds α (here 0.136 > 0.05) — the false-SAT the guard forbids."""
+def test_clark_kink_guard_refuses_convergence_and_does_not_fund_pins() -> None:
+    """§4.1 mechanism 1 (the guard) + the conflation removal (§4.3): in the kink regime convergence is
+    REFUSED while the arg-min-flip probability Φ(−t) exceeds α (here 0.136 > 0.05) — the false-SAT the
+    guard forbids. AND, with this `_kink_driver`'s inputs all `Fixed` pins (irreducible declared
+    spreads), NONE is funded: a pin's variance does not respond to effort, so the allocator/nudge
+    correctly leave it un-funded. (Pre-fix, the forward-progress nudge would FUTILELY fund a pin — the
+    over-funding the typed-marginal fundability gate removes; a pin nudged makes no progress, it stays
+    the worst contributor and the loop pours budget into it every round.) The dead-gradient on the
+    contender arm is cured at the GRADIENT level (the Φ(±t)-weighted `grad_alloc`); funding follows only
+    for a SHRINKABLE contender input — see test_clark_kink_funds_shrinkable_contender_input below."""
     d = _kink_driver(sigma_R=8.0)
     rec = d.step(second_order_check=False)
-    assert rec.converged is False                 # guard refuses: P(flip)=0.136 > alpha=0.05
-    # both arms are live: the producer inputs and the serve input both register (the contender no longer
-    # has the hard-min's df/dx = 0). At least one producer input gets funded OR the forward-progress
-    # nudge fires on a contending input — the dead-gradient pathology is cured.
+    assert rec.converged is False                 # guard refuses: P(flip)=0.136 > alpha=0.05 (unchanged)
     funded = {p.name: p.recommend for p in rec.primitives}
-    assert sum(funded.values()) > 0
+    assert sum(funded.values()) == 0              # all-pin arms: nothing is sampled (no pin is funded)
+
+
+def test_clark_kink_funds_shrinkable_contender_input() -> None:
+    """§4.1 mechanism 3 (the REAL 'fund both arms' cure, post-conflation-fix): when the non-binding
+    (contender) arm carries a SHRINKABLE input, the Φ(±t)-weighted gradient near the tie gives that input
+    nonzero weight AND — because its variance responds to effort (a `QuantileLaw` marginal < 0) — the
+    allocator FUNDS it, curing the dead-gradient pathology. The pins on either arm correctly stay
+    un-funded (the conflation removal). This is the faithful test of mechanism 3: it exercises funding of
+    a contender input the allocator can actually sample, not the futile pin-funding the pre-fix nudge did."""
+    names = ["N_gen", "R_gen", "serve_cap"]
+    f = ot.SymbolicFunction(names, ["min(N_gen*R_gen, serve_cap)"])
+    d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=2.0, names=names, confidence=0.95)
+    d.set_estimate(0, _fixed("N_gen", 3.0, 0.01))
+    # R_gen as a SHRINKABLE median pool (a real spread), tuned so producer ~ serve (a live tie).
+    rng = np.random.default_rng(5)
+    rgen_pool = [float(v) for v in (142.76 + rng.normal(0.0, 30.0, 120))]
+    d.set_estimate(1, _median(rgen_pool, "R_gen"))
+    d.set_estimate(2, _fixed("serve_cap", 428.28, 2.0))
+
+    def arms_fn(x):
+        N, R, S = x["N_gen"], x["R_gen"], x["serve_cap"]
+        return [(N * R, {"N_gen": R, "R_gen": N, "serve_cap": 0.0}),
+                (S, {"N_gen": 0.0, "R_gen": 0.0, "serve_cap": 1.0})]
+    d.arms_fn = arms_fn
+
+    rec = d.step(second_order_check=False)
+    assert rec.kink_regime is True
+    assert rec.converged is False
+    funded = {p.name: p.recommend for p in rec.primitives}
+    assert funded["R_gen"] > 0                     # the SHRINKABLE contender input IS funded (mechanism 3)
+    assert funded["N_gen"] == 0 and funded["serve_cap"] == 0   # the pins are not (conflation removal)
 
 
 def test_no_kink_regime_without_the_arms_hook() -> None:

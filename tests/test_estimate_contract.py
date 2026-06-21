@@ -346,6 +346,89 @@ def test_composed_non_shrink_part_raises() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 3b. The typed D2 marginal `dΣ_ii/d(effort)` (§1 D2/§2.3) — the per-ShrinkLaw shrink rate the
+# allocator consults INSTEAD of `Σ_ii·len(pools)`-as-`n` (the conflation removal). Each variant
+# owns its marginal (P1/P8 the SSOT of how its variance responds to effort): a mean shrinks −V/n²,
+# a median by its order-statistic 1/n law, a FLOORED fit ~0 (more iters never cross the leverage
+# floor), a pin 0, a composite the steepest constituent.
+# --------------------------------------------------------------------------- #
+def test_poolwise_marginal_is_minus_v_over_n2() -> None:
+    """MEAN (§1 D2): `dΣ_ii/dn = −s²/n² = −Σ_ii/n` — the EXACT derivative the closed-form Neyman
+    `n_i* ∝ √(a_i/c_i)` is the KKT solution of (so the mean allocation is byte-for-byte). At the
+    operating point Σ_ii = s²/n = 4/50, the marginal is −Σ_ii/n = −(4/50)/50 = −s²/n²."""
+    s = E.Poolwise(per_sample_var=np.array([4.0]))
+    n, s2 = 50.0, 4.0
+    sigma_ii = s2 / n                                  # the already-divided sampling variance the driver holds
+    m = s.marginal_dvar_deffort(sigma_ii, n)
+    assert math.isclose(m, -sigma_ii / n, rel_tol=1e-15)
+    assert math.isclose(m, -s2 / (n * n), rel_tol=1e-15)   # = −V/n² in raw terms
+    assert m < 0.0                                     # a mean's variance DOES respond to effort (fundable)
+
+
+def test_quantilelaw_marginal_is_order_statistic_1_over_n() -> None:
+    """MEDIAN (§1 D2): the order-statistic law `cov(n)=p(1−p)/(n·f̂²)` gives `dcov/dn = −cov/n` per
+    reading; with `readings_per_effort` the chain rule scales it by dn/d(effort) (the ~0.1%-of-trials
+    capture). Default ratio 1.0 (a latency microbench) -> −cov/n; a 0.1% ratio scales it down 1000×."""
+    s = E.QuantileLaw(p=0.5, f_at_q=np.array([0.02]), n=2000)
+    cov_ii, n = 0.01, 2000.0
+    m = s.marginal_dvar_deffort(cov_ii, n)
+    assert math.isclose(m, -cov_ii / n, rel_tol=1e-15)
+    assert m < 0.0                                     # a median responds to readings (fundable)
+    # the effort->readings currency: catching 0.1% of trials as readings scales the marginal by 1e-3.
+    m_frac = s.marginal_dvar_deffort(cov_ii, n, readings_per_effort=0.001)
+    assert math.isclose(m_frac, (-cov_ii / n) * 0.001, rel_tol=1e-15)
+
+
+def test_regressionlaw_marginal_is_floored_when_lack_of_fit_dominates() -> None:
+    """FIT (§1 D2/§4.3 — the conflation's core): a `RegressionLaw` with NO `per_point_var` (the common
+    case — the bench computes only `resid_var`, which mixes measurement noise with lack-of-fit) returns
+    ~0: we REFUSE to assume `resid_var` is all-shrinkable (that re-introduces the 1/n conflation). The
+    leverage floor `1/Sxx` is fixed; only widening the x-design lowers it, not the iter budget. So the
+    fit is UN-shrinkable by iters — `marginal == 0` — exactly the de-funding the fix delivers."""
+    xs = np.array([32.0, 64.0, 128.0, 192.0, 256.0, 384.0, 512.0])
+    design = np.column_stack([np.ones_like(xs), xs])
+    XtX_inv = np.linalg.inv(design.T @ design)
+    s = E.RegressionLaw(resid_var=566.8, XtX_inv=XtX_inv, design=design)   # no per_point_var -> floored
+    sigma_ii = 566.8 * float(XtX_inv[0, 0])
+    m = s.marginal_dvar_deffort(sigma_ii, 1.0)
+    assert m == 0.0                                    # floored: more iters never cross the leverage floor
+
+
+def test_regressionlaw_marginal_is_nonzero_with_per_point_var() -> None:
+    """FIT, weighted-LS branch (§4.3): WITH `per_point_var` (the bench knows the measurement-noise
+    share), the marginal is the derivative of the shrinkable share only — nonzero (so a residual-limited
+    fit IS fundable), but scaled by the FIXED leverage `XtX_inv[c,c]` and shrinking ~1/iters²."""
+    xs = np.array([32.0, 64.0, 128.0, 192.0, 256.0, 384.0, 512.0])
+    design = np.column_stack([np.ones_like(xs), xs])
+    XtX_inv = np.linalg.inv(design.T @ design)
+    ppv = np.array([2.0] * 7)
+    s = E.RegressionLaw(resid_var=10.0, XtX_inv=XtX_inv, design=design, per_point_var=ppv)
+    m = s.marginal_dvar_deffort(5e-5, 200.0, 0, 200.0)
+    leverage = float(XtX_inv[0, 0])
+    assert math.isclose(m, -leverage * 2.0 / (200.0 * 200.0), rel_tol=1e-12)
+    assert m < 0.0                                     # a residual-limited fit responds to iters (fundable)
+
+
+def test_fixed_marginal_is_zero() -> None:
+    """PIN (§2.3): `dΣ_ii/d(effort) = 0` — irreducible; no finite budget reduces it, so it drops out of
+    allocation (it still contributes its a_i to the bound via gᵀΣg, but gets no funding)."""
+    assert E.Fixed().marginal_dvar_deffort(4096.0, 1.0) == 0.0
+    assert E.Fixed().marginal_dvar_deffort(0.0, 100.0) == 0.0
+
+
+def test_composed_marginal_is_the_steepest_constituent() -> None:
+    """RATIO/composite (§1 D2): recurse to the STEEPEST (most-negative) constituent marginal. A Composed
+    of {Fixed (0), Poolwise (−Σ/n)} returns the Poolwise marginal (the steepest)."""
+    pw = E.Poolwise(per_sample_var=np.array([4.0]))
+    comp = E.Composed(parts=(E.Fixed(), pw))
+    sigma_ii, n = 0.08, 50.0
+    m_comp = comp.marginal_dvar_deffort(sigma_ii, n)
+    m_pw = pw.marginal_dvar_deffort(sigma_ii, n)
+    assert m_comp == m_pw                              # the steepest (the Fixed's 0 is not the min)
+    assert m_comp < 0.0
+
+
+# --------------------------------------------------------------------------- #
 # 4. jsonb round-trip identity (in-process, no DB).
 # --------------------------------------------------------------------------- #
 def _assert_estimate_equal(a: E.Estimate, b: E.Estimate) -> None:
