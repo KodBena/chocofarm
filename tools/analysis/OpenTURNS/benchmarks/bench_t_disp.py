@@ -30,9 +30,17 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import fit_estimate, logged_run  # noqa: E402
 
 NAME = "T_disp_us"
+# The co-fit PARTNER: T_disp (the dispatch-floor INTERCEPT) and cpp_inproc_port_t_row_bare (the bare-forward
+# SLOPE) are the SAME `fully_device` fit (one fit, two read-offs — see the cpp-port bench docstring). So the
+# harmonized Estimate this bench logs is that k=2 fit with T_disp's INTERCEPT as component 0 (the marginal
+# manifest.value("T_disp_us") projects — 2 live model consumers read this floor) and the bare-forward slope
+# as the partner carrying the off-diagonal (§4.2). NOTE (§4.2): this fit is a DIFFERENT fit from the staged
+# (iota/t_row) one — they must NOT be cross-paired (different variants); only co-fit components pair.
+PARTNER_NAME = "cpp_inproc_port_t_row_bare_us"
+WARMUP = 8   # harness warmup phase (bench_common.warm): burn cold-compile forwards before measuring
 MODULE_PATH = "benchmarks.bench_t_disp"
 _DESC = ("Pure pjit/XLA dispatch floor (us): the irreducible per-forward dispatch with params+input "
          "staged device-resident and output on-device (fully_device variant). The cycle-time model's "
@@ -77,19 +85,38 @@ def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int =
     if t_disp is None:
         raise RuntimeError(f"bench_t_disp.measure: neither decomposition.dispatch_floor_us nor "
                            f"fits.fully_device.intercept_us present in bench output keys {list(out)}")
-    r2 = fits.get("fully_device", {}).get("r2")
-    return {"t_disp_us": float(t_disp), "r2": r2, "decomposition": decomp}
+    fd_fit = fits.get("fully_device", {})
+    r2 = fd_fit.get("r2")
+    # The fully_device per-width medians (the design points behind the fit) — the inputs the harmonized
+    # k=2 Estimate's covariance is computed from (§4.2/§5: _fit_line discards them, so the bench recovers
+    # them here from bench()'s per-variant record). bench() returns per_batch_us[variant] = {str(B):
+    # {median_us, iqr_us}}; key it back to int widths in the swept order.
+    pb_fd = out.get("per_batch_us", {}).get("fully_device", {})
+    median_us = {int(B): float(pb_fd[str(B)]["median_us"]) for B in batches if str(B) in pb_fd}
+    return {"t_disp_us": float(t_disp), "intercept_us": fd_fit.get("intercept_us"),
+            "slope_us_per_row": fd_fit.get("slope_us_per_row"), "r2": r2,
+            "per_width_median_us": median_us, "batches": batches, "decomposition": decomp}
 
 
 def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure T_disp and LOG it (the dispatch floor as the headline reading). TIMING-SENSITIVE —
-    operator-invoked, pinned, never during the fan-out."""
+    """Measure T_disp and LOG it as a harmonized k=2 fit `Estimate` (§6 Phase 3): the fully_device-fit
+    intercept/slope with their −0.81 off-diagonal, T_disp's INTERCEPT (== dispatch floor) as component 0.
+    The fully_device per-width medians are logged as raw-design-point PROVENANCE — the variance authority
+    is now `estimate.cov`, so the headline dispatch-floor scalar is NO LONGER double-logged as a sample row
+    (the §5.2 de-dup obligation). TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
     res = measure(batches=batches, iters=iters, repeat=repeat)
-    cfg = {"iters": iters, "repeat": repeat, "fit_r2": res["r2"], "decomposition": res["decomposition"],
-           "variant": "fully_device", "bench": "mlp_lowlatency"}
+    batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
+    medians = [res["per_width_median_us"][B] for B in batches_used]
+    # The k=2 fit Estimate, T_disp (the intercept) as component 0; the bare-forward slope the partner.
+    est = fit_estimate(batches_used, medians, own_name=NAME, own_role="intercept", partner_name=PARTNER_NAME)
+    cfg = {"iters": iters, "repeat": repeat, "batches": batches_used, "fit_r2": res["r2"],
+           "fit_intercept_us": res["intercept_us"], "fit_slope_us_per_row": res["slope_us_per_row"],
+           "decomposition": res["decomposition"], "variant": "fully_device", "bench": "mlp_lowlatency"}
     with logged_run(NAME, quantity="dispatch_floor_cost", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["t_disp_us"], sample_size=iters)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2): the fully_device per-width medians. The headline dispatch floor is NOT
+        # logged as a sample — it lives in estimate.theta_hat[0] (the SSOT).
+        log(medians, sample_size=iters)
     return res
 
 

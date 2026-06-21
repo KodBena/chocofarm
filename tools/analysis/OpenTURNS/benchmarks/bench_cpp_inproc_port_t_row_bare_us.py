@@ -46,9 +46,15 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import fit_estimate, logged_run  # noqa: E402
 
 NAME = "cpp_inproc_port_t_row_bare_us"
+# The co-fit PARTNER: this bare-forward SLOPE and T_disp (the dispatch-floor INTERCEPT) are read off the
+# SAME `fully_device` fit (one fit, two read-offs — see WHAT run() MEASURES above). So the harmonized
+# Estimate this bench logs is that k=2 fit with the bare-forward SLOPE as component 0 (the marginal
+# manifest.value("cpp_inproc_port_t_row_bare_us") projects) and T_disp_us the partner carrying the −0.81
+# off-diagonal (§4.2). This fit is DISTINCT from the staged (iota/t_row) fit — they must NOT cross-pair.
+PARTNER_NAME = "T_disp_us"
 MODULE_PATH = "benchmarks.bench_cpp_inproc_port_t_row_bare_us"
 _DESC = ("BARE-forward per-row marginal cost (us/row) the C++ in-process queue-port feeds: the slope of the "
          "fully_device JAX forward (params+input staged device-resident, output on-device — no host pull, no "
@@ -95,8 +101,14 @@ def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int =
     if slope is None:  # ADR-0002: surface the shape rather than silently default
         raise RuntimeError(f"bench_cpp_inproc_port_t_row_bare: fits.fully_device.slope_us_per_row absent in "
                            f"bench output keys {list(out)} (fits keys {list(fits)})")
+    # The fully_device per-width medians (the design points behind the fit) — the inputs the harmonized k=2
+    # Estimate's covariance is computed from (§4.2/§5: the fit's lstsq discards them, so the bench recovers
+    # them here from bench()'s per_batch_us[variant] = {str(B): {median_us, iqr_us}}).
+    pb_fd = out.get("per_batch_us", {}).get("fully_device", {})
+    median_us = {int(B): float(pb_fd[str(B)]["median_us"]) for B in batches if str(B) in pb_fd}
     return {"slope_us_per_row": float(slope), "intercept_us": fd.get("intercept_us"),
-            "r2": fd.get("r2"), "decomposition": out.get("decomposition", {}), "batches": batches}
+            "r2": fd.get("r2"), "per_width_median_us": median_us, "batches": batches,
+            "decomposition": out.get("decomposition", {})}
 
 
 def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
@@ -105,14 +117,21 @@ def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30)
     and the decomposition in the run config. TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
     NEVER during the fan-out."""
     res = measure(batches=batches, iters=iters, repeat=repeat)
-    cfg = {"batches": res["batches"], "iters": iters, "repeat": repeat, "variant": "fully_device",
-           "fully_device_intercept_us": res["intercept_us"], "fit_r2": res["r2"],
-           "decomposition": res["decomposition"], "bench": "mlp_lowlatency",
+    batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
+    medians = [res["per_width_median_us"][B] for B in batches_used]
+    # The k=2 fit Estimate, the bare-forward slope as component 0; T_disp_us the partner with the
+    # off-diagonal. SAME fully_device fit T_disp logs, only the component order differs (§4.2).
+    est = fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
+    cfg = {"batches": batches_used, "iters": iters, "repeat": repeat, "variant": "fully_device",
+           "fully_device_intercept_us": res["intercept_us"], "fit_slope_us_per_row": res["slope_us_per_row"],
+           "fit_r2": res["r2"], "decomposition": res["decomposition"], "bench": "mlp_lowlatency",
            "note": "bare-forward slope (no run_microbatch concat, output device-resident); the inproc-port "
                    "t_row. T_disp is THIS fit's intercept (one fit, two read-offs)."}
     with logged_run(NAME, quantity="serve_per_row_cost_bare_forward", units="us/row", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["slope_us_per_row"], sample_size=len(res["batches"]))
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2): the fully_device per-width medians. The headline slope is NOT logged as a
+        # sample — it lives in estimate.theta_hat[0] (the SSOT).
+        log(medians, sample_size=iters)
     return res
 
 

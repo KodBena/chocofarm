@@ -32,9 +32,15 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import fit_estimate, logged_run  # noqa: E402
 
 NAME = "t_row_us"
+# The co-fit PARTNER: t_row (the slope) and iota (the intercept) are the SAME staged `time = intercept +
+# slope·rows` fit (bench_iota.measure delegates here). So the harmonized Estimate this bench logs is the
+# k=2 fit with t_row's SLOPE as component 0 (the marginal manifest.value("t_row_us") projects — 8 live
+# model consumers read this slope) and iota_us as the partner carrying the −0.81 off-diagonal (§4.2).
+PARTNER_NAME = "iota_us"
+WARMUP = 8   # harness warmup phase (bench_common.warm): burn cold-compile forwards before measuring
 MODULE_PATH = "benchmarks.bench_t_row"
 _DESC = ("SERVE per-row marginal forward cost (us/row): the slope of the staged run_microbatch JAX "
          "forward (time = iota + t_row*rows). Baseline, transport-invariant; the per-row term of the "
@@ -82,18 +88,26 @@ def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int =
 
 
 def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure t_row and LOG it to postgres (a fresh instance + the per-width readings + the fitted slope
-    sample). Returns the measurement dict. TIMING-SENSITIVE — operator-invoked, pinned, never during the
-    fan-out."""
+    """Measure t_row and LOG it to postgres as a harmonized k=2 fit `Estimate` (§6 Phase 3): the staged-fit
+    slope/intercept with their −0.81 off-diagonal, t_row's SLOPE as component 0. The per-width medians are
+    logged as raw-design-point PROVENANCE — the variance authority is now `estimate.cov` (the SE comes from
+    `resid_var` + the x-design), so the headline slope scalar is NO LONGER double-logged as a sample row
+    (the §5.2 de-dup obligation: that double-log corrupts `latest_aggregate`'s count + averages a slope
+    with seven 4-digit medians). Returns the measurement dict. TIMING-SENSITIVE — operator-invoked, pinned,
+    never during the fan-out."""
     res = measure(batches=batches, iters=iters, repeat=repeat)
-    cfg = {"batches": res["batches"], "iters": iters, "repeat": repeat,
-           "fit_intercept_us": res["intercept_us"], "fit_r2": res["r2"], "bench": "run_microbatch_staged"}
+    batches_used = res["batches"]
+    medians = [res["per_width_median_us"][B] for B in batches_used]
+    # The k=2 fit Estimate, t_row (the slope) as component 0; iota_us the partner with the off-diagonal.
+    est = fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
+    cfg = {"batches": batches_used, "iters": iters, "repeat": repeat,
+           "fit_slope_us_per_row": res["slope_us_per_row"], "fit_intercept_us": res["intercept_us"],
+           "fit_r2": res["r2"], "bench": "run_microbatch_staged"}
     with logged_run(NAME, quantity="serve_per_row_cost", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        # The slope is the model input; log it as the headline reading (sample_size = the fit's #widths),
-        # plus the per-width medians as supporting readings (sample_size = iters behind each median).
-        log(res["slope_us_per_row"], sample_size=len(res["batches"]))
-        log([res["per_width_median_us"][B] for B in res["batches"]], sample_size=iters)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2): the per-width medians (the raw design points), sample_size = iters behind
+        # each. The headline slope is NOT logged as a sample — it lives in estimate.theta_hat[0] (the SSOT).
+        log(medians, sample_size=iters)
     return res
 
 
