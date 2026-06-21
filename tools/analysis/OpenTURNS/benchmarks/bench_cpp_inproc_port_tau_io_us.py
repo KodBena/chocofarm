@@ -72,7 +72,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "cpp_inproc_port_tau_io_us"
 MODULE_PATH = "benchmarks.bench_cpp_inproc_port_tau_io_us"
@@ -181,19 +181,21 @@ def measure(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> dict
 
 
 def run(b_rows: int = 256, n_producers: int = 3, cycles: int = 5000) -> dict[str, Any]:
-    """Measure cpp_inproc_port tau_io and LOG it to postgres (per-cycle us readings + the gather-ELIDED headline
-    median; the gather-charged arm is logged as a config note + supporting readings). TIMING-SENSITIVE —
-    operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
+    """Measure cpp_inproc_port tau_io and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
+    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
+    NEVER during the fan-out."""
     res = measure(b_rows=b_rows, n_producers=n_producers, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)
     cfg = {"b_rows": res["b_rows"], "n_producers": res["n_producers"], "cycles": cycles,
            "transport": "cpp_inproc_port_direct_call", "gather": "elided_contiguous_arena",
            "tau_io_gather_charged_us_median": res["tau_io_gather_charged_us_median"],
+           "tau_io_us_median": res["tau_io_us_median"],
            "note": "headline = gather ELIDED (one address space -> contiguous staging arena; only the "
                    "host->device crossing of the B-row block remains); gather-charged arm = scattered writes "
                    "+ a same-process gather (pessimistic). No reply-memcpy (the reply is read device-resident)."}
     with logged_run(NAME, quantity="serve_transport_io_cost_cpp_inproc_port", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["tau_io_us_median"], sample_size=cycles)        # headline median (gather elided)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_cycle_us"], sample_size=1)                  # raw per-cycle readings
     return res
 

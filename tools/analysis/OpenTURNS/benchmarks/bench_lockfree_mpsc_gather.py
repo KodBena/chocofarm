@@ -47,7 +47,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "lockfree_mpsc_gather_us"
 MODULE_PATH = "benchmarks.bench_lockfree_mpsc_gather"
@@ -118,16 +118,18 @@ def measure(rows: int = 256, rows_per_node: int = 32, cycles: int = 5000) -> dic
 
 
 def run(rows: int = 256, rows_per_node: int = 32, cycles: int = 5000) -> dict[str, Any]:
-    """Measure the request-gather and LOG it. TIMING-SENSITIVE — operator-invoked, pinned, never during the
-    fan-out."""
+    """Measure the request-gather and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5, bootstrap
+    median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
     res = measure(rows=rows, rows_per_node=rows_per_node, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)
     cfg = {"rows": rows, "rows_per_node": rows_per_node, "cycles": cycles,
            "transport": "lockfree_mpsc_queue", "kind": "request_gather_scattered",
+           "gather_us_median": res["gather_us_median"],
            "note": "gather B scattered node rows -> contiguous; charged in the headline tau_io, "
                    "elided only by a scatter/gather-aware staging path"}
     with logged_run(NAME, quantity="serve_req_gather_lockfree_mpsc", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["gather_us_median"], sample_size=cycles)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_cycle_us"], sample_size=1)
     return res
 

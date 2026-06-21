@@ -28,7 +28,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, pin_estimate  # noqa: E402
 
 NAME = "n_gen"
 MODULE_PATH = "benchmarks.bench_n_gen"
@@ -55,12 +55,13 @@ def measure() -> dict[str, Any]:
 
 
 def run() -> dict[str, Any]:
-    """Record the pinned n_gen to postgres as a single sample, flagged as a config fact. Returns the dict.
+    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided. Returns the dict.
     (n_gen is a config fact — this records the deployment decision, not a timing measurement.)"""
     res = measure()
+    est = pin_estimate(get_seed().mean, get_seed().sigma, name=NAME, constant=True)
     cfg = {"kind": "config_fact", "pinning": res["pinning"], "note": res["note"]}
     with logged_run(NAME, quantity="generator_cores", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
         log(res["n_gen"], sample_size=None)
     return res
 

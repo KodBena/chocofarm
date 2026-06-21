@@ -39,7 +39,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "tau_io_us"
 MODULE_PATH = "benchmarks.bench_tau_io"
@@ -133,15 +133,23 @@ def _encode_reply(b: int) -> bytes:
 
 
 def run(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 2000) -> dict[str, Any]:
-    """Measure tau_io (ZMQ baseline) and LOG it to postgres (per-cycle us readings + the median headline).
+    """Measure tau_io (ZMQ baseline) and LOG it to postgres as a harmonized k=1 median `Estimate` (§6
+    Phase 3): `QuantileLaw(p=0.5)` with a BOOTSTRAP median SE over the per-cycle pool (§7.A — the
+    order-statistic variance, NOT s²/n), `family=EMPIRICAL`, `kind='median'`. The per-cycle readings are
+    logged as raw PROVENANCE — the variance authority is now `estimate.cov`, so the headline median
+    scalar is NO LONGER double-logged as a sample row (the §5.2 de-dup obligation: tau_io previously
+    wrote the median AND ~2000 readings into one instance, corrupting `latest_aggregate`'s count).
     TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
     res = measure(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)   # bootstrap median SE over the per-cycle pool
     cfg = {"n_msgs": res["n_msgs"], "rows_per_msg": res["rows_per_msg"],
-           "rows_per_forward": res["rows_per_forward"], "cycles": cycles, "transport": "zmq_inproc_router"}
+           "rows_per_forward": res["rows_per_forward"], "cycles": cycles, "transport": "zmq_inproc_router",
+           "tau_io_us_median": res["tau_io_us_median"]}
     with logged_run(NAME, quantity="serve_transport_io_cost", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["tau_io_us_median"], sample_size=cycles)       # headline median
-        log(res["per_cycle_us"], sample_size=1)                 # raw per-cycle readings
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2): the raw per-cycle readings. The headline median is NOT logged as a
+        # sample — it lives in estimate.theta_hat[0] (the SSOT), the median SE in estimate.cov.
+        log(res["per_cycle_us"], sample_size=1)
     return res
 
 

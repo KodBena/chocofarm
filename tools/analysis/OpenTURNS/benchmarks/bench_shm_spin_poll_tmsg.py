@@ -31,7 +31,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, pin_estimate  # noqa: E402
 
 NAME = "shm_spin_poll_tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_shm_spin_poll_tmsg"
@@ -90,13 +90,15 @@ def measure(iters: int = 200000) -> dict[str, Any]:
 
 
 def run(iters: int = 200000) -> dict[str, Any]:
-    """Measure shm_spin_poll_tmsg_us_leaf and LOG it. TIMING-SENSITIVE — operator-invoked, pinned, never
+    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided, alongside the live measurement. TIMING-SENSITIVE — operator-invoked, pinned, never
     during the fan-out."""
     res = measure(iters=iters)
+    _sm, _ss, _ = get_seed()
+    est = pin_estimate(_sm, _ss, name=NAME)
     cfg = {"iters": iters, "transport": "shm_ring_spin_poll", "codec": "bare_ring_memcpy",
            "note": "in-ring memcpy of one request row in + one reply row out; no envelope, no syscall"}
     with logged_run(NAME, quantity="transport_msg_cost_per_leaf_shm_spin_poll", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
         log(res["tmsg_us_leaf"], sample_size=iters)
     return res
 

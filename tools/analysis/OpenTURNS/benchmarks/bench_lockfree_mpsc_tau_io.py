@@ -71,7 +71,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "lockfree_mpsc_tau_io_us"
 MODULE_PATH = "benchmarks.bench_lockfree_mpsc_tau_io"
@@ -200,19 +200,21 @@ def measure(n_nodes: int = 8, rows_per_node: int = 32, cycles: int = 5000) -> di
 
 
 def run(n_nodes: int = 8, rows_per_node: int = 32, cycles: int = 5000) -> dict[str, Any]:
-    """Measure lockfree_mpsc tau_io and LOG it to postgres (per-cycle us readings + the gather-charged
-    headline median; the gather-elided arm is logged as a config note + supporting readings).
+    """Measure lockfree_mpsc tau_io and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5, bootstrap
+    median SE, §6 Phase 3, §5.2 de-dup); the gather-elided arm is logged as a config note + supporting readings.
     TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
     res = measure(n_nodes=n_nodes, rows_per_node=rows_per_node, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)
     cfg = {"n_nodes": res["n_nodes"], "rows_per_node": res["rows_per_node"],
            "rows_per_forward": res["rows_per_forward"], "cycles": cycles,
            "transport": "lockfree_mpsc_queue", "gather": "charged_contiguous_materialize",
+           "tau_io_us_median": res["tau_io_us_median"],
            "tau_io_gather_elided_us_median": res["tau_io_gather_elided_us_median"],
            "note": "headline = gather CHARGED (intrinsic to coalescing; scattered nodes); "
                    "gather-elided arm = staging accepts a scatter/gather iovec list (optimistic)"}
     with logged_run(NAME, quantity="serve_transport_io_cost_lockfree_mpsc", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["tau_io_us_median"], sample_size=cycles)        # headline median (gather charged)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_cycle_us"], sample_size=1)                  # raw per-cycle readings
     return res
 

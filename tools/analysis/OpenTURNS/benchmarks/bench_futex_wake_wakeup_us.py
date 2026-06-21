@@ -69,7 +69,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "futex_wake_wakeup_us"
 MODULE_PATH = "benchmarks.bench_futex_wake_wakeup_us"
@@ -193,17 +193,20 @@ def measure(trials: int = 20000) -> dict[str, Any]:
 
 
 def run(trials: int = 20000) -> dict[str, Any]:
-    """Measure the futex-wake edge handoff and LOG it (the median headline + the raw per-trial readings).
-    TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0,1, two cores), NEVER during the fan-out."""
+    """Measure the futex-wake edge handoff and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
+    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0,1,
+    two cores), NEVER during the fan-out."""
     res = measure(trials=trials)
+    est = median_estimate(res["per_trial_us"], name=NAME)
     cfg = {"trials": res["trials"], "transport": "shm_ring_futex_wake", "kind": "wakeup_latency",
            "mechanism": "bare_kernel_FUTEX_WAKE_one_waiter + scheduler_context_switch",
            "regime": "per_edge_handoff",
+           "wakeup_us_median": res["wakeup_us_median"],
            "note": "one-waiter futex wake on the ring empty->nonempty edge; no burnt core (serve sleeps); "
                    "charged per-forward in the pessimistic bound arm, amortized by the edge fraction at saturation"}
     with logged_run(NAME, quantity="transport_wakeup_latency_futex_wake", units=_SEED_UNIT, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["wakeup_us_median"], sample_size=res["trials"])    # headline median
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_trial_us"], sample_size=1)                     # raw per-trial readings
     return res
 

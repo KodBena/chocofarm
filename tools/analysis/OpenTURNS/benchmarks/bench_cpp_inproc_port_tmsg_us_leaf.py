@@ -38,7 +38,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "cpp_inproc_port_tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_cpp_inproc_port_tmsg_us_leaf"
@@ -100,14 +100,17 @@ def measure(leaves: int = 200000) -> dict[str, Any]:
 
 
 def run(leaves: int = 200000) -> dict[str, Any]:
-    """Measure the per-leaf inproc enqueue and LOG it to postgres (per-window per-leaf us + the median
-    headline). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
+    """Measure the per-leaf inproc enqueue and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
+    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
+    NEVER during the fan-out."""
     res = measure(leaves=leaves)
+    est = median_estimate(res["per_leaf_us"], name=NAME)
     cfg = {"leaves": res["leaves"], "transport": "cpp_inproc_port_direct_call",
+           "tmsg_us_leaf_median": res["tmsg_us_leaf_median"],
            "note": "per-leaf enqueue handoff (arena row write + ready-queue slot-index push); NON-BINDING"}
     with logged_run(NAME, quantity="transport_msg_cost_per_leaf_cpp_inproc_port", units="us/leaf",
-                    description=_DESC, module_path=MODULE_PATH, config=cfg) as log:
-        log(res["tmsg_us_leaf_median"], sample_size=leaves)
+                    description=_DESC, module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_leaf_us"], sample_size=1)
     return res
 

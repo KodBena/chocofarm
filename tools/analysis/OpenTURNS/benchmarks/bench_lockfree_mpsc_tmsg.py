@@ -39,7 +39,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, pin_estimate  # noqa: E402
 
 NAME = "lockfree_mpsc_tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_lockfree_mpsc_tmsg"
@@ -107,13 +107,15 @@ def measure(iters: int = 200000) -> dict[str, Any]:
 
 
 def run(iters: int = 200000) -> dict[str, Any]:
-    """Measure lockfree_mpsc_tmsg_us_leaf and LOG it. TIMING-SENSITIVE — operator-invoked, pinned, never
+    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided, alongside the live measurement. TIMING-SENSITIVE — operator-invoked, pinned, never
     during the fan-out."""
     res = measure(iters=iters)
+    _sm, _ss, _ = get_seed()
+    est = pin_estimate(_sm, _ss, name=NAME)
     cfg = {"iters": iters, "transport": "lockfree_mpsc_queue", "codec": "cas_enqueue_slot_write",
            "note": "tail-CAS enqueue + slot write of one request row + reply-slot read; no envelope, no syscall"}
     with logged_run(NAME, quantity="transport_msg_cost_per_leaf_lockfree_mpsc", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
         log(res["tmsg_us_leaf"], sample_size=iters)
     return res
 

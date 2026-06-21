@@ -39,7 +39,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, pin_estimate  # noqa: E402
 
 NAME = "zmq_baseline_tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_zmq_baseline_tmsg_us_leaf"
@@ -90,13 +90,13 @@ def measure(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
 
 
 def run(s_leaves: int = 256, iters: int = 5000) -> dict[str, Any]:
-    """Measure the ZMQ-baseline tmsg_us_leaf and LOG it (the per-leaf headline + the encode/decode
-    components). TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
+    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided, alongside the live measurement. TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
     res = measure(s_leaves=s_leaves, iters=iters)
+    est = pin_estimate(get_seed().mean, get_seed().sigma, name=NAME)
     cfg = {"s_leaves": s_leaves, "iters": iters, "encode_us": res["encode_us"],
            "decode_us": res["decode_us"], "codec": "inference_wire_memcpy", "transport": "zmq_baseline"}
     with logged_run(NAME, quantity="transport_msg_cost_per_leaf", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
         log(res["tmsg_us_leaf"], sample_size=iters)
     return res
 

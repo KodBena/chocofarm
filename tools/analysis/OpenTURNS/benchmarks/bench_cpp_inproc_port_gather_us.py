@@ -43,7 +43,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "cpp_inproc_port_gather_us"
 MODULE_PATH = "benchmarks.bench_cpp_inproc_port_gather_us"
@@ -101,15 +101,18 @@ def measure(b_rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
 
 
 def run(b_rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
-    """Measure the arena gather and LOG it to postgres (per-cycle us + the median headline). TIMING-SENSITIVE —
-    operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
+    """Measure the arena gather and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5, bootstrap
+    median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER
+    during the fan-out."""
     res = measure(b_rows=b_rows, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)
     cfg = {"b_rows": res["b_rows"], "cycles": cycles, "transport": "cpp_inproc_port_direct_call",
            "kind": "arena_gather_contrast",
-           "note": "the gather the contiguous-arena headline ELIDES; the swing term of tau_io's two arms"}
+           "note": "the gather the contiguous-arena headline ELIDES; the swing term of tau_io's two arms",
+           "gather_us_median": res["gather_us_median"]}
     with logged_run(NAME, quantity="serve_arena_gather_cost_cpp_inproc_port", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["gather_us_median"], sample_size=cycles)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_cycle_us"], sample_size=1)
     return res
 

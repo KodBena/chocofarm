@@ -33,7 +33,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, pin_estimate  # noqa: E402
 
 NAME = "LPD"
 MODULE_PATH = "benchmarks.bench_lpd"
@@ -62,14 +62,14 @@ def measure() -> dict[str, Any]:
 
 
 def run() -> dict[str, Any]:
-    """Record the current LPD estimate to postgres as a single sample (the design pin), flagged in config
-    as a PIN awaiting the per-decision histogram. Returns the estimate dict. (Recording a pin is not
+    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided. Returns the estimate dict. (Recording a pin is not
     timing-sensitive; the real histogram measurement is the outstanding sole-workload run.)"""
     res = measure()
+    est = pin_estimate(get_seed().mean, get_seed().sigma, name=NAME)
     cfg = {"kind": "design_pin", "needs_measurement": "per-decision leaf-count histogram (instrumented search run)",
            "note": res["note"]}
     with logged_run(NAME, quantity="leaves_per_decision", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
         log(res["lpd"], sample_size=None)   # a single recorded reading (NULL sample_size — not an aggregate)
     return res
 

@@ -45,7 +45,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "shm_spin_poll_wakeup_us"
 MODULE_PATH = "benchmarks.bench_shm_spin_poll_wakeup"
@@ -120,14 +120,17 @@ def measure(trials: int = 20000) -> dict[str, Any]:
 
 
 def run(trials: int = 20000) -> dict[str, Any]:
-    """Measure the spin-poll wakeup latency and LOG it. TIMING-SENSITIVE — operator-invoked, pinned
-    (taskset -c 0,1, two cores), never during the fan-out."""
+    """Measure the spin-poll wakeup latency and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
+    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0,1,
+    two cores), never during the fan-out."""
     res = measure(trials=trials)
+    est = median_estimate(res["per_trial_us"], name=NAME)
     cfg = {"trials": res["trials"], "transport": "shm_ring_spin_poll", "kind": "wakeup_latency",
+           "wakeup_us_median": res["wakeup_us_median"],
            "note": "cross-core cache-line coherence floor; no syscall, no context switch (dedicated poll core)"}
     with logged_run(NAME, quantity="wakeup_latency_shm_spin_poll", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["wakeup_us_median"], sample_size=res["trials"])
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_trial_us"], sample_size=1)
     return res
 

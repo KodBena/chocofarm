@@ -61,7 +61,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "shm_spin_poll_tau_io_us"
 MODULE_PATH = "benchmarks.bench_shm_spin_poll_tau_io"
@@ -203,18 +203,20 @@ def ctr_to_rows(c: int, rows_per_msg: int, cap: int) -> int:
 
 
 def run(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> dict[str, Any]:
-    """Measure shm_spin_poll tau_io and LOG it to postgres (per-cycle us readings + the zero-copy headline
-    median; the copy-both arm is logged as a config note + supporting readings). TIMING-SENSITIVE —
-    operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
+    """Measure shm_spin_poll tau_io and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
+    bootstrap median SE, §6 Phase 3, §5.2 de-dup); the copy-both arm is logged as a config note + supporting
+    readings. TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
     res = measure(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)
     cfg = {"n_msgs": res["n_msgs"], "rows_per_msg": res["rows_per_msg"],
            "rows_per_forward": res["rows_per_forward"], "cycles": cycles,
            "transport": "shm_ring_spin_poll", "request_drain": "zero_copy_view",
+           "tau_io_us_median": res["tau_io_us_median"],
            "tau_io_copyboth_us_median": res["tau_io_copyboth_us_median"],
            "note": "headline = zero-copy request drain (design intent); copy-both arm charges the req memcpy"}
     with logged_run(NAME, quantity="serve_transport_io_cost_shm_spin_poll", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["tau_io_us_median"], sample_size=cycles)        # headline median (zero-copy drain)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_cycle_us"], sample_size=1)                  # raw per-cycle readings
     return res
 

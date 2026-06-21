@@ -32,7 +32,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, pin_estimate  # noqa: E402
 
 NAME = "B_op"
 MODULE_PATH = "benchmarks.bench_b_op"
@@ -61,14 +61,14 @@ def measure() -> dict[str, Any]:
 
 
 def run() -> dict[str, Any]:
-    """Record the current B_op estimate to postgres as a single sample, flagged as awaiting the saturated
-    rows/forward histogram. Returns the estimate dict."""
+    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided. Returns the estimate dict."""
     res = measure()
+    est = pin_estimate(get_seed().mean, get_seed().sigma, name=NAME)
     cfg = {"kind": "operating_point",
            "needs_measurement": "saturated end-to-end rows/forward histogram (server batch-size counter)",
            "note": res["note"]}
     with logged_run(NAME, quantity="serve_full_bucket_rows", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
         log(res["b_op_rows"], sample_size=None)
     return res
 

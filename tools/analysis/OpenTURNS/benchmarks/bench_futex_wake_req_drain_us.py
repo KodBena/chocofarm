@@ -42,7 +42,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "futex_wake_req_drain_us"
 MODULE_PATH = "benchmarks.bench_futex_wake_req_drain_us"
@@ -100,15 +100,18 @@ def measure(rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
 
 
 def run(rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
-    """Measure the request-drain copy and LOG it. TIMING-SENSITIVE — operator-invoked, pinned, never during
+    """Measure the request-drain copy and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
+    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never during
     the fan-out."""
     res = measure(rows=rows, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)
     cfg = {"rows": rows, "cycles": cycles, "transport": "shm_ring_futex_wake",
            "kind": "request_drain_copy_fallback",
+           "req_drain_us_median": res["req_drain_us_median"],
            "note": "the cost the zero-copy ring-span drain avoids; charged only in the copy-both arm"}
     with logged_run(NAME, quantity="serve_req_drain_copy_futex_wake", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["req_drain_us_median"], sample_size=cycles)
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_cycle_us"], sample_size=1)
     return res
 

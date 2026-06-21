@@ -49,7 +49,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "zmq_baseline_wakeup_us"
 MODULE_PATH = "benchmarks.bench_zmq_baseline_wakeup_us"
@@ -134,16 +134,18 @@ def measure(cycles: int = 20000) -> dict[str, Any]:
 
 
 def run(cycles: int = 20000) -> dict[str, Any]:
-    """Measure the ZMQ-baseline wakeup and LOG it (the ready-poll median headline + the raw readings; the
-    blocking-poll tail in the config for provenance). TIMING-SENSITIVE — operator-invoked, pinned, never
+    """Measure the ZMQ-baseline wakeup and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
+    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never
     during the fan-out."""
     res = measure(cycles=cycles)
+    est = median_estimate(res["ready_poll_us"], name=NAME)
     cfg = {"cycles": res["cycles"], "transport": "zmq_baseline_router_dealer_inproc",
            "mechanism": "poll(2)+libzmq_signaler_readiness", "regime": "saturation_ready_poll",
-           "blocking_poll_us_median": res["blocking_poll_us_median"]}
+           "blocking_poll_us_median": res["blocking_poll_us_median"],
+           "wakeup_us_median": res["wakeup_us_median"]}
     with logged_run(NAME, quantity="transport_wakeup_latency", units=_SEED_UNIT, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["wakeup_us_median"], sample_size=res["cycles"])    # headline ready-poll median
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["ready_poll_us"], sample_size=1)                    # raw per-cycle readings
     return res
 

@@ -54,7 +54,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run  # noqa: E402
+from bench_common import logged_run, median_estimate  # noqa: E402
 
 NAME = "zmq_baseline_tau_io_us"
 MODULE_PATH = "benchmarks.bench_zmq_baseline_tau_io_us"
@@ -153,15 +153,18 @@ def _encode_reply(b: int) -> bytes:
 
 
 def run(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 2000) -> dict[str, Any]:
-    """Measure the ZMQ-baseline tau_io and LOG it to postgres (per-cycle us readings + the median headline).
-    TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
+    """Measure the ZMQ-baseline tau_io and LOG it to postgres as a harmonized k=1 median Estimate (QuantileLaw
+    p=0.5, bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never
+    during the fan-out."""
     res = measure(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)
+    est = median_estimate(res["per_cycle_us"], name=NAME)
     cfg = {"n_msgs": res["n_msgs"], "rows_per_msg": res["rows_per_msg"],
            "rows_per_forward": res["rows_per_forward"], "cycles": cycles,
-           "transport": "zmq_baseline_router_dealer_inproc", "mechanism": "poll+recv_multipart(NOBLOCK)+send_multipart"}
+           "transport": "zmq_baseline_router_dealer_inproc", "mechanism": "poll+recv_multipart(NOBLOCK)+send_multipart",
+           "tau_io_us_median": res["tau_io_us_median"]}
     with logged_run(NAME, quantity="serve_transport_io_cost", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg) as log:
-        log(res["tau_io_us_median"], sample_size=cycles)       # headline median
+                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
+        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
         log(res["per_cycle_us"], sample_size=1)                 # raw per-cycle readings
     return res
 
