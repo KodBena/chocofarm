@@ -58,7 +58,7 @@ def get_seed() -> "G.Grounded":
     # cycle-time model's sigma/cost for this term (model_cycletime._T_DISP).
     return G.Grounded(name="T_disp", mean=G.DISPATCH_FLOOR_US, sigma=2.0, cost=1.0, unit="us",
                       provenance="mlp_lowlatency/results.json decomposition.dispatch_floor_us (68.84, R2~0.997)",
-                      needs_measurement=False)
+                      estimability=G.Estimability.MEASURED, module="bench_t_disp")
 
 
 def register_self() -> Any:

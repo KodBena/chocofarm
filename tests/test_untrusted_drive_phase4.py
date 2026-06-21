@@ -101,6 +101,40 @@ def _all_bench_modules() -> list:
     return mods
 
 
+# The bench-body SHRINK-LAW classifier, single-homed (ADR-0012 P1) so the class-level guards below — the
+# shrinkable=>sizable guard AND the Grounded-estimability agreement guard — read a bench's pin-vs-shrinkable
+# from ONE place, not two copies of the same AST walk. A bench's shrink law is which bench_common builder its
+# `_estimate_from_raw` calls: `pin_estimate` -> Fixed; `median_estimate` -> QuantileLaw; `fit_estimate` ->
+# RegressionLaw.
+_ESTIMATOR_BUILDERS = ("pin_estimate", "median_estimate", "fit_estimate")
+_SHRINKABLE_BUILDERS = frozenset({"median_estimate", "fit_estimate"})   # the non-pin builders (vs pin -> Fixed)
+
+
+def _bench_estimator_builders(mod) -> set:
+    """The bench_common estimator builder(s) `mod._estimate_from_raw` calls — the run-free AST classifier of a
+    bench's shrink law (no live timed run / postgres / C++ binary). Returns the called subset of
+    `_ESTIMATOR_BUILDERS`; a bench calling none is a loud failure (ADR-0002: classify it, never silently
+    mis-rank). `result & _SHRINKABLE_BUILDERS` is truthy iff the bench is shrinkable (non-Fixed)."""
+    import ast
+    import inspect
+    import textwrap
+    efr = getattr(mod, "_estimate_from_raw", None)
+    assert efr is not None, (
+        f"{mod.__name__}: no _estimate_from_raw — measure() = _estimate_from_raw(_measure_raw()) is the "
+        f"Phase-4 contract; its shrink law cannot be classified")
+    called = {
+        (n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
+        for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(efr))))
+        if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))
+    }
+    known = called & set(_ESTIMATOR_BUILDERS)
+    assert known, (
+        f"{mod.__name__}._estimate_from_raw calls no known bench_common estimator builder (expected one of "
+        f"{_ESTIMATOR_BUILDERS}) — classify it; ADR-0002: fail loud, never silently mis-rank a bench's "
+        f"shrinkability")
+    return known
+
+
 def test_every_bench_measure_returns_an_estimate_annotation() -> None:
     """§6 Phase-4 deliverable 1: EVERY bench exposes `measure`, `_measure_raw`, `_estimate_from_raw`, and
     `measure()` is annotated to return an `Estimate` (the typed contract the driver consumes). The
@@ -258,41 +292,23 @@ def test_every_shrinkable_bench_is_sizable_by_the_driver() -> None:
     bench exists" signal). Classified by AST of the bench body (the single-homed estimator builder it
     calls) so NO live timed run / postgres / C++ binary is needed; a bench calling no known builder
     fails LOUD (ADR-0002) rather than being silently mis-ranked."""
-    import ast
     import inspect
-    import textwrap
     import bench_common as BC
-    SHRINKABLE_BUILDERS = {"median_estimate", "fit_estimate"}   # -> QuantileLaw / RegressionLaw
-    KNOWN = SHRINKABLE_BUILDERS | {"pin_estimate"}              # pin_estimate -> Fixed (un-shrinkable)
     n_shrinkable = 0
     for mod in _all_bench_modules():
-        efr = getattr(mod, "_estimate_from_raw", None)
-        assert efr is not None, (
-            f"{mod.__name__}: no _estimate_from_raw — measure() = _estimate_from_raw(_measure_raw()) is "
-            f"the Phase-4 contract; its shrink law cannot be classified")
-        called = {
-            (n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
-            for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(efr))))
-            if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))
-        }
-        known = called & KNOWN
-        assert known, (
-            f"{mod.__name__}._estimate_from_raw calls no known bench_common estimator builder (expected "
-            f"one of {sorted(KNOWN)}) — classify it; ADR-0002: fail loud, never silently mis-rank a "
-            f"bench's shrinkability")
-        if not (known & SHRINKABLE_BUILDERS):
+        if not (_bench_estimator_builders(mod) & _SHRINKABLE_BUILDERS):
             continue   # pin_estimate only -> Fixed -> the honest-pin exemption (B_op, n_gen)
         n_shrinkable += 1
         params = inspect.signature(mod.measure).parameters
         kw = next((k for k in BC.SIZING_KWARGS if k in params), None)
         assert kw is not None, (
-            f"{mod.__name__} is SHRINKABLE ({sorted(known)}) but measure({list(params)}) exposes no "
-            f"recognized sizing kwarg — the driver shows budget-kw None and cannot size it. Name the knob "
-            f"a `bench_common.SIZING_KWARGS` member (the budget-kw bug, now caught over the class).")
+            f"{mod.__name__} is SHRINKABLE but measure({list(params)}) exposes no recognized sizing kwarg — "
+            f"the driver shows budget-kw None and cannot size it. Name the knob a `bench_common.SIZING_KWARGS` "
+            f"member (the budget-kw bug, now caught over the class).")
     assert n_shrinkable >= 10, (
-        f"discovery reached only {n_shrinkable} shrinkable benches (expected >=10: the tmsg family + the "
-        f"median tau_io/wakeup/gather/drain benches + the fits) — a vacuous pass means the glob or the AST "
-        f"classifier regressed (every bench mis-read as a pin)")
+        f"discovery reached only {n_shrinkable} shrinkable benches (expected >=10: the tmsg family + the median "
+        f"tau_io/wakeup/gather/drain benches + the fits) — a vacuous pass means the glob or the AST classifier "
+        f"regressed (every bench mis-read as a pin)")
 
 
 def test_every_race_based_collector_bench_uses_the_pool_floor() -> None:
@@ -331,6 +347,45 @@ def test_every_race_based_collector_bench_uses_the_pool_floor() -> None:
         f"expected at least the 4 known race-based wakeup collectors (shm_spin_poll, futex_wake, "
         f"lockfree_mpsc, cpp_inproc_port); discovery found {n_race} — the glob or the Thread predicate "
         f"regressed (a vacuous pass)")
+
+
+def test_grounded_estimability_agrees_with_the_bench_body() -> None:
+    """INVARIANT 2 — RCA fix #1's class guard (docs/notes/leaf-eval-estimator-pin-cascade-rca.md): each
+    Grounded's declared `estimability` — the SINGLE-HOME measured-vs-pinned axis — must AGREE with its bench's
+    body. MEASURED <=> a shrinkable builder (median_estimate/fit_estimate); CONSTANT or PRIOR <=> pin_estimate.
+    This is the structural net for the P8 lying-signature: the measured-but-punted defect (declare a quantity
+    measurable, then pin its body — the R_gen/g_core/LPD/tmsg cascade) fails HERE, at authoring, not at a
+    stalled drive. The RCA's "a runnable bench exists" discriminator IS the MEASURED-vs-PRIOR split: B_op is
+    PRIOR (an engineering-judgement prior, no runnable bench yet), so its Fixed body is CORRECT and not flagged
+    — which is precisely why the over-firing "needs_measurement + Fixed => loud" guard is NOT used. Discovery
+    over every Grounded (no hand-list); the body is classified run-free by the shared `_bench_estimator_builders`.
+
+    RED UNTIL FIX #1 (TDD: this guard SPECIFIES the contract): fix #1 adds `leaf_eval_grounding.Estimability`
+    (CONSTANT/MEASURED/PRIOR) as the single home, each Grounded carrying `estimability` + `module` (the bench
+    module it owns), with `constant`/`needs_measurement` DERIVED from `estimability` (so the punt cannot be
+    authored — there is no second flag to disagree)."""
+    import importlib
+    import leaf_eval_grounding as G
+    assert hasattr(G, "Estimability"), (
+        "fix #1 NOT YET IMPLEMENTED: leaf_eval_grounding must expose the single-home `Estimability` axis "
+        "(CONSTANT/MEASURED/PRIOR) and each Grounded must carry `estimability` + `module` (the bench module it "
+        "owns) — this guard then enforces MEASURED <=> shrinkable body, CONSTANT|PRIOR <=> pin.")
+    grounded = [v for v in vars(G).values() if isinstance(v, G.Grounded)]
+    assert len(grounded) >= 8, (
+        f"expected the leaf-eval Grounded quantities (iota/slope/tau_io/LPD/g_core/R_gen/n_gen/B_op/tmsg); "
+        f"discovered {len(grounded)} — the vars(G) discovery scan regressed")
+    for g in grounded:
+        builders = _bench_estimator_builders(importlib.import_module(g.module))
+        shrinkable = bool(builders & _SHRINKABLE_BUILDERS)
+        if g.estimability is G.Estimability.MEASURED:
+            assert shrinkable, (
+                f"{g.name}: declared MEASURED (a runnable bench exists) but its body PINS ({sorted(builders)}) "
+                f"— the measured-but-punted P8 lie (the R_gen/g_core/LPD/tmsg shape). Build a shrinkable "
+                f"Estimate in _estimate_from_raw, or re-declare estimability=PRIOR (no runnable bench yet).")
+        else:
+            assert not shrinkable, (
+                f"{g.name}: declared {g.estimability.name} (a pin) but its body is SHRINKABLE "
+                f"({sorted(builders)}) — mis-declared; a runnable shrinkable bench is estimability=MEASURED.")
 
 
 def test_make_measurer_returns_estimate_and_rejects_non_estimate(monkeypatch) -> None:

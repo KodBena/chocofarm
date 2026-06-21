@@ -112,17 +112,21 @@ def throughput_numpy(x: dict[str, float]) -> float:
 _T_DISP = G.Grounded(
     name="T_disp", mean=G.DISPATCH_FLOOR_US, sigma=2.0, cost=1.0, unit="us",
     provenance="mlp_lowlatency/results.json decomposition.dispatch_floor_us (68.84, R2~0.997)",
+    # MEASURED (RCA fix #1): bench_t_disp runs a live RegressionLaw fit (a shrinkable body), so the
+    # single-home estimability axis classifies it MEASURED — closing the same path-dependent split the
+    # _T_ROW note below already hand-patched for t_row (it had been left at the defaulted, un-measured pin).
+    estimability=G.Estimability.MEASURED, module="bench_t_disp",
 )
-# t_row IS the staged-fit slope (G.SERVE_SLOPE_US): its mean AND its needs_measurement DERIVE
-# from that one SSOT (P1 single-home / ADR-0008), so the slope classifies IDENTICALLY here and on
-# model_capacity (which reads G.SERVE_SLOPE_US directly). Re-homing it as a fresh Grounded with a
-# defaulted needs_measurement=False would re-open the path-dependent split the iota/slope fix closes
-# — the slope is a runnable RegressionLaw fit (bench_t_row), so it is NEEDS-SOLE-WORKLOAD on every
-# path. (sigma/cost stay this model's own engineering-judgement seed-path spread for the cycle term.)
+# t_row IS the staged-fit slope (G.SERVE_SLOPE_US): its mean AND its estimability (hence the derived
+# needs_measurement) DERIVE from that one SSOT (P1 single-home / ADR-0008; RCA fix #1), so the slope
+# classifies IDENTICALLY here and on model_capacity (which reads G.SERVE_SLOPE_US directly). Re-homing it
+# as a fresh Grounded with a wrong estimability would re-open the path-dependent split the iota/slope fix
+# closes — the slope is a runnable RegressionLaw fit (bench_t_row), so it is MEASURED on every path.
+# (sigma/cost stay this model's own engineering-judgement seed-path spread for the cycle term.)
 _T_ROW = G.Grounded(
     name="t_row", mean=G.SERVE_SLOPE_US.mean, sigma=0.15, cost=1.0, unit="us/row",
     provenance="run_microbatch_staging/results_nopad.json fits.staged.slope_us_per_row (4.316)",
-    needs_measurement=G.SERVE_SLOPE_US.needs_measurement,
+    estimability=G.SERVE_SLOPE_US.estimability, module="bench_t_row",
 )
 _INPUTS: list[G.Grounded] = [
     G.N_GEN_CORES,            # N_gen

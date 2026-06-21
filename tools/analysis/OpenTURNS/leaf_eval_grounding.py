@@ -16,32 +16,59 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
+
+
+class Estimability(enum.Enum):
+    """The single-home (ADR-0012 P1) measured-vs-pinned axis of a grounded quantity — RCA fix #1
+    (docs/notes/leaf-eval-estimator-pin-cascade-rca.md). It is GENERATIVE: both the model flags
+    (`Grounded.constant`/`needs_measurement` DERIVE from it) and the bench's pin-vs-shrinkable body answer
+    to this ONE axis, so the measured-but-punted P8 lie — a quantity labelled measurable whose bench pins —
+    cannot be authored (there is no second flag to disagree). The estimability-agreement guard in
+    `tests/test_untrusted_drive_phase4.py` enforces body <=> this axis."""
+    CONSTANT = "constant"   # a TRUE deployment/layout constant (n_gen=3 cores) -> DEGENERATE Fixed pin, a_i~0
+    MEASURED = "measured"   # a RUNNABLE bench measures it live -> a SHRINKABLE Estimate (median / regression fit)
+    PRIOR = "prior"         # an engineering-judgement prior, NO runnable bench yet (B_op) -> NORMAL Fixed pin
 
 
 @dataclass(frozen=True)
 class Grounded:
-    """One grounded quantity: a mean, a 1-sigma spread, a relative per-sample benchmark
-    cost, and whether it still needs a fresh SOLE-WORKLOAD measurement (the Neyman loop
-    ranks these). `provenance` is the file the number was read from.
+    """One grounded quantity: a mean, a 1-sigma spread, a relative per-sample benchmark cost, its
+    `estimability` (the measured-vs-pinned axis), and the `module` of the bench that owns its live
+    measurement. `provenance` is the file the number was read from.
 
-    `constant` marks a TRUE CONSTANT — a deployment/layout fact (e.g. `n_gen` = 3 generator
-    cores, set by the 1:3 pinning), NOT a quantity with CI-bearing uncertainty. This is the
-    SSOT of the DEGENERATE-vs-declared-spread classification (the harmonized-estimator-interface
-    §3 PIN-true-constant vs PIN-declared-spread distinction; ADR-0012 P1 single-home): the bench's
-    `pin_estimate(constant=…)` and the manifest's seed Estimate (`family=DEGENERATE` vs `NORMAL`)
-    both DERIVE from this one flag, so a true constant cannot leak its frozen-display σ into the
-    bound on one path while dropping out on another. A `constant` quantity's `sigma` is a display/
-    seed artifact (a placeholder on an integer/fixed value), not a real spread — the bound treats
-    it as ~0 (the §3 'a_i ≈ 0, ~0 bound contribution' rule). Default False (a measured quantity)."""
+    `estimability` (`Estimability`, ADR-0012 P1 single-home; RCA fix #1) is the SSOT of the
+    DEGENERATE-vs-declared-spread-vs-measured classification (the harmonized-estimator-interface §3 PIN
+    distinction). The two former flags now DERIVE from it (properties below), so they cannot disagree with
+    the bench body: `constant` (a TRUE CONSTANT — a deployment/layout fact like `n_gen`=3 cores, set by the
+    1:3 pinning, NOT CI-bearing) iff `CONSTANT`; `needs_measurement` (still needs a fresh SOLE-WORKLOAD run,
+    the Neyman loop ranks these) iff NOT `CONSTANT`. The bench's `pin_estimate(constant=…)` and the
+    manifest's seed Estimate (`family=DEGENERATE` vs `NORMAL`) read `constant`, so a true constant cannot
+    leak its frozen-display σ into the bound on one path while dropping out on another. A `CONSTANT`
+    quantity's `sigma` is a display/seed artifact (a placeholder on an integer/fixed value), not a real
+    spread — the bound treats it as ~0 (the §3 'a_i ≈ 0' rule)."""
     name: str
     mean: float
     sigma: float
     cost: float
     unit: str
     provenance: str
-    needs_measurement: bool = False
-    constant: bool = False
+    estimability: Estimability
+    module: str
+
+    @property
+    def constant(self) -> bool:
+        """A TRUE CONSTANT (DEGENERATE pin, ~0 bound contribution) iff `estimability is CONSTANT` — DERIVED
+        from the single axis (P1), never an independent flag that could disagree with the bench body."""
+        return self.estimability is Estimability.CONSTANT
+
+    @property
+    def needs_measurement(self) -> bool:
+        """Needs a fresh SOLE-WORKLOAD measurement iff NOT a true constant — DERIVED from the single axis
+        (both MEASURED and PRIOR would benefit; only MEASURED has a runnable bench today). The static models
+        (model_capacity/model_cycletime) read this; it now single-homes off `estimability`."""
+        return self.estimability is not Estimability.CONSTANT
 
 
 # --- Server forward affine fit (the ONE measured serve cost model) -------------------
@@ -78,13 +105,13 @@ SERVE_INTERCEPT_US = Grounded(
     name="iota_us", mean=94.58, sigma=12.0, cost=6.0, unit="us",
     provenance="run_microbatch_staging/results_nopad.json fits.staged.intercept_us "
                "(v1 seed; MEASURED live by bench_iota as the k=2 staged-fit intercept)",
-    needs_measurement=True,
+    estimability=Estimability.MEASURED, module="bench_iota",
 )
 SERVE_SLOPE_US = Grounded(
     name="slope_us", mean=4.317, sigma=0.5, cost=6.0, unit="us/row",
     provenance="run_microbatch_staging/results_nopad.json fits.staged.slope_us_per_row "
                "(v1 seed; MEASURED live by bench_t_row as the k=2 staged-fit slope)",
-    needs_measurement=True,
+    estimability=Estimability.MEASURED, module="bench_t_row",
 )
 
 # Decomposition of the JAX-forward fixed cost (mlp_lowlatency/results.json decomposition):
@@ -108,7 +135,7 @@ DISPATCH_FLOOR_US = 68.84    # mlp_lowlatency decomposition.dispatch_floor_us (i
 SERVE_IO_US = Grounded(
     name="tau_io_us", mean=20.0, sigma=12.0, cost=8.0, unit="us",
     provenance="UNMEASURED — SYNTHESIS v2 §3.3 serial drain/scatter; inference_server.py",
-    needs_measurement=True,
+    estimability=Estimability.MEASURED, module="bench_tau_io",
 )
 
 # --- Leaves per recorded decision (the unit conversion to dps) -----------------------
@@ -121,7 +148,7 @@ SERVE_IO_US = Grounded(
 LEAVES_PER_DECISION = Grounded(
     name="LPD", mean=500.0, sigma=25.0, cost=2.0, unit="leaves/decision",
     provenance="analysis_clean.txt '@ 500 leaves/decision' (DESIGN PIN, not a histogram)",
-    needs_measurement=True,
+    estimability=Estimability.MEASURED, module="bench_lpd",
 )
 
 # --- Per-core generation rate (the producer ceiling input) ---------------------------
@@ -134,19 +161,19 @@ LEAVES_PER_DECISION = Grounded(
 GEN_PER_CORE_LEAVES = Grounded(
     name="g_core", mean=76000.0, sigma=9000.0, cost=3.0, unit="leaves/s/core",
     provenance="analysis_clean.txt gen-ceiling; adapter.md §2 line 93 (MEASURED, 4.0x linear)",
-    needs_measurement=True,   # a fresh SOLE-WORKLOAD per-core read (eval mocked) would tighten it
+    estimability=Estimability.MEASURED, module="bench_g_core",   # a SOLE-WORKLOAD per-core read would tighten it
 )
 GEN_PER_CORE_DPS = Grounded(
     name="R_gen", mean=152.0, sigma=8.0, cost=30.0, unit="decisions/s/core",
     provenance="adapter.md §2 line 93 'MEASURED gen 152 dps/core, 4.0x linear'",
-    needs_measurement=True,
+    estimability=Estimability.MEASURED, module="bench_r_gen",
 )
 N_GEN_CORES = Grounded(
     name="n_gen", mean=3.0, sigma=0.05, cost=0.5, unit="cores",
     provenance="adapter.md §6 M3 1:3 pinning; CLAUDE.md host (4-vCPU, isolcpus 1-3)",
-    constant=True,   # a TRUE CONSTANT: 3 generator cores is a layout/pinning fact, not a measured
-                     # spread — DEGENERATE, ~0 bound contribution (§3). The σ=0.05 is a display
-                     # placeholder on an integer core count, never a CI-bearing uncertainty.
+    estimability=Estimability.CONSTANT, module="bench_n_gen",   # a TRUE CONSTANT: 3 generator cores is a
+                     # layout/pinning fact, not a measured spread — DEGENERATE, ~0 bound contribution
+                     # (§3). The σ=0.05 is a display placeholder on an integer core count, never CI-bearing.
 )
 
 # --- The server's sustained FULL-bucket operating point (rows/forward) ----------------
@@ -160,7 +187,7 @@ N_GEN_CORES = Grounded(
 SERVE_FULL_BUCKET = Grounded(
     name="B_op", mean=256.0, sigma=64.0, cost=4.0, unit="rows/forward",
     provenance="analysis_clean.txt GLOBAL MAX rows/fwd=511.5 pad=0; inference_server max_batch=256",
-    needs_measurement=True,
+    estimability=Estimability.PRIOR, module="bench_b_op",
 )
 
 # --- Per-leaf-amortized message-passing cost (the transport stage; non-binding) -------
@@ -181,7 +208,7 @@ MSG_PER_LEAF_US = Grounded(
     name="tmsg_us_leaf", mean=1.0, sigma=0.5, cost=2.0, unit="us/leaf",
     provenance="inference_wire codec per-leaf framing (v1 seed 1.0us deliberate over-charge; "
                "MEASURED by bench_tmsg over the live codec; non-binding, ranks LAST)",
-    needs_measurement=True,
+    estimability=Estimability.MEASURED, module="bench_tmsg",
 )
 
 # --- Reference points (NOT targets — re-derive, do not anchor) ------------------------
