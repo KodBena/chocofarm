@@ -115,6 +115,73 @@ search output, P6) — out of scope for the HPO tooling that exposed it. **Accep
 f64/f32/jax search-output parity stays green; a measured drop in remote leaf-evals per episode at the
 production config; cache coherence held on the rebind-not-mutate invariant (ADR-0001).
 
+## `tools/analysis/OpenTURNS/` → rename `SSAT` + migrate off OpenTURNS to JAX (deferred 2026-06-21)
+
+The directory is misnamed. It is the **sequential sampling-allocation / optimal-experiment-design
+driver** (the `NeymanDriver` plus the closed-form throughput models), not an OpenTURNS application —
+rename it `tools/analysis/SSAT/`. And drop the `openturns` dependency entirely, conforming to the
+numpy/JAX/numba house stack (CLAUDE.md) and the spirit of ADR-0012: a seam typed on a foreign
+`ot.Function` is the P2/P8 smell, and the model-as-a-string DSL is an interpreted form the rest of
+the stack can't `jit`/`vmap`/compose. (Paths below are as they exist on the `feat/issue-control-lab`
+control-lab branch, where this directory lives; absent on `main` until that merges.)
+
+**Rationale — none of OpenTURNS' UQ is actually used.** An exhaustive call-site inventory (every
+`ot.*` reference lives under this one directory, all function-local imports) shows OpenTURNS supplies
+only: (1) the symbolic gradient of the closed-form model (`ot.SymbolicFunction(...).gradient()` — the
+"autodiff", and already with a numpy central-FD fallback); (2) evaluation of that same expression;
+(3) Normal/Student CI quantiles (already with scipy→z fallbacks); and (4) one optional curvature
+diagnostic. The genuine UQ — the `gᵀΣg` delta method, the c-optimal SOCP allocation (cvxpy/CLARABEL),
+the Clark-1961 min-kink correction (scipy.stats.norm), the Σ assembly — is already hand-rolled in
+numpy/scipy/cvxpy and imports no openturns (`estimate.py` is numpy+stdlib; `manifest.py` already
+states *"openturns is NOT required … the openturns path is the driver's"*). JAX does every used piece
+natively, and `jax.grad` through `jnp.minimum` gives the same one-sided subgradient at the
+`min()`-bottleneck the symbolic gradient does.
+
+**Micro-roadmap** (names, not line numbers — the code is live):
+
+- **Rename.** `git mv tools/analysis/OpenTURNS tools/analysis/SSAT`. The intra-package
+  `_HERE = dirname(__file__)` sys.path shims (`neyman_driver.py`, `manifest.py`, …) survive the move
+  automatically; what must be repointed is the **hardcoded `"OpenTURNS"` path segment in the test
+  shims** — `tests/test_estimate_contract.py`, `tests/test_neyman_driver_phase2.py`,
+  `tests/test_untrusted_drive_phase4.py`, `tests/test_manifest_estimate_seam.py`,
+  `tests/test_bench_fit_estimate_phase3.py`, `tests/test_bench_median_pin_estimate_phase3.py` — plus
+  the **ADR-0006 path headers** in each moved file's module docstring.
+
+- **Model representation (the autodiff seam).** Each `model_*.py` (`model_capacity`,
+  `model_cpp_inproc_port`, `model_cycletime`, `model_futex_wake`, `model_lockfree_mpsc`,
+  `model_shm_spin_poll`, `model_zmq_baseline`) carries a string `THROUGHPUT_EXPR` (muParser/ExprTk) +
+  `build_symbolic_function()` **and already a numpy twin** `throughput_numpy()`. Collapse the P1
+  duplication: make one `jnp`-based model function the single source (`min()` → `jnp.minimum`),
+  delete `THROUGHPUT_EXPR` + `build_symbolic_function`. Same for `examples/demo_msgpass.py`.
+
+- **Driver (`neyman_driver.py`, class `NeymanDriver`).** `_gradient`: replace
+  `self.f.gradient(ot.Point(...))` with `jax.grad`/`jacfwd` of the model fn (the FD fallback
+  `_fd_gradient` can stay or retire — `jax.grad` is exact). `step`: replace the `self.f(ot.Point(mu))`
+  value eval with the model call. **The ADR-0012 core:** retype the `f: ot.Function` contract in
+  `__init__` (and the `getInputDimension`/`getOutputDimension` probes) onto a typed callable Protocol
+  — a model object carrying `input_names`, `__call__`, and `grad` — so the seam stops typing on a
+  foreign library class (P2 seam / P8 honest-signature).
+
+- **Quantiles.** `_z_from_confidence` / `_t_multiplier` already fall back to scipy/z; promote scipy
+  (or `jax.scipy.stats`) to primary and delete the `ot.Normal` / `ot.Student` path.
+
+- **The lone UQ-stack use — decide.** `_second_order_mean` (`KernelSmoothing` + `_make_joint` +
+  `CompositeRandomVector` + `TaylorExpansionMoments`) is an optional `try/except → None` curvature
+  diagnostic feeding only the printed `Recommendation.estimate_second_order` — never convergence,
+  variance, or allocation. **Drop it** (simplest; KDE is the only used feature with no native JAX
+  equivalent), or reimplement as a resample-the-pools + `jax.vmap` pushforward if the curvature
+  cross-check is wanted.
+
+- **`estimate.py` needs no change** (numpy + stdlib; the `gᵀΣg`/SOCP/Clark contract). The migration
+  is confined to the driver's gradient/eval/quantile path + the model representation; then **drop
+  `openturns`** from the env.
+
+**Acceptance (ADR-0009 two-tier, behavioral not byte-identical):** the JAX gradient and `gᵀΣg` match
+the OT/FD path within tol on the existing benches; quantiles match scipy; the Neyman
+allocation/convergence decisions are unchanged on `tests/test_neyman_driver_phase2.py` (and the
+Phase-3/4 estimate tests); each model value matches its `throughput_numpy` twin (the lockstep
+cross-check the models already assert).
+
 ## Retired
 
 - **NMCS parity tests** marked `skip` in `tests/test_cpp_runner.py` (2026-06-16): validated repeatedly,
