@@ -42,6 +42,14 @@ RAISES — the ~/shm_spin_poll_fail wakeup crash). It re-runs the batch at growi
 met (the floor binds on readings COLLECTED, not effort), then `median_estimate` consumes the floored pool;
 ONE home for the guarantee (P1) so a new race bench inherits it, never re-deriving a retry loop.
 
+`window_pool` is the DETERMINISTIC counterpart (RCA fix #2, the DRY half): the ONE home of the
+`for _ in range(N): pool.append(measure_one_window())` idiom the median benches hand-copied (the tau_io
+family, gather, req_drain, zmq_baseline_wakeup, the tmsg family). It takes the per-window measurement as a
+closure + the window count and runs the loop `max(min_windows, count)` times — so unlike the race collector
+(whose count it cannot promise, hence collect_pool's retry), a window loop's count IS the budget and the
+floor is owned STRUCTURALLY (`len(pool) >= 2` by construction, P1/P3). At count >= 2 it is a pure refactor
+of the inline loop (ADR-0009 behavioral equivalence); the only change is the >= 2 floor at a tiny budget.
+
 FAIL LOUD (ADR-0002). A registration/insert error propagates as a typed psycopg error; a degenerate
 fit (too few / collinear design points) RAISES in `fit_estimate`, never a padded low-info estimate.
 The git_sha read is best-effort (a bench may run outside a checkout) and degrades to None, which is
@@ -251,6 +259,71 @@ def collect_pool(
         f"collect_pool({name!r}): only {len(pool)} reading(s) after {max_attempts} batches (final effort "
         f"{effort}) — the race collector under-yields below the floor {min_readings}; a real fault (a "
         f"wedged/over-coalescing producer), not a sub-floor pool to pad (ADR-0002).")
+
+
+# ============================================================================================
+# The DETERMINISTIC WINDOW-LOOP pool builder (RCA fix #2, the DRY half;
+# docs/notes/leaf-eval-estimator-pin-cascade-rca.md §5.1 "factor the window-loop idiom" / §5.2c):
+# the deterministic COUNTERPART to `collect_pool`. The leaf-eval median benches whose `_measure_raw`
+# runs a `for _ in range(N): pool.append(measure_one_window())` loop (the tau_io family, gather,
+# req_drain, zmq_baseline_wakeup, the tmsg family) hand-copied that loop ≈12 times, each differing
+# only in the per-window measurement + setup — the audit's cancer D (copy-paste) / P1 (no single
+# home). `window_pool` is the ONE home (ADR-0012 P1/P3: a parameterized collaborator, the per-window
+# measurement injected as a closure), so a new deterministic window bench inherits the loop by
+# calling this, never re-deriving it.
+#
+# WHY A SEPARATE HELPER FROM `collect_pool` (the deterministic↔race asymmetry). A window loop has a
+# KNOWN reading count — exactly the budget, ONE reading per window iteration — because the loop body
+# is timed deterministically (no edge-coalescing, no torn-read drops), unlike a race collector whose
+# realized count is decoupled from the effort. So `collect_pool`'s RETRY-until-floor machinery
+# (re-run the batch at growing effort) is the wrong shape here: there is nothing to retry, the count
+# is the loop bound. `window_pool` instead OWNS THE FLOOR STRUCTURALLY — it runs the loop
+# `max(min_windows, count)` times, so `len(pool) >= min_windows >= 2` BY CONSTRUCTION. This makes the
+# deterministic benches EXPLICITLY safe (a 1-window pool RAISES in `median_estimate`, ADR-0002):
+# before this, each bench leaned on the driver's `max(2, …)` budget floor (untrusted_drive
+# `_make_measurer`) plus its own ad-hoc `n_windows = max(2, …)` — a per-bench guard the audit names
+# as the right instinct applied per-bench (RCA §5.2c); making the floor a PROPERTY OF THE CONTRACT
+# closes the gap symmetrically with `collect_pool`.
+#
+# BEHAVIORAL EQUIVALENCE (ADR-0009). At any `count >= min_windows` (the normal operating regime — a
+# real allocator budget is hundreds), `max(min_windows, count) == count`, so the loop runs EXACTLY
+# `count` times: the migration is a pure refactor (same closure body, same readings, same pool), the
+# `min_windows` default of 2 reproducing the benches' existing `max(2, …)` floor byte-for-byte. The
+# ONLY intended change is at a tiny `count < 2` (the floor lifts it to 2) — the same safety
+# improvement `collect_pool` made for the race family. `window_pool` owns ONLY the count/floor
+# guarantee (the finiteness / zero-spread checks stay single-homed in `median_estimate`, its sole
+# gate — this helper does not duplicate them).
+# ============================================================================================
+def window_pool(
+    measure_window: Callable[[], float],
+    *,
+    name: str,
+    count: int,
+    min_windows: int = 2,
+) -> list[float]:
+    """Build a deterministic latency/cost pool by calling `measure_window()` once per window — the
+    shared home of the `for _ in range(N): pool.append(one_window())` idiom. `measure_window() ->
+    float` times ONE window (the per-window measurement the bench injects; its setup/warmup/teardown
+    stay in the bench, around the call) and returns that window's reading; `window_pool` runs it
+    `n = max(min_windows, count)` times and returns the `n` readings (so `len(pool) >= min_windows`,
+    the >= 2 the bootstrap median SE needs — the floor is structural, not per-bench).
+
+    `min_windows` defaults to 2 — `median_estimate`'s HARD minimum (a 1-reading pool has no bootstrap
+    spread and RAISES, ADR-0002), and exactly the floor the deterministic benches carried inline as
+    `max(2, …)`. The normal path (a real allocator budget) passes `count` in the hundreds, so the
+    floor never binds and the loop runs `count` times unchanged; the floor binds only at the
+    pathological tiny budget, lifting it to 2.
+
+    FAIL LOUD (ADR-0002): `min_windows < 2` is itself a contract violation (a bootstrap median SE
+    needs >= 2 readings) and RAISES — symmetric with `collect_pool`. It NEVER fabricates a reading;
+    each window's value is whatever `measure_window()` returns (the finiteness / zero-spread gate is
+    `median_estimate`'s, the single home for that check)."""
+    if min_windows < 2:
+        raise ValueError(
+            f"window_pool({name!r}): min_windows must be >= 2 (a bootstrap median SE needs >= 2 "
+            f"readings); got {min_windows} (ADR-0002).")
+    n = max(int(min_windows), int(count))
+    return [float(measure_window()) for _ in range(n)]
 
 
 # The §6 Phase-3 MEDIAN/LATENCY slice: turn a raw pool of per-cycle/per-trial/per-window readings
