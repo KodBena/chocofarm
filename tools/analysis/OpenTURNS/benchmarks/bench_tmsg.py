@@ -56,7 +56,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import logged_run, median_estimate, window_pool  # noqa: E402
 
 NAME = "tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_tmsg"
@@ -102,7 +102,6 @@ def _measure_raw(budget: int = 64, s_leaves: int = _S_LEAVES) -> dict[str, Any]:
     import numpy as np
     from chocofarm.az.inference_wire import encode_request, encode_response, decode_response
 
-    n_windows = max(2, int(budget))   # >= 2 readings so the bootstrap median SE is defined (a 1-window pool has none)
     feats = np.zeros((s_leaves, _IN_DIM), dtype=np.float32)
     reply = encode_response(np.zeros((s_leaves,), dtype=np.float32),
                             np.zeros((s_leaves, _N_ACTIONS), dtype=np.float32))
@@ -114,16 +113,19 @@ def _measure_raw(budget: int = 64, s_leaves: int = _S_LEAVES) -> dict[str, Any]:
     # encode+decode frames (the request encode + the reply decode, the full per-leaf framing cost) and
     # records dt/frames/S. The headline is the median over the windows (latency is right-skewed — the
     # mean is tail-poisoned, §7.A); a per-frame enc/dec split is kept for provenance.
-    per_leaf_us: list[float] = []
-    enc_acc_ns = 0.0
-    dec_acc_ns = 0.0
-    for _w in range(n_windows):
+    def _one_window() -> float:
+        """One window: time `_FRAMES_PER_WINDOW` coalesced encode+decode frames -> the per-leaf framing
+        share dt/frames/S (the per-window measurement window_pool calls once per window)."""
         t0 = time.perf_counter_ns()
         for _ in range(_FRAMES_PER_WINDOW):
             encode_request(feats)               # the request encode (S x in_dim -> frame)
             decode_response(reply)              # the reply decode (frame -> S values + logits)
         dt = time.perf_counter_ns() - t0
-        per_leaf_us.append(dt / 1000.0 / _FRAMES_PER_WINDOW / s_leaves)
+        return dt / 1000.0 / _FRAMES_PER_WINDOW / s_leaves
+
+    # window_pool owns the loop + the >= 2 floor (RCA fix #2 — the >= 2 readings the bootstrap median SE
+    # needs): one reading per window, count == budget windows.
+    per_leaf_us = window_pool(_one_window, name=NAME, count=budget)
     # A per-frame enc/dec split (informational provenance only — the headline + the pool are the codec's
     # full per-leaf framing share above; this attributes it to encode vs decode at the same operating point).
     t0 = time.perf_counter_ns()
@@ -142,7 +144,7 @@ def _measure_raw(budget: int = 64, s_leaves: int = _S_LEAVES) -> dict[str, Any]:
         "encode_us": enc_us,
         "decode_us": dec_us,
         "s_leaves": s_leaves,
-        "budget": n_windows,
+        "budget": len(per_leaf_us),   # the realized window count (== the floored max(2, budget) window_pool ran)
     }
 
 

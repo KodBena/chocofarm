@@ -48,7 +48,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import logged_run, median_estimate, window_pool  # noqa: E402
 
 NAME = "lockfree_mpsc_gather_us"
 MODULE_PATH = "benchmarks.bench_lockfree_mpsc_gather"
@@ -106,11 +106,15 @@ def _measure_raw(rows: int = 256, rows_per_node: int = 32, cycles: int = 5000) -
         contiguous = np.empty((rows, _IN_DIM), dtype=np.float32)
         for _ in range(min(200, cycles)):           # warm caches + page table
             contiguous[:] = slab[src_idx]
-        per_cycle_us: list[float] = []
-        for _ in range(cycles):
+        def _one_cycle() -> float:
+            """One charged request gather (scattered node-ordered rows -> contiguous) -> its us reading
+            (the per-window measurement window_pool calls once per window)."""
             t0 = time.perf_counter_ns()
             contiguous[:] = slab[src_idx]            # the charged request GATHER (scattered -> contiguous)
-            per_cycle_us.append((time.perf_counter_ns() - t0) / 1000.0)
+            return (time.perf_counter_ns() - t0) / 1000.0
+
+        # window_pool owns the loop + the >= 2 floor (RCA fix #2): one reading per cycle, count == cycles.
+        per_cycle_us = window_pool(_one_cycle, name=NAME, count=cycles)
         med = float(np.median(per_cycle_us))
         return {"gather_us_median": med, "per_cycle_us": per_cycle_us, "rows": rows}
     finally:

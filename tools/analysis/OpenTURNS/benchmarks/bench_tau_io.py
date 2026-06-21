@@ -40,7 +40,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import logged_run, median_estimate, window_pool  # noqa: E402
 
 NAME = "tau_io_us"
 MODULE_PATH = "benchmarks.bench_tau_io"
@@ -91,26 +91,31 @@ def _measure_raw(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 2000) ->
     # Pre-encode each producer's coalesced request frame (rows_per_msg leaves of in_dim features).
     feats = np.zeros((rows_per_msg, _IN_DIM), dtype=np.float32)
     req_payload = encode_request(feats)
-    per_cycle_us: list[float] = []
+
+    def _one_cycle() -> float:
+        """One drain+decode+encode+scatter cycle over the n_msgs coalesced frames -> its us reading
+        (the per-window measurement window_pool calls once per window)."""
+        for d in dealers:                       # producers send their parked frame
+            d.send(req_payload)
+        t0 = time.perf_counter_ns()
+        # DRAIN: recv_multipart(NOBLOCK) every queued frame; DECODE each; ENCODE a reply; SCATTER it.
+        drained = 0
+        while drained < n_msgs:
+            try:
+                frames = router.recv_multipart(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+            ident, payload = frames[0], frames[-1]
+            req = decode_request(payload)           # decode x 1 (of T)
+            b = req.shape[0] if hasattr(req, "shape") else rows_per_msg
+            reply = _encode_reply(b)                 # encode x 1 (of T)
+            router.send_multipart([ident, reply])    # scatter x 1 (of T)
+            drained += 1
+        return (time.perf_counter_ns() - t0) / 1000.0
+
     try:
-        for _ in range(cycles):
-            for d in dealers:                       # producers send their parked frame
-                d.send(req_payload)
-            t0 = time.perf_counter_ns()
-            # DRAIN: recv_multipart(NOBLOCK) every queued frame; DECODE each; ENCODE a reply; SCATTER it.
-            drained = 0
-            while drained < n_msgs:
-                try:
-                    frames = router.recv_multipart(flags=zmq.NOBLOCK)
-                except zmq.Again:
-                    continue
-                ident, payload = frames[0], frames[-1]
-                req = decode_request(payload)           # decode x 1 (of T)
-                b = req.shape[0] if hasattr(req, "shape") else rows_per_msg
-                reply = _encode_reply(b)                 # encode x 1 (of T)
-                router.send_multipart([ident, reply])    # scatter x 1 (of T)
-                drained += 1
-            per_cycle_us.append((time.perf_counter_ns() - t0) / 1000.0)
+        # window_pool owns the loop + the >= 2 floor (RCA fix #2): one reading per cycle, count == cycles.
+        per_cycle_us = window_pool(_one_cycle, name=NAME, count=cycles)
     finally:
         for d in dealers:
             d.close(linger=0)

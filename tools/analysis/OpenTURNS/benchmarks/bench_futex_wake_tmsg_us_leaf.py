@@ -57,7 +57,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import logged_run, median_estimate, window_pool  # noqa: E402
 
 NAME = "futex_wake_tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_futex_wake_tmsg_us_leaf"
@@ -110,17 +110,20 @@ def _measure_raw(iters: int = 200000) -> dict[str, Any]:
             req_slot[:] = one_req
             out_rep[:] = rep_slot
         # Time per-leaf in small windows; the headline is the median per-leaf over the windows (a single
-        # per-leaf perf_counter call would be clock-dominated). >= 2 windows so the bootstrap median SE is
-        # defined (median_estimate RAISES on a 1-reading pool — ADR-0002).
-        n_windows = max(2, iters // _WINDOW)
-        per_leaf_us: list[float] = []
-        for _w in range(n_windows):
+        # per-leaf perf_counter call would be clock-dominated). window_pool owns the loop + the >= 2
+        # window floor (RCA fix #2 — the >= 2 readings the bootstrap median SE needs; median_estimate
+        # RAISES on a 1-reading pool, ADR-0002), count == iters // _WINDOW windows.
+        def _one_window() -> float:
+            """One window of `_WINDOW` per-leaf ring memcpies -> the per-leaf us dt/_WINDOW (the per-window
+            measurement window_pool calls once per window)."""
             t0 = time.perf_counter_ns()
             for _ in range(_WINDOW):
                 req_slot[:] = one_req                # producer writes one request row into the ring
                 out_rep[:] = rep_slot                # consumer reads one reply row out of the ring
             dt = time.perf_counter_ns() - t0
-            per_leaf_us.append(dt / 1000.0 / _WINDOW)
+            return dt / 1000.0 / _WINDOW
+
+        per_leaf_us = window_pool(_one_window, name=NAME, count=iters // _WINDOW)
         return {"tmsg_us_leaf_median": float(np.median(per_leaf_us)),
                 "per_leaf_us": per_leaf_us, "iters": iters}
     finally:

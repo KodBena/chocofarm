@@ -50,7 +50,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import logged_run, median_estimate, window_pool  # noqa: E402
 
 NAME = "zmq_baseline_wakeup_us"
 MODULE_PATH = "benchmarks.bench_zmq_baseline_wakeup_us"
@@ -102,11 +102,12 @@ def _measure_raw(cycles: int = 20000) -> dict[str, Any]:
     poller.register(router, zmq.POLLIN)
 
     one_row = encode_request(np.zeros((1, _IN_DIM), dtype=np.float32))
-    ready_poll_us: list[float] = []
     blocking_poll_us: list[float] = []
     try:
         # SATURATION ready-poll: a frame is already queued; time poll(0) returning POLLIN, then drain.
-        for _ in range(cycles):
+        def _one_cycle() -> float:
+            """One saturation ready-poll: prime a queued frame, time `poll(0)` returning POLLIN, drain to
+            re-prime -> its us reading (the per-window measurement window_pool calls once per window)."""
             dealer.send(one_row)
             # Spin until the inproc frame is actually queued (inproc delivery is near-instant but not
             # synchronous), so we time a READY poll, not an arrival wait — the saturation case.
@@ -114,9 +115,13 @@ def _measure_raw(cycles: int = 20000) -> dict[str, Any]:
                 pass
             t0 = time.perf_counter_ns()
             events = poller.poll(0)
-            ready_poll_us.append((time.perf_counter_ns() - t0) / 1000.0)
+            dt_us = (time.perf_counter_ns() - t0) / 1000.0
             if events:
                 router.recv_multipart(flags=zmq.NOBLOCK)   # drain to re-prime next cycle
+            return dt_us
+
+        # window_pool owns the loop + the >= 2 floor (RCA fix #2): one reading per cycle, count == cycles.
+        ready_poll_us = window_pool(_one_cycle, name=NAME, count=cycles)
 
         # BLOCKING-poll tail (supporting, honesty): time poll(timeout) that WAITS for the arrival.
         tail = min(2000, cycles)
