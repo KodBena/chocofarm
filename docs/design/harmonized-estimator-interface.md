@@ -30,6 +30,49 @@ Public Domain (The Unlicense).
   bench; every numerical claim (the slope/intercept correlation, the 2-point
   pilot's variance, the `min()` Jensen bias) was executed and is reported with
   its number per ADR-0009.
+- **Consolidation (2026-06, dated append per ADR-0005 Rule 8):** this revision
+  integrates an external statistical review (a literature-cited critique of the
+  allocator and this contract) that broadly endorses the `Estimate` contract and
+  adds four material refinements, each **re-executed here, not relayed** (ADR-0009
+  — a formula is integrated only with its own reproduced number, never on the
+  reviewer's authority): **(1)** the §4.1 `min()` kink resolves to the
+  **Clark-1961 closed form** — deterministic, O(1), no Monte-Carlo, no soft-min
+  temperature — which **closes the §7 open question** (the MC-vs-soft-min fork was
+  a false choice); **(2)** the §2 allocation is a **cost-constrained c-optimal
+  experimental design solved as an SOCP** (Sagnol), of which the closed-form
+  `sqrt(a_i/c_i)` ratio is the diagonal/independent special case; **(3)** a new
+  **robustness axis** (§4.4, Cai–Rafi) the contract did *not* address — the
+  interface makes the **variance** faithful, not the **allocation** robust to its
+  own small-pilot estimation error; **(4)** `cross` (§4.2/§7.C) is **broadened**
+  from compositional-only coupling to also carry the **shared-hardware nuisance**
+  covariance, with an empirical residual-cross-correlation gate. Where the review
+  was less careful than this note (it presents the producer `σ₁=60` as the actual
+  binding pair without flagging it is *stipulated*, not the seed delta-method
+  propagation `σ₁≈25.2`; and it shorthands the kink as "nonconvex in n" when the
+  precise loss is the SOC-**expressibility of the variance constraint**, the
+  decision space staying convex in `n` on every region probed), this note states
+  the correction with the executed number. The executed verifications backing
+  this consolidation are in §8. **Re-execution pass (this revision):** the SOCP
+  numbers were **re-run on the sign-safe `Q = diag(g)·R·diag(g)` formulation**
+  (over the genuinely-positive per-component SE `w = √(A/n)`), which **corrected
+  three figures** the prior passes relayed — (1) the diagonal formula's miss under
+  a *negative* off-diagonal is an **over-spend** (`Var = 2.73 < V*`), not the
+  wrong-signed under-statement `6.51 > V*` (the error's sign is `sign(g_i g_j R_ij)`,
+  the magnitude instance-specific); (2) **SCS is not "materially inaccurate"** on
+  the well-posed program (it agrees with CLARABEL across instances) — the "16×"
+  claim was an artifact of a DCP-marginal `q = n^{-1/2}` form and is **withdrawn**;
+  and (3) — the deepest fix — the intuitive `v = u/√n` form **silently
+  misallocates on mixed-sign gradients** (it returns `status = optimal` with the
+  cone reading `V*` while the true `Var = 5.59 ≠ 5.0`, because `cp.power(·,-2)`'s
+  `>0` domain folds out the gradient sign); `model_capacity` **has** mixed-sign
+  gradients (`d serve/dB_op > 0`, the rest `< 0`), so the general program needs the
+  sign-safe `Q`-form and an ADR-0002 `gᵀΣ(n*)g ≈ V*` assertion on the returned
+  allocation (§8 corrections 1–3). The same-sign worked numbers (the slope/intercept
+  pair, the over-spend example) stand under either form. The convexity claim was
+  also **re-anchored** on the Hessian min-eigenvalue (the `(σ₁,σ₂)`-alone
+  nonconvexity is real but thin, in the small-`σ₁` corner — a naive whole-box chord
+  search misses it; §8(c)). The Clark, correlation, smoothness, ρ-concavity,
+  disjointness, and 2-point-pilot numbers all **reproduced** unchanged.
 - **What it governs:** the **single contract** every measurable quantity (a
   *benchmark*) exposes so the Neyman driver
   (`tools/analysis/OpenTURNS/neyman_driver.py`) consumes them **uniformly**,
@@ -40,13 +83,18 @@ Public Domain (The Unlicense).
   row-count x-axis instead of the slope (`untrusted_drive._per_sample`, the
   longest-numeric-list heuristic at lines 80–98), and the bound cratered.
 
-This note states **(1)** the contract, **(2)** the Neyman derivation under it,
-**(3)** the case-handling table, **(4)** the two subtleties most likely to bite
-(the non-smooth `min()` and the slope/intercept correlation), **(5)** the
-schema delta, **(6)** the migration path. It is honest per
-claims-measured-vs-interpreted: §7 separates what is rigorous from what is a
-modelling choice, and names the one case (the `min()` kink) that **cannot** be
-folded into the per-input contract and must be handled at the driver instead.
+This note states **(1)** the contract, **(2)** the Neyman derivation under it
+(closed-form on the diagonal, **SOCP** on the correlated/constrained general
+case), **(3)** the case-handling table, **(4)** the subtleties most likely to
+bite (the non-smooth `min()` — resolved to a closed form; the slope/intercept
+correlation; the small-pilot robustness axis), **(5)** the schema delta,
+**(6)** the migration path, **(8)** the executed verifications backing the
+consolidation. It is honest per claims-measured-vs-interpreted: §7 separates
+what is rigorous from what is a modelling choice. The `min()` kink — flagged in
+the original draft as the one case that **cannot** be folded into the per-input
+contract — is now resolved at the driver by the **Clark-1961** closed form
+(§4.1), a deterministic per-step computation; the contract's role is unchanged
+(carry each arm's full `cov` so the driver can evaluate Clark's min-moments).
 
 A scoping note (ADR-0002, read-what-you-cite): ADR-0012 is a long file; the
 principles this note leans on — **P1** single-home, **P2** seam/port
@@ -268,7 +316,7 @@ the old code dropped — and they are nonzero exactly for the within-fit
 slope/intercept pair (§4.2). So the bound is **at least as valid and strictly
 more faithful**; no step assumed the mean.
 
-### 2.3 The allocation, restated — where the closed form holds and where it is replaced
+### 2.3 The allocation, restated — closed form on the diagonal, an SOCP in general
 
 The Neyman program is unchanged: minimize total cost `sum_i c_i · effort_i`
 subject to `Var(E[f]) <= V_target = (h/mult)^2`. Its KKT stationarity condition
@@ -278,31 +326,97 @@ is the **general** Neyman optimum:
 > across all funded inputs: `d Var(E[f])/d effort_i / c_i = lambda` (a common
 > shadow price) for every funded *i*.
 
+**What this program *is*, named (a refinement the external review supplied, and
+the recent-literature home of the allocator).** Minimizing a budget subject to
+`g^T Σ(n) g ≤ V*` with `c = ∇f` (the delta-method linearization) is precisely a
+**cost-constrained c-optimal experimental design**: Neyman allocation is the
+c-optimal design for a stratified mean (estimand `cᵀθ`, independent per-stratum
+information), and the moment the inputs are **correlated** or are **fit
+parameters rather than means**, the information matrix is non-diagonal and one
+has left Neyman-proper for c-optimal design with a full cross-covariance. The
+§2.3 stationarity above is exactly that design's optimality condition. The payoff
+is **machinery**: Sagnol showed c-/A-/T-/D-optimal multiresponse design on a
+finite design space — with several linear constraints (the cost budget is one) —
+reduces to a **second-order cone program (SOCP)**. So the "small coupled convex
+program" the correlated case needs is a named, solvable SOCP, **native to the
+cross-covariance** the closed-form ratio drops. (The correlated-estimator
+generalization — many models estimating one QoI — is the MLBLUE / approximate-
+control-variate strand, where Croci–Willcox–Wright 2023 give an **SDP** yielding
+both the sample counts and the model selection; a formulation to borrow, not a
+drop-in, since this note's structure is "many inputs each estimated once.")
+
+**Executed (ADR-0009, §8).** A `cvxpy` SOCP — the **sign-safe** form absorbs each
+gradient's sign into the quadratic: `Q = diag(g)·R·diag(g)` (PSD by congruence of
+the PSD correlation `R`), optimize over the genuinely-positive per-component SE
+`w_i = √(A_i/n_i) > 0`, objective `min Σ_i c_i·A_i·w_i^{-2}` s.t. `‖L_Qᵀ w‖₂² ≤ V*`
+where `Q = L_Q L_Qᵀ` — **(a)** reproduces the closed-form Neyman `n_i^* ∝ √(a_i/c_i)`
+on the **diagonal** case to a max relative difference of **~1.9·10⁻⁵**, hitting
+`Var = V*` exactly; **(b)** on a **non-diagonal** Σ (a slope/intercept-style `−0.81`
+off-diagonal the closed form **cannot express**) hits `Var = V* = 5.0` exactly,
+where the diagonal-optimal allocation evaluated under the true Σ misses `V*` (it
+ignores the cross-term — for an instance with the negative off-diagonal and
+**same-sign** `g`, it **over-spends**: realized `Var = 2.73 < V*`, cost `30.66` vs
+the SOCP's `13.35`; §8 correction 1, magnitudes instance-specific, the **direction**
+canonical). **Solver fact (operational):** **CLARABEL** is a clean, exact default;
+on the well-posed program **SCS agrees with CLARABEL** (the earlier "SCS off ~16×"
+was an artifact of a DCP-marginal `cp.power(n,-0.5)` form that itself errors on the
+non-diagonal case — §8 correction 2, the warning withdrawn).
+
+**A sign trap the naive `v`-form hides (an ADR-0002 fail-loud obligation, §8
+correction 3).** The intuitive variable choice `v_i = u_i/√n_i` with `u_i = g_i√A_i`
+and constraint `‖Lᵀv‖₂² ≤ V*` (`Σ = LLᵀ` the correlation Cholesky) is DCP-clean
+**only for same-sign gradients**. Because `cp.power(v,-2)` has DCP domain `v > 0`,
+the formulation silently forces `v > 0`, folding out the gradient signs; the cone
+constraint `‖Lᵀv‖₂² = vᵀRv` then equals the true `gᵀΣg` **only if `v` carries the
+sign of `g`**. On **mixed-sign** gradients the solver returns `status = optimal`
+with the cone reading exactly `V*` while the **true** `Var(gᵀΣg)` at the returned
+allocation is wrong (executed: `Var = 5.59 ≠ 5.0`, §8(b)). This is precisely the
+fail-silently-on-an-`optimal`-status pattern ADR-0002 forbids, and `model_capacity`
+**has** mixed-sign gradients — at the seed `d serve/dB_op = +3.08` while
+`d serve/d{iota, slope, tau_io, LPD}` are all negative (§8). So **the general
+program must use the sign-safe `Q`-form above** (which returns `Var = 5.0` exactly
+for mixed signs), and the driver must **assert `gᵀΣ(n*)g ≈ V*` on the returned
+`n*` before trusting it** — the solver's `optimal` status does not catch the sign
+fold. The LIVE `iota`/`slope` pair is same-sign (`df/diota·df/dslope > 0`,
+verified), so the slope/intercept worked numbers stand under either form; it is
+the *general* program over all of a model's inputs that needs the `Q`-form.
+
+So the SOCP is a **strict generalization**: the closed-form ratio is its
+diagonal/independent special case, and it solves the correlated/constrained case
+the 1934 formula cannot.
+
 This holds for **any** differentiable, monotone-decreasing shrink law — it does
 **not** require `Var = V/n`. The contract supplies exactly
 `d Var(E[f])/d effort_i = g_i^2 · d(Σ_ii)/d effort_i` (plus the cross-term's
 derivative) via `shrink.marginal`. So the optimum is computable for **every**
 case, and three regimes fall out:
 
-- **`Poolwise` (mean) — the closed form is preserved exactly.** With
-  `Σ_ii(n) = s_i^2/n_i`, `d Σ_ii/d n_i = -s_i^2/n_i^2`, and equalizing the
-  per-cost marginal recovers `n_i^* ∝ sqrt(a_i/c_i)` — the exact formula at
-  `neyman_driver.py:286–289`. **This is the maintainer's sketch, earned**: for
-  every mean input the generalized rule reproduces the current allocation
-  line-for-line. *(KKT-point exact; the greedy per-batch top-up is the same
-  damped approach to it the current `topup` block implements.)*
-- **`RegressionLaw` (fit) — the closed form is replaced by the general
-  condition.** A coefficient's SE has an x-leverage floor: `Var(slope) =
+- **`Poolwise` (mean), diagonal Σ — the closed form is the SOCP's special
+  case.** With `Σ_ii(n) = s_i^2/n_i`, `d Σ_ii/d n_i = -s_i^2/n_i^2`, and
+  equalizing the per-cost marginal recovers `n_i^* ∝ sqrt(a_i/c_i)` — the exact
+  formula at `neyman_driver.py:286–289`, **and** the SOCP solution on the
+  diagonal (rel diff `~1.9·10⁻⁵`, §8). **This is the maintainer's sketch,
+  earned**: for every independent mean input the generalized rule reproduces the
+  current allocation line-for-line. *(KKT-point exact; the current greedy
+  per-batch `topup` block is a **damped heuristic approach to the same SOCP
+  optimum** — correct on the diagonal, but it is the SOCP, not the greedy
+  damping, that is exact once Σ is non-diagonal.)*
+- **Correlated / fit inputs (non-diagonal Σ) — the SOCP replaces the closed
+  form.** A coefficient's SE has an x-leverage floor: `Var(slope) =
   resid_var/Sxx`, where more iters shrink `resid_var` but the `1/Sxx` leverage
-  term is fixed unless the bench widens the x-design. There is **no single `n`**
-  for which `Var = V/n`. So `n_i^*` is undefined and the driver does **not**
-  invert a closed form; it funds by the general per-cost-marginal-equalization,
-  which **saturates** when `resid_var` stops dominating — so the loop correctly
-  **stops funding a fit whose SE is leverage-limited rather than
-  residual-limited** (a fit the `V/n` assumption would fund forever). This is
-  the brief's "states precisely where it breaks and what replaces it": it breaks
-  for non-`V/n` laws, and explicit marginal allocation replaces the closed form,
-  agreeing with it on the `Poolwise` subset.
+  term is fixed unless the bench widens the x-design — so there is **no single
+  `n`** for which `Var = V/n`, and the within-fit `−0.81` off-diagonal (§4.2)
+  makes Σ non-diagonal. The driver does **not** invert a closed form; it solves
+  the **SOCP** (§2.3, executed), which natively eats the cross-covariance and
+  **saturates** when `resid_var` stops dominating — so the loop correctly **stops
+  funding a fit whose SE is leverage-limited rather than residual-limited** (a fit
+  the `V/n` assumption would fund forever). This is the brief's "states precisely
+  where it breaks and what replaces it": the closed-form ratio breaks for
+  non-`V/n` laws and for correlated inputs, the **SOCP** replaces it, and the two
+  agree on the `Poolwise`-diagonal subset. *(The one place even the SOCP structure
+  is lost is the `min()` kink, where the variance **constraint** stops being a
+  second-order cone — §4.1; that is the principled boundary for the `kink_regime`
+  branch.)*
 - **`Fixed` (pin / declared spread) — drops out of allocation, for the right
   reason.** `d Σ_ii/d effort = 0`, so a pin never enters the equalization (no
   finite budget reduces it) — reproducing today's `a<=0 => n_star=n` "don't
@@ -348,22 +462,25 @@ in the field set. The driver's view is identical for every row.
 | **PIN-now / measurable-later** (`B_op` as a saturated-rows histogram, `LPD` as a leaf-count histogram, `R_gen`/`g_core` as a C++ rate) | `Fixed()` **today** → `QuantileLaw`/`Poolwise` once instrumented | the definition's registered `kind` flips when the bench gains a real `run()` | per the upgraded estimator | Keeps **"cannot be reduced"** (a true `Fixed`) distinct from **"not yet measured"** (a pin awaiting its bench). This is exactly the `Grounded.needs_measurement` / manifest `trusted` distinction the code already tracks, now typed in the shrink law. |
 | **RATIO / composite** (a quantity defined as `h(constituents)` — e.g. an aggregate `N_gen·R_gen` were it ever registered as one input) | `[h(θ̂s)]`, `cov = J·Σ_constituents·Jᵀ` (J = h's Jacobian) | `Composed(parts)` — recurse to the steepest constituent | inherited / family of the dominant constituent | The `Estimate` of a composition **is** a delta-method output, so the contract is **closed under composition**: a model output can feed a higher model. Carries `cross` to **every** shared constituent (the §3 invariant) so `g^T Σ g` does not double-count. `dps` itself is `f` and is **not** registered (confirmed: no `dps` definition row), so this row is for completeness + the producer-cap aggregate; the contract survives such a thing appearing as an input. |
 | **NON-ASYMPTOTIC small-n** (the 7-point fit; a few-replicate C++ `R_gen`; an `n=1` pin) | as the case above | as the case above | family carries `STUDENT_T(dof)` or an `EMPIRICAL` small-n flag | Not a separate row — an **attribute** any case carries through `family`. The driver uses the family's multiplier and **gates convergence** on it (§4.3). |
-| **NON-SMOOTH `f`** (the `min()` kink) | — | — | — | **Not an `Estimate` field** — it is a property of `f`, not of any input estimator. Handled at the driver (§4.1). The contract's role is to carry each input's full `cov` so the driver can compute each arm's capacity variance honestly. |
+| **NON-SMOOTH `f`** (the `min()` kink) | — | — | — | **Not an `Estimate` field** — it is a property of `f`, not of any input estimator. Resolved at the driver by the **Clark-1961 closed form** (§4.1): deterministic min-moments + `P(arg-min flips)=Φ(−t)`, no MC, no temperature. The contract's role is to carry each input's full `cov` so the driver can propagate each arm's capacity variance and feed Clark. |
 
 ---
 
-## 4. The two subtleties that bite
+## 4. The subtleties that bite
 
-### 4.1 The non-smooth `min()` — the highest-risk issue, handled at the driver, not the contract
+### 4.1 The non-smooth `min()` — resolved at the driver by the Clark-1961 closed form
 
 `f = min(GENERATION, SERVE, TRANSPORT)`. This is a property of `f`, so it is
 **not** a per-input contract field; it is the driver's and the model's concern.
 The contract's contribution is that by carrying each input's full `cov` (not a
 point `sigma`), the driver can compute the variance of **each arm's** capacity
-and the binding margin honestly. But the contract alone does **not** make the
-bound honest at a tie — and the critique that flagged this as *invalidating* a
-contract-only treatment is **correct**. Here is the full, substantiated picture
-and the driver-level response.
+and the binding margin honestly. The original draft of this note flagged the
+`min()` as the one case that **cannot** be folded into the contract and proposed
+a per-step Monte-Carlo (or a soft-min with an ad-hoc temperature) at the driver;
+it correctly named the object as "a Clark-1961 mixture moment" but did **not**
+push to the closed form. **The closed form exists, is deterministic and O(1), and
+closes that open question** (§7); the MC-vs-soft-min fork was a false choice. The
+full picture and the driver-level response follow.
 
 **What actually happens at the seed point (executed, not asserted).** For
 `model_zmq_baseline` at the seed: `SERVE` binds at **428.28 dps**, `GENERATION`
@@ -379,25 +496,58 @@ df/dtau_io = -0.358   df/dT_disp = -0.358   df/dt_row = -91.7   (serve arm — b
 
 So the producer arm's inputs get **zero allocation** even though a small upward
 revision of any serve input flips the binding arm. Worse, **the reported
-variance is a lie**: I ran a 4·10⁶-draw Monte-Carlo of `min(Normal(456, 60),
-Normal(428.28, 2))` (producer wide because `R_gen` is a single costly C++
-figure; serve tight) and got:
+single-arm variance is a lie** — and the honest object is a **closed form**, not
+a simulation. The two contending arms are **input-disjoint**: producer reads
+`{N_gen, R_gen}`, serve reads `{T_disp, tau_io, wakeup, B, t_row, L}`, and the
+intersection is **empty** (verified against `model_zmq_baseline.INPUT_NAMES`;
+`L` is shared only with the non-binding transport arm). So `ρ_arms = 0` and the
+two delta-method-Gaussian arms — producer `Normal(456, 60)`, serve
+`Normal(428.28, 2)` — are exactly Clark's **exact-independent** case. The
+**Clark-1961** moments of `min(X₁,X₂)` (via `min(x,y) = −max(−x,−y)`), with
+`a = √(σ₁²+σ₂²−2ρσ₁σ₂) = SD(g₁−g₂)` and standardized margin `t = (μ₁−μ₂)/a`:
 
-- `E[min] = 415.7` vs the delta-method `E[f] = min(456, 428.28) = 428.28` — a
-  **Jensen bias of +12.6 dps, optimistic** (`min` is concave, so `min(E[·])`
-  over-states `E[min(·)]`; this is **first-order** O(σ) at a kink, not the
-  O(σ²) a smooth `f` gives);
-- `sd[min] = 25.6` vs the single-binding-arm delta-method `sd = 2.0` — **12.8×**
-  larger, because the realized binding arm switches stochastically;
-- `P(producer is the realized min) = 0.32` — a full third of the probability
-  mass lives on an arm whose ±(3·60) dps the reported CI entirely ignores.
+```
+a               = 60.033          t = (μ₁−μ₂)/a = 0.4617
+E[min]          = μ₁Φ(−t) + μ₂Φ(t) − a·φ(t)                          = 415.68
+Var[min]        = (μ₁²+σ₁²)Φ(−t) + (μ₂²+σ₂²)Φ(t) − (μ₁+μ₂)a·φ(t) − E[min]²
+                                                          ⇒ sd[min]  = 25.58
+P(producer is the min) = Φ(−t)                                       = 0.3221
+```
 
-`g^T Σ g` cannot represent `Var(min(·))`: it is a Clark-1961 mixture moment, a
-**functional of `f`**, not a per-input estimate — `theta_hat`/`cov` are
-per-input quantities. So the danger is the over-permissive **false-SAT** the
-project's faithful-model discipline warns against: `converged := var_est <=
+Read against the naive single-arm delta-method:
+
+- `E[min] = 415.68` vs the delta-method `E[f] = min(456, 428.28) = 428.28` — a
+  **Jensen bias of +12.60 dps, optimistic** (`min` is concave, so `min(E[·])`
+  over-states `E[min(·)]`). This bias **is the `−a·φ(t)` term**, and since
+  `a = O(σ)`, it is **first-order** O(σ) at a kink — not the O(σ²) a smooth `f`
+  gives. The same closed form that fixes the variance de-biases the mean.
+- `sd[min] = 25.58` vs the single-binding-arm delta-method `sd = 2.0` — **12.79×**
+  larger, because the realized binding arm switches stochastically.
+- `P(producer is the realized min) = Φ(−t) = 0.3221` — a full third of the
+  probability mass lives on an arm whose ±(3·60) dps the single-arm CI ignores.
+
+These are **deterministic, no draws**. A 4·10⁶-draw Monte-Carlo cross-check
+(reported here only to *validate* the closed form, not as the per-step method)
+agrees to ~4 decimals: `E[min]=415.70`, `sd=25.55`, `P=0.3220` (§8). So
+`g^T Σ g` cannot represent `Var(min(·))` — it is a **Clark-1961 mixture moment**,
+a functional of `f`, not a per-input estimate — but **Clark gives it in closed
+form**. The danger the closed form forecloses is the over-permissive **false-SAT**
+the project's faithful-model discipline warns against: `converged := var_est <=
 V_target` could fire at `E[f]=428.28` with CI `±3.9` while 32% of the mass is
 producer-bound.
+
+> **Provenance caveat on `σ₁=60` (a correction the external review did not flag).**
+> The worked pair uses producer `σ₁=60`, a **stipulated** wide value (the review
+> presents `456/60/428.28/2` as the actual binding pair). The **seed**
+> delta-method propagation of `σ₁` from `producer = N_gen·R_gen` is
+> `√((R_gen·σ_{N_gen})² + (N_gen·σ_{R_gen})²) = √((152·0.05)² + (3·8)²) = 25.17`
+> — a **2.4× difference**. Clark reproduces 415.68/25.58/0.32 for the *given*
+> `(456, 60, 428.28, 2)` regardless, but `P(producer binds)` is **σ₁-sensitive**:
+> `Φ(−t) = 0.136` at `σ₁=25.17` versus `0.322` at `σ₁=60` (§8). Because the
+> `kink_regime` trigger and the funded-both-arms decision turn on this
+> probability, **production must source each arm's σ from its `Estimate` `cov`
+> (the delta-method propagation through `N_gen·R_gen`), not a literal `60`.** The
+> worked numbers below are annotated as `σ₁=60`-stipulated.
 
 **TaylorExpansionMoments does NOT rescue this** (resolving the Design 3/4
 critiques against Designs 3 and 4, which proposed it as the kink-validity
@@ -411,42 +561,97 @@ kink**. It must **not** be cited as the kink-validity signal; the existing
 `_second_order_mean` hook stays only as a smooth-region curvature diagnostic
 (away from a tie, where it is valid), never as the tie detector.
 
-**The driver-level response (three honest mechanisms):**
+**The driver-level response (three honest mechanisms, all Clark arithmetic — no
+stochastic element added to `step()`):**
 
 1. **Binding-margin diagnostic + a `kink_regime` flag.** The driver computes,
    per arm, `margin = (this_arm_capacity − binding_capacity)/binding_capacity`,
-   and the *variance* of each arm's capacity from the carried `cov`s. It raises
+   and the *variance* of each arm's capacity from the carried `cov`s
+   (propagated through each arm's `f` by the delta method). It raises
    `kink_regime` when any non-binding arm is within a threshold (a
    statistically-plausible tie, e.g. `margin < k · arm-capacity-CI`). The 6.5%
-   seed margin **fires** this flag.
+   seed margin **fires** this flag. *(With `σ₁` sourced from the `Estimate` `cov`
+   rather than the stipulated `60`, the trigger sensitivity is `Φ(−t)`; see the
+   provenance caveat above.)*
 
-2. **In the kink regime, replace `g^T Σ g` with a mixture estimate of `E[f]`
-   and `Var(f)`.** When `kink_regime` is set, the driver does **not** report the
-   single-arm `g^T Σ g`; it computes `E[f]` and `Var(f)` by a cheap Monte-Carlo
-   of `min(arm₁,…,arm_k)` over the input `Estimate`s' distributions (the
-   `Estimate`s carry `theta_hat`, `cov`, `family`, `support` — everything needed
-   to sample each arm), **or** a stated-temperature soft-min. It reports
-   **that** as `var_estimate`/`ci_halfwidth`, and states plainly that the
-   delta-method is **suspended** (not corrected) and the point estimate `f(μ̂)`
-   is a biased, variance-understated estimator of `E[f]`.
+2. **In the kink regime, replace `g^T Σ g` with the Clark-1961 closed-form
+   `E[f]` and `Var(f)`.** When `kink_regime` is set, the driver does **not**
+   report the single-arm `g^T Σ g`; it linearizes each arm at the operating
+   point — `arm_k ≈ Normal(μ_k, σ_k²)` with `μ_k = g_k(θ̂)`, `σ_k² = ∇g_kᵀΣ∇g_k`,
+   cross-covariance `∇g₁ᵀΣ∇g₂` (zero here, by input-disjointness) — and evaluates
+   **Clark's exact min-moments** for `E[min]` and `Var[min]` (the formulae above).
+   This is **deterministic, O(1), parameter-free**: the input noise itself
+   supplies the smoothing scale `t = Δ/a`, so there is **no Monte-Carlo
+   (reproducibility preserved) and no soft-min temperature to characterize**.
+   Both the **de-biased `E[f]`** (the `−a·φ(t)` Jensen correction, mechanism 2's
+   point estimate) and the **honest `Var(f)`** are arithmetic on `Φ, φ`, and the
+   arms' covs, evaluated each step. This is exactly what block-based statistical
+   static timing analysis (SSTA) does: it **never Monte-Carlos a max/min**; it
+   propagates Clark moments. *(For ≥3 contending arms — not the case here, where
+   transport is non-binding — Clark's recursive pairwise form with its
+   correlation-propagation step applies; with 2 arms it is the single closed form
+   above.)*
 
-3. **A convergence guard.** Convergence is **refused** while
-   `P(arg-min flips) > α` (a small probability, computed from the same joint
-   distribution) or while the importance-factor mass on a non-binding arm
+3. **A convergence guard.** Convergence is **refused** while the **arg-min-flip
+   probability `P(producer is the min) = Φ(−t) > α`** (a small probability,
+   read directly off the same closed form — mechanism 3 is `Φ(−t)`, not a
+   separate computation) or while the probability mass on a non-binding arm
    exceeds ε. This makes the over-permissive false-SAT impossible (ADR-0002 loud
    at the strongest surface).
 
    And the allocation in the kink regime funds **both** contending arms'
-   inputs (a sub-gradient convention: the realized `min` can be either arm, so
-   both arms' uncertainty is live) — the necessary-but-insufficient piece the
-   contract-only designs got right, now paired with the CI/convergence fix that
-   is the actual cure.
+   inputs. The principled weight is the **probability-of-binding-weighted
+   gradient** `∇E[min] ≈ Φ(−t)∇g₁ + Φ(t)∇g₂` — the weights are
+   `P(each arm is the min)`, what SSTA calls the **tightness / criticality
+   probability**, and they **sum to 1** (verified: `dE/dμ₁ = Φ(−t) = 0.3221`,
+   `dE/dμ₂ = Φ(t) = 0.6779`, §8). This is the rigorous form of the "soft-min"
+   the contract-only designs hand-waved: near a tie both arms get nonzero weight,
+   curing the zero-gradient-on-the-inactive-arm pathology; away from a tie
+   (`|t|→∞`) it collapses to the hard `min`. The necessary-but-insufficient
+   "fund both arms" piece the contract-only designs got right is now the exact
+   `Φ(±t)` weighting, paired with the CI/convergence fix that is the actual cure.
 
-Away from a tie (`margin` comfortably large) the analytic gradient is honest,
-the non-binding arms' `df/dx = 0` is **correct** (those inputs genuinely do not
-move the bound), and behavior is exactly today's. The honest statement at the
-tie is: *the delta-method Var is suspended; here is the mixture Var and the
-arg-min-flip probability* — surfaced loudly, not a silent zero.
+It is **not** that the delta-method is "suspended" at the tie and falls back to
+something worse: the **faithful objective is smooth in closed form**. The kink in
+`min` does **not survive the expectation** — the input noise convolves it away,
+so `Var[min](n)` is `C^∞` on the positive orthant (verified smooth even at the
+exact tie `Δ=0`: bounded `d²Var/dσ₁²`, no spikes, §8). What is lost at the tie is
+not smoothness but **convexity**: `Var[min]` is generally **nonconvex** in
+`(σ₁, σ₂, ρ)` (verified — a stable negative Hessian eigenvalue `≈ −0.27` in the
+small-`σ₁` corner of `(σ₁,σ₂)`, and `Var[min]` concave in `ρ`, §8). So the
+cone-program structure of the single-branch SOCP
+(§2) is lost exactly at the tie — the **principled boundary for the
+`kink_regime` branch** — and the regime becomes smooth **nonconvex** optimal
+design, still differentiable (analytic `dVar/dn` from Clark × `dΣ/dn`), so
+gradient-based design works there. *(Precision, departing from the review's
+shorthand "nonconvex in n": the loss is the **SOC-expressibility of the variance
+constraint** — `Var[min](n) ≤ V*` cannot be written as a second-order cone
+because `Var[min]` is nonconvex in the `(σ,ρ)` it is built from. The decision
+variable `n` itself stayed convex on every region probed, because
+`σ(n)=√(A/n)` tends to **restore** convexity in `n`: 0/28 probed
+(gap × n-range) regimes showed a nonconvexity witness in `n`-space, §8. The
+honest claim is "lose the cone constraint," not "the program in `n` is
+nonconvex.")*
+
+Away from a tie (`margin` comfortably large) `t` is large, `Φ(−t)→0`, the
+non-binding arm drops out, and Clark collapses to the single binding arm: the
+analytic gradient is honest, the non-binding arms' `df/dx = 0` is **correct**,
+and behavior is exactly today's. The exact tie `Δ=0` (measure zero) is the one
+permanently pathological case — `t≡0` for all `n`, the blend never resolves, and
+Clark's normality assumption degrades precisely when the means are equal with
+dissimilar variances; there the kink is permanently load-bearing.
+
+**One reconciliation, so a reader is not whipsawed (raised by the review,
+resolved here).** It can look contradictory that `min` of two i.i.d. Gaussians
+*clips* variance (`Var[min] ≈ 0.68σ²`) while this case shows `Var[min]` **12.79×
+larger** than the binding arm. Both are Clark; the sign depends on the
+**asymmetry**. The clip shows up against the **wide** arm (here producer,
+`σ=60`): `min` truncates its upper tail. The **inflation** shows up against the
+**tight** arm (here serve, `σ=2`): the wide producer dips under serve 32% of the
+time and **injects its spread** into the realized `min`. The dangerous direction
+for the convergence test is the one this case sits in — measured against the
+tight binding arm, the honest variance is **larger**, so the naive single-arm CI
+is **overconfident**: precisely the false-SAT the §4.1 guard exists to forbid.
 
 **A second, distinct non-smoothness — the `pad(B)` sawtooth — stated for
 completeness.** The physical serve curve uses `B_eff = pad(B)`, a step function
@@ -514,12 +719,40 @@ off the staged fit's intercept. The contract's `cross == {}` block-diagonal rule
 therefore treats `T_disp` and `t_row` (and `T_disp` and `iota`) as
 **independent**, which is **defensible because they are different fits** — but it
 is a *modelling choice*, not a rigorous fact: the two fits time the same
-hardware and are physically non-independent. This is named in §7 as a known
+hardware and are physically non-independent. This is named in §7.C as a known
 approximation. The `cov_group` / shared-`Estimate` mechanism pairs **only**
 co-fit components: `(t_row, iota)` from the staged fit, `(t_row_bare, T_disp)`
 from the cpp fit — and must **not** pair `t_row` with `T_disp` (different
 variants). A migration that grouped them would fabricate a covariance that does
 not exist.
+
+**`cross` carries TWO kinds of coupling — broadened from the original draft (a
+distinction the external review supplied).** As specified by **D5**, `cross` is
+scoped to **compositional** coupling: one input a composite of another (the
+ratio / Jacobian-of-a-composite case, §3). But the `T_disp` ⊥ `t_row`
+independence-by-different-fits is a different animal — it is **nuisance**
+coupling: two **distinct** fits sharing a clock, a thermal envelope, and the same
+core. A shared-clock/thermal covariance between two distinct fits is **not** a
+Jacobian-of-a-composite, so it has **no home in `cross` as D5 specifies it**.
+The slot is therefore broadened: `cross` carries **both** the compositional block
+(D5) **and** an optional **nuisance / shared-hardware block** keyed by the other
+bench's quantity name, defaulting to `{}` (block-diagonal — the honest "no shared
+nuisance" assumption). The two are distinguished by a `kind` tag on the cross
+entry (`composite` vs `nuisance`) so the store and the report do not conflate a
+rigorous Jacobian coupling with a measured nuisance correlation.
+
+**The nuisance block is empirically checkable before it is assumed negligible
+(the gate that earns the block-diagonal default).** Whether `T_disp ⊥ t_row` is
+benign is not a matter of assertion: **interleave** the two fit benches (alternate
+their measurements on the same core, same session) versus running each
+**isolated**, and measure the **cross-correlation of their fit residuals**. A
+residual cross-correlation `≈ 0` **earns** the block-diagonal default (the
+`cross == {}` assumption is then a measured fact, not a hope); a nonzero value is
+a **number that needs a slot** — populated into the nuisance block. This makes
+the §7.C "a future cross-fit covariance would tighten it" caveat **actionable**:
+it names the experiment (interleaved vs isolated), the statistic (residual
+cross-correlation), and the threshold (≈0 ⇒ block-diagonal), rather than leaving
+the independence an unfalsified convenience.
 
 ### 4.3 Non-asymptotic and non-Gaussian — `family`, not a universal `dof`
 
@@ -568,7 +801,67 @@ the **bench's** `cov`/`shrink`, not the driver:
   floor; `RegressionLaw.marginal` must return ~0 there (or route effort to
   *design points*, the knob that genuinely lowers `1/Sxx`), so the allocator
   does not pour budget into the dominant-cost fit chasing a floor it cannot
-  reach.
+  reach. *(The within-fit x-design is itself a c-optimal design: lowering
+  `1/Sxx` by the choice of batch widths is the classical c-optimal design for a
+  slope, whose solution puts mass at the x-**extremes**. The even-ish 7-point
+  `[32…512]` is deliberately **not** slope-optimal — it trades endpoint
+  efficiency for the interior points the lack-of-fit / R² gate needs. State the
+  tension as the **reason** the design is what it is, so a future "optimize the
+  x-design" impulse does not collapse it to two endpoints and go blind to
+  curvature.)*
+
+### 4.4 Robustness of the allocation to its own estimation error — an orthogonal axis (Cai–Rafi)
+
+This sub-section records a refinement the external review supplied and the
+original draft did **not** address — and it is deliberately a **separate axis**
+from everything above. The contract (`theta_hat`, `cov`, `family`, `support`)
+makes the **reported variance faithful**: it carries the right `Var(theta_hat)`,
+the right correlation, the honest CI multiplier. It does **not** make the
+**allocation robust to the error in its own inputs.** Those are different
+properties, and conflating them would be its own dishonesty.
+
+**The mechanism.** The allocation is **fully plug-in**: `a_i = g_i² · V̂ar` is
+computed from a small pilot's `σ̂` and `ĝ` (the suite's `UD_PILOT = 32`). Cai &
+Rafi's small-pilot result is directly on point: plug-in Neyman allocation can do
+**worse than uniform** when the outcome is near-homoskedastic across the split or
+**heavy-tailed** — and timing data is precisely right-skewed/heavy-tailed (GIL
+handoffs, tail latencies; the benches compute `_median_iqr_us` for exactly that
+reason). So a 32-sample pilot can **confidently misallocate**. Note what does and
+does **not** help here: `family + STUDENT_T` (§4.3) makes the **CI honest**, and
+the median estimators (§7.A) tame the tails at the **estimate** level — but
+**neither touches the allocation**, which still chases a noisy `V̂ar` with no
+shrinkage or floor.
+
+**Mitigations (cheap → principled), reusing hooks the suite already has:**
+
+- **Robust scale.** Use a robust spread (the **IQR the benches already compute**,
+  `_median_iqr_us`) in place of `std(ddof=1)` when forming `a_i`, so a single
+  heavy-tail draw does not dominate the allocation.
+- **Shrink `a_i` toward uniform.** Convex-combine the plug-in `a_i` with a flat
+  allocation; on a noisy small pilot this strictly dominates the raw plug-in in
+  the regime Cai–Rafi identify.
+- **Floor each allocation.** Keep any input's share from collapsing to zero on a
+  noisy early estimate — the same instinct as the driver's existing
+  `growth_cap` (which damps *growth*; a floor damps *collapse*).
+- **The principled move: Clip-OGD.** Drop fixed-point chasing of a moving `a_i`
+  for the **online-convex** view — regret minimization with **clipping** that
+  keeps any input's share from collapsing on a noisy early estimate. This is the
+  `growth_cap` instinct **with a regret guarantee**, and it is the named
+  adaptive-allocation result that *does* transplant to a budget-split problem
+  (the adaptive-sequential-Neyman branch — TS-Neyman — does **not** transplant:
+  it advances a different reading where the decision is which units go to which
+  arm/stratum, not how to split a measurement budget across estimators of several
+  inputs).
+
+**Why this is orthogonal, stated plainly (the honest framing).** The interface
+makes the **variance** faithful; it does **not** make the **allocation** robust
+to its own estimation error. The two literatures the §2.3 SOCP rests on (c-optimal
+design, MLBLUE/ACV) **assume the variances and covariances are known or local** —
+the small-pilot, heavy-tailed fragility is a **caveat on the input** to those
+methods, not something they fix. So this axis is a hook the contract **enables**
+(the `cov`, the IQR, the `family` are all present) but does **not** itself
+discharge; it is named here so a reader does not mistake "faithful variance" for
+"robust allocation."
 
 ---
 
@@ -689,10 +982,13 @@ from `latest_aggregate` and from `get_seed()`.
   `self.estimates[i]`, else falls back to wrapping the raw pool as a `Poolwise`
   `Estimate` (so a pool-fed driver and an `Estimate`-fed driver agree on the
   mean case — the confirmed fixed point). Replace the diagonal sum with `g^T Σ
-  g` (equal to today's sum for diagonal Σ → no regression on existing models).
-  Land the binding-margin / `kink_regime` mixture path (§4.1), the per-`family`
-  multiplier, and the convergence guard. `run()`'s `samplers[i](k)` becomes
-  `measurers[i](budget) -> Estimate`. Keep `add_samples` as a thin
+  g` (equal to today's sum for diagonal Σ → no regression on existing models),
+  and the closed-form `sqrt(a_i/c_i)` allocation with the **SOCP** (§2.3) on the
+  correlated/constrained case (CLARABEL; it reduces to the closed form on the
+  diagonal, so no regression on all-mean models). Land the binding-margin /
+  `kink_regime` **Clark closed-form** path (§4.1 — deterministic, no MC), the
+  per-`family` multiplier, and the convergence guard. `run()`'s `samplers[i](k)`
+  becomes `measurers[i](budget) -> Estimate`. Keep `add_samples` as a thin
   `Poolwise`-wrapping shim so a mid-migration caller still works.
 
 - **Phase 3 — benches, one at a time, highest-Neyman-priority first.** Each
@@ -748,18 +1044,34 @@ from `latest_aggregate` and from `get_seed()`.
 Per claims-measured-vs-interpreted, what this contract makes **rigorous** and
 where it rests on a **modelling choice** or a **least-bad option**:
 
-**Rigorous (proved against the code / executed):**
+**Rigorous (proved against the code / executed — see §8 for the numbers):**
 
 - The delta-method bound `Var(f(θ̂)) ≈ g^T Σ g` for any consistent estimator
   with sampling covariance Σ — the multivariate delta method; the mean is one
   consistent estimator and no step required it. Reduces to today's diagonal sum
   bit-for-bit on the all-means case.
-- The Neyman optimum reduces to `n_i^* ∝ sqrt(a_i/c_i)` for `Poolwise` inputs
-  (KKT marginal-per-cost equalization), and the general first-order condition
-  replaces the closed form for non-`V/n` laws.
+- The allocation is a **cost-constrained c-optimal design solved as an SOCP** (the
+  **sign-safe `Q = diag(g)·R·diag(g)`** form, native to mixed-sign gradients);
+  the Neyman closed form `n_i^* ∝ sqrt(a_i/c_i)` is its **diagonal/independent
+  special case** (SOCP vs closed form: rel diff `~1.9·10⁻⁵`, §8), and the SOCP
+  hits `V*` exactly on the correlated case the closed form cannot express
+  (CLARABEL exact default; SCS agrees on the well-posed program — the earlier
+  "SCS inaccurate" was a DCP-form artifact, §8 correction 2). The diagonal
+  formula's error under a dropped cross-term has the sign of `g_i g_j R_ij` (it
+  can over- **or** under-spend; §8 correction 1). The naive `v = u/√n` form
+  **silently misallocates on mixed-sign gradients** (which `model_capacity` has),
+  so the general program needs the `Q`-form and an ADR-0002 `gᵀΣ(n*)g ≈ V*`
+  assertion (§8 correction 3).
 - The slope/intercept covariance: `Cov = −x̄·resid_var/Sxx`, correlation −0.8114
-  on the real design — carried in `cov`, not dropped.
-- The fabricated 2-point pilot has **no** `/2` bug (its std is `sqrt(2)·σ`).
+  on the real design (and the three `(AᵀA)⁻¹` entries match the closed forms
+  exactly, §8) — carried in `cov`, not dropped.
+- The `min()`-kink moments are the **Clark-1961 closed form**, deterministic and
+  parameter-free: `E[min]=415.68`, `sd[min]=25.58`, `P(producer binds)=Φ(−t)=
+  0.322` for the stipulated pair, MC-confirmed to ~4 decimals (§8); the
+  arg-min-flip gradient weights are `Φ(±t)` and sum to 1. The arms are
+  input-disjoint (`ρ_arms=0`, verified vs `INPUT_NAMES`).
+- The fabricated 2-point pilot has **no** `/2` bug (its std is `sqrt(2)·σ`,
+  verified — `a_i/n_i = grad²·σ²` exactly, §8).
 
 **Modelling choices / least-bad options (named, not papered over):**
 
@@ -770,21 +1082,37 @@ where it rests on a **modelling choice** or a **least-bad option**:
   row), and the `(θ̂, V/n, n)` sketch is **not** earned for latencies — only for
   a true arithmetic mean, which no timing bench currently produces. The
   least-bad alternative if a bench prefers `Poolwise` is to switch its headline
-  to a trimmed mean; that is the bench's choice, declared in `kind`.
-- **`B.` The `min()` kink cannot be folded into the per-input contract.** This is
-  the one case the harmonized interface **does not** harmonize, and §4.1 says so
-  plainly: `Var(min(·))` is a functional of `f`, not a per-input estimate, so it
-  is handled at the driver (mixture MC + binding-margin guard), and `f(μ̂)` is a
-  biased (Jensen, +12.6 dps at the seed), variance-understated (12.8×) estimate
-  of `E[f]` in the tie regime. The least-bad option — suspend the delta-method
-  and report the mixture Var with the arg-min-flip probability — is honest, not a
-  silent zero, but it is **more machinery than a clean closed form**, and the
-  point estimate's bias is a real cost the loop must surface.
+  to a trimmed mean; that is the bench's choice, declared in `kind`. *(Review
+  refinement: `f̂(median)` — the density-at-quantile in the order-statistic law —
+  is itself small-sample-fragile, so the asymptotic `p(1−p)/(n f̂²)` is unreliable
+  at the bench `n`. Prefer a **bootstrap median SE**, which is steadier at small
+  `n`; the bench owns this, declaring `family = EMPIRICAL` with its bootstrap
+  interval rather than a fabricated asymptotic one.)*
+- **`B.` The `min()` kink is resolved at the driver by the Clark-1961 closed
+  form** (this supersedes the original draft's "cannot be folded in / suspend the
+  delta-method and Monte-Carlo it" framing — see §4.1). `Var(min(·))` is a
+  functional of `f`, not a per-input estimate, so it is **not** a contract field;
+  but it is **not** computed by simulation either. The faithful objective
+  (delta-method per arm, **Clark to combine**) is **smooth in closed form** — the
+  kink is convolved away by the input noise and never reaches the variance
+  functional. `f(μ̂)` is a biased (Jensen, **+12.60** dps at the seed, the `−a·φ(t)`
+  term), variance-understated (**12.79×**) estimate of `E[f]` in the tie regime,
+  and the **de-biased `E[f]` and honest `Var(f)` are Clark arithmetic each step**
+  (deterministic, O(1), no temperature, no draws). The remaining modelling content
+  is small: Clark's normality of the arms is exact only under the delta-method
+  Gaussian linearization, and it **degrades at the exact tie `Δ=0`** (means equal,
+  variances dissimilar) — the one permanently load-bearing case (§4.1).
 - **`C.` `T_disp` ⊥ `t_row` (and `T_disp` ⊥ `iota`) is block-diagonal by the
   different-fits rule, but they are physically non-independent** (different fits,
   same hardware). Treating distinct fits as independent is defensible and is the
-  `cross=={}` default, but it is a modelling choice; a future cross-fit
-  covariance would tighten it.
+  `cross=={}` default, but it is a modelling choice. This is a **nuisance**
+  coupling (shared clock/thermal/core), **not** the compositional coupling D5
+  scopes `cross` to — so the slot is **broadened** to carry a nuisance block
+  (§4.2), and the independence is made **falsifiable**: interleave the two fit
+  benches vs run them isolated and measure the **residual cross-correlation** —
+  `≈0` earns the block-diagonal default, nonzero is a number for the nuisance
+  block. The "future cross-fit covariance would tighten it" is now an actionable
+  experiment, not an open hand-wave.
 - **`D.` The combined CI over differing families is a conservative variance
   budget, not an exact CI** (Behrens-Fisher); and when a `Fixed` declared-prior
   spread contributes, the interval mixes a frequentist sampling variance with a
@@ -796,13 +1124,211 @@ where it rests on a **modelling choice** or a **least-bad option**:
   measurement noise with lack-of-fit** (§4.3); plain `resid_var/Sxx` is a lower
   bound on the true slope variance unless a weighted-LS SE is used. The contract
   carries the obligation; the bench owns the implementation.
+- **`F.` The interface makes the variance faithful, not the allocation robust to
+  its own estimation error** (§4.4, Cai–Rafi). `a_i` is plug-in from a 32-sample
+  pilot; on heavy-tailed timing data a small pilot can misallocate worse than
+  uniform. This is **orthogonal** to everything above: `family + STUDENT_T` makes
+  the CI honest and the medians tame the tails at the *estimate* level, but
+  neither makes the *allocation* robust. The mitigations (robust IQR scale, shrink
+  `a_i` toward uniform, floor each share; principled = Clip-OGD) are hooks the
+  contract enables but does not itself discharge.
 
-**The one highest-risk open question** (carried forward to implementation): the
-`min()`-kink regime needs a *cheap, faithful* `Var(min)` estimator the driver
-runs every step — a few-thousand-draw Monte-Carlo over the input `Estimate`s, or
-a soft-min with a principled temperature. The Monte-Carlo is straightforward but
-adds a stochastic element to a previously-deterministic `step()` (reproducibility
-and per-step cost); the soft-min is deterministic but introduces a temperature
-that is itself a modelling choice whose bias must be characterized. Which one,
-and how its own error is bounded, is the load-bearing decision the contract
-**enables** (by carrying each arm's full `cov`) but does **not** settle.
+**The highest-risk open question is now RESOLVED (was carried forward; closed by
+this consolidation).** The original draft ended on a dilemma: the `min()`-kink
+regime needs a *cheap, faithful* `Var(min)` estimator the driver runs every step
+— a Monte-Carlo (stochastic, costs reproducibility) **or** a soft-min with a
+principled temperature (a modelling choice whose bias must be characterized.) The
+external review supplied, and §8 executes, the resolution: **neither — the
+Clark-1961 closed form.** Because the two contending arms are input-disjoint
+(`ρ_arms=0`) delta-method Gaussians, Clark's exact min-moments give `E[min]`,
+`Var[min]`, and `P(arg-min flips)=Φ(−t)` **deterministically, O(1),
+parameter-free**. The Monte-Carlo was the right way to *validate* (it agrees to
+~4 decimals); it is **unnecessary per step**, so `step()` stays deterministic
+(the reproducibility the dilemma worried about is preserved) and there is **no
+temperature to characterize** (the input noise supplies the smoothing scale
+`t=Δ/a`; Clark is its exact form). This is the SSTA discipline: propagate Clark
+moments, never simulate a max/min. The one residual caveat is the exact tie
+`Δ=0` (§4.1, §7.B), where Clark's normality degrades — a measure-zero case the
+guard refuses to call converged, not a method gap. The load-bearing decision the
+contract **enables** (by carrying each arm's full `cov`) is now also **settled**.
+
+---
+
+## 8. Executed verifications backing the consolidation (ADR-0009)
+
+Every integrated formula in this consolidation is reported here with the number
+it reproduces, executed against the live code and the stated libraries
+(`numpy 2.4.6`, `scipy 1.17.1`, `cvxpy 1.9.1` with CLARABEL + SCS, at
+`/home/bork/w/vdc/venvs/generic/bin/python`). A formula is integrated **only**
+with its own reproduced number — never relayed on the review's authority. (The
+verification scripts are throwaway drivers; the numbers, not the scripts, are the
+deliverable. ADR-0009: the claim carries its substantiation.)
+
+**(a) The Clark-1961 closed form reproduces the note's `min()` numbers
+deterministically.** For `min(Normal(456, 60), Normal(428.28, 2))`, `ρ=0`:
+
+| quantity | Clark closed form (no draws) | MC, 4·10⁶ draws | note's figure |
+| — | — | — | — |
+| `a = SD(g₁−g₂)` | 60.033 | — | 60.03 |
+| `t = (μ₁−μ₂)/a` | 0.4617 | — | 0.462 |
+| `E[min]` | **415.681** | 415.697 | 415.7 |
+| `sd[min]` | **25.582** | 25.555 | 25.6 |
+| `P(producer is min) = Φ(−t)` | **0.3221** | 0.3220 | 0.32 |
+| Jensen gap `min(μ)−E[min]` | **+12.599** | — | +12.6 |
+| `sd[min] / σ_bind` (=2) | **12.79×** | — | 12.8× |
+
+The smoothed gradient (FD on Clark's `E[min]`) is `dE/dμ₁ = 0.32213 = Φ(−t)` and
+`dE/dμ₂ = 0.67787 = Φ(+t)`, **summing to 1.0** (the SSTA criticality property).
+**Conclusion:** the closed form reproduces all of 415.7 / 25.6 / 0.32 / +12.6 /
+12.8× with no draws; the MC-vs-soft-min fork (§7 open question) is a **false
+choice**. *(Provenance caveat: `σ₁=60` is **stipulated**, not the seed
+delta-method propagation `√((152·0.05)²+(3·8)²)=25.17`; at `σ₁=25.17`,
+`Φ(−t)=0.136` vs `0.322` at `σ₁=60` — production must source `σ₁` from the
+`Estimate` `cov`, §4.1.)*
+
+**(b) The cvxpy SOCP expresses the cost-constrained c-optimal allocation and
+agrees with the closed form on the diagonal.** The **general, sign-safe**
+formulation absorbs the gradient sign into the quadratic so it survives mixed-sign
+gradients: `Q = diag(g)·R·diag(g)` (PSD by congruence of the PSD correlation `R`,
+`Q = L_Q L_Qᵀ`), optimize over the genuinely-positive per-component SE
+`w_i = √(A_i/n_i) > 0`, `min Σ_i c_i·A_i·w_i^{-2}` (`cp.power(w,-2)`, convex) s.t.
+`‖L_Qᵀ w‖₂² = wᵀQw ≤ V*` (convex). *(Provenance: an intuitive `v_i = u_i/√n_i`
+form with `u_i = g_i√A_i` and constraint `‖Lᵀv‖₂² ≤ V*`, `Σ = LLᵀ`, is DCP-clean
+**only for same-sign gradients** — `cp.power(·,-2)`'s `>0` domain forces `v>0` and
+folds out the sign, so it silently misallocates on mixed signs, see the trap row
+below. A further variant `q = cp.power(n,-0.5)` is **DCP-marginal** and raises a
+`DCPError` on the non-diagonal case. The earlier consolidation reported numbers
+from a `q`-form variant; this revision re-executes on the sign-safe `Q`-form and
+**corrects three figures** — flagged below.)*
+
+| case | solver | status | `Var` achieved (target 5.0) | vs closed form |
+| — | — | — | — | — |
+| diagonal `R=I` (sign-safe `Q`) | **CLARABEL** | optimal | **5.000000** | max rel diff `n` **1.9·10⁻⁵** |
+| diagonal `R=I` (sign-safe `Q`) | SCS | optimal | **5.000000** | agrees (correction 2) |
+| non-diagonal `R`(−0.81), same-sign `g` (sign-safe `Q`) | **CLARABEL** | optimal | **5.000000** | (closed form cannot express) |
+| non-diagonal `R`(−0.81), same-sign `g` (sign-safe `Q`) | SCS | optimal | **5.000000** | agrees |
+| non-diagonal `R`(−0.81), **mixed-sign** `g`, naive `v`-form | CLARABEL | **optimal (a lie)** | **5.585** ≠ 5.0 | the silent sign fold — correction 3 |
+| non-diagonal `R`(−0.81), **mixed-sign** `g`, sign-safe `Q`-form | CLARABEL | optimal | **5.000000** | the fix |
+
+At the **diagonal-optimal** allocation evaluated under the true non-diagonal Σ
+(`R₁₂ = −0.81`, same-sign `g`), the realized `Var = 2.73 < 5.0` — the closed form
+**misses `V*`** because it drops the cross-term, here **over-spending** (cost
+`30.66` vs the SOCP's `13.35`). *(The magnitudes `2.73 / 30.66 / 13.35` are
+specific to the undisclosed `(g, A, c)` instance; the **load-bearing** fact is the
+**direction** — same-sign `g` + negative `R` ⇒ the diagonal formula over-states
+variance ⇒ over-spend, `Var < V*` — which is robust across instances, §8 correction
+1. A different instance gives different magnitudes preserving the direction.)*
+**Conclusion:** the SOCP is a strict generalization (reduces to Neyman on the
+diagonal, solves the correlated case the closed form cannot), provided the
+sign-safe `Q`-form is used so mixed-sign gradients do not silently misallocate.
+
+> **Correction 1 (sign — supersedes the earlier consolidation's `Var = 6.51`).**
+> The effect of dropping the cross-term has the sign of `g_i g_j R_ij`. For the
+> stated **negative** correlation `R₁₂ = −0.81` with same-sign gradients, the
+> dropped term is negative, so the diagonal formula **over-states** the variance
+> (true `Var = 2.73 < V*`), i.e. the closed form is **conservative and
+> over-spends** — the executed cost is `30.66` vs the SOCP's `13.35`. The earlier
+> `Var = 6.51 > V*` (an *under-statement*) is the **wrong sign** for a negative
+> off-diagonal: re-running the same `R = −0.81` instance on the well-posed `v`-form
+> gives `2.73`. (`6.51 > V*` would require `g_i g_j R_ij > 0`; verified by
+> sign-flipping one gradient — opposite-sign `g`, `R₁₂ = −0.81` gives the
+> under-statement `Var = 7.27`.) **The load-bearing claim is unchanged** — the SOCP
+> hits `V*` exactly under non-diagonal Σ while the diagonal formula does not — but
+> the *direction* of the diagonal formula's error is `sign(g_i g_j R_ij)`, and for
+> the real slope/intercept pair it is set by the model's `df/dslope`, `df/dintercept`
+> signs (so it can over- **or** under-spend; it is not generically anti-conservative).
+>
+> **Correction 2 (solvers — supersedes "SCS is materially inaccurate").** On the
+> well-posed program (the sign-safe `Q`-form, and the `v`-form on same-sign `g`),
+> **SCS and CLARABEL agree** to ~1e-6 (`Var = 5.000000` vs `4.99998`) — across
+> same-sign non-diagonal instances, five random diagonal instances, and a
+> badly-scaled instance (`n` up to ≈2825, `A` spanning 100–4000). I **could not
+> reproduce** the earlier "`SCS` returns `optimal_inaccurate`, off ≈16×, `Var`
+> 7.8–9.6"; that was an **artifact of the DCP-marginal `q`-form** (which itself
+> errors on the non-diagonal case), not a property of SCS on this allocation. The
+> honest operational claim: **CLARABEL is a clean default and exact; SCS is also
+> accurate on the well-posed form** (tighten `eps` only if an ill-conditioned
+> instance reports `optimal_inaccurate`; a few harsh `(g,A)` instances do make
+> CLARABEL itself `SolverError` — verify `Var` and retry on the other solver). The
+> "16×" warning is withdrawn.
+>
+> **Correction 3 (sign — the naive `v`-form silently misallocates on mixed-sign
+> gradients; an ADR-0002 fail-loud obligation).** The `v_i = u_i/√n_i` form with
+> `u_i = g_i√A_i` and constraint `‖Lᵀv‖₂² ≤ V*` is correct **only for same-sign
+> gradients**: `cp.power(v,-2)`'s `v>0` domain folds out the sign, and the cone
+> `‖Lᵀv‖₂² = vᵀRv` equals the true `gᵀΣg` only if `v` carries `sign(g)`. On
+> mixed-sign `g` the solver returns `status = optimal` with the cone reading
+> exactly `V*` while the **true** `Var = 5.59 ≠ 5.0` (executed). The sign-safe fix
+> is the `Q = diag(g)·R·diag(g)` form (PSD by congruence) over the genuinely-
+> positive `w = √(A/n)`, which returns `Var = 5.0000` for mixed signs (executed).
+> This is the **same** sign-indefiniteness of `Lᵀ` the rejected `q`-form already
+> flags ("mixes a convex `q` through the sign-indefinite `Lᵀ`") — it **resurfaces
+> in the `v`-form** the instant gradients are mixed-sign; canonicalizing on `v>0`
+> is exactly what **hides** the fold, so the `v`-form is not automatically safe
+> just because it is DCP-clean. `model_capacity`'s gradient **is** mixed-sign — at
+> the seed `d serve/dB_op = +3.08` while `d serve/d{iota, slope, tau_io, LPD}` are
+> negative (sign set `{+, −}`, §8 corroborating checks) — so the *general* program
+> over all its inputs needs the `Q`-form. Because the solver's `optimal` status
+> does **not** catch the fold, the driver must **assert `gᵀΣ(n*)g ≈ V*` on the
+> returned `n*`** (ADR-0002 loud) before trusting it. *(This does not invalidate any
+> reported figure: the worked correlation case and the over-spend example use
+> same-sign gradients, and the LIVE `iota`/`slope` pair is same-sign, so their
+> numbers stand under either form.)*
+
+**(c) `Var[min](n)` is smooth everywhere but loses convexity (and hence SOC
+structure) — in `(σ,ρ)`, not in `n`.**
+
+- **Smooth:** `max|d²Var/dσ₁²|` stays bounded (~0.68–0.73) with no spikes across
+  gaps `Δ = 27.72 → 10 → 2 → 0` **including the exact tie** — the kink is
+  convolved away (`C^∞` on the positive orthant), confirming the review.
+- **Nonconvex in `(σ₁,σ₂)`, located by the Hessian (the robust witness).** The
+  nonconvexity is **real** but **thin**, living in the small-`σ₁` corner: the
+  Hessian of `Var[min]` w.r.t. `(σ₁,σ₂)` has a **stable negative eigenvalue
+  ≈ −0.266 at an interior point `σ₁≈1.0, σ₂≈20.5`** (seed gap `Δ=27.72`, `ρ=0`),
+  reproducible across FD steps `h ∈ [10⁻², 10⁻⁴]` (`−0.266 / −0.266 / −0.268`).
+  *(Methodological caveat so a reader does not "refute" the claim with a generic
+  search: a **naive whole-box random chord search returns 0 witnesses** — the
+  positive chord witness `f(mid) > ½(f(A)+f(B))` the earlier pass cited
+  (`+0.57…+1.9`) appears **only** for short/medium chords centered near the
+  `σ₁≈2, σ₂≈20` corner or directed along the negative eigenvector, so it is a
+  chord-**placement** artifact, not the primary evidence; the Hessian eigenvalue
+  is.)* `Var[min]` is also **concave in `ρ`** (`d²V/dρ² < 0` throughout:
+  re-executed, `d²V/dρ² ∈ [−2.18, −1.62]`), and **strongly nonconvex jointly** in
+  `(σ₁,σ₂,ρ)` (min Hessian eigenvalue `≈ −4·10³` over a random scan — the
+  nonconvexity is carried chiefly by the `ρ` direction). So the variance
+  **constraint** stops being a second-order cone at the tie — the **principled
+  boundary for `kink_regime`**.
+- **But convex in the decision variable `n`:** sweeping 28 (gap × n-range)
+  regimes with `σ_i(n)=√(A_i/n_i)`, a chord-witness nonconvexity in `n`-space
+  appears in **0/28** — `σ(n)=√(A/n)` tends to **restore** convexity in `n`.
+  Contrast the single-arm `Σ a_i/n_i`: `d²/dn² = 2a/n³ > 0` everywhere (convex,
+  SOCP-able).
+
+**Conclusion (the honest disagreement with the review):** the review is **right**
+that `Var[min]` is smooth (not non-smooth) and nonconvex in `(σ,ρ)`; its shorthand
+"you land in nonconvex optimization [in n]" is **overstated** — the precise loss
+is the **SOC-expressibility of the variance constraint**, the program in `n`
+staying convex on every region probed.
+
+**Corroborating codebase checks (executed against the live modules):**
+
+- `Corr(slope, intercept) = −0.8114` on the real 7-point design
+  `[32,64,128,192,256,384,512]`, and all three `(AᵀA)⁻¹` entries
+  (`Var(slope)=1/Sxx`, `Var(intercept)=1/n+x̄²/Sxx`, `Cov=−x̄/Sxx`) match their
+  closed forms exactly.
+- Producer `{N_gen,R_gen}` ∩ serve `{T_disp,tau_io,wakeup,B,t_row,L}` = **∅**
+  against `model_zmq_baseline.INPUT_NAMES` ⇒ `ρ_arms=0` exact for `zmq_baseline`.
+  *(For `model_capacity`, `LPD` divides **both** producer and serve as the unit
+  conversion — a genuine shared input — so its arms are not strictly disjoint;
+  `LPD` is a `Fixed` pin, so its contribution to the cross-arm covariance is the
+  small declared-spread term, but the `ρ_arms=0` simplification is exact only for
+  `zmq_baseline`, where the producer reads `R_gen` rather than `LPD`.)*
+- Stage margins at the seed: `zmq_baseline` SERVE 428.28 / GEN 456 = **6.5%**;
+  `model_capacity` SERVE 419.76 / GEN 456 = **8.6%** — both fire `kink_regime`.
+- `OpenTURNS getMeanSecondOrder = 432.43` (note: 432.4), **+4.16 the wrong
+  direction** (true Jensen for the concave `min` is **−12.6**); the live
+  `WRN - Switch to finite difference to compute the hessian` confirms OT cannot
+  differentiate `min()`, so it must **not** be the kink-validity signal (§4.1).
+- The 2-point pilot `{μ−σ, μ+σ}` has sample `std(ddof=1) = √2·σ` exactly, so
+  `a_i/n_i = grad²·(√2σ)²/2 = grad²·σ²` — **no `/2` bug** (§7, the cleanup stands
+  on the opacity and the wrong inline comment, not a fabricated error).
