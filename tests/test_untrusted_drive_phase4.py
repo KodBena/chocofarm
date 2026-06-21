@@ -295,6 +295,44 @@ def test_every_shrinkable_bench_is_sizable_by_the_driver() -> None:
         f"classifier regressed (every bench mis-read as a pin)")
 
 
+def test_every_race_based_collector_bench_uses_the_pool_floor() -> None:
+    """CLASS-LEVEL discovery guard (ADR-0011 Rule 4 — keyed on the predicate, by glob), the structural NET
+    for RCA fix #2: a RACE-BASED collector bench — one that spawns a producer/consumer `threading.Thread`
+    in `_measure_raw`, so its realized reading count is DECOUPLED from the requested effort and can fall
+    below median_estimate's >= 2 floor at a tiny allocator budget (the ~/shm_spin_poll_fail crash) — MUST
+    floor its pool via `bench_common.collect_pool`. Detected by AST of `_measure_raw` (a `Thread(...)` call
+    => race; a `collect_pool(...)` call => floored), so NO live timed run is needed. Symmetric to the
+    shrinkable=>sizable guard: a NEW race bench that forgets the floor fails HERE, not at a tiny-budget crash
+    in production. (`Thread`-in-_measure_raw is the proxy for "race collector": the 4 wakeup benches are the
+    only thread-spawning benches; the deterministic for-range collectors size their pool == effort, safe at
+    the driver's max(2,..).)"""
+    import ast
+    import inspect
+    import textwrap
+    n_race = 0
+    for mod in _all_bench_modules():
+        mr = getattr(mod, "_measure_raw", None)
+        if mr is None:
+            continue
+        calls = {
+            (n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
+            for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(mr))))
+            if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))
+        }
+        if "Thread" not in calls:
+            continue   # a deterministic for-range collector (pool size == effort; safe at the driver's max(2,..))
+        n_race += 1
+        assert "collect_pool" in calls, (
+            f"{mod.__name__} is a RACE-based collector (spawns a producer/consumer Thread in _measure_raw, so "
+            f"its realized pool count is decoupled from the budget) but does NOT floor via "
+            f"bench_common.collect_pool — at a tiny allocator budget its pool underflows median_estimate's "
+            f">= 2 floor (the ~/shm_spin_poll_fail crash). Wrap the batch in collect_pool (RCA fix #2).")
+    assert n_race >= 4, (
+        f"expected at least the 4 known race-based wakeup collectors (shm_spin_poll, futex_wake, "
+        f"lockfree_mpsc, cpp_inproc_port); discovery found {n_race} — the glob or the Thread predicate "
+        f"regressed (a vacuous pass)")
+
+
 def test_make_measurer_returns_estimate_and_rejects_non_estimate(monkeypatch) -> None:
     """§6 Phase-4 deliverable 2: `_make_measurer(qname)(budget)` returns the bench's `Estimate` directly
     (P2). A bench whose measure() returns a non-Estimate (a bespoke dict — exactly the old failure) is a

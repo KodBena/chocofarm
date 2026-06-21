@@ -52,7 +52,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import collect_pool, logged_run, median_estimate  # noqa: E402
 
 NAME = "lockfree_mpsc_wakeup_us"
 MODULE_PATH = "benchmarks.bench_lockfree_mpsc_wakeup"
@@ -90,44 +90,49 @@ def _measure_raw(trials: int = 20000) -> dict[str, Any]:
     import numpy as np
     from multiprocessing import shared_memory
 
-    shm_ctr = shared_memory.SharedMemory(create=True, size=16)
-    try:
-        ctr = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf)     # the MPSC tail (enqueue) counter
-        enq_ns = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf, offset=8)  # the producer's enqueue stamp
-        ctr[0] = 0
-        per_trial_us: list[float] = []
-        done = threading.Event()
+    def _collect(effort: int) -> list[float]:
+        """ONE producer/consumer spin batch of `effort` enqueues -> the per-trial wakeup pool (a RACE
+        count <= effort; collect_pool re-runs this until the >= min_readings floor is met)."""
+        shm_ctr = shared_memory.SharedMemory(create=True, size=16)
+        try:
+            ctr = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf)     # the MPSC tail (enqueue) counter
+            enq_ns = np.ndarray((1,), dtype=np.int64, buffer=shm_ctr.buf, offset=8)  # the producer's enqueue stamp
+            ctr[0] = 0
+            per_trial_us: list[float] = []
+            done = threading.Event()
 
-        def producer() -> None:
-            for k in range(1, trials + 1):
-                # brief randomized spacing within the consumer's spin window so the consumer is mid-spin when
-                # the enqueue lands (a real in-regime wakeup), not synchronized to the loop edge.
-                spin = 200 + (k * 2654435761) % 800       # ~200-1000 busy iters between enqueues
-                for _ in range(spin):
-                    pass
-                enq_ns[0] = time.perf_counter_ns()        # stamp, then publish the enqueue (the CAS tail bump)
-                ctr[0] = k
-            done.set()
+            def producer() -> None:
+                for k in range(1, effort + 1):
+                    # brief randomized spacing within the consumer's spin window so the consumer is mid-spin when
+                    # the enqueue lands (a real in-regime wakeup), not synchronized to the loop edge.
+                    spin = 200 + (k * 2654435761) % 800       # ~200-1000 busy iters between enqueues
+                    for _ in range(spin):
+                        pass
+                    enq_ns[0] = time.perf_counter_ns()        # stamp, then publish the enqueue (the CAS tail bump)
+                    ctr[0] = k
+                done.set()
 
-        prod = threading.Thread(target=producer, daemon=True)
-        prod.start()
-        last = 0
-        # CONSUMER spin: poll the head; on each new enqueue record (now - producer_stamp).
-        while last < trials:
-            if ctr[0] != last:
-                obs = time.perf_counter_ns()
-                last = int(ctr[0])
-                dt_us = (obs - int(enq_ns[0])) / 1000.0
-                if dt_us >= 0:                             # guard a torn read on the 64-bit stamp
-                    per_trial_us.append(dt_us)
-            if done.is_set() and last >= trials:
-                break
-        prod.join(timeout=5.0)
-        med = float(np.median(per_trial_us)) if per_trial_us else float("nan")
-        return {"wakeup_us_median": med, "per_trial_us": per_trial_us, "trials": len(per_trial_us)}
-    finally:
-        shm_ctr.close()
-        shm_ctr.unlink()
+            prod = threading.Thread(target=producer, daemon=True)
+            prod.start()
+            last = 0
+            # CONSUMER spin: poll the head; on each new enqueue record (now - producer_stamp).
+            while last < effort:
+                if ctr[0] != last:
+                    obs = time.perf_counter_ns()
+                    last = int(ctr[0])
+                    dt_us = (obs - int(enq_ns[0])) / 1000.0
+                    if dt_us >= 0:                             # guard a torn read on the 64-bit stamp
+                        per_trial_us.append(dt_us)
+                if done.is_set() and last >= effort:
+                    break
+            prod.join(timeout=5.0)
+            return per_trial_us
+        finally:
+            shm_ctr.close()
+            shm_ctr.unlink()
+
+    pool = collect_pool(_collect, name=NAME, budget=trials)   # floors the RACE count at min_readings (>= 2)
+    return {"wakeup_us_median": float(np.median(pool)), "per_trial_us": pool, "trials": len(pool)}
 
 
 def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":

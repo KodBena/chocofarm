@@ -70,7 +70,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import logged_run, median_estimate  # noqa: E402
+from bench_common import collect_pool, logged_run, median_estimate  # noqa: E402
 
 NAME = "futex_wake_wakeup_us"
 MODULE_PATH = "benchmarks.bench_futex_wake_wakeup_us"
@@ -124,74 +124,80 @@ def _measure_raw(trials: int = 20000) -> dict[str, Any]:
     _FUTEX_WAKE = 1
     libc = ctypes.CDLL(None, use_errno=True)
 
-    shm = shared_memory.SharedMemory(create=True, size=8)
-    try:
-        word = np.ndarray((1,), dtype=np.int32, buffer=shm.buf)            # the futex word (consumer waits on it)
-        word[0] = 0
-        # The producer's wake stamp lives in its OWN small buffer (a separate 64-bit int) so it never overlaps
-        # the 4-byte futex word — a torn/overlapping write would corrupt the latency reading.
-        shm_stamp = shared_memory.SharedMemory(create=True, size=8)
-        stamp = np.ndarray((1,), dtype=np.int64, buffer=shm_stamp.buf)
-        stamp[0] = 0
+    def _collect(effort: int) -> list[float]:
+        """ONE producer/consumer futex-edge batch of `effort` wakes -> the per-trial wakeup pool (a RACE
+        count <= effort; collect_pool re-runs this until the >= min_readings floor is met)."""
+        shm = shared_memory.SharedMemory(create=True, size=8)
+        try:
+            word = np.ndarray((1,), dtype=np.int32, buffer=shm.buf)            # the futex word (consumer waits on it)
+            word[0] = 0
+            # The producer's wake stamp lives in its OWN small buffer (a separate 64-bit int) so it never overlaps
+            # the 4-byte futex word — a torn/overlapping write would corrupt the latency reading.
+            shm_stamp = shared_memory.SharedMemory(create=True, size=8)
+            stamp = np.ndarray((1,), dtype=np.int64, buffer=shm_stamp.buf)
+            stamp[0] = 0
 
-        addr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))         # &word[0] for the futex syscall
-        per_trial_us: list[float] = []
-        stop = threading.Event()
+            addr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))         # &word[0] for the futex syscall
+            per_trial_us: list[float] = []
+            stop = threading.Event()
 
-        def _futex_wait(expected: int) -> int:
-            # FUTEX_WAIT(addr, expected): sleep if *addr == expected; return 0 on wake, -EAGAIN if it already
-            # changed. NULL timeout (block). errno EAGAIN/EINTR are the benign "value moved / spurious" cases.
-            r = libc.syscall(_SYS_futex, ctypes.c_void_p(addr), _FUTEX_WAIT,
-                             ctypes.c_int(expected), ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_int(0))
-            if r != 0:
-                err = ctypes.get_errno()
-                if err not in (11, 4):   # EAGAIN=11 (value changed), EINTR=4 (spurious) — both benign
-                    raise OSError(err, f"FUTEX_WAIT failed: errno {err}")
-            return r
+            def _futex_wait(expected: int) -> int:
+                # FUTEX_WAIT(addr, expected): sleep if *addr == expected; return 0 on wake, -EAGAIN if it already
+                # changed. NULL timeout (block). errno EAGAIN/EINTR are the benign "value moved / spurious" cases.
+                r = libc.syscall(_SYS_futex, ctypes.c_void_p(addr), _FUTEX_WAIT,
+                                 ctypes.c_int(expected), ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_int(0))
+                if r != 0:
+                    err = ctypes.get_errno()
+                    if err not in (11, 4):   # EAGAIN=11 (value changed), EINTR=4 (spurious) — both benign
+                        raise OSError(err, f"FUTEX_WAIT failed: errno {err}")
+                return r
 
-        def _futex_wake(n: int = 1) -> int:
-            r = libc.syscall(_SYS_futex, ctypes.c_void_p(addr), _FUTEX_WAKE,
-                             ctypes.c_int(n), ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_int(0))
-            if r < 0:
-                raise OSError(ctypes.get_errno(), "FUTEX_WAKE failed")
-            return r   # number of waiters woken
+            def _futex_wake(n: int = 1) -> int:
+                r = libc.syscall(_SYS_futex, ctypes.c_void_p(addr), _FUTEX_WAKE,
+                                 ctypes.c_int(n), ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_int(0))
+                if r < 0:
+                    raise OSError(ctypes.get_errno(), "FUTEX_WAKE failed")
+                return r   # number of waiters woken
 
-        def consumer() -> None:
-            seen = 0
-            while seen < trials and not stop.is_set():
-                expected = seen          # park while the word still reads the value we last consumed
-                if word[0] == expected:
-                    _futex_wait(expected)     # sleep until the producer bumps the word and wakes us
-                obs = time.perf_counter_ns()
-                if word[0] != expected:
-                    dt_us = (obs - int(stamp[0])) / 1000.0
-                    if 0 <= dt_us < 1e6:      # guard a torn/racing stamp read
-                        per_trial_us.append(dt_us)
-                    seen = int(word[0])
+            def consumer() -> None:
+                seen = 0
+                while seen < effort and not stop.is_set():
+                    expected = seen          # park while the word still reads the value we last consumed
+                    if word[0] == expected:
+                        _futex_wait(expected)     # sleep until the producer bumps the word and wakes us
+                    obs = time.perf_counter_ns()
+                    if word[0] != expected:
+                        dt_us = (obs - int(stamp[0])) / 1000.0
+                        if 0 <= dt_us < 1e6:      # guard a torn/racing stamp read
+                            per_trial_us.append(dt_us)
+                        seen = int(word[0])
 
-        cons = threading.Thread(target=consumer, daemon=True)
-        cons.start()
+            cons = threading.Thread(target=consumer, daemon=True)
+            cons.start()
 
-        # PRODUCER: bump the word + FUTEX_WAKE the parked consumer, with spacing so the consumer is parked.
-        for k in range(1, trials + 1):
-            # Busy-spin a short gap so the consumer reaches FUTEX_WAIT before we wake it (a real edge handoff,
-            # not a wake of a not-yet-parked thread).
-            for _ in range(2000):
-                pass
-            stamp[0] = time.perf_counter_ns()    # stamp, then publish + wake
-            word[0] = k                          # the empty->nonempty edge value
-            _futex_wake(1)                       # wake the one parked waiter
-        stop.set()
-        word[0] = trials + 1
-        _futex_wake(1)
-        cons.join(timeout=10.0)
+            # PRODUCER: bump the word + FUTEX_WAKE the parked consumer, with spacing so the consumer is parked.
+            for k in range(1, effort + 1):
+                # Busy-spin a short gap so the consumer reaches FUTEX_WAIT before we wake it (a real edge handoff,
+                # not a wake of a not-yet-parked thread).
+                for _ in range(2000):
+                    pass
+                stamp[0] = time.perf_counter_ns()    # stamp, then publish + wake
+                word[0] = k                          # the empty->nonempty edge value
+                _futex_wake(1)                       # wake the one parked waiter
+            stop.set()
+            word[0] = effort + 1
+            _futex_wake(1)
+            cons.join(timeout=10.0)
 
-        med = float(np.median(per_trial_us)) if per_trial_us else float("nan")
-        shm_stamp.close(); shm_stamp.unlink()
-        return {"wakeup_us_median": med, "per_trial_us": per_trial_us, "trials": len(per_trial_us)}
-    finally:
-        shm.close()
-        shm.unlink()
+            shm_stamp.close()
+            shm_stamp.unlink()
+            return per_trial_us
+        finally:
+            shm.close()
+            shm.unlink()
+
+    pool = collect_pool(_collect, name=NAME, budget=trials)   # floors the RACE count at min_readings (>= 2)
+    return {"wakeup_us_median": float(np.median(pool)), "per_trial_us": pool, "trials": len(pool)}
 
 
 def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
