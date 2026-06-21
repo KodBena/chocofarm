@@ -244,25 +244,55 @@ def test_sizing_kwargs_single_home_includes_budget_and_leaves() -> None:
     assert "leaves" in BC.SIZING_KWARGS, "the cpp-inproc tmsg `leaves` knob must be a recognized knob"
 
 
-def test_reclassified_tmsg_benches_expose_a_recognized_sizing_kwarg() -> None:
-    """REGRESSION (the budget-kw "None" bug): the audit flipped the tmsg quantity-class Fixed -> QuantileLaw
-    (SHRINKABLE — its framing-cost median tightens with more windows), so the drive MUST be able to SIZE
-    each: measure() must expose a kwarg the drive recognizes. The bug was that the reclassified benches
-    named the knob `budget` (bench_tmsg / zmq_baseline) and `leaves` (cpp-inproc), absent from the
-    recognized set, so `_make_measurer` detected None and ran them at a fixed default — shrinkable but
-    un-fundable. Signature-only (no live timed measurement); mirrors `_make_measurer`'s detection exactly."""
-    import importlib
+def test_every_shrinkable_bench_is_sizable_by_the_driver() -> None:
+    """CLASS-LEVEL discovery guard (ADR-0011 Rule 4 — keyed on the PREDICATE, discovered by glob,
+    never a hand-list): for EVERY bench module, IF its measure() declares a SHRINKABLE Estimate then
+    measure() MUST expose a recognized `bench_common.SIZING_KWARGS` member — else the driver detects
+    budget-kw None and runs it at a fixed default (the shrinkable-but-un-sizable trap; the original
+    `budget`/`leaves` bug). This SUPERSEDES the per-instance tmsg modname list (the RCA
+    `docs/notes/leaf-eval-estimator-pin-cascade-rca.md` names that enumeration as the smoking gun: an
+    instance list fails open at the next instance). A bench is shrinkable iff its `_estimate_from_raw`
+    builds the Estimate with a non-pin bench_common builder (`median_estimate` -> QuantileLaw /
+    `fit_estimate` -> RegressionLaw); a `pin_estimate`-only bench is Fixed and AUTO-EXEMPT (B_op,
+    n_gen — the honest pins are never asked to be sizable, which sidesteps the unsolved "a runnable
+    bench exists" signal). Classified by AST of the bench body (the single-homed estimator builder it
+    calls) so NO live timed run / postgres / C++ binary is needed; a bench calling no known builder
+    fails LOUD (ADR-0002) rather than being silently mis-ranked."""
+    import ast
     import inspect
+    import textwrap
     import bench_common as BC
-    for modname in ("bench_tmsg", "bench_zmq_baseline_tmsg_us_leaf", "bench_futex_wake_tmsg_us_leaf",
-                    "bench_lockfree_mpsc_tmsg", "bench_shm_spin_poll_tmsg",
-                    "bench_cpp_inproc_port_tmsg_us_leaf"):
-        mod = importlib.import_module(modname)
+    SHRINKABLE_BUILDERS = {"median_estimate", "fit_estimate"}   # -> QuantileLaw / RegressionLaw
+    KNOWN = SHRINKABLE_BUILDERS | {"pin_estimate"}              # pin_estimate -> Fixed (un-shrinkable)
+    n_shrinkable = 0
+    for mod in _all_bench_modules():
+        efr = getattr(mod, "_estimate_from_raw", None)
+        assert efr is not None, (
+            f"{mod.__name__}: no _estimate_from_raw — measure() = _estimate_from_raw(_measure_raw()) is "
+            f"the Phase-4 contract; its shrink law cannot be classified")
+        called = {
+            (n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
+            for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(efr))))
+            if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))
+        }
+        known = called & KNOWN
+        assert known, (
+            f"{mod.__name__}._estimate_from_raw calls no known bench_common estimator builder (expected "
+            f"one of {sorted(KNOWN)}) — classify it; ADR-0002: fail loud, never silently mis-rank a "
+            f"bench's shrinkability")
+        if not (known & SHRINKABLE_BUILDERS):
+            continue   # pin_estimate only -> Fixed -> the honest-pin exemption (B_op, n_gen)
+        n_shrinkable += 1
         params = inspect.signature(mod.measure).parameters
         kw = next((k for k in BC.SIZING_KWARGS if k in params), None)
         assert kw is not None, (
-            f"{modname}.measure({list(params)}) exposes no recognized sizing kwarg — a SHRINKABLE tmsg "
-            f"bench the drive cannot size (budget-kw None). Name the knob a SIZING_KWARGS member.")
+            f"{mod.__name__} is SHRINKABLE ({sorted(known)}) but measure({list(params)}) exposes no "
+            f"recognized sizing kwarg — the driver shows budget-kw None and cannot size it. Name the knob "
+            f"a `bench_common.SIZING_KWARGS` member (the budget-kw bug, now caught over the class).")
+    assert n_shrinkable >= 10, (
+        f"discovery reached only {n_shrinkable} shrinkable benches (expected >=10: the tmsg family + the "
+        f"median tau_io/wakeup/gather/drain benches + the fits) — a vacuous pass means the glob or the AST "
+        f"classifier regressed (every bench mis-read as a pin)")
 
 
 def test_make_measurer_returns_estimate_and_rejects_non_estimate(monkeypatch) -> None:
