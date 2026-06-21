@@ -1019,6 +1019,17 @@ class NeymanDriver:
         rounds = 0
         while not rec.converged and rounds < max_rounds:
             to_fund = [p for p in rec.primitives if p.recommend > 0]
+            if not to_fund:
+                # No fundable input: every primitive's recommend is 0 — the bound's CI rests ENTIRELY on
+                # un-shrinkable variance (declared-spread pins, leverage-floored fits) that sampling cannot
+                # reduce. Re-stepping adds no data, so `rec` cannot change: this is a FIXED POINT, not
+                # convergence to V_target. Stop rather than spin `max_rounds` identical rounds (ADR-0002:
+                # surface the stall loudly; do not churn silently in a way that mimics progress).
+                if verbose:
+                    print("  STALLED — no input is fundable: the CI is dominated by un-shrinkable variance "
+                          "(declared-spread pins and/or leverage-floored fits), which sampling cannot reduce. "
+                          "Stopping (a fixed point, NOT convergence to the CI target).\n")
+                break
             if measurers is not None:
                 for p in to_fund:
                     self.set_estimate(p.index, measurers[p.index](p.recommend))

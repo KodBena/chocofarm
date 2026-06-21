@@ -542,6 +542,22 @@ def test_no_kink_regime_without_the_arms_hook() -> None:
     assert rec.estimate_kink is None
 
 
+def test_run_stalls_when_nothing_fundable(capsys) -> None:
+    """When the bound's CI rests ENTIRELY on un-fundable (pinned) inputs, run() must STOP — not spin
+    max_rounds re-stepping with no new data (the ~/run_output symptom: identical iters, +samples=0
+    everywhere). f=min(a*b, c) with a,b declared-spread pins binding (a*b=456) and c a high non-binding
+    pin: nothing is fundable, so the loop is a fixed point, not convergence to the CI target."""
+    f = ot.SymbolicFunction(["a", "b", "c"], ["min(a*b, c)"])
+    d = NeymanDriver(f, costs=[1.0, 1.0, 1.0], tolerance=0.01, names=["a", "b", "c"], confidence=0.95)
+    ms = {0: lambda _b: _fixed("a", 3.0, 0.05), 1: lambda _b: _fixed("b", 152.0, 8.0),
+          2: lambda _b: _fixed("c", 1000.0, 2.0)}
+    rec = d.run(measurers=ms, pilot=10, max_rounds=20, verbose=True)
+    out = capsys.readouterr().out
+    assert rec.converged is False                  # the CI is irreducible — it does not converge
+    assert "STALLED" in out                         # it stopped AND said so, instead of spinning
+    assert out.count("continue") <= 2               # the pilot step only — NOT 20 identical rounds
+
+
 def test_kink_collapses_to_smooth_far_from_a_tie() -> None:
     """§4.1: away from a tie (a comfortably-bound contender) Φ(−t)→0 and the driver returns to the smooth
     regime — the analytic single-arm gradient is honest, the non-binding arm's df/dx=0 is correct. Here
