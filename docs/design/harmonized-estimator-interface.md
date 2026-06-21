@@ -497,7 +497,22 @@ df/dtau_io = -0.358   df/dT_disp = -0.358   df/dt_row = -91.7   (serve arm — b
 So the producer arm's inputs get **zero allocation** even though a small upward
 revision of any serve input flips the binding arm. Worse, **the reported
 single-arm variance is a lie** — and the honest object is a **closed form**, not
-a simulation. The two contending arms are **input-disjoint**: producer reads
+a simulation.
+
+**The operating point, in the real (propagated) numbers — anchor here, not on the
+dramatic worked figures below.** The producer spread is **not** a literal `60`: it
+is the delta-method propagation through `producer = N_gen·R_gen`, which at the seed
+is **`σ₁ ≈ 25.2`** (`√((R_gen·σ_{N_gen})² + (N_gen·σ_{R_gen})²)`; production rule:
+*source each arm's σ from its `Estimate` `cov`*, §8 — never a literal). There Clark
+gives **`E[min] = 426.5`** (Jensen bias **+1.7 dps**), **`sd = 6.2`**, and
+**`P(producer binds) = Φ(−t) = 0.136`** — modest, but enough that the binding margin
+is statistically live and the convergence guard funds both arms. **The worked example
+below uses `σ₁ = 60`**, a **stipulated stress case** (2.4× wider) chosen to make the
+kink's structure legible; read every `σ₁=60`-tagged figure below
+(`E[min]=415.68 / sd=25.58 / P=0.322 / 12.79×`) as the **stress reading**, not the
+operating point (full propagation in the provenance caveat below).
+
+The two contending arms are **input-disjoint**: producer reads
 `{N_gen, R_gen}`, serve reads `{T_disp, tau_io, wakeup, B, t_row, L}`, and the
 intersection is **empty** (verified against `model_zmq_baseline.INPUT_NAMES`;
 `L` is shared only with the non-binding transport arm). So `ρ_arms = 0` and the
@@ -1101,7 +1116,18 @@ where it rests on a **modelling choice** or a **least-bad option**:
   (deterministic, O(1), no temperature, no draws). The remaining modelling content
   is small: Clark's normality of the arms is exact only under the delta-method
   Gaussian linearization, and it **degrades at the exact tie `Δ=0`** (means equal,
-  variances dissimilar) — the one permanently load-bearing case (§4.1).
+  variances dissimilar) — the one permanently load-bearing case (§4.1). **And —
+  bridging `B` to `F`/§4.4, the connection the two sections otherwise leave
+  implicit:** Clark's arm-normality is also only **leading-order on heavy-tailed
+  inputs**. The producer arm `N_gen·R_gen` inherits `R_gen`'s right skew, and
+  serve's delta-method-Gaussianity is only as good as its inputs' CoV — so the
+  **same heavy-tail fact that makes the allocation fragile (`F`) also makes the
+  kink moments approximate**: the `P(flip)` and `Var[min]` the convergence guard
+  reads are Gaussian-arm estimates of **skewed** quantities. This is the standard
+  leading-order choice and almost certainly fine to start; if the Gaussian-arm
+  error ever proves material, the **SSTA** literature §4.1 already borrows carries
+  **skew-aware** max/min moment variants (skew-normal arms / higher-moment
+  matching) as the escalation path — a documented hand-off, not a blocker.
 - **`C.` `T_disp` ⊥ `t_row` (and `T_disp` ⊥ `iota`) is block-diagonal by the
   different-fits rule, but they are physically non-independent** (different fits,
   same hardware). Treating distinct fits as independent is defensible and is the
