@@ -304,8 +304,8 @@ def asymptote_dps(trust: bool = True) -> float:
 # A reference point (NOT a target) for the report — the empirical plateau, pulled from the grounding module
 # so it has ONE home (it is a reference constant, not a manifest-measured quantity).
 def _ref_plateau() -> float:
-    from leaf_eval_bound.contract import grounding as G
-    return G.REF_PLATEAU_DPS
+    from leaf_eval_bound.contract import references
+    return references.REF_PLATEAU_DPS
 
 
 if __name__ == "__main__":

@@ -1,74 +1,16 @@
 """
-tools/analysis/leaf_eval_bound/leaf_eval_grounding.py
-===============================================
+tools/analysis/leaf_eval_bound/contract/grounding.py
 
-Single-home (ADR-0012 P1) for the MEASURED physical quantities the two leaf-eval
-throughput lower-bound models (`model_capacity.py`, `model_cycletime.py`) draw on, so
-the grounded numbers have ONE definition both models import — never two hand-copied
-literals that must agree. Each constant carries its provenance in a comment; a value
-that is a DESIGN PIN (not a fresh measurement) or that needs a fresh sole-workload
-benchmark is labelled as such, per the claims-measured-vs-interpreted discipline.
-
-This module imports nothing but the standard library + numpy, so it is import-clean —
-the grounding SSOT every model + bench reads, independent of the driver's deps.
+Single-home (ADR-0012 P1) for the MEASURED Band-3 physical-quantity CONSTANTS the leaf-eval models draw
+on. The vocabulary lives in `grounded_types` (Grounded/Estimability); the display anchors in `references`
+(REF_*). Import-clean (stdlib only) -- the grounding SSOT every model + bench reads.
 
 Public Domain (The Unlicense).
 """
+
 from __future__ import annotations
 
-import enum
-from dataclasses import dataclass
-
-
-class Estimability(enum.Enum):
-    """The single-home (ADR-0012 P1) measured-vs-pinned axis of a grounded quantity — RCA fix #1
-    (docs/notes/leaf-eval-estimator-pin-cascade-rca.md). It is GENERATIVE: both the model flags
-    (`Grounded.constant`/`needs_measurement` DERIVE from it) and the bench's pin-vs-shrinkable body answer
-    to this ONE axis, so the measured-but-punted P8 lie — a quantity labelled measurable whose bench pins —
-    cannot be authored (there is no second flag to disagree). The estimability-agreement guard in
-    `tests/test_untrusted_drive_phase4.py` enforces body <=> this axis."""
-    CONSTANT = "constant"   # a TRUE deployment/layout constant (n_gen=3 cores) -> DEGENERATE Fixed pin, a_i~0
-    MEASURED = "measured"   # a RUNNABLE bench measures it live -> a SHRINKABLE Estimate (median / regression fit)
-    PRIOR = "prior"         # an engineering-judgement prior, NO runnable bench yet (B_op) -> NORMAL Fixed pin
-
-
-@dataclass(frozen=True)
-class Grounded:
-    """One grounded quantity: a mean, a 1-sigma spread, a relative per-sample benchmark cost, its
-    `estimability` (the measured-vs-pinned axis), and the `module` of the bench that owns its live
-    measurement. `provenance` is the file the number was read from.
-
-    `estimability` (`Estimability`, ADR-0012 P1 single-home; RCA fix #1) is the SSOT of the
-    DEGENERATE-vs-declared-spread-vs-measured classification (the harmonized-estimator-interface §3 PIN
-    distinction). The two former flags now DERIVE from it (properties below), so they cannot disagree with
-    the bench body: `constant` (a TRUE CONSTANT — a deployment/layout fact like `n_gen`=3 cores, set by the
-    1:3 pinning, NOT CI-bearing) iff `CONSTANT`; `needs_measurement` (still needs a fresh SOLE-WORKLOAD run,
-    the Neyman loop ranks these) iff NOT `CONSTANT`. The bench's `pin_estimate(constant=…)` and the
-    manifest's seed Estimate (`family=DEGENERATE` vs `NORMAL`) read `constant`, so a true constant cannot
-    leak its frozen-display σ into the bound on one path while dropping out on another. A `CONSTANT`
-    quantity's `sigma` is a display/seed artifact (a placeholder on an integer/fixed value), not a real
-    spread — the bound treats it as ~0 (the §3 'a_i ≈ 0' rule)."""
-    name: str
-    mean: float
-    sigma: float
-    cost: float
-    unit: str
-    provenance: str
-    estimability: Estimability
-    module: str
-
-    @property
-    def constant(self) -> bool:
-        """A TRUE CONSTANT (DEGENERATE pin, ~0 bound contribution) iff `estimability is CONSTANT` — DERIVED
-        from the single axis (P1), never an independent flag that could disagree with the bench body."""
-        return self.estimability is Estimability.CONSTANT
-
-    @property
-    def needs_measurement(self) -> bool:
-        """Needs a fresh SOLE-WORKLOAD measurement iff NOT a true constant — DERIVED from the single axis
-        (both MEASURED and PRIOR would benefit; only MEASURED has a runnable bench today). The static models
-        (model_capacity/model_cycletime) read this; it now single-homes off `estimability`."""
-        return self.estimability is not Estimability.CONSTANT
+from leaf_eval_bound.contract.grounded_types import Estimability, Grounded
 
 
 # --- Server forward affine fit (the ONE measured serve cost model) -------------------
@@ -210,18 +152,3 @@ MSG_PER_LEAF_US = Grounded(
                "MEASURED by bench_tmsg over the live codec; non-binding, ranks LAST)",
     estimability=Estimability.MEASURED, module="bench_tmsg",
 )
-
-# --- Reference points (NOT targets — re-derive, do not anchor) ------------------------
-# The empirical ~203 dps plateau is a USER-supplied reference for ONE config family on
-# the current harness; it is NOT grounded in any readable repo file (the only repo '203'
-# hits are unrelated). The nearest MEASURED production-path numbers are below.
-REF_PLATEAU_DPS = 203.0       # user-supplied empirical reference (one config family)
-REF_PRIOR_MODEL_DPS = 456.0   # overcommit_sweep.py:307 BARE LITERAL model_optimistic_dps;
-                              # adapter.md §6 calls it "an upper bound" the bench fell short of
-# MEASURED production-path anchors (analysis_clean.txt + adapter.md §5/§7):
-REF_STRICT_BARRIER_DPS_PER_CORE = 49.0     # analysis_clean.txt strict-barrier ref
-REF_GREEDY_ASYNC_DPS_PER_CORE = 37.0       # analysis_clean.txt greedy-async ref
-REF_GLOBAL_MAX_DPS = 468.0                 # analysis_clean.txt GLOBAL MAX (full bucket, pad=0)
-REF_SERVE_CEILING_DPS = (380.0, 528.0)     # 190k..264k leaves/s / 500
-REF_HIGH_N_BENCH_DPS = 189.0               # adapter.md §7 N=9 (BENCH, over-reads e2e)
-REF_STAGEB_1THREAD_DPS_PER_CORE = 72.65    # adapter.md §5 arm3 1-thread (e2e-ish)

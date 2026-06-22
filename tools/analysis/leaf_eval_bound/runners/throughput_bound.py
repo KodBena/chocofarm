@@ -32,6 +32,7 @@ import sys
 import numpy as np
 
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.contract import references
 from leaf_eval_bound.store import reconstruct  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
 from leaf_eval_bound.models import model_capacity  # noqa: E402
 from leaf_eval_bound.models import model_cycletime  # noqa: E402
@@ -108,13 +109,13 @@ def run_model(title, model):
 
 def main():
     print("Leaf-eval transport — first-principles throughput LOWER BOUNDS")
-    print(f"Reference points (NOT targets): empirical plateau ~{G.REF_PLATEAU_DPS:.0f} dps "
-          f"(user-supplied, one config family); prior model literal ~{G.REF_PRIOR_MODEL_DPS:.0f} "
+    print(f"Reference points (NOT targets): empirical plateau ~{references.REF_PLATEAU_DPS:.0f} dps "
+          f"(user-supplied, one config family); prior model literal ~{references.REF_PRIOR_MODEL_DPS:.0f} "
           f"dps (overcommit_sweep.py bare literal, called 'an upper bound').")
     print(f"Measured anchors: gen-ceiling 3x152={3*152} dps (4.0x linear) | "
-          f"serve full-bucket GLOBAL MAX {G.REF_GLOBAL_MAX_DPS:.0f} dps | "
-          f"high-N bench (over-reads e2e) {G.REF_HIGH_N_BENCH_DPS:.0f} dps | "
-          f"StageB 1-thread {G.REF_STAGEB_1THREAD_DPS_PER_CORE:.0f} dps/core\n")
+          f"serve full-bucket GLOBAL MAX {references.REF_GLOBAL_MAX_DPS:.0f} dps | "
+          f"high-N bench (over-reads e2e) {references.REF_HIGH_N_BENCH_DPS:.0f} dps | "
+          f"StageB 1-thread {references.REF_STAGEB_1THREAD_DPS_PER_CORE:.0f} dps/core\n")
 
     fa, cia = run_model("MODEL A — capacity / min-of-stages (Design-A)", model_capacity)
     print()
@@ -123,7 +124,7 @@ def main():
     print("\n" + "=" * 80)
     print("SUMMARY — the two lower bounds vs the references")
     print("=" * 80)
-    plat = G.REF_PLATEAU_DPS
+    plat = references.REF_PLATEAU_DPS
     print(f"  Design-A (capacity)  : {fa:.0f} +/- {cia:.0f} dps   "
           f"(~{fa/plat:.2f}x the ~{plat:.0f} plateau)")
     print(f"  Design-B (cycle-time): {fb:.0f} +/- {cib:.0f} dps   "

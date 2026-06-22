@@ -281,13 +281,14 @@ def bound(trust: bool = True) -> dict[str, Any]:
 
 # The ~203 dps empirical plateau is a USER-supplied reference for ONE config family (NOT grounded in
 # any repo file, NOT a target). It is a model-side reference constant, not a measured quantity, so it
-# lives here as a named constant (mirroring leaf_eval_grounding.REF_PLATEAU_DPS — the single home of
+# lives here as a named constant (mirroring references.REF_PLATEAU_DPS — the single home of
 # the references; this module re-exposes it for the report rather than re-deriving a literal).
 def ref_plateau_dps() -> float:
     """The ~203 dps empirical plateau reference (NOT a target). Single-homed in the v1 grounding
-    (`leaf_eval_grounding.REF_PLATEAU_DPS`); pulled from there so there is one home for the reference."""
+    (`references.REF_PLATEAU_DPS`); pulled from there so there is one home for the reference."""
     from leaf_eval_bound.contract import grounding as G
-    return float(G.REF_PLATEAU_DPS)
+    from leaf_eval_bound.contract import references
+    return float(references.REF_PLATEAU_DPS)
 
 
 if __name__ == "__main__":

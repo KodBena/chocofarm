@@ -101,6 +101,7 @@ from typing import Any, cast  # (Callable dropped with the runner _fd_gradient �
 
 
 from leaf_eval_bound.contract import grounding as G  # noqa: E402  — the single home of the references + the transfer decomposition
+from leaf_eval_bound.contract import references
 from leaf_eval_bound.store import manifest  # noqa: E402   — the SSOT registry (import-clean; touches no DB on import)
 from leaf_eval_bound.models.model_base import TransportModel  # noqa: E402  — the typed transport-variant contract (move 3)
 
@@ -405,7 +406,7 @@ def _ref_v1() -> dict[str, float]:
 
 
 def print_report(results: list[VariantResult]) -> None:
-    plat = float(G.REF_PLATEAU_DPS)
+    plat = float(references.REF_PLATEAU_DPS)
     v1 = _ref_v1()
     pg = manifest.postgres_available()
 
@@ -418,7 +419,7 @@ def print_report(results: list[VariantResult]) -> None:
     print(f"  v1 Design-B cycle-time bound ~{v1['design_b_dps']:.0f} dps   |   "
           f"v1 inproc-port contrast ~{v1['inproc_port_contrast_dps']:.0f} dps (full-512, serve-only)")
     print(f"  measured anchors: gen-ceiling 3*152={3*152} dps (4.0x linear) | "
-          f"serve GLOBAL MAX {G.REF_GLOBAL_MAX_DPS:.0f} dps | high-N bench {G.REF_HIGH_N_BENCH_DPS:.0f} dps")
+          f"serve GLOBAL MAX {references.REF_GLOBAL_MAX_DPS:.0f} dps | high-N bench {references.REF_HIGH_N_BENCH_DPS:.0f} dps")
 
     # ---- the transport -> bound table -------------------------------------------------------
     print("\n" + "-" * 92)
