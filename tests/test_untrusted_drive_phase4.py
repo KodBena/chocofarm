@@ -26,9 +26,9 @@ coercion + unify on `measure() -> Estimate`. The three coupled deliverables:
      `Fixed` Estimate that drops out of allocation (the §2.3 branch), un-shrinkable.
 
 The `estimate`/`neyman_driver`/`manifest`/`untrusted_drive`/`throughput_bound`/
-`transport_sweep`/`bench_*` modules live under tools/analysis/OpenTURNS/ (no __init__.py —
+`transport_sweep`/`bench_*` modules live under tools/analysis/leaf_eval_bound/ (no __init__.py —
 imported by sys.path the way manifest.py imports bench_store), so this test prepends those
-directories. openturns + scipy + cvxpy are the driver's deps; the tests skip loudly if one
+directories. jax + scipy + cvxpy are the driver's deps; the tests skip loudly if one
 is genuinely absent. The bench-import tests do NOT run a live timed measurement (the benches
 are timing-sensitive — Estimate SHAPE is exercised via the bench's `_estimate_from_raw` on a
 recorded/synthesized `_measure_raw` dict, per the §8 / Phase-3 discipline).
@@ -47,7 +47,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 _BENCH = os.path.join(_OT, "benchmarks")
 for _p in (_OT, _BENCH):

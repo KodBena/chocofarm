@@ -27,7 +27,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)

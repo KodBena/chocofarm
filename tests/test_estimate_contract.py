@@ -14,7 +14,7 @@ harmonized `Estimate` contract + its store. These tests cover
     in-process AND, when the live control_research store is reachable, through the
     postgres `estimate` jsonb column (set_estimate / latest_estimate).
 
-The `estimate`/`bench_store` modules live under tools/analysis/OpenTURNS/ (no
+The `estimate`/`bench_store` modules live under tools/analysis/leaf_eval_bound/ (no
 __init__.py — imported by sys.path, the same way manifest.py imports bench_store),
 so this test prepends that directory to sys.path.
 
@@ -32,7 +32,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)

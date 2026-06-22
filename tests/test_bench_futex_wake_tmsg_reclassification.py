@@ -37,7 +37,7 @@ LIVE tail RUNS the bench's own in-process windowed measurement (NO external bina
 gate on — numpy + multiprocessing.shared_memory): it must report a positive us/leaf and a shrinkable
 Estimate (ADR-0009 — run it; pin `taskset -c 0` is the operator's job, this is a behavioral gate).
 
-The estimate/bench modules live under tools/analysis/OpenTURNS/ (no __init__.py — imported by
+The estimate/bench modules live under tools/analysis/leaf_eval_bound/ (no __init__.py — imported by
 sys.path), so this test prepends those directories.
 
 Public Domain (The Unlicense).
@@ -53,7 +53,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 _BENCH = os.path.join(_OT, "benchmarks")
 for _p in (_OT, _BENCH):

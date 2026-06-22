@@ -26,7 +26,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 _BENCH = os.path.join(_OT, "benchmarks")
 for _p in (_OT, _BENCH):

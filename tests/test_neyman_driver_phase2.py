@@ -28,9 +28,9 @@ The tests cover the §6 Phase-2 deliverables and the §8 EXECUTED verification t
   * the per-family CI multiplier (§4.3) — NORMAL→z, STUDENT_T(dof)→t_dof, the mixed-family
     conservative multiplier.
 
-The `estimate`/`neyman_driver` modules live under tools/analysis/OpenTURNS/ (no
+The `estimate`/`neyman_driver` modules live under tools/analysis/leaf_eval_bound/ (no
 __init__.py — imported by sys.path the way manifest.py imports them), so this test
-prepends that directory. openturns + cvxpy + scipy are required (the driver's deps); the
+prepends that directory. jax + cvxpy + scipy are required (the driver's deps); the
 tests skip loudly if a dep is genuinely absent rather than asserting a false pass.
 
 Public Domain (The Unlicense).
@@ -46,7 +46,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)

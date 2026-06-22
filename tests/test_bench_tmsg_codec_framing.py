@@ -39,7 +39,7 @@ These run WITHOUT timing the live codec by exercising `_estimate_from_raw` on a 
 pool (the §8 discipline — the Estimate SHAPE + bootstrap SE + marginal are pool-driven). A
 codec-gated tail RUNS the real in-process codec (sole-workload, pinned by the operator with
 taskset -c 0): it must report a small positive us/leaf and produce a shrinkable Estimate. The
-estimate/bench modules live under tools/analysis/OpenTURNS/ (no __init__.py — imported by sys.path),
+estimate/bench modules live under tools/analysis/leaf_eval_bound/ (no __init__.py — imported by sys.path),
 so this test prepends those directories.
 
 Public Domain (The Unlicense).
@@ -55,7 +55,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 _BENCH = os.path.join(_OT, "benchmarks")
 for _p in (_OT, _BENCH):

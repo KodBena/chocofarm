@@ -32,7 +32,7 @@ ALREADY a live `RegressionLaw`, the design's §3 REGRESSION-fit row, not the R_g
 These run WITHOUT the live timed JAX forward by exercising `_estimate_from_raw` on a synthesized
 per-width-median design (the §8 discipline — the Estimate SHAPE + cov are design-driven; the live
 timed numerics are pinned by test_bench_fit_estimate_phase3.py and the binary/JAX-gated benches).
-The estimate/bench modules live under tools/analysis/OpenTURNS/ (no __init__.py — imported by
+The estimate/bench modules live under tools/analysis/leaf_eval_bound/ (no __init__.py — imported by
 sys.path), so this test prepends those directories.
 
 Public Domain (The Unlicense).
@@ -47,7 +47,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 _BENCH = os.path.join(_OT, "benchmarks")
 for _p in (_OT, _BENCH):

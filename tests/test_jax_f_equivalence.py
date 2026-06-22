@@ -27,7 +27,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
@@ -66,7 +66,7 @@ def test_jax_backend_is_x64() -> None:
 @pytest.mark.parametrize("modname", _MODELS)
 def test_throughput_jax_evaluates_identically_to_numpy(modname: str) -> None:
     """The single JAX `f` reproduces `throughput_numpy` at the grounded point (the eval the bound rests on),
-    in x64 — exactly (the formulae are identical; the cross-check that the muParser/numpy/JAX homes agree)."""
+    in x64 — exactly (the formulae are identical; the cross-check that the numpy + JAX homes agree)."""
     M = importlib.import_module(modname)
     x0 = _x0(M)
     arr = jnp.array([x0[nm] for nm in M.INPUT_NAMES])

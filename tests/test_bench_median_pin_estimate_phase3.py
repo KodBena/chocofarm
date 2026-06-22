@@ -37,7 +37,7 @@ unreachable, self-cleaning), proving `manifest.estimate('tau_io_us')` returns th
 reconstruction) and `manifest.estimate('B_op')` the `Fixed` one with σ=64 in `cov`.
 
 The `estimate`/`bench_common`/`bench_<name>` modules live under
-tools/analysis/OpenTURNS/ (no __init__.py — imported by sys.path, the way manifest.py
+tools/analysis/leaf_eval_bound/ (no __init__.py — imported by sys.path, the way manifest.py
 imports bench_store), so this test prepends those directories to sys.path.
 
 Public Domain (The Unlicense).
@@ -53,7 +53,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 _BENCH = os.path.join(_OT, "benchmarks")
 for _p in (_OT, _BENCH):

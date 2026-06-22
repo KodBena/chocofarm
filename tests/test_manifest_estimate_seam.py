@@ -25,7 +25,7 @@ deterministic core of the seam). An optional tail exercises the real
 `bench_store.latest_estimate`/`latest_aggregate` through `quantity()` against the live
 control_research store (skipped when it is unreachable), mirroring the Phase-0 test.
 
-The `estimate`/`manifest`/`bench_store` modules live under tools/analysis/OpenTURNS/
+The `estimate`/`manifest`/`bench_store` modules live under tools/analysis/leaf_eval_bound/
 (no __init__.py — imported by sys.path, the way manifest.py imports bench_store), so
 this test prepends that directory to sys.path.
 
@@ -42,7 +42,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)

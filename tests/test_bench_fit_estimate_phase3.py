@@ -32,7 +32,7 @@ self-cleaning of its synthetic instances), proving `manifest.estimate('t_row_us'
 k=2 fit Estimate (not the Phase-1 legacy Poolwise reconstruction) and the §5.2 DE-DUP holds
 (only the per-width medians as provenance rows, the headline scalar NOT double-logged).
 
-The `estimate`/`bench_common`/`bench_<name>` modules live under tools/analysis/OpenTURNS/
+The `estimate`/`bench_common`/`bench_<name>` modules live under tools/analysis/leaf_eval_bound/
 (no __init__.py — imported by sys.path, the way manifest.py imports bench_store), so this
 test prepends those directories to sys.path.
 
@@ -49,7 +49,7 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "OpenTURNS",
+    "tools", "analysis", "leaf_eval_bound",
 )
 _BENCH = os.path.join(_OT, "benchmarks")
 for _p in (_OT, _BENCH):
