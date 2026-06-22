@@ -169,7 +169,7 @@ two dispatch paths for leaf evaluation:
 to be comparable — §5.2 of the MANUAL's `cycle_breakdown` / `stage_capacities` are the surface):
 
 | Model stage / term | What it denotes | Implementation locus | Benchmark today |
-| — | — | — | — |
+| --- | --- | --- | --- |
 | `GENERATION` = `N_gen·R_gen` | producer cores' aggregate search rate | the C++ search core, serial path | `bench_r_gen` (C++ subprocess, eval mocked by `DetNet`) |
 | `R_gen` | one core's decisions/s | one producer core in isolation | `bench_r_gen` |
 | `L` (LPD) | leaves per recorded decision | the Gumbel tree's distinct-node count per decision | `bench_lpd` (PRIOR/design-pin today) |
@@ -588,7 +588,7 @@ conclusion (the project's verify-the-artifact discipline — the maintainer appr
 artifact, never a claim).
 
 | Step | Checkpoint artifact surfaced to the maintainer | The maintainer's decision |
-| — | — | — |
+| --- | --- | --- |
 | 0 | the stage→locus→observation table (each model term ↔ its real code locus ↔ how to observe it) | every stage maps to a real locus + observation point? (or a stage has no locus = a form finding) → proceed / flag |
 | 1 | `D_impl ± CI` under a named frozen config, with the raw measurement provenance | is this the config we mean to explain, and is the number measured (not asserted)? → proceed / re-config |
 | 2 | per stage, the pair `(bench_i, impl_i)` as two `Estimate`s with CIs + the boundary each was read at | are the two readings at the *same* boundary, same units, both measured? → proceed / re-measure |

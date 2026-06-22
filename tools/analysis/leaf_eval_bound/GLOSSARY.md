@@ -29,7 +29,7 @@ These are the ones that have bitten. A symbol below means **different things in 
 never carry one file's reading into another.
 
 | Symbol | The trap |
-| — | — |
+| --- | --- |
 | **`N`** | **Overloaded three ways.** (1) In the **wire serve path** (`runner_wire_batched.hpp`), `N` = `trees_per_thread`, the **overcommit multiplier** (§5). (2) In the **belief/env path** (`collected_set.hpp`, `env.hpp`), `N` = the **world / treasure count**, structurally `≤ 32` (the world-mask packs into a `uint32`). (3) In featurization (`feature_compute.hpp`), `N` is a feature/action dimension. **Stale framing (flagged 2026-06-23):** the blind-model SYNTHESIS's *"deployed default = strict-barrier, N=1"* is the **outdated** formal model — under the current code `N` is a `PipelinedBucket`-only knob and is **ignored under the `StrictBarrier` default**, so "the default is N=1" conflates two modes. Whether `N` is even live in production is the consultation's open question #2 (unresolved). |
 | **`B` / `B_op`** | `B` (model symbol) = `B_op` (registry quantity) = **rows per forward** — the serve batch width. The *model* evaluates it at a full bucket; the *implementation*'s realized rows/forward is a **different, measured** number (`mean_rows_per_msg`, §5). Do not assume they are equal — their gap is the contested operating point (consultation §7.4). |
 | **`K`** | `K` = `fibers_per_thread` = `ceil(pool_batch / pool_threads)` — the per-thread in-flight **slot count** in the strict path (§5). It is *not* the model's `B`, though under `StrictBarrier` the realized rows/forward is close to `K`. (Beware: `K` also appears in C++ profiling comments as an unrelated profile label, e.g. "the K=16 profile.") |
@@ -41,7 +41,7 @@ never carry one file's reading into another.
 ## 1. Throughput and the bound
 
 | Term | Meaning |
-| — | — |
+| --- | --- |
 | **DPS** | **Decisions per second** — the throughput quantity everything targets. (A "decision" is one recorded Gumbel-AZ move.) |
 | **the bound** / `f(μ̂)` | The model's throughput **lower bound**: `f` (the cycle model) evaluated at the grounded mean point `μ̂`. Read *"under this model, at least `f(μ̂)` DPS is achievable."* It is a **denotational conjecture**, not a measured fact (MANUAL §1). |
 | **lower-bound semantics** | A real well-designed cycle has every cost the model has *plus* the coordination losses the model omits, so it achieves *at least* `f(μ̂)`; a sloppy one reveals its slack as the gap below. Conservative by construction. |
@@ -59,7 +59,7 @@ formal model is outdated) — treat these symbols as the *current* vocabulary, n
 "Registry quantity" is the name the manifest resolves (the bench/grounding key).
 
 | Symbol | Meaning | Unit | Registry quantity | Dialect |
-| — | — | — | — | — |
+| --- | --- | --- | --- | --- |
 | `N_gen` / `n_gen` | generator **cores** (producer parallelism) | cores | `n_gen` | both |
 | `R_gen` | one core's decision rate | decisions/s/core | `R_gen` | B |
 | `g_core` | one core's **leaf** rate | leaves/s/core | `g_core` (`GEN_PER_CORE_LEAVES`) | A |
@@ -77,7 +77,7 @@ formal model is outdated) — treat these symbols as the *current* vocabulary, n
 **Stages** (what the `min` is over — *one* model shape, not a law; MANUAL §2):
 
 | Stage | Meaning | Form (Design-B) |
-| — | — | — |
+| --- | --- | --- |
 | **GENERATION** / `producer` | producer cores' aggregate search rate | `N_gen · R_gen` |
 | **SERVE** | the serialized serve-forward capacity | `1e6 · B / (cycle_us · L)` |
 | **TRANSPORT** | per-leaf wire-framing capacity (ranks last / non-binding) | `1 / (L · tmsg · 1e-6)` |
@@ -88,7 +88,7 @@ formal model is outdated) — treat these symbols as the *current* vocabulary, n
 ## 3. The estimator & grounding contract
 
 | Term | Meaning |
-| — | — |
+| --- | --- |
 | **`Estimate`** | The typed value a bench's `measure()` returns (`contract/estimate.py`, frozen). Fields: `theta_hat` (the point(s) `f` is evaluated at), `cov` (the **already-divided** sampling covariance — an SE², not a per-sample variance), `shrink` (a `ShrinkLaw`), `support`, `family`, `kind`. |
 | **`theta_hat`** | the estimate's central value(s) (a length-k vector; k=1 for most, k=2 for a fit). |
 | **`cov`** | the sampling covariance of `theta_hat` (SE², already divided by n). |
@@ -109,7 +109,7 @@ formal model is outdated) — treat these symbols as the *current* vocabulary, n
 From `docs/design/leaf-eval-impl-to-model-diagnostic-loop.md` and the witness-lowering review.
 
 | Term | Meaning |
-| — | — |
+| --- | --- |
 | **witness** | the model **lowered to a runnable cycle** built from the benched stages, and clocked — a real end-to-end DPS. The *operational* semantics to `f`'s *denotational* one; the **adequacy witness** for `f`. Does not exist yet (the consultation's biggest open question). |
 | **`gap_A`** | `f(μ̂) − witness` — the **omitted coordination loss** (RTT idle, convoy, cold-JIT) the model excludes by assumption. A *legitimate* gap; the adequacy gap between the two composition maps. |
 | **`gap_B`** | `witness − implementation` — the **implementation's own slack** (it runs a suboptimal config). An *engineering* finding, not a model error. |
@@ -130,7 +130,7 @@ The running actor is a persistent **C++ Gumbel-AZ** process generating episodes;
 by one of two paths.
 
 | Term | Meaning | Source |
-| — | — | — |
+| --- | --- | --- |
 | **serial path** | leaf eval is a *local, in-process* C++ MLP forward (`NetForward`), no wire. Its sole-workload ceiling is what `bench_r_gen` measures (`R_gen`). | — |
 | **wire-batched path** | the C++ producer parks leaves; a drain gathers them into one ZMQ multipart frame; a single-threaded Python `inference_server.py` decodes, coalesces across threads, runs **one JAX forward**, scatters replies. This is the path the model's SERVE cycle abstracts. | — |
 | **`WireMode`** | the transport scheduling arm: **`StrictBarrier`** (the **production DEFAULT**, untouched: each round gathers ALL parked slots into ONE message — structurally `D=1`) or **`PipelinedBucket`** (arm 3, behind a flag — the overcommit / D-pipeline). | `runner_wire_batched.hpp:59,107` |
@@ -153,7 +153,7 @@ by one of two paths.
 ## 6. Hyperparameters & run knobs
 
 | Knob | Meaning | Default / source |
-| — | — | — |
+| --- | --- | --- |
 | `--n-sims` (`n_sims`) | Gumbel-AZ **simulations per decision** | search config (e.g. `n_sims=256`) |
 | `--m` (`m`) | Gumbel **top-m** sampled root actions | search config (e.g. `m=24`) |
 | `--max-depth` | search tree **max depth** | search config |
@@ -170,7 +170,7 @@ by one of two paths.
 ## 7. Reference anchors (`references.py` — display only, never inputs)
 
 | Symbol | Meaning |
-| — | — |
+| --- | --- |
 | `REF_PLATEAU_DPS` (≈ 203) | the contested "~200 roof" — a one-config user reference, code-disowned (§1). |
 | `REF_GLOBAL_MAX_DPS` (≈ 468) | the analysis_clean.txt global-max (full bucket, pad=0) — grounded in a readable file. |
 | `REF_PRIOR_MODEL_DPS`, `REF_SERVE_CEILING_DPS`, `REF_*_DPS_PER_CORE`, … | other display anchors (per-core ceilings, serve ceilings). Re-derive; do not anchor on them. |
@@ -180,7 +180,7 @@ by one of two paths.
 ## 8. Bands & cross-cutting
 
 | Term | Meaning |
-| — | — |
+| --- | --- |
 | **Band 1 / 2 / 3** | the domain-classification axis (ADR-0003): **Band 1** solver-agnostic (the `Estimate` contract), **Band 2** OR-general (the allocation driver, the model shapes), **Band 3** FFXIII-/serving-path-bound (the grounded constants). |
 | **manifest / registry** | the metric store (`store/`): a name → `(mean, sigma, n, trusted)` / `Estimate` resolver, backed by **host PostgreSQL `control_research` @ 192.168.122.1:5432** (psycopg3) — *not* the `:6379` redis (that backs a different subsystem). |
 | **SSOT** | single source of truth (ADR-0012: the typed signature is the SSOT — for a value, its one home). |
@@ -190,7 +190,7 @@ by one of two paths.
 ## 9. Units
 
 | Unit | Meaning |
-| — | — |
+| --- | --- |
 | `µs` / `us` | microseconds |
 | `µs/row` | per-row serve cost (the `t_row` slope) |
 | `µs/leaf` | per-leaf message cost (`tmsg`) |
