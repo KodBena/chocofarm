@@ -97,7 +97,7 @@ import importlib
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any  # (Callable dropped with the runner _fd_gradient — move 5; Optional was already unused)
+from typing import Any, cast  # (Callable dropped with the runner _fd_gradient — move 5; Optional was already unused)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -105,6 +105,7 @@ if _HERE not in sys.path:
 
 import leaf_eval_grounding as G  # noqa: E402  — the single home of the references + the transfer decomposition
 import manifest  # noqa: E402   — the SSOT registry (import-clean; touches no DB on import)
+from model_base import TransportModel  # noqa: E402  — the typed transport-variant contract (move 3)
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +216,7 @@ class VariantResult:
     contrasts: dict[str, Any] = field(default_factory=dict)
 
 
-def _binding_stage(x: dict[str, float], producer_dps: float, model: Any) -> tuple[float, str]:
+def _binding_stage(x: dict[str, float], producer_dps: float, model: TransportModel) -> tuple[float, str]:
     """The serve dps + which of {GENERATION, SERVE, TRANSPORT} binds, given a producer ceiling. Uses
     the model's own cycle_breakdown for the serve/transport capacities so the structure matches the
     model exactly; substitutes the supplied producer ceiling for the min (the conservative arm passes
@@ -228,7 +229,7 @@ def _binding_stage(x: dict[str, float], producer_dps: float, model: Any) -> tupl
     return caps[binding], binding
 
 
-def _serve_floor_bound(model: Any, variant: TransportVariant,
+def _serve_floor_bound(model: TransportModel, variant: TransportVariant,
                        x: dict[str, float]) -> tuple[float, str]:
     """The TRANSFER-CORRECTED serve floor: add the per-variant H<->D transfer residual into T_disp but
     KEEP the 4.0x-linear producer ceiling (3*R_gen). This ISOLATES the one fix the two valid=false
@@ -243,7 +244,7 @@ def _serve_floor_bound(model: Any, variant: TransportVariant,
     return _binding_stage(x_c, producer_4x, model)
 
 
-def _conservative_bound(model: Any, variant: TransportVariant,
+def _conservative_bound(model: TransportModel, variant: TransportVariant,
                         x: dict[str, float]) -> tuple[float, str]:
     """The strictly-defensible floor: add the per-variant H<->D transfer residual into T_disp AND take
     the 1.9x producer ceiling as a hard min. Computed via the model's OWN cycle structure (so the serve
@@ -256,7 +257,7 @@ def _conservative_bound(model: Any, variant: TransportVariant,
     return bound, binding
 
 
-def _ci_via_driver(model: Any) -> tuple[float, str]:
+def _ci_via_driver(model: TransportModel) -> tuple[float, str]:
     """The delta-method CI half-width on E[f] via the model's `build_driver()` + each input fed as its
     harmonized `Estimate` (§6 Phase 4 — `driver.set_estimates_by_name`, REPLACING the fabricated 2-point
     `{mean±sigma}` pilot). The grounded inputs are `Fixed`/declared-spread Estimates (`cov=[[sigma^2]]`),
@@ -271,7 +272,7 @@ def _ci_via_driver(model: Any) -> tuple[float, str]:
     return rec.ci_halfwidth, "jax"
 
 
-def _variance_targets(model: Any, top: int = 6) -> list[tuple[str, float, int]]:
+def _variance_targets(model: TransportModel, top: int = 6) -> list[tuple[str, float, int]]:
     """The allocator's VARIANCE-CONTRIBUTION ranking (which input most tightens E[f]'s CI): (model-input
     name, a_i=(df/dx)^2*sigma^2, recommended +samples), ranked desc. Via the JAX-driven driver step (§6
     Phase 4 — each input fed as its harmonized `Estimate` via `set_estimates_by_name`). `+samples` is 0
@@ -302,7 +303,7 @@ def _transport_targets(slug: str) -> list[tuple[str, float, bool]]:
     return out
 
 
-def _model_estimates(model: Any) -> dict[str, "Any"]:
+def _model_estimates(model: TransportModel) -> dict[str, "Any"]:
     """The §6 Phase-4 input feed: `{model_input_name: manifest.Estimate}` for `driver.set_estimates_by_name`,
     REPLACING the fabricated 2-point `{mean±sigma}` pilot. Each input is resolved to its harmonized
     `Estimate` straight from the manifest (`manifest.estimate(qname, trust=True)`) — a `Fixed`/declared-spread
@@ -315,7 +316,7 @@ def _model_estimates(model: Any) -> dict[str, "Any"]:
     return {nm: manifest.estimate(model.registry_qname(nm), trust=True) for nm in model.INPUT_NAMES}
 
 
-def _untrusted(model: Any) -> tuple[bool, list[str]]:
+def _untrusted(model: TransportModel) -> tuple[bool, list[str]]:
     """(all_trusted, untrusted_input_names) — the ADR-0002 honesty surface. Every transport model now
     exposes the canonical `trusted_flags(trust)` (move 3b grew it on shm_spin_poll + futex_wake), so the
     old 3-fallback that sniffed untrusted_inputs / trusted_flags / resolve_inputs collapses to the one
@@ -329,7 +330,7 @@ def evaluate_variant(variant: TransportVariant) -> VariantResult:
     """Compute one variant's headline + conservative bounds, CI, trust state, and both Neyman rankings.
     The headline is the model's OWN f(mu_hat) (reported faithfully); the conservative arm applies the
     two cross-cutting corrections (1.9x producer + H<->D transfer residual)."""
-    model = importlib.import_module(variant.module)
+    model: TransportModel = cast(TransportModel, importlib.import_module(variant.module))
     x = model.initial_point(trust=True)
 
     headline = model.throughput_numpy(x)
@@ -371,7 +372,7 @@ def evaluate_variant(variant: TransportVariant) -> VariantResult:
     )
 
 
-def _variant_contrasts(model: Any) -> dict[str, Any]:
+def _variant_contrasts(model: TransportModel) -> dict[str, Any]:
     """The variant's own design-question contrasts (zero-copy? gather elidable? bare-vs-staged slope?),
     each computed by the model's own helper when present. Reported so the sweep surfaces each variant's
     dominant transport uncertainty, not just its headline."""
