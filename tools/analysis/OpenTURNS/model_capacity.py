@@ -153,7 +153,7 @@ def build_symbolic_function() -> Any:
 def build_driver(tolerance: float = 5.0) -> tuple[NeymanDriver, dict[str, float]]:
     """Factory: a configured `NeymanDriver` (over the symbolic f, grounded costs) + the
     initial point estimate. `tolerance` is the target CI half-width on E[f] in dps."""
-    f = build_symbolic_function()
+    f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     costs = [g.cost for g in _INPUTS]
     driver = NeymanDriver(
         f, costs=costs, tolerance=tolerance, names=INPUT_NAMES,

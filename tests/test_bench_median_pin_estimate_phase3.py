@@ -312,11 +312,10 @@ def test_quantile_and_fixed_estimates_flow_through_the_driver_step() -> None:
     drops out, its variance is irreducible' branch) is asserted directly on `_socp_allocation` below,
     separately from `step()`'s forward-progress nudge (which can fund any input when the reducible ones
     round to zero — a distinct mechanism, not the allocator)."""
-    ot = pytest.importorskip("openturns", reason="the driver requires openturns")
     pytest.importorskip("scipy")
 
     from neyman_driver import NeymanDriver
-    f = ot.SymbolicFunction(["x0", "x1"], ["2*x0 + 3*x1"])
+    f = lambda x: 2.0 * x[0] + 3.0 * x[1]
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
     med_est = BC.median_estimate(_skewed_pool(base=10.0), name="x0")   # a QuantileLaw input
     pin_est = BC.pin_estimate(5.0, 2.0, name="x1")                     # a Fixed declared-spread input

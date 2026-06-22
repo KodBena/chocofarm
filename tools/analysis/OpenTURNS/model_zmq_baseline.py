@@ -218,7 +218,7 @@ def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[NeymanDriv
     """Factory: a configured `NeymanDriver` (over the symbolic f, manifest-grounded costs) + the
     initial point estimate. `tolerance` is the target CI half-width on E[f] in dps. The costs are the
     model-side bench-effort weights (costs()); the pilot is drawn from the manifest means/sigmas."""
-    f = build_symbolic_function()
+    f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     c = [COSTS[nm] for nm in INPUT_NAMES]
     driver = NeymanDriver(
         f, costs=c, tolerance=tolerance, names=INPUT_NAMES,

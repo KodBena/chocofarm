@@ -242,7 +242,7 @@ def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[Any, dict[
     point. `tolerance` is the target CI half-width on E[f] in dps. `trust` selects live-vs-seed inputs. Imported
     lazily (the driver pulls in openturns)."""
     from neyman_driver import NeymanDriver
-    f = build_symbolic_function()
+    f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     cost_list = [_COST[nm] for nm in INPUT_NAMES]
     driver = NeymanDriver(
         f, costs=cost_list, tolerance=tolerance, names=INPUT_NAMES,

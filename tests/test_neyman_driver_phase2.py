@@ -51,12 +51,13 @@ _OT = os.path.join(
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
-ot = pytest.importorskip("openturns", reason="neyman_driver requires openturns")
 pytest.importorskip("scipy", reason="the Clark closed form needs scipy.stats.norm")
 
 import estimate as E  # noqa: E402  — the Estimate contract
 import neyman_driver as ND  # noqa: E402  — the Phase-2 driver under test
 from neyman_driver import NeymanDriver, _t_multiplier  # noqa: E402
+from alloc.jax_backend import jnp  # noqa: E402  — x64-enabled JAX; needed for jnp.minimum fixtures
+from alloc.gradient import jax_gradient  # noqa: E402  — for _legacy_diagonal_step
 
 _HAS_CVXPY = __import__("importlib").util.find_spec("cvxpy") is not None
 
@@ -125,8 +126,7 @@ def _legacy_diagonal_step(f, costs, tol, names, pools, z=1.959963984540054):
     n = np.array([len(p) for p in pools], dtype=float)
     mu = np.array([p.mean() for p in pools])
     sigma = np.array([p.std(ddof=1) for p in pools])
-    g = f.gradient(ot.Point(mu))
-    grad = np.array([g[i, 0] for i in range(len(names))])
+    grad = jax_gradient(f, mu)
     a = (grad * sigma) ** 2
     var_est = float((a / n).sum())
     ci = z * math.sqrt(max(var_est, 0.0))
@@ -139,7 +139,7 @@ def _legacy_diagonal_step(f, costs, tol, names, pools, z=1.959963984540054):
 def test_set_estimate_rejects_non_estimate_and_bad_index() -> None:
     """ADR-0002: set_estimate validates the input contract — a non-Estimate, or an out-of-range index,
     is a loud error, never a silent accept."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["x0 + x1"])
+    f = lambda x: x[0] + x[1]
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
     with pytest.raises(TypeError):
         d.set_estimate(0, {"mean": 1.0})  # a bespoke dict is exactly what the contract forbids
@@ -148,7 +148,7 @@ def test_set_estimate_rejects_non_estimate_and_bad_index() -> None:
 
 
 def test_set_estimates_by_name_unknown_name_raises() -> None:
-    f = ot.SymbolicFunction(["x0", "x1"], ["x0 + x1"])
+    f = lambda x: x[0] + x[1]
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
     with pytest.raises(KeyError):
         d.set_estimates_by_name({"not_an_input": _poolwise("q", 1.0, 1.0, 10)})
@@ -158,7 +158,7 @@ def test_pool_and_estimate_fed_drivers_agree_on_the_mean_case() -> None:
     """THE confirmed fixed point (§6 Phase-2 deliverable 1): a pool-fed driver and an Estimate-fed
     driver produce the SAME var_estimate, ci, per-input a, and recommendation on an all-means model —
     because step() wraps a raw pool as exactly the Poolwise Estimate the Estimate-fed driver is handed."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["3*x0 - 1.5*x1"])
+    f = lambda x: 3.0 * x[0] - 1.5 * x[1]
     costs, tol = [1.0, 2.0], 0.5
     rng = np.random.default_rng(11)
     p0, p1 = rng.normal(10, 3, 60), rng.normal(20, 2, 45)
@@ -191,7 +191,7 @@ def test_gtsigmag_equals_legacy_diagonal_sum_no_regression() -> None:
     the per-sample `p.a = (g·σ)²` is byte-for-byte the legacy field, and `p.var_contribution` is the
     legacy `a/n`. This is the no-regression guarantee for every all-mean model."""
     names = ["x0", "x1", "x2"]
-    f = ot.SymbolicFunction(names, ["3*x0 - 1.5*x1 + 0.7*x2"])
+    f = lambda x: 3.0 * x[0] - 1.5 * x[1] + 0.7 * x[2]
     costs, tol = [1.0, 2.5, 0.8], 0.5
     rng = np.random.default_rng(7)
     pools = [rng.normal(10, 3, 60), rng.normal(20, 2, 45), rng.normal(5, 4, 80)]
@@ -212,7 +212,7 @@ def test_gtsigmag_folds_in_the_cross_term() -> None:
     """§4.2: a declared `cross` makes Σ non-diagonal, and `gᵀΣg` picks up the `2·g_i·g_j·Σ_ij` cross-term
     the diagonal sum drops — materially changing the variance (here a negative off-diagonal with
     same-sign gradients LOWERS it). The assembled Σ carries the off-diagonal symmetrically."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["2*x0 + 3*x1"])  # same-sign gradients g=[2,3]
+    f = lambda x: 2.0 * x[0] + 3.0 * x[1]  # same-sign gradients g=[2,3]
     n0, n1, s0, s1, corr = 50, 50, 9.0, 4.0, -0.81
     Sig00, Sig11 = s0 / n0, s1 / n1
     Sig01 = corr * math.sqrt(Sig00 * Sig11)
@@ -232,7 +232,7 @@ def test_gtsigmag_folds_in_the_cross_term() -> None:
 def test_assemble_sigma_rejects_disagreeing_cross_homes() -> None:
     """ADR-0002 / P1: a cross coupling declared by BOTH sides with DIFFERENT values is two homes for one
     number that disagree — a loud fault, not a silent pick."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["x0 + x1"])
+    f = lambda x: x[0] + x[1]
     e0 = _poolwise("x0", 1.0, 1.0, 10, cross={"x1": -0.05})
     e1 = _poolwise("x1", 1.0, 1.0, 10, cross={"x0": -0.09})  # disagrees with e0's -0.05
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
@@ -247,7 +247,7 @@ def test_socp_reduces_to_closed_form_on_the_diagonal() -> None:
     """§2.3 / §8(b): on a diagonal Σ the allocation is the closed form `n_i* ∝ √(a_i/c_i)`. The driver
     dispatches to the closed form on the diagonal (exact + robust to scaling); we check it reproduces
     the textbook Neyman ratio to a tight relative tolerance."""
-    f = ot.SymbolicFunction(["x0", "x1", "x2"], ["3*x0 - 1.5*x1 + 0.7*x2"])
+    f = lambda x: 3.0 * x[0] - 1.5 * x[1] + 0.7 * x[2]
     costs = np.array([1.0, 2.5, 0.8])
     rng = np.random.default_rng(7)
     pools = [rng.normal(10, 3, 60), rng.normal(20, 2, 45), rng.normal(5, 4, 80)]
@@ -276,7 +276,7 @@ def test_socp_reduces_to_closed_form_on_the_diagonal() -> None:
 def test_socp_hits_v_star_on_a_nondiagonal_sigma() -> None:
     """§2.3 / §8(b): on a NON-diagonal Σ the SOCP fires (not the closed form) and the returned `n*`
     realizes `gᵀΣ(n*)g = V*` EXACTLY — the case the closed form cannot express. Same-sign gradients."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["2*x0 + 3*x1"])
+    f = lambda x: 2.0 * x[0] + 3.0 * x[1]
     n0, n1, s0, s1, corr = 50, 50, 9.0, 4.0, -0.81
     Sig00, Sig11 = s0 / n0, s1 / n1
     Sig01 = corr * math.sqrt(Sig00 * Sig11)
@@ -301,7 +301,7 @@ def test_socp_sign_safe_on_mixed_sign_gradients() -> None:
     naive v=u/√n form silently misallocates, claiming `optimal` while the true Var≠V*). The driver's
     fail-loud `gᵀΣ(n*)g ≈ V*` assertion is what guarantees this — a returned allocation always realizes
     V* or the call raises. `model_capacity` HAS mixed-sign gradients, so this is the live case."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["x0 + x1"])  # f arbitrary; we drive _socp_allocation directly
+    f = lambda x: x[0] + x[1]  # f arbitrary; we drive _socp_allocation directly
     n0, n1, s0, s1, corr = 50, 50, 9.0, 4.0, -0.81
     Sig00, Sig11 = s0 / n0, s1 / n1
     Sig01 = corr * math.sqrt(Sig00 * Sig11)
@@ -323,7 +323,7 @@ def test_fixed_pin_drops_out_of_allocation() -> None:
     """§2.3: a Fixed/declared-spread pin has irreducible variance, so it gets NO allocation (its n is
     unchanged) — but it still contributes its a_i to the bound (via gᵀΣg). The 'don't sample dead
     inputs' branch, now for the right reason (irreducible, not merely a==0)."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["2*x0 + 3*x1"])
+    f = lambda x: 2.0 * x[0] + 3.0 * x[1]
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))   # shrinkable mean
     d.set_estimate(1, _fixed("x1", 5.0, 2.0))           # un-shrinkable pin
@@ -343,7 +343,7 @@ def test_degenerate_true_constant_contributes_zero_to_the_bound() -> None:
     core count is the ADR-0008 'derived value frozen as a literal' slip — not a real spread). The
     driver's bound (`gᵀΣg`) must zero it: the DEGENERATE `var_contribution` is 0 even though `df/dx≠0`.
     This is the bound-side twin of `_family_multiplier` already excluding DEGENERATE."""
-    f = ot.SymbolicFunction(["N_gen", "R_gen"], ["N_gen * R_gen"])  # both gradients nonzero (g=[R, N])
+    f = lambda x: x[0] * x[1]  # both gradients nonzero (g=[R, N])
     d = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
     d.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))   # TRUE CONSTANT (DEGENERATE), df/dN = R = 152
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))       # declared-spread prior (NORMAL), df/dR = N = 3
@@ -363,7 +363,7 @@ def test_degenerate_pin_removal_is_the_before_after_of_the_run_output_stall() ->
     conflated 49.34 (z·√(57.76+576)) to the honest 47.04 (z·√576) — the 57.76 DEGENERATE term is
     removed; the 576 declared-spread R_gen floor (correctly) stays. If N_gen were instead a NORMAL
     declared-spread it WOULD contribute (the contrast that proves it is the family, not the law)."""
-    f = ot.SymbolicFunction(["N_gen", "R_gen"], ["N_gen * R_gen"])
+    f = lambda x: x[0] * x[1]
     # DEGENERATE N_gen -> 47.04 (the fix)
     d1 = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"])
     d1.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))
@@ -386,7 +386,7 @@ def test_var_floor_separates_declared_prior_from_shrinkable_variance() -> None:
     """§7.D: the driver surfaces the irreducible-prior floor (Σ a_i over declared-spread `Fixed` inputs)
     DISTINCT from the shrinkable sampling variance. A model with one shrinkable mean + one declared-
     spread pin splits `var_estimate` into `var_floor` (the pin) + `var_shrinkable` (the mean) exactly."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["2*x0 + 3*x1"])
+    f = lambda x: 2.0 * x[0] + 3.0 * x[1]
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))   # shrinkable mean: a = 2²·(9/50) = 0.72
     d.set_estimate(1, _fixed("x1", 5.0, 2.0))           # declared-spread pin: a = 3²·2² = 36
@@ -402,7 +402,7 @@ def test_var_floor_blocks_target_when_prior_exceeds_tolerance() -> None:
     """§2.3 honest edge: when the declared-prior floor ALONE exceeds V_target, `floor_blocks_target` is
     True and `converged` stays False — the CI honestly rests on the prior; the driver does NOT falsely
     converge on the shrinkable part alone (the false-SAT §2.3 forbids), it SURFACES why it cannot."""
-    f = ot.SymbolicFunction(["N_gen", "R_gen"], ["N_gen * R_gen"])
+    f = lambda x: x[0] * x[1]
     d = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
     d.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))   # the true constant (out of the bound)
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))       # the declared prior, floor = 576
@@ -417,7 +417,7 @@ def test_var_floor_blocks_target_when_prior_exceeds_tolerance() -> None:
 def test_all_mean_report_has_no_floor_line_no_regression() -> None:
     """No-regression: an all-mean model (no Fixed input) has var_floor=0 and its report shows NO floor
     line — the §7.D surface is additive, visually inert on the case it does not apply to."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["3*x0 - 1.5*x1"])
+    f = lambda x: 3.0 * x[0] - 1.5 * x[1]
     d = NeymanDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))
     d.set_estimate(1, _poolwise("x1", 20.0, 4.0, 50))
@@ -463,7 +463,7 @@ def test_floored_fit_is_defunded_by_the_allocator_and_the_nudge() -> None:
     not fund it either. Pre-fix the allocator targeted n_star≫n_cur (1/n shrinkage on `Σ_ii·len(pools)`)
     and the nudge funded the worst contributor — the over-funding this removes."""
     names = ["slope_us", "tau_io_us", "T_disp_us", "B_op"]
-    f = ot.SymbolicFunction(names, ["1000000.0 / (T_disp_us + tau_io_us + B_op * slope_us)"])
+    f = lambda x: 1000000.0 / (x[2] + x[1] + x[3] * x[0])
     d = NeymanDriver(f, costs=[50.0, 5.0, 1.0, 1.0], tolerance=5.0, names=names)
     d.set_estimate(0, _fit(94.58, 4.317, lack_of_fit=True))      # the floored fit (dominant contributor)
     # near-certain pins so the fit is the dominant variance source.
@@ -502,7 +502,7 @@ def test_residual_limited_fit_is_funded() -> None:
                                design=design[:, ::-1], per_point_var=np.array([2.0]*7)),
         support=(E.Support.POSITIVE, E.Support.POSITIVE),
         family=(E.StudentT(dof=5), E.StudentT(dof=5)), kind="ols_fit")
-    f = ot.SymbolicFunction(["slope_us", "p"], ["1000000.0 / (100.0 + 64.0 * slope_us) + 0*p"])
+    f = lambda x: 1000000.0 / (100.0 + 64.0 * x[0]) + 0.0 * x[1]
     d = NeymanDriver(f, costs=[50.0, 1.0], tolerance=5.0, names=["slope_us", "p"])
     d.set_estimate(0, est)
     d.set_estimate(1, _fixed("p", 1.0, 0.001))
@@ -520,7 +520,7 @@ def test_mean_allocation_A_is_byte_for_byte_the_pre_fix_sigma_times_n() -> None:
     the marginal-derived `A_i = −marginal·n_eff²` equals the pre-fix `A_i = Σ_ii·n_eff` to ZERO (not just
     machine epsilon) — so the closed-form / SOCP target the mean case produces is identical. This is the
     'keep the Poolwise mean case byte-for-byte' assertion the fix is required to preserve."""
-    f = ot.SymbolicFunction(["x0", "x1", "x2"], ["3*x0 - 1.5*x1 + 0.7*x2"])
+    f = lambda x: 3.0 * x[0] - 1.5 * x[1] + 0.7 * x[2]
     d = NeymanDriver(f, costs=[1.0, 2.5, 0.8], tolerance=0.5, names=["x0", "x1", "x2"])
     rng = np.random.default_rng(7)
     for i, (mu, s2, n) in enumerate([(10.0, 9.0, 60), (20.0, 4.0, 45), (5.0, 16.0, 80)]):
@@ -545,7 +545,7 @@ def _kink_driver(sigma_R: float) -> NeymanDriver:
     producer spread) propagates through N·R from the Estimate covs. The arms hook supplies the per-arm
     capacities + gradients the Clark path linearizes."""
     names = ["N_gen", "R_gen", "serve_cap"]
-    f = ot.SymbolicFunction(names, ["min(N_gen*R_gen, serve_cap)"])
+    f = lambda x: jnp.minimum(x[0] * x[1], x[2])
     d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names, confidence=0.95)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.05))
     d.set_estimate(1, _fixed("R_gen", 152.0, sigma_R))
@@ -613,7 +613,7 @@ def test_clark_kink_funds_shrinkable_contender_input() -> None:
     un-funded (the conflation removal). This is the faithful test of mechanism 3: it exercises funding of
     a contender input the allocator can actually sample, not the futile pin-funding the pre-fix nudge did."""
     names = ["N_gen", "R_gen", "serve_cap"]
-    f = ot.SymbolicFunction(names, ["min(N_gen*R_gen, serve_cap)"])
+    f = lambda x: jnp.minimum(x[0] * x[1], x[2])
     d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=2.0, names=names, confidence=0.95)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.01))
     # R_gen as a SHRINKABLE median pool (a real spread), tuned so producer ~ serve (a live tie).
@@ -641,7 +641,7 @@ def test_no_kink_regime_without_the_arms_hook() -> None:
     differentiate through min() anyway), so it stays in the smooth regime — it never fabricates a tie. A
     min() model WITHOUT arms_fn behaves exactly as today (kink_regime False, single-arm gᵀΣg)."""
     names = ["N_gen", "R_gen", "serve_cap"]
-    f = ot.SymbolicFunction(names, ["min(N_gen*R_gen, serve_cap)"])
+    f = lambda x: jnp.minimum(x[0] * x[1], x[2])
     d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.05))
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
@@ -657,7 +657,7 @@ def test_run_stalls_when_nothing_fundable(capsys) -> None:
     max_rounds re-stepping with no new data (the ~/run_output symptom: identical iters, +samples=0
     everywhere). f=min(a*b, c) with a,b declared-spread pins binding (a*b=456) and c a high non-binding
     pin: nothing is fundable, so the loop is a fixed point, not convergence to the CI target."""
-    f = ot.SymbolicFunction(["a", "b", "c"], ["min(a*b, c)"])
+    f = lambda x: jnp.minimum(x[0] * x[1], x[2])
     d = NeymanDriver(f, costs=[1.0, 1.0, 1.0], tolerance=0.01, names=["a", "b", "c"], confidence=0.95)
     ms = {0: lambda _b: _fixed("a", 3.0, 0.05), 1: lambda _b: _fixed("b", 152.0, 8.0),
           2: lambda _b: _fixed("c", 1000.0, 2.0)}
@@ -673,7 +673,7 @@ def test_kink_collapses_to_smooth_far_from_a_tie() -> None:
     regime — the analytic single-arm gradient is honest, the non-binding arm's df/dx=0 is correct. Here
     the producer (456) is far above a much-lower serve (200), so no kink fires."""
     names = ["N_gen", "R_gen", "serve_cap"]
-    f = ot.SymbolicFunction(names, ["min(N_gen*R_gen, serve_cap)"])
+    f = lambda x: jnp.minimum(x[0] * x[1], x[2])
     d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.05))
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
@@ -694,7 +694,7 @@ def test_kink_collapses_to_smooth_far_from_a_tie() -> None:
 # --------------------------------------------------------------------------- #
 def test_family_multiplier_normal_is_z() -> None:
     """§4.3: an all-NORMAL set uses the z multiplier (today's behavior)."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["3*x0 - 1.5*x1"])
+    f = lambda x: 3.0 * x[0] - 1.5 * x[1]
     d = NeymanDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))
     d.set_estimate(1, _poolwise("x1", 20.0, 4.0, 50))
@@ -707,7 +707,7 @@ def test_family_multiplier_student_t_widens() -> None:
     """§4.3: a STUDENT_T(dof=5) fit-coefficient input widens the multiplier to t_{5,0.975}≈2.571 (vs
     z=1.96, a 31% wider CI honestly reported). The mixed-family case is LABELLED conservative."""
     assert _t_multiplier(5, 0.95) == pytest.approx(2.5706, abs=1e-3)
-    f = ot.SymbolicFunction(["x0", "x1"], ["3*x0 - 1.5*x1"])
+    f = lambda x: 3.0 * x[0] - 1.5 * x[1]
     d = NeymanDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, E.Estimate(
         theta_hat=np.array([10.0]), cov=np.array([[0.5]]), names=("x0",),
@@ -725,7 +725,7 @@ def test_family_multiplier_student_t_widens() -> None:
 # --------------------------------------------------------------------------- #
 def test_run_requires_exactly_one_of_measurers_or_samplers() -> None:
     """ADR-0002: run() takes EXACTLY ONE input contract — both, or neither, is a loud error."""
-    f = ot.SymbolicFunction(["x0"], ["x0"])
+    f = lambda x: x[0]
     d = NeymanDriver(f, costs=[1.0], tolerance=1.0, names=["x0"])
     with pytest.raises(ValueError):
         d.run()  # neither
@@ -737,7 +737,7 @@ def test_run_requires_exactly_one_of_measurers_or_samplers() -> None:
 def test_run_measurers_form_converges() -> None:
     """The §6 Phase-2 `measurers[i](budget) -> Estimate` form drives the loop to convergence on a smooth
     all-mean model (the form the migrated runners move to in Phase 4)."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["x0 + 2*x1"])
+    f = lambda x: x[0] + 2.0 * x[1]
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=2.0, names=["x0", "x1"], confidence=0.95)
     rng = np.random.default_rng(1)
     state = {0: [], 1: []}
@@ -759,7 +759,7 @@ def test_run_legacy_samplers_form_still_works() -> None:
     """Backward compat: the legacy `samplers[i](k) -> array` form (which untrusted_drive used pre-Phase-4,
     before it moved to `measurers` -> Estimate) still drives the loop — Phase 2 is additive, the
     `add_samples` shim is kept, not a breaking change."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["x0 + 2*x1"])
+    f = lambda x: x[0] + 2.0 * x[1]
     d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=2.0, names=["x0", "x1"], confidence=0.95)
     rng = np.random.default_rng(0)
     rec = d.run(samplers={0: lambda k: rng.normal(10, 3, int(k)),

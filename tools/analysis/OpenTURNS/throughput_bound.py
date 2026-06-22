@@ -90,7 +90,6 @@ def _ot_bound(model):
     flip it to trusted, not drawing more samples of a fixed prior); the grounded mean anchors the
     gradient at the binding stage (important because the min() kink makes it point-sensitive). We
     deliberately do NOT loop to convergence — these are seeds, not a live system."""
-    import openturns as ot
     driver, x0 = model.build_driver(tolerance=0.1)
     names = model.INPUT_NAMES
     sig = model.SIGMAS
@@ -99,7 +98,7 @@ def _ot_bound(model):
     ests = {nm: manifest._estimate_from_seed(nm, x0[nm], sig[nm], "") for nm in names}
     driver.set_estimates_by_name(ests)
     rec = driver.step(second_order_check=False)
-    f_mu = float(model.build_symbolic_function()(ot.Point([x0[nm] for nm in names]))[0])
+    f_mu = float(model.throughput_jax(np.array([x0[nm] for nm in names])))  # JAX f eval (x64 via the f's jax_backend)
     return driver, rec, f_mu, x0
 
 

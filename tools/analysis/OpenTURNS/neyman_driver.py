@@ -7,7 +7,7 @@ allocator for functional uncertainty-propagation models. It owns NO specific mod
 (ADR-0012 P1 single-home / P2 separation of the allocator-transport from the thing
 allocated): a concrete throughput model is a SEPARATE module (e.g.
 `examples/demo_msgpass.py`, `model_capacity.py`, `model_cycletime.py`) that builds an
-`ot.Function` and hands it to `NeymanDriver`. The synthetic demo that previously lived
+a JAX-traceable `f(x_array)` (its `throughput_jax`) and hands it to `NeymanDriver`. The synthetic demo that previously lived
 in this file (the `_demo()` impurity) was extracted to
 `tools/analysis/OpenTURNS/examples/demo_msgpass.py` per the ADR-0012 purification.
 
@@ -35,13 +35,18 @@ scaled to hit V*. Because a_i depends on sigma_i and the gradient at mu --
 which you only know after sampling -- the procedure is iterative: pilot,
 estimate a_i, allocate a top-up, repeat. This module runs that loop.
 
-OpenTURNS supplies f and its gradient (with a finite-difference fallback), and
-an optional TaylorExpansionMoments diagnostic flags when the linearisation the
-allocation rests on is no longer trustworthy (Jensen / curvature).
+JAX supplies f and its gradient: a model declares f ONCE as a JAX-traceable callable
+`f(x_array) -> scalar` (x ordered by `names`), and the driver differentiates it with
+`jax.grad` (the OpenTURNS→JAX migration, note §5 — `alloc.gradient.jax_gradient`). jax.grad
+is analytic and exact through the min() (away from an arm-tie it gives the binding arm's
+gradient; the tie itself is handled by the Clark closed form `alloc.kink`, never a
+linearisation — so the old TaylorExpansionMoments curvature diagnostic was DROPPED, not
+ported). x64 is enforced (`alloc.jax_backend`; the tool is float64 throughout).
 
-Dependencies: numpy, openturns (>=1.17 or so). TaylorExpansionMoments and the
-JointDistribution/ComposedDistribution naming are version-sensitive and are
-both guarded.
+Dependencies: numpy, jax (the autodiff backend, x64), scipy.stats (the Clark Φ/φ), cvxpy
+(the §2.3 SOCP). openturns is still imported for the z / Student-t CI quantiles
+(`_z_from_confidence` / `_t_multiplier`) ONLY — that remaining OT use migrates to scipy in a
+later increment, after which the tool imports no OpenTURNS.
 
 Author's note: this allocates effort to shrink the CI on E[f] (the expected
 ceiling). It does NOT shrink sigma_f = sqrt(sum_i a_i), the genuine run-to-run
@@ -98,7 +103,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -120,13 +125,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import estimate as _est  # noqa: E402  — the Estimate contract (numpy-only; touches no DB)
-# The generic OR machinery lifted out of this file into the `alloc` sub-package (the responsibility
-# refactor, docs/design/leaf-eval-bound-responsibility-refactor.md): `alloc.gradient` is the §5
-# gradient-backend Port (OT analytic `f.gradient()` + a finite-difference fallback — the ONE site the
-# planned JAX swap replaces), `alloc.kink` is the §4.1 Clark-1961 min()-kink closed form (pure, backend-
-# independent). Both resolve via the `sys.path.insert(0, _HERE)` above — `alloc` is a sub-package of
-# this directory (no top-level `__init__.py` yet; the package conversion is a later refactor increment).
+# The generic OR machinery in the `alloc` sub-package: `alloc.gradient.jax_gradient` is the JAX gradient
+# backend (the OT→JAX migration, §5 — the driver consumes a JAX-traceable `f` and differentiates it with
+# jax.grad), `alloc.kink` is the §4.1 Clark-1961 min()-kink closed form (pure, backend-independent). The
+# x64-enabled JAX handle `alloc.jax_backend.jnp` evaluates `f` at a point. All resolve via the
+# `sys.path.insert(0, _HERE)` above — `alloc` is a sub-package of this directory.
 from alloc import gradient as _grad, kink as _kink  # noqa: E402
+from alloc.jax_backend import jnp  # noqa: E402  — x64-enabled jnp for evaluating the JAX f at a point
 
 # cvxpy (CLARABEL) backs the §2.3 cost-constrained c-optimal SOCP allocation (the sign-safe
 # Q = diag(g)·R·diag(g) form, native to mixed-sign gradients). scipy.stats.norm backs the §4.1
@@ -252,14 +257,14 @@ class Recommendation:
 # --------------------------------------------------------------------------- #
 class NeymanDriver:
     """
-    Iterative optimal-allocation driver for an OpenTURNS scalar function f.
+    Iterative optimal-allocation driver for a JAX-traceable scalar function f.
 
     Parameters
     ----------
-    f : ot.Function
-        Scalar-output function of d inputs. Built however you like
-        (SymbolicFunction, PythonFunction, composite). Its .gradient() is used
-        if available; otherwise central finite differences on f are used.
+    f : callable (JAX-traceable)
+        A scalar-output function of d inputs, called with a 1-D array ordered by `names`
+        (a model's `throughput_jax`). Its gradient is taken with `jax.grad`
+        (`alloc.gradient.jax_gradient`) — analytic, exact through the model's `min()`.
     costs : sequence of float
         Per-sample cost c_i of benchmarking each primitive. Relative scale is
         all that matters. Use wall-clock seconds, or 1.0 for all if uniform.
@@ -279,31 +284,32 @@ class NeymanDriver:
 
     def __init__(
         self,
-        f: "ot.Function",
+        f: Callable[..., Any],
         costs: Sequence[float],
         tolerance: float,
         names: Optional[Sequence[str]] = None,
         confidence: float = 0.95,
         growth_cap: float = 3.0,
         max_batch: Optional[int] = None,
-        fd_rel_step: float = 1e-5,
     ):
+        if names is None:
+            raise ValueError(
+                "NeymanDriver: `names` is required — it defines the input dimension AND the order the "
+                "JAX `f` is called with (`f` takes an array ordered by `names`). The OT→JAX migration "
+                "dropped `f.getInputDimension()` (a JAX callable has no such method) — ADR-0002.")
         self.f = f
-        self.d = f.getInputDimension()
-        if f.getOutputDimension() != 1:
-            raise ValueError("f must have scalar output (output dimension 1).")
+        self.d = len(names)
         self.costs = np.asarray(costs, dtype=float)
         if self.costs.shape != (self.d,):
             raise ValueError(f"costs must have length {self.d}.")
         if np.any(self.costs <= 0):
             raise ValueError("costs must be positive.")
         self.tolerance = float(tolerance)
-        self.names = list(names) if names is not None else [f"x{i}" for i in range(self.d)]
+        self.names = list(names)
         self.confidence = float(confidence)
         self.z = float(_z_from_confidence(confidence))
         self.growth_cap = float(growth_cap)
         self.max_batch = max_batch
-        self.fd_rel_step = float(fd_rel_step)
 
         # pools[i] is a 1-D numpy array of collected samples for primitive i (the legacy raw-pool
         # path; add_samples appends to it). estimates[i] is the §6 Phase-2 harmonized Estimate for
@@ -403,29 +409,11 @@ class NeymanDriver:
     # single home of the FD fallback, reached through `gradient()` above — no driver-local copy remains.)
     # ------------------------------------------------------------------ #
     def _gradient(self, point: np.ndarray) -> np.ndarray:
-        return _grad.gradient(self.f, point, dim=self.d, fd_rel_step=self.fd_rel_step)
-
-    # ------------------------------------------------------------------ #
-    # Optional curvature diagnostic via TaylorExpansionMoments
-    # ------------------------------------------------------------------ #
-    def _second_order_mean(self) -> Optional[float]:
-        """
-        Build a kernel-smoothed joint distribution from the current pools and
-        ask OpenTURNS for the second-order (curvature-corrected) mean. Returns
-        None if anything in this version-sensitive path is unavailable.
-        """
-        try:
-            marginals = []
-            for i in range(self.d):
-                sample = ot.Sample(self.pools[i].reshape(-1, 1))
-                marginals.append(ot.KernelSmoothing().build(sample))
-            dist = _make_joint(marginals)
-            inputRV = ot.RandomVector(dist)
-            outputRV = ot.CompositeRandomVector(self.f, inputRV)
-            taylor = ot.TaylorExpansionMoments(outputRV)
-            return float(taylor.getMeanSecondOrder()[0])
-        except Exception:
-            return None
+        """The gradient of the JAX-traceable `f` at `point`, via jax.grad (`alloc.gradient.jax_gradient`) —
+        the OT→JAX migration's backend (§5). Called by step() and the phase-2 tests (`d._gradient(mu)`).
+        (The 2nd-order TaylorExpansionMoments curvature diagnostic that lived here was OpenTURNS-only and
+        was dropped with the swap — note §5 drop-not-port.)"""
+        return _grad.jax_gradient(self.f, point)
 
     # ------------------------------------------------------------------ #
     # The allocation step
@@ -484,7 +472,7 @@ class NeymanDriver:
         # carries (the divided share of Var(E[f])), the off-diagonal cross-terms now folded in.
         a_contrib = grad * Sg
 
-        estimate = float(self.f(ot.Point(mu))[0])  # the hard-min point value f(μ̂)
+        estimate = float(self.f(jnp.asarray(mu)))  # the hard-min point value f(μ̂) (JAX f eval, x64)
 
         # --- §4.1 the min()-kink path: binding-margin diagnostic + Clark closed form (no MC) --- #
         # The Clark-1961 machinery is lifted to `alloc.kink` (refactor move 4): read the model's min()-arms
@@ -605,9 +593,10 @@ class NeymanDriver:
         S = float(sqrt_ac.sum())
         shadow = (S ** 2) / (V_target ** 2) if (V_target > 0 and math.isfinite(V_target)) else float("inf")
 
-        second_order = (
-            self._second_order_mean() if (second_order_check and not converged) else None
-        )
+        # The 2nd-order TaylorExpansionMoments curvature diagnostic was OpenTURNS-only and was DROPPED in
+        # the OT→JAX migration (note §5 drop-not-port). `second_order_check` is kept as a no-op for
+        # call-site compatibility; `estimate_second_order` is always None now (report() omits the line).
+        second_order = None
 
         prims = [
             PrimitiveState(
@@ -1068,13 +1057,6 @@ def _report_sigma(est: "_est.Estimate") -> float:
     if isinstance(shrink, _est.Poolwise):
         return float(math.sqrt(max(float(shrink.per_sample_var[0]), 0.0)))
     return float(math.sqrt(max(float(est.cov[0, 0]), 0.0)))
-
-
-def _make_joint(marginals):
-    """JointDistribution (newer OT) or ComposedDistribution (older)."""
-    if hasattr(ot, "JointDistribution"):
-        return ot.JointDistribution(marginals)
-    return ot.ComposedDistribution(marginals)
 
 
 # This module owns NO model and has no __main__ (ADR-0012 P1/P2): the synthetic
