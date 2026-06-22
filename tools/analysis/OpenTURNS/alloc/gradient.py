@@ -108,3 +108,18 @@ def fd_gradient_dict(
         xm = dict(x0); xm[nm] -= h
         g[nm] = (fn(xp) - fn(xm)) / (2.0 * h)
     return g
+
+
+def jax_gradient(f: Callable[..., Any], point: np.ndarray) -> np.ndarray:
+    """The gradient of a JAX-traceable scalar `f` at `point` (ordered by the model's INPUT_NAMES), via
+    `jax.grad` — analytic reverse-mode autodiff. The OpenTURNS→JAX migration's gradient backend (§5): it
+    REPLACES `gradient`/`fd_gradient` (OT-analytic-with-FD-fallback — OT itself fell back to central FD
+    through the model's `min()`, so it was never truly analytic) and the runner-side `fd_gradient_dict`.
+    `jax.grad` differentiates through `min()` exactly: away from an arm-tie it returns the binding arm's
+    gradient (== FD, validated ~1e-9); at a tie it returns the symmetric 0.5/0.5 subgradient (== central
+    FD). The arm-TIE bound is NOT a linearization at all — it is the Clark-1961 closed form (`alloc.kink`)
+    the driver routes to near a tie, so the subgradient is never the bound there. No FD step-size
+    truncation. x64 is enforced via `jax_backend` (float32 would drift the bound ~1e-6)."""
+    from alloc.jax_backend import grad, jnp
+    g = grad(f)(jnp.asarray(point, dtype=float))
+    return np.asarray(g, dtype=float)

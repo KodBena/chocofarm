@@ -137,6 +137,19 @@ def throughput_numpy(x: dict[str, float]) -> float:
     return float(min(producer, serve))
 
 
+def throughput_jax(x: Any) -> Any:
+    """The single JAX-traceable throughput f (x ordered by INPUT_NAMES) — the OT→JAX migration's one home
+    for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
+    handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
+    tests/test_jax_f_equivalence.py). Supersedes THROUGHPUT_EXPR + throughput_numpy once the driver consumes it."""
+    from alloc.jax_backend import jnp
+    N_gen, R_gen, B, T_disp, wakeup, tau_io, t_row, L = x
+    cycle_us = T_disp + wakeup + tau_io + B * t_row
+    serve = 1e6 * B / (cycle_us * L)
+    producer = N_gen * R_gen
+    return jnp.minimum(producer, serve)
+
+
 # --------------------------------------------------------------------------- #
 # Manifest resolution — pull every input through the TRUST contract; branch on `trusted`.
 # --------------------------------------------------------------------------- #

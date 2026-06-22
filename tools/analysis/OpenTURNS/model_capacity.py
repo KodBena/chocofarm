@@ -103,6 +103,20 @@ def throughput_numpy(x: dict[str, float]) -> float:
     return float(min(gen, serve, transport))
 
 
+def throughput_jax(x: Any) -> Any:
+    """The single JAX-traceable throughput f (x ordered by INPUT_NAMES) — the OT→JAX migration's one home
+    for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
+    handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
+    tests/test_jax_f_equivalence.py). Supersedes THROUGHPUT_EXPR + throughput_numpy once the driver consumes it."""
+    from alloc.jax_backend import jnp
+    g_core, n_gen, LPD, iota_us, slope_us, tau_io_us, B_op, tmsg_us_leaf = x
+    gen = n_gen * g_core / LPD
+    fwd_us = iota_us + slope_us * B_op + tau_io_us
+    serve = (B_op / (fwd_us * 1e-6)) / LPD
+    transport = 1.0 / (LPD * tmsg_us_leaf * 1e-6)
+    return jnp.minimum(jnp.minimum(gen, serve), transport)
+
+
 # Per-input grounded (mean, sigma, cost) — single-homed in leaf_eval_grounding.
 _INPUTS: list[G.Grounded] = [
     G.GEN_PER_CORE_LEAVES,   # g_core
