@@ -10,8 +10,8 @@ models are the things transported; this runner + the generic `NeymanDriver` are 
 
 The bound is computed via the `NeymanDriver` (§6 Phase 4 — each input fed as its harmonized
 `Estimate` via `driver.set_estimate`, NOT a fabricated 2-point pilot). Each grounded input is a
-`Fixed`/declared-spread `Estimate` (`cov=[[sigma^2]]` un-divided — built via the manifest's OWN
-seed->Estimate SSOT `manifest._estimate_from_seed`), so the allocation reflects the grounded
+`Fixed`/declared-spread `Estimate` (`cov=[[sigma^2]]` un-divided — built via reconstruct's
+seed->Estimate SSOT `reconstruct._estimate_from_seed`), so the allocation reflects the grounded
 uncertainty: `gᵀΣg` is the grounded-uncertainty CI on E[f]. A declared-spread prior is
 un-shrinkable by sampling, so it gets NO allocation (the §2.3 "a Fixed pin drops out, for the
 right reason" branch); the report ranks the next-benchmark targets by a_i = (df/dx)²·sigma² (the
@@ -34,7 +34,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import leaf_eval_grounding as G  # noqa: E402
-import manifest  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
+import reconstruct  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
 import model_capacity  # noqa: E402
 import model_cycletime  # noqa: E402
 
@@ -42,15 +42,15 @@ import model_cycletime  # noqa: E402
 def _bound(model):
     """Feed each input as its GROUNDED `Estimate` then one driver `step()`, so the Recommendation's
     per-input a_i ranks which quantity to benchmark next (the deliverable). The §6 Phase-4 feed: a
-    `Fixed`/declared-spread `Estimate` per input built via the manifest's seed->Estimate SSOT
-    (`manifest._estimate_from_seed`) from the model's grounded (mean, sigma) — a declared-spread prior,
+    `Fixed`/declared-spread `Estimate` per input built via reconstruct's seed->Estimate SSOT
+    (`reconstruct._estimate_from_seed`) from the model's grounded (mean, sigma) — a declared-spread prior,
     un-shrinkable by sampling, so the §2.3 allocator funds none (a Fixed pin drops out, for the right
     reason). The grounded mean anchors the gradient at the binding stage (the min() kink makes it
     point-sensitive). We deliberately do NOT loop to convergence — these are seeds, not a live system."""
     driver, x0 = model.build_driver(tolerance=0.1)
     names = model.INPUT_NAMES
     sig = model.SIGMAS
-    ests = {nm: manifest._estimate_from_seed(nm, x0[nm], sig[nm], "") for nm in names}
+    ests = {nm: reconstruct._estimate_from_seed(nm, x0[nm], sig[nm], "") for nm in names}
     driver.set_estimates_by_name(ests)
     rec = driver.step(second_order_check=False)
     f_mu = float(model.throughput_jax(np.array([x0[nm] for nm in names])))  # JAX f eval (x64 via the f's jax_backend)

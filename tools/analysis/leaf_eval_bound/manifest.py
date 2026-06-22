@@ -41,7 +41,7 @@ fill the contract (docs/design/harmonized-estimator-interface.md §5/§6):
 
 THE 4-TUPLE IS PRESERVED AS A PROJECTION OF THE Estimate (the confirmed fixed point). `value()`
 keeps its signature and return type; `quantity()` builds its (mean, sigma, n) BY PROJECTING the
-carried estimate (`_project_estimate`), so a pool-fed caller and an `Estimate`-fed caller agree
+carried estimate (`reconstruct._project_estimate`), so a pool-fed caller and an `Estimate`-fed caller agree
 byte-for-byte on the mean case. For a `Poolwise` mean the projection recovers the per-sample
 spread `sigma = sqrt(per_sample_var[0])` (NOT sqrt(cov[0,0]) — that is the SE; the 4-tuple's
 sigma is the per-sample stddev_samp every model consumes as Normal(mean, sigma)) and
@@ -99,6 +99,7 @@ if _HERE not in sys.path:
 # already requires). It carries the Phase-1 Estimate seam.
 import numpy as np  # noqa: E402
 import estimate as _est  # noqa: E402
+import reconstruct  # noqa: E402  — the lifted seed/aggregate->Estimate + projection glue (move 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -113,7 +114,7 @@ class Quantity:
 
     §6 PHASE 1: `estimate` carries the harmonized `estimate.Estimate` ALONGSIDE the legacy 4-tuple
     (additive — every existing `.mean`/`.sigma`/`.n`/`.trusted` reader is unchanged). The (mean,
-    sigma, n) are a PROJECTION of this estimate (`_project_estimate`), so the 4-tuple and the
+    sigma, n) are a PROJECTION of this estimate (`reconstruct._project_estimate`), so the 4-tuple and the
     Estimate cannot disagree. `estimate` defaults to None ONLY so the dataclass stays constructible
     in a degenerate path; every `quantity()` resolution sets it (a None `estimate` on a resolved
     Quantity would be a Phase-1 bug)."""
@@ -218,109 +219,6 @@ def _seed_from_module(module_path: str, name: str) -> tuple[float, float, str, b
 # DB, no postgres) — the manifest's TRUST/SEED paths call them to attach `Quantity.estimate`
 # and to derive the 4-tuple from it, so the two cannot disagree (the confirmed fixed point).
 # --------------------------------------------------------------------------- #
-def _estimate_from_aggregate(name: str, mean: float, sigma: float, n: int, kind: str) -> "_est.Estimate":
-    """Reconstruct a k=1 legacy `Estimate` from a `latest_aggregate` (mean, sigma, n) — the TRUST
-    fall-back for a legacy instance that carries no stored `estimate` jsonb (spec §5/§6 Phase 1).
-
-    The aggregate's `sigma` is the PER-SAMPLE spread (`stddev_samp`), so the SAMPLING variance is
-    `sigma^2 / n` and that is what goes on `cov`'s diagonal (already divided — an SE^2, the
-    contract's invariant). The shrink law is `Poolwise(per_sample_var=[sigma^2])`: the mean's
-    `cov(n) = per_sample_var / n` law, with the per-sample variance (NOT the divided SE^2) carried
-    so the projection recovers the 4-tuple's per-sample sigma AND n byte-for-byte.
-
-    `kind` is the definition's declared estimator label (carried onto the Estimate for the store /
-    report; the driver branches on none of it). NOTE (spec ambiguity, flagged in the Phase-1
-    report): even when a quantity's declared estimator is `median`/`quantile`, the legacy aggregate
-    supplies NO density-at-quantile (`f_at_q`), so a faithful `QuantileLaw` CANNOT be reconstructed
-    from `(mean, sigma, n)` alone — the legacy reconstruction is ALWAYS a `Poolwise` (the order-
-    statistic variance is the migrated bench's job, Phase 3). `support=POSITIVE` (every physical
-    quantity in this suite is a positive latency/rate/count); `family=NORMAL` (a measured aggregate
-    over n samples)."""
-    nn = int(n)
-    if nn < 1:
-        raise ValueError(
-            f"_estimate_from_aggregate({name!r}): n must be >= 1 for a measured aggregate; got {n!r} "
-            f"(ADR-0002: a measured value with n<1 is a contract violation, not a silent default).")
-    s2 = float(sigma) ** 2
-    cov00 = s2 / nn  # the already-divided SAMPLING variance (SE^2); 0.0 when sigma==0 (the n==1 case)
-    return _est.Estimate(
-        theta_hat=np.array([float(mean)], dtype=np.float64),
-        cov=np.array([[cov00]], dtype=np.float64),
-        names=(name,),
-        shrink=_est.Poolwise(per_sample_var=np.array([s2], dtype=np.float64)),
-        support=(_est.Support.POSITIVE,),
-        family=(_est.CIFamily.NORMAL,),
-        kind=(kind or "mean"),
-    )
-
-
-def _estimate_from_seed(
-    name: str, mean: float, sigma: float, units: str, constant: bool = False
-) -> "_est.Estimate":
-    """Build a `Fixed`-law k=1 `Estimate` from a bench's `get_seed()` Grounded (mean, sigma, units) —
-    the SEED path (DISTRUST, or a TRUST read that fell back to the seed; spec §5/§6 Phase 1).
-
-    A seed is a DECLARED 1-sigma spread (an engineering-judgement prior), un-shrinkable by sampling:
-    the spread IS the variance, so `cov=[[sigma^2]]` directly (NOT divided by any n — a prior has no
-    n). The shrink law is `Fixed()` (no finite budget reduces it; the §2.3 "drops out of allocation"
-    case). `support=POSITIVE`; the projection of this Estimate is `(mean, sigma, n=0)` — exactly
-    today's seed 4-tuple (a seed carries n=0).
-
-    `constant` (the `Grounded.constant` flag, threaded from `_seed_from_module`) selects the §3 PIN
-    flavor — the DEGENERATE-vs-declared-spread classification, single-homed on `Grounded.constant`:
-      * `constant=False` (the default — a DECLARED-SPREAD prior, e.g. R_gen/B_op/LPD): `family=NORMAL`,
-        `kind='declared_spread'` — the prior the models treat as `Normal(mean, sigma)`; it CONTRIBUTES
-        its `a_i` to the bound (the CI honestly rests on it — §2.3 / §7.D).
-      * `constant=True` (a TRUE CONSTANT — n_gen, a layout fact): `family=DEGENERATE`, `kind='pin'` —
-        the bound treats it as ~0 (`a_i ≈ 0`, §3), exactly as the bench's `pin_estimate(constant=True)`
-        `measure()` path does, so the SEED and MEASURE paths agree (P1; the σ is a display placeholder
-        on an integer/fixed value, never a CI-bearing spread)."""
-    s = float(sigma)
-    return _est.Estimate(
-        theta_hat=np.array([float(mean)], dtype=np.float64),
-        cov=np.array([[s * s]], dtype=np.float64),
-        names=(name,),
-        shrink=_est.Fixed(),
-        support=(_est.Support.POSITIVE,),
-        family=(_est.CIFamily.DEGENERATE if constant else _est.CIFamily.NORMAL,),
-        kind=("pin" if constant else "declared_spread"),
-    )
-
-
-def _project_estimate(est: "_est.Estimate") -> tuple[float, float, int]:
-    """Project an `Estimate` onto the legacy `(mean, sigma, n)` — the 4-tuple's first three fields
-    (the fourth, `trusted`, is the resolution path's, not the estimate's). This is the inverse of
-    the two reconstructions above on the mean/seed cases (the confirmed byte-for-byte fixed point),
-    and the marginal of the first component for a multi-component stored estimate (a fit):
-
-      * mean  = theta_hat[0]                              (always — the §5 projection rule).
-      * sigma : the PER-SAMPLE spread the 4-tuple carries —
-          - Poolwise  -> sqrt(per_sample_var[0])         (recovers the aggregate's stddev_samp; this
-                          is NOT sqrt(cov[0,0]), which is the already-divided SE — the 4-tuple's
-                          sigma is the per-sample stddev every model consumes as Normal(mean, sigma)).
-          - otherwise -> sqrt(cov[0,0])                  (Fixed: the declared spread, since cov=sigma^2;
-                          a stored fit/quantile component: its marginal SE — the honest first-component
-                          spread for a 4-tuple caller).
-      * n     :
-          - Poolwise  -> round(per_sample_var[0]/cov[0,0]) when cov[0,0]>0, else 1 (the sigma==0,
-                          n==1 degenerate aggregate; per_sample_var==cov==0 carries no n, and n==1 is
-                          the only aggregate that yields sigma==0).
-          - QuantileLaw -> shrink.n                      (carried explicitly by the law).
-          - otherwise (Fixed/RegressionLaw/Composed) -> 0 (a seed/pin/fit carries no sample n in the
-                          legacy 4-tuple; today's seed path already returns n=0).
-    """
-    mean = float(est.theta_hat[0])
-    cov00 = float(est.cov[0, 0])
-    shrink = est.shrink
-    if isinstance(shrink, _est.Poolwise):
-        psv0 = float(shrink.per_sample_var[0])
-        sigma = float(np.sqrt(psv0))
-        n = int(round(psv0 / cov00)) if cov00 > 0.0 else 1
-        return mean, sigma, n
-    if isinstance(shrink, _est.QuantileLaw):
-        return mean, float(np.sqrt(cov00)), int(shrink.n)
-    # Fixed / RegressionLaw / Composed: the spread is the first component's marginal SE; no sample n.
-    return mean, float(np.sqrt(cov00)), 0
 
 
 def _quantity_from_estimate(
@@ -329,7 +227,7 @@ def _quantity_from_estimate(
     """Build a `Quantity` whose `(mean, sigma, n)` ARE the projection of `est` and whose `estimate`
     is `est` — so the 4-tuple a caller reads and the Estimate carried alongside cannot disagree
     (Phase 1's whole point). The single place a resolved Quantity is assembled from an Estimate."""
-    mean, sigma, n = _project_estimate(est)
+    mean, sigma, n = reconstruct._project_estimate(est)
     return Quantity(
         name=name, mean=mean, sigma=sigma, n=n, trusted=trusted,
         units=units, source=source, estimate=est)
@@ -423,7 +321,7 @@ def quantity(
     `estimate`). The richer form a report wants; `value()` is the 4-tuple convenience over it.
 
     §6 Phase 1: every returned `Quantity` carries an `estimate.Estimate`, and its (mean, sigma, n)
-    are the PROJECTION of that estimate (`_quantity_from_estimate` -> `_project_estimate`), so the
+    are the PROJECTION of that estimate (`_quantity_from_estimate` -> `reconstruct._project_estimate`), so the
     4-tuple cannot drift from the Estimate. The resolution order is unchanged — only the object
     carried alongside is new:
       * TRUST + a STORED estimate (the bench's COMPUTED Estimate)  -> latest_estimate(name).
@@ -442,7 +340,7 @@ def quantity(
         # `constant` (Grounded.constant) selects the §3 PIN flavor: a true constant -> DEGENERATE (~0 bound
         # contribution), a declared spread -> NORMAL prior (contributes a_i) — single-homed, so the SEED
         # path agrees with the bench's measure() path (n_gen drops out of the bound on BOTH).
-        est = _estimate_from_seed(name, mean, sigma, units, constant=constant)
+        est = reconstruct._estimate_from_seed(name, mean, sigma, units, constant=constant)
         return _quantity_from_estimate(name, est, trusted=False, units=units, source=src)
 
     if not trust:
@@ -474,11 +372,11 @@ def quantity(
     mean, sigma, n = agg
     units = (_definition(name) or {}).get("units", "") or ""
     kind = str((_definition(name) or {}).get("estimator", "") or "")
-    est = _estimate_from_aggregate(name, mean, sigma, n, kind)
+    est = reconstruct._estimate_from_aggregate(name, mean, sigma, n, kind)
     # ADR-0002 fixed-point guard: the legacy reconstruction and the 4-tuple projection MUST be exact
     # inverses on the mean case — if the projected (mean, sigma, n) ever drifts from the aggregate the
     # seam is broken, and that is a loud fault, not a silent number swap.
-    pm, ps, pn = _project_estimate(est)
+    pm, ps, pn = reconstruct._project_estimate(est)
     if not (math.isclose(pm, mean, rel_tol=1e-12, abs_tol=1e-12)
             and math.isclose(ps, sigma, rel_tol=1e-12, abs_tol=1e-12)
             and pn == n):

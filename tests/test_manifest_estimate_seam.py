@@ -49,6 +49,7 @@ if _OT not in sys.path:
 
 import estimate as E  # noqa: E402  — the contract
 import manifest as M  # noqa: E402  — the Phase-1 seam under test
+import reconstruct as R  # noqa: E402  — the lifted seed/aggregate->Estimate + projection (move 2)
 
 
 # The real seed numbers + a spread of plausible measured aggregates (mean, sigma, n). The n==1
@@ -80,7 +81,7 @@ def test_legacy_reconstruction_projects_back_byte_for_byte(mean, sigma, n) -> No
     the per-sample sigma comes back from `Poolwise.per_sample_var` (NOT sqrt(cov00), which is the
     already-divided SE), and n from `round(per_sample_var/cov00)`. This is the confirmed fixed point
     the §6 Phase-1 4-tuple must reduce to."""
-    est = M._estimate_from_aggregate("q", mean, sigma, n, "mean")
+    est = R._estimate_from_aggregate("q", mean, sigma, n, "mean")
     # the reconstruction's invariants: a k=1 Poolwise mean, cov = sigma^2/n (already divided).
     assert est.k == 1
     assert isinstance(est.shrink, E.Poolwise)
@@ -88,7 +89,7 @@ def test_legacy_reconstruction_projects_back_byte_for_byte(mean, sigma, n) -> No
     assert est.cov[0, 0] == (sigma ** 2) / n
     assert est.family == (E.CIFamily.NORMAL,)
     # the projection is the EXACT inverse (byte-for-byte == on every field).
-    pm, ps, pn = M._project_estimate(est)
+    pm, ps, pn = R._project_estimate(est)
     assert pm == mean
     assert ps == sigma
     assert pn == n
@@ -98,7 +99,7 @@ def test_legacy_reconstruction_rejects_bad_n() -> None:
     """n < 1 on a 'measured' aggregate is a loud ADR-0002 violation (a measured value has at least one
     reading), not a silent default."""
     with pytest.raises(ValueError):
-        M._estimate_from_aggregate("q", 1.0, 1.0, 0, "mean")
+        R._estimate_from_aggregate("q", 1.0, 1.0, 0, "mean")
 
 
 @pytest.mark.parametrize("mean,sigma,n", _AGG_CASES)
@@ -130,7 +131,7 @@ def test_quantity_trust_legacy_path_matches_todays_4tuple(monkeypatch, mean, sig
     assert q.source == "postgres"
     # and the carried Estimate projects to exactly that 4-tuple (the pool-fed / Estimate-fed agreement).
     assert q.estimate is not None
-    assert M._project_estimate(q.estimate) == (mean, sigma, n)
+    assert R._project_estimate(q.estimate) == (mean, sigma, n)
     # value() (unchanged signature) is the projection-backed 4-tuple.
     assert M.value("tau_io_us", trust=True) == (mean, sigma, n, True)
     # estimate() exposes the same object.
@@ -145,14 +146,14 @@ def test_seed_fixed_law_estimate_and_projection(name, mean, sigma, units) -> Non
     """`_estimate_from_seed` builds a Fixed-law k=1 Estimate: cov = sigma^2 (the declared spread IS
     the variance, un-divided — a prior has no n), family NORMAL. Its projection is (mean, sigma, 0)
     — exactly today's seed 4-tuple."""
-    est = M._estimate_from_seed(name, mean, sigma, units)
+    est = R._estimate_from_seed(name, mean, sigma, units)
     assert est.k == 1
     assert isinstance(est.shrink, E.Fixed)
     assert est.cov[0, 0] == sigma ** 2            # the declared spread^2, NOT divided by any n
     assert est.theta_hat[0] == mean
     assert est.family == (E.CIFamily.NORMAL,)
     assert est.kind == "declared_spread"
-    assert M._project_estimate(est) == (mean, sigma, 0)
+    assert R._project_estimate(est) == (mean, sigma, 0)
 
 
 @pytest.mark.parametrize("name,mp,mean,sigma", [
@@ -168,7 +169,7 @@ def test_quantity_seed_path_via_module_path(name, mp, mean, sigma) -> None:
     assert q.source == "seed"
     assert isinstance(q.estimate.shrink, E.Fixed)
     assert q.estimate.cov[0, 0] == sigma ** 2
-    assert M._project_estimate(q.estimate) == (mean, sigma, 0)
+    assert R._project_estimate(q.estimate) == (mean, sigma, 0)
     # value() / estimate() agree with quantity() (all three resolve the same object).
     assert M.value(name, trust=False, module_path=mp) == (mean, sigma, 0, False)
     assert M.estimate(name, trust=False, module_path=mp).theta_hat[0] == mean
@@ -179,12 +180,12 @@ def test_seed_estimate_honors_the_constant_flag_degenerate_vs_declared_spread() 
     DEGENERATE / kind='pin' Estimate (a true constant — ~0 bound contribution), while the default
     `constant=False` is the NORMAL / 'declared_spread' prior. `cov` is the declared σ² on BOTH
     (the projection's per-sample sigma is unchanged — only the bound's treatment of it changes)."""
-    deg = M._estimate_from_seed("n_gen", 3.0, 0.05, "cores", constant=True)
+    deg = R._estimate_from_seed("n_gen", 3.0, 0.05, "cores", constant=True)
     assert deg.family == (E.CIFamily.DEGENERATE,)
     assert deg.kind == "pin"
     assert deg.cov[0, 0] == 0.05 ** 2                      # σ preserved in cov (display/seed value)
-    assert M._project_estimate(deg) == (3.0, 0.05, 0)     # projection per-sample sigma unchanged
-    nrm = M._estimate_from_seed("R_gen", 152.0, 8.0, "dps", constant=False)
+    assert R._project_estimate(deg) == (3.0, 0.05, 0)     # projection per-sample sigma unchanged
+    nrm = R._estimate_from_seed("R_gen", 152.0, 8.0, "dps", constant=False)
     assert nrm.family == (E.CIFamily.NORMAL,)
     assert nrm.kind == "declared_spread"
 
@@ -364,7 +365,7 @@ def test_manifest_reconstructs_legacy_aggregate_through_postgres() -> None:
         # the 4-tuple matches the live aggregate exactly; the carried Estimate projects to it.
         assert q.as_tuple() == (agg[0], agg[1], agg[2], True)
         assert isinstance(q.estimate.shrink, E.Poolwise)
-        assert M._project_estimate(q.estimate) == (agg[0], agg[1], agg[2])
+        assert R._project_estimate(q.estimate) == (agg[0], agg[1], agg[2])
     finally:
         with bench_store.connect() as conn:
             with conn.cursor() as cur:

@@ -207,12 +207,12 @@ def test_n_gen_constant_flag_is_the_single_home_of_the_degenerate_classification
     NOTE (ADR-0008 reclassification, 2026-06-21): `bench_r_gen.measure()` no longer returns a `Fixed`
     NORMAL pin — R_gen is a MEASURED quantity (the C++ gen-ceiling bench), so its MEASURED Estimate is a
     SHRINKABLE `QuantileLaw` (EMPIRICAL). The declared-spread NORMAL `Fixed` classification R_gen's
-    `constant=False` still drives is the SEED/DISTRUST path (`manifest._estimate_from_seed`), checked
+    `constant=False` still drives is the SEED/DISTRUST path (`reconstruct._estimate_from_seed`), checked
     here DB-free — the actual single-home contrast (and it does not invoke the live, timing-sensitive
     binary). See tests/test_bench_r_gen_cpp_gen_ceiling.py for the measured-path shrinkability."""
     import leaf_eval_grounding as G
     import bench_n_gen
-    import manifest as M
+    import reconstruct as R
     assert G.N_GEN_CORES.constant is True                  # the SSOT marks n_gen a true constant
     assert G.GEN_PER_CORE_DPS.constant is False            # R_gen is a measured declared-spread prior
     # the bench derives the family from the SSOT (not a literal) — change the flag, change the family.
@@ -220,7 +220,7 @@ def test_n_gen_constant_flag_is_the_single_home_of_the_degenerate_classification
     assert bench_n_gen.measure().kind == "pin"
     # R_gen's SEED path: constant=False -> a NORMAL declared-spread `Fixed` prior (the un-shrinkable
     # DISTRUST fallback), single-homed on Grounded.constant exactly as n_gen's DEGENERATE is.
-    seed_rgen = M._estimate_from_seed(
+    seed_rgen = R._estimate_from_seed(
         "R_gen", G.GEN_PER_CORE_DPS.mean, G.GEN_PER_CORE_DPS.sigma, G.GEN_PER_CORE_DPS.unit,
         constant=G.GEN_PER_CORE_DPS.constant)
     assert seed_rgen.family == (E.CIFamily.NORMAL,)

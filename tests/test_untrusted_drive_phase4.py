@@ -463,7 +463,7 @@ def test_old_longest_list_heuristic_craters_the_bound() -> None:
     driver evaluated `f` with `t_row ≈ 224` instead of the slope `4.317`. The bound CRATERS (E[f] ≪ the
     sane ~428). This is the failure Phase 4 removes; we reproduce it to anchor the contrast."""
     _driver_deps()
-    import manifest as M
+    import reconstruct as R
     import model_zmq_baseline as model
     from neyman_driver import NeymanDriver  # noqa: F401  (import gate)
 
@@ -481,7 +481,7 @@ def test_old_longest_list_heuristic_craters_the_bound() -> None:
                 shrink=E.Poolwise(per_sample_var=np.array([s2])),
                 support=(E.Support.POSITIVE,), family=(E.CIFamily.NORMAL,), kind="mean"))
         else:
-            driver.set_estimate(i, M._estimate_from_seed(nm, x0[nm], sig[nm], ""))
+            driver.set_estimate(i, R._estimate_from_seed(nm, x0[nm], sig[nm], ""))
     rec = driver.step(second_order_check=False)
     assert rec.estimate < 50.0   # the cratered nonsense (the ~11.9 family) — t_row read as ~224
 

@@ -51,7 +51,7 @@ import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the
 # `lstsq` threw away.
 #
 # THE COMPONENT ORDERING (the §4.2 + driver contract, the load-bearing subtlety). The driver
-# (neyman_driver.set_estimate / _assemble_sigma / manifest._project_estimate) reads a multi-component
+# (neyman_driver.set_estimate / _assemble_sigma / reconstruct._project_estimate) reads a multi-component
 # estimate's FIRST component as the input's marginal (theta_hat[0], cov[0,0]) and the off-diagonal
 # via `cross[partner_name]`. The 8 live `manifest.value("t_row_us")` consumers read the SLOPE mean,
 # and `value("T_disp_us")` reads the INTERCEPT mean — so the Estimate a fit bench logs must order its
@@ -231,7 +231,7 @@ def median_estimate(
 # pinning fact, σ tiny) is `family=DEGENERATE` (no sampling interval; a_i≈0, drops out of allocation)
 # and `kind='pin'`. A DECLARED-SPREAD PRIOR (B_op's σ=64, LPD's σ=25, R_gen's σ=8 — an engineering-
 # judgement 1-sigma the manifest seeds) is `family=NORMAL` (a prior the models consume as
-# `Normal(mean, sigma)` — matching `manifest._estimate_from_seed`) and `kind='declared_spread'`: it
+# `Normal(mean, sigma)` — matching `reconstruct._estimate_from_seed`) and `kind='declared_spread'`: it
 # CONTRIBUTES its a_i to the bound (so the CI honestly rests on the prior) but is un-shrinkable by
 # sampling (`shrink=Fixed()`; no finite budget reduces an engineering-judgement prior). EITHER way the
 # variance is the declared spread UN-DIVIDED — `cov=[[σ²]]`, NOT σ²/n (a prior has no n) — which is
