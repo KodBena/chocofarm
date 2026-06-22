@@ -476,3 +476,46 @@ the natural enforcement surface (ADR-0011 Rule 1) for the layout is **review +
 the import-cycle DAG of §3** (a `tests/` import-direction check is the mechanical
 form, if the split recurs into a cycle); until then it is review-only, declared
 as such.
+
+---
+
+## Landed — 2026-06-22 (append per ADR-0005 Rule 8)
+
+This advisory was ratified; the work landed on `feat/issue-control-lab`. The body above is
+left intact as the point-in-time advisory it was (Rule 8: amend by append, never rewrite) —
+this section records what became of each proposal, in the §6 honest register (verifiable in
+the git log and on disk, not on this note's word).
+
+**§3's package layout landed in full.** `tools/analysis/leaf_eval_bound/` is now the
+`contract/ · store/ · alloc/ · models/ · benchmarks/ · runners/` package §3 drew, with a real
+top-level `__init__.py` (the per-module `sys.path.insert` preamble is gone). Move by move:
+
+- **1** — `bench_common` → `estimators.py` / `pools.py` / `harness.py` (`075147f`).
+- **2** — `reconstruct.py` lifted out of `manifest.py` (`8d34957`).
+- **3** — one model interface: the typed `TransportModel` contract + a variant-family
+  conformance net (`7ad7ae7`).
+- **4** — the §2.3 driver god-object split into `alloc/{driver,kink,report,gradient}.py`
+  (A+B+C+F in `driver`, the Clark-1961 D in `kink`, the `Recommendation`/E in `report`; `c3f9e4f`).
+- **5** — landed *in substance, relocated*: the three-copy runner `_fd_gradient` (+ numpy-bound)
+  triplication is gone (verified — no `_fd_gradient` remains in any runner), but its home is
+  **`alloc/gradient.py`** (+ `alloc/jax_backend.py`), not the advisory's proposed
+  `runners/support.py`. The §5 JAX swap made the gradient backend the natural single home, and
+  the runners now reach the gradient through the driver's one seam. A deviation in *placement
+  only* — the copy-paste defect move 5 named is closed.
+- **6** — a bench `scaffold.py` owning the `measure=_estimate_from_raw(_measure_raw())` wiring,
+  adopted across all 30 benches (`4e3f089`).
+- **7** — discovery-driven registration replacing the hand-list (`register_baseline.py` →
+  `register_benches.py`; `9cff51a`).
+
+**§4 renames landed**: `OpenTURNS/` → `leaf_eval_bound/` (`c1d954f`), `neyman_driver` →
+`alloc/driver` + `NeymanDriver` → `AllocationDriver` (`948858f`), and the
+`grounding`/`grounded_types`/`references` split (`9d713f1`). The declined renames (benches,
+`SLUG`, `THROUGHPUT_EXPR`, the `Estimate` fields) were left as recommended.
+
+**§5 is underway**: the `THROUGHPUT_EXPR ⊕ throughput_numpy` dual-write is dissolved (`0dc2769`),
+and `alloc/jax_backend.py` is the gradient-backend seam the swap drops into.
+
+**Verification (ADR-0009)**: every stage gated on the full `tests/` suite — **732 passed,
+33 skipped** (the baseline), behavior-preserving throughout (relocation + subtraction; the
+bound numbers unchanged). The independent before/after audit of this arc is
+`docs/notes/leaf-eval-refactor-audit-2026-06-22/`.
