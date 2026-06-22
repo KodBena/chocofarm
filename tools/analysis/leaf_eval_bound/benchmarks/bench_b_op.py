@@ -22,15 +22,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any
 
 
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
 from leaf_eval_bound.benchmarks.estimators import pin_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "B_op"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_b_op"
@@ -42,12 +40,6 @@ _DESC = ("Server sustained FULL-BUCKET operating point (rows/forward): the achie
 def get_seed() -> G.Grounded:
     """The v1 seed (DISTRUST fallback): B_op=256 rows/forward (full-bucket operating point)."""
     return G.SERVE_FULL_BUCKET
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="serve_full_bucket_rows", units=get_seed().unit,
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw() -> dict[str, Any]:
@@ -68,24 +60,18 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return pin_estimate(res["b_op_rows"], get_seed().sigma, name=NAME)
 
 
-def measure() -> "_est.Estimate":
-    """Measure B_op and return its harmonized k=1 `Fixed` `Estimate` (§6 Phase 4: `measure()` returns the
-    `Estimate` the bench DECLARES — a pin is a `Fixed`/declared-spread Estimate, NOT a faked pool, consumed
-    directly by the driver/untrusted_drive). The raw dict is the bench's internal `_measure_raw()` provenance."""
-    return _estimate_from_raw(_measure_raw())
-
-
-def run() -> dict[str, Any]:
-    """Logs a harmonized k=1 Fixed Estimate (§6 Phase 3) recovering the declared spread un-divided. Returns the raw provenance dict."""
-    res = _measure_raw()                          # the raw provenance dict
-    est = _estimate_from_raw(res)                 # the SAME Estimate measure() returns (P1)
-    cfg = {"kind": "operating_point",
-           "needs_measurement": "saturated end-to-end rows/forward histogram (server batch-size counter)",
-           "note": res["note"]}
-    with logged_run(NAME, quantity="serve_full_bucket_rows", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        log(res["b_op_rows"], sample_size=None)
-    return res
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# B_op is a v1 operating-point pin (the saturated e2e rows/forward histogram is the outstanding real
+# measurement); run() logs the pinned value (sample_size=None) flagged needs-measurement.
+_B = _scaffold(
+    name=NAME, quantity="serve_full_bucket_rows", module_path=MODULE_PATH, description=_DESC,
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"kind": "operating_point",
+                            "needs_measurement": "saturated end-to-end rows/forward histogram (server batch-size counter)",
+                            "note": res["note"]},
+    run_log=lambda res, log, **kw: log(res["b_op_rows"], sample_size=None),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

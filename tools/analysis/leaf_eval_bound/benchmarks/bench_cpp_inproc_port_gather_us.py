@@ -33,8 +33,6 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Any
 
@@ -42,7 +40,7 @@ from typing import Any
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
 from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "cpp_inproc_port_gather_us"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_cpp_inproc_port_gather_us"
@@ -66,12 +64,6 @@ def get_seed() -> tuple[float, float, str]:
     (and ADDED to the elided headline to get the charged arm) in the model's copy_contrast()."""
     gather_us = _B_OP_SEED * _REQ_ROW_B / _GATHER_BW_BYTES_PER_NS / 1000.0
     return (gather_us, 0.5 * gather_us, "us")
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="serve_arena_gather_cost_cpp_inproc_port", units="us",
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(b_rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
@@ -111,29 +103,20 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_cycle_us"], name=NAME)   # bootstrap median SE over the per-cycle pool
 
 
-def measure(b_rows: int = 256, cycles: int = 5000) -> "_est.Estimate":
-    """Measure the same-RAM gather and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
-    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
-    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
-    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(b_rows=b_rows, cycles=cycles))
-
-
-def run(b_rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
-    """Measure the arena gather and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5, bootstrap
-    median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER
-    during the fan-out."""
-    res = _measure_raw(b_rows=b_rows, cycles=cycles)  # ONE measurement (Estimate + provenance)
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"b_rows": res["b_rows"], "cycles": cycles, "transport": "cpp_inproc_port_direct_call",
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# TUPLE seed (no .unit) — the explicit registered unit is passed via units="us". The cfg references the
+# `cycles` run-knob, read from the scaffold-supplied kw (defaults applied) per pattern (b).
+_B = _scaffold(
+    name=NAME, quantity="serve_arena_gather_cost_cpp_inproc_port", module_path=MODULE_PATH, description=_DESC,
+    units="us",
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"b_rows": res["b_rows"], "cycles": kw["cycles"], "transport": "cpp_inproc_port_direct_call",
            "kind": "arena_gather_contrast",
            "note": "the gather the contiguous-arena headline ELIDES; the swing term of tau_io's two arms",
-           "gather_us_median": res["gather_us_median"]}
-    with logged_run(NAME, quantity="serve_arena_gather_cost_cpp_inproc_port", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
-        log(res["per_cycle_us"], sample_size=1)
-    return res
+           "gather_us_median": res["gather_us_median"]},
+    run_log=lambda res, log, **kw: log(res["per_cycle_us"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

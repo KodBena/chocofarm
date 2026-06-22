@@ -20,15 +20,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any, Optional
 
 
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
 from leaf_eval_bound.benchmarks.estimators import fit_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "T_disp_us"
 # The co-fit PARTNER: T_disp (the dispatch-floor INTERCEPT) and cpp_inproc_port_t_row_bare (the bare-forward
@@ -56,12 +54,6 @@ def get_seed() -> "G.Grounded":
     return G.Grounded(name="T_disp", mean=G.DISPATCH_FLOOR_US, sigma=2.0, cost=1.0, unit="us",
                       provenance="mlp_lowlatency/results.json decomposition.dispatch_floor_us (68.84, R2~0.997)",
                       estimability=G.Estimability.MEASURED, module="bench_t_disp")
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="dispatch_floor_cost", units=get_seed().unit,
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
@@ -105,33 +97,31 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return fit_estimate(batches_used, medians, own_name=NAME, own_role="intercept", partner_name=PARTNER_NAME)
 
 
-def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> "_est.Estimate":
-    """Measure T_disp and return its harmonized k=2 fit `Estimate` (§6 Phase 4: `measure()` returns
-    the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly). The raw
-    design-point dict is the bench's internal `_measure_raw()` provenance. TIMING-SENSITIVE — pin (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(batches=batches, iters=iters, repeat=repeat))
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# run()'s body has an INTERMEDIATE (membership-filtered batches_used -> medians) and a run-knob
+# (sample_size=iters), so the config + log hooks are DEFs that recompute that intermediate VERBATIM from
+# `res` (and the threaded `kw`, defaults applied). A lambda can't hold the statements; recompute is identical.
+def _run_config(res, **kw):
+    batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
+    return {"iters": kw["iters"], "repeat": kw["repeat"], "batches": batches_used, "fit_r2": res["r2"],
+            "fit_intercept_us": res["intercept_us"], "fit_slope_us_per_row": res["slope_us_per_row"],
+            "decomposition": res["decomposition"], "variant": "fully_device", "bench": "mlp_lowlatency"}
 
 
-def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure T_disp and LOG it as a harmonized k=2 fit `Estimate` (§6 Phase 3): the fully_device-fit
-    intercept/slope with their −0.81 off-diagonal, T_disp's INTERCEPT (== dispatch floor) as component 0.
-    The fully_device per-width medians are logged as raw-design-point PROVENANCE — the variance authority
-    is now `estimate.cov`, so the headline dispatch-floor scalar is NO LONGER double-logged as a sample row
-    (the §5.2 de-dup obligation). TIMING-SENSITIVE — operator-invoked, pinned, never during the fan-out."""
-    res = _measure_raw(batches=batches, iters=iters, repeat=repeat)  # ONE measurement (Estimate + provenance)
+def _run_log(res, log, **kw):
     batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
     medians = [res["per_width_median_us"][B] for B in batches_used]
-    # The k=2 fit Estimate, T_disp (the intercept) as component 0; the bare-forward slope the partner.
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"iters": iters, "repeat": repeat, "batches": batches_used, "fit_r2": res["r2"],
-           "fit_intercept_us": res["intercept_us"], "fit_slope_us_per_row": res["slope_us_per_row"],
-           "decomposition": res["decomposition"], "variant": "fully_device", "bench": "mlp_lowlatency"}
-    with logged_run(NAME, quantity="dispatch_floor_cost", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2): the fully_device per-width medians. The headline dispatch floor is NOT
-        # logged as a sample — it lives in estimate.theta_hat[0] (the SSOT).
-        log(medians, sample_size=iters)
-    return res
+    # PROVENANCE only (§5.2): the fully_device per-width medians. The headline dispatch floor is NOT
+    # logged as a sample — it lives in estimate.theta_hat[0] (the SSOT).
+    log(medians, sample_size=kw["iters"])
+
+
+_B = _scaffold(
+    name=NAME, quantity="dispatch_floor_cost", module_path=MODULE_PATH, description=_DESC,
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=_run_config, run_log=_run_log,
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

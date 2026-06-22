@@ -51,15 +51,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Any
 
 
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "shm_spin_poll_tau_io_us"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_shm_spin_poll_tau_io"
@@ -104,12 +102,6 @@ def get_seed() -> tuple[float, float, str]:
     req_drain_us = _B_OP_SEED * _REQ_ROW_B / _MEMCPY_BW_BYTES_PER_NS / 1000.0
     sigma = 0.5 * req_drain_us
     return (mean, sigma, "us")
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="serve_transport_io_cost_shm_spin_poll", units="us",
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> dict[str, Any]:
@@ -202,37 +194,26 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_cycle_us"], name=NAME)   # bootstrap median SE over the per-cycle pool
 
 
-def measure(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> "_est.Estimate":
-    """Measure shm_spin_poll tau_io and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
-    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
-    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
-    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles))
-
-
 def ctr_to_rows(c: int, rows_per_msg: int, cap: int) -> int:
     """The drained row count for a tail-counter value `c` (messages), capped at the ring width — the trivial
     head/tail arithmetic the server does to know how many rows are ready."""
     return min(int(c) * rows_per_msg, cap)
 
 
-def run(n_msgs: int = 8, rows_per_msg: int = 32, cycles: int = 5000) -> dict[str, Any]:
-    """Measure shm_spin_poll tau_io and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
-    bootstrap median SE, §6 Phase 3, §5.2 de-dup); the copy-both arm is logged as a config note + supporting
-    readings. TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
-    res = _measure_raw(n_msgs=n_msgs, rows_per_msg=rows_per_msg, cycles=cycles)  # ONE measurement (Estimate + provenance)
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"n_msgs": res["n_msgs"], "rows_per_msg": res["rows_per_msg"],
-           "rows_per_forward": res["rows_per_forward"], "cycles": cycles,
-           "transport": "shm_ring_spin_poll", "request_drain": "zero_copy_view",
-           "tau_io_us_median": res["tau_io_us_median"],
-           "tau_io_copyboth_us_median": res["tau_io_copyboth_us_median"],
-           "note": "headline = zero-copy request drain (design intent); copy-both arm charges the req memcpy"}
-    with logged_run(NAME, quantity="serve_transport_io_cost_shm_spin_poll", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
-        log(res["per_cycle_us"], sample_size=1)                  # raw per-cycle readings
-    return res
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above. The
+# seed is a bare (mean, sigma, unit) tuple (no .unit), so the registered unit is passed explicitly (units="us").
+_B = _scaffold(
+    name=NAME, quantity="serve_transport_io_cost_shm_spin_poll", module_path=MODULE_PATH, description=_DESC,
+    units="us", seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"n_msgs": res["n_msgs"], "rows_per_msg": res["rows_per_msg"],
+                                  "rows_per_forward": res["rows_per_forward"], "cycles": kw["cycles"],
+                                  "transport": "shm_ring_spin_poll", "request_drain": "zero_copy_view",
+                                  "tau_io_us_median": res["tau_io_us_median"],
+                                  "tau_io_copyboth_us_median": res["tau_io_copyboth_us_median"],
+                                  "note": "headline = zero-copy request drain (design intent); copy-both arm charges the req memcpy"},
+    run_log=lambda res, log, **kw: log(res["per_cycle_us"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

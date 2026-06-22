@@ -38,8 +38,6 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Any
 
@@ -48,7 +46,7 @@ from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the har
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
 from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "zmq_baseline_wakeup_us"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_zmq_baseline_wakeup_us"
@@ -70,12 +68,6 @@ def get_seed() -> tuple[float, float, str]:
     A saturation ready-poll wakeup = a poll(2) syscall + libzmq signaler readiness (provenance in the module
     docstring). Returned as a tuple (the manifest accepts a Grounded-like OR a (mean, sigma, unit) tuple)."""
     return (_SEED_MEAN_US, _SEED_SIGMA_US, _SEED_UNIT)
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="transport_wakeup_latency", units=_SEED_UNIT,
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(cycles: int = 20000) -> dict[str, Any]:
@@ -146,29 +138,19 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["ready_poll_us"], name=NAME)   # bootstrap median SE over the ready_poll pool
 
 
-def measure(cycles: int = 20000) -> "_est.Estimate":
-    """Measure the ZMQ-baseline saturation wakeup and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
-    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
-    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
-    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(cycles=cycles))
-
-
-def run(cycles: int = 20000) -> dict[str, Any]:
-    """Measure the ZMQ-baseline wakeup and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
-    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never
-    during the fan-out."""
-    res = _measure_raw(cycles=cycles)  # ONE measurement (Estimate + provenance)
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"cycles": res["cycles"], "transport": "zmq_baseline_router_dealer_inproc",
-           "mechanism": "poll(2)+libzmq_signaler_readiness", "regime": "saturation_ready_poll",
-           "blocking_poll_us_median": res["blocking_poll_us_median"],
-           "wakeup_us_median": res["wakeup_us_median"]}
-    with logged_run(NAME, quantity="transport_wakeup_latency", units=_SEED_UNIT, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
-        log(res["ready_poll_us"], sample_size=1)                    # raw per-cycle readings
-    return res
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# Bare-tuple seed (no .unit) -> explicit units="us". cfg sources cycles from res["cycles"] VERBATIM.
+_B = _scaffold(
+    name=NAME, quantity="transport_wakeup_latency", module_path=MODULE_PATH, description=_DESC,
+    units=_SEED_UNIT,
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"cycles": res["cycles"], "transport": "zmq_baseline_router_dealer_inproc",
+                                  "mechanism": "poll(2)+libzmq_signaler_readiness", "regime": "saturation_ready_poll",
+                                  "blocking_poll_us_median": res["blocking_poll_us_median"],
+                                  "wakeup_us_median": res["wakeup_us_median"]},
+    run_log=lambda res, log, **kw: log(res["ready_poll_us"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

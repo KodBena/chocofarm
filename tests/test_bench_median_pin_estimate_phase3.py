@@ -285,7 +285,7 @@ def test_median_bench_run_logs_only_the_pool_not_the_headline(monkeypatch) -> No
                 captured["logs"].append(("scalar", float(values)))
         yield log
 
-    monkeypatch.setattr(B, "logged_run", fake_logged_run)
+    monkeypatch.setattr("leaf_eval_bound.benchmarks.scaffold.logged_run", fake_logged_run)
     B.run()
 
     est = captured["estimate"]

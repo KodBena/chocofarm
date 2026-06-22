@@ -28,15 +28,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Any
 
 
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "cpp_inproc_port_tmsg_us_leaf"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_cpp_inproc_port_tmsg_us_leaf"
@@ -57,12 +55,6 @@ def get_seed() -> tuple[float, float, str]:
     slot-index push; the arena row write overlaps the producer's feature compute). NON-BINDING. Returns
     (mean, sigma, unit)."""
     return (_SEED_US_LEAF, _SEED_SIGMA, "us/leaf")
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="transport_msg_cost_per_leaf_cpp_inproc_port", units="us/leaf",
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(leaves: int = 200000) -> dict[str, Any]:
@@ -105,28 +97,18 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_leaf_us"], name=NAME)   # bootstrap median SE over the per-leaf pool
 
 
-def measure(leaves: int = 200000) -> "_est.Estimate":
-    """Measure the per-leaf inproc enqueue and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
-    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
-    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
-    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(leaves=leaves))
-
-
-def run(leaves: int = 200000) -> dict[str, Any]:
-    """Measure the per-leaf inproc enqueue and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
-    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
-    NEVER during the fan-out."""
-    res = _measure_raw(leaves=leaves)  # ONE measurement (Estimate + provenance)
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"leaves": res["leaves"], "transport": "cpp_inproc_port_direct_call",
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# TUPLE seed (no .unit) — the explicit registered unit is passed via units="us/leaf".
+_B = _scaffold(
+    name=NAME, quantity="transport_msg_cost_per_leaf_cpp_inproc_port", module_path=MODULE_PATH, description=_DESC,
+    units="us/leaf",
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"leaves": res["leaves"], "transport": "cpp_inproc_port_direct_call",
            "tmsg_us_leaf_median": res["tmsg_us_leaf_median"],
-           "note": "per-leaf enqueue handoff (arena row write + ready-queue slot-index push); NON-BINDING"}
-    with logged_run(NAME, quantity="transport_msg_cost_per_leaf_cpp_inproc_port", units="us/leaf",
-                    description=_DESC, module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
-        log(res["per_leaf_us"], sample_size=1)
-    return res
+           "note": "per-leaf enqueue handoff (arena row write + ready-queue slot-index push); NON-BINDING"},
+    run_log=lambda res, log, **kw: log(res["per_leaf_us"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

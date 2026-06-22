@@ -224,7 +224,7 @@ def test_measure_and_run_share_one_estimate_builder(monkeypatch) -> None:
             captured.setdefault("logs", []).append(("pool" if isinstance(values, (list, tuple)) else "scalar"))
         yield log
 
-    monkeypatch.setattr(bench_tau_io, "logged_run", fake_logged_run)
+    monkeypatch.setattr("leaf_eval_bound.benchmarks.scaffold.logged_run", fake_logged_run)
     bench_tau_io.run()
     measure_est = bench_tau_io.measure()
     run_est = captured["estimate"]

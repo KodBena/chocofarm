@@ -60,8 +60,6 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Any
 
@@ -69,7 +67,7 @@ from typing import Any
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
 from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "lockfree_mpsc_tmsg_us_leaf"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_lockfree_mpsc_tmsg"
@@ -95,12 +93,6 @@ def get_seed() -> tuple[float, float, str]:
     (mean, sigma, unit)."""
     mean = (_REQ_ROW_B + _REP_ROW_B) / _MEMCPY_BW_BYTES_PER_NS / 1000.0 + _CAS_NS / 1000.0
     return (mean, 0.08, "us")
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="transport_msg_cost_per_leaf_lockfree_mpsc", units="us",
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(iters: int = 200000) -> dict[str, Any]:
@@ -167,30 +159,19 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_leaf_us"], name=NAME)   # bootstrap median SE over the per-leaf pool
 
 
-def measure(iters: int = 200000) -> "_est.Estimate":
-    """Measure lockfree_mpsc_tmsg_us_leaf (time the per-leaf CAS-enqueue + slot write/read in windows) and
-    return its harmonized k=1 SHRINKABLE median `Estimate` (§6 Phase 4: `measure()` returns the `Estimate`
-    the bench DECLARES — a `QuantileLaw(p=0.5)` over the per-window per-leaf pool, consumed directly by the
-    driver/untrusted_drive). `iters` sizes the measurement pool (the budget the Neyman loop passes — more
-    leaves → more windows → a tighter SE). The raw pool is the bench's internal `_measure_raw()` provenance.
-    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(iters=iters))
-
-
-def run(iters: int = 200000) -> dict[str, Any]:
-    """Measure lockfree_mpsc_tmsg_us_leaf and LOG it as a harmonized k=1 SHRINKABLE median Estimate
-    (`QuantileLaw(p=0.5)`, BOOTSTRAP median SE over the per-window per-leaf pool, §6 Phase 3, §5.2 de-dup).
-    TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0), NEVER during the fan-out."""
-    res = _measure_raw(iters=iters)  # ONE measurement (Estimate + provenance pool)
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"iters": iters, "transport": "lockfree_mpsc_queue", "codec": "cas_enqueue_slot_write",
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# `iters` sizes the measurement pool (the Neyman budget); TIMING-SENSITIVE — measure()/run() are operator-
+# invoked, pinned (taskset -c 0), NEVER during the fan-out.
+_B = _scaffold(
+    name=NAME, quantity="transport_msg_cost_per_leaf_lockfree_mpsc", module_path=MODULE_PATH, description=_DESC, units="us",
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"iters": kw["iters"], "transport": "lockfree_mpsc_queue", "codec": "cas_enqueue_slot_write",
            "tmsg_us_leaf_median": res["tmsg_us_leaf_median"],
-           "note": "tail-CAS enqueue + slot write of one request row + reply-slot read; no envelope, no syscall"}
-    with logged_run(NAME, quantity="transport_msg_cost_per_leaf_lockfree_mpsc", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
-        log(res["per_leaf_us"], sample_size=1)
-    return res
+           "note": "tail-CAS enqueue + slot write of one request row + reply-slot read; no envelope, no syscall"},
+    # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
+    run_log=lambda res, log, **kw: log(res["per_leaf_us"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

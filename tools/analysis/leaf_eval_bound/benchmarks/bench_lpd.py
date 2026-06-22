@@ -67,7 +67,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -75,7 +74,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "LPD"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_lpd"
@@ -134,12 +133,6 @@ def get_seed() -> G.Grounded:
     shrinkable `QuantileLaw`. Per ADR-0008 the seed is a declared-spread prior on the seed path; only the
     measured per-decision pool flips it to a median."""
     return G.LEAVES_PER_DECISION
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="leaves_per_decision", units=get_seed().unit,
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _run_cpp_bench(n_tasks: int) -> tuple[list[int], int]:
@@ -248,33 +241,19 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_decision_leaves"], name=NAME)   # bootstrap median SE over the per-decision pool
 
 
-def measure(trials: int = _DEFAULT_TASKS) -> "_est.Estimate":
-    """Measure LPD (RUN the C++ gen-ceiling bench, eval mocked, sole-workload) and return its harmonized
-    k=1 SHRINKABLE median `Estimate` (§6 Phase 4: `measure()` returns the `Estimate` the bench DECLARES —
-    the driver/untrusted_drive `set_estimate`s it directly). `trials` sizes the per-decision measurement
-    pool (the budget the Neyman loop passes — more decisions tightens LPD's SE -> the generation-arm CI).
-    SOLE-WORKLOAD — pinned (taskset -c 0); never during the fan-out."""
-    return _estimate_from_raw(_measure_raw(trials=trials))
-
-
-def run(trials: int = _DEFAULT_TASKS) -> dict[str, Any]:
-    """Measure LPD (RUN the C++ gen-ceiling bench) and LOG it to postgres as a harmonized k=1 SHRINKABLE
-    median `Estimate` (§6 Phase 3): `QuantileLaw(p=0.5)` with a BOOTSTRAP median SE over the per-decision
-    leaf-count pool (§7.A), `family=EMPIRICAL`, `kind='median'`. The per-decision readings are logged as
-    raw PROVENANCE — the variance authority is `estimate.cov`, so the headline LPD is NOT double-logged as
-    a sample row (§5.2 de-dup). Returns the raw provenance dict. SOLE-WORKLOAD — operator-invoked, pinned
-    (taskset -c 0), never during the fan-out."""
-    res = _measure_raw(trials=trials)        # ONE measurement (Est + provenance pool)
-    est = _estimate_from_raw(res)            # the SAME Estimate measure() returns (P1)
-    cfg = {"kind": "cpp_gen_ceiling_measured", "config": res["config"], "n_tasks": res["n_tasks"],
-           "leaf_requests_total": res["leaf_requests_total"], "lpd_mean_cross_read": res["lpd_mean_cross_read"],
-           "lpd_median": res["lpd"]}
-    with logged_run(NAME, quantity="leaves_per_decision", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2): the raw per-decision readings. The headline LPD lives in
-        # estimate.theta_hat[0] (the SSOT), the median SE in estimate.cov.
-        log(res["per_decision_leaves"], sample_size=1)
-    return res
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# SOLE-WORKLOAD — measure()/run() RUN the C++ gen-ceiling bench (eval mocked, taskset -c 0); the `trials`
+# budget threads through measure_raw (its own default sizes the per-decision pool). run() logs the
+# per-decision leaf-count pool as raw PROVENANCE (the variance authority is estimate.cov — §5.2 de-dup).
+_B = _scaffold(
+    name=NAME, quantity="leaves_per_decision", module_path=MODULE_PATH, description=_DESC,
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"kind": "cpp_gen_ceiling_measured", "config": res["config"], "n_tasks": res["n_tasks"],
+                            "leaf_requests_total": res["leaf_requests_total"], "lpd_mean_cross_read": res["lpd_mean_cross_read"],
+                            "lpd_median": res["lpd"]},
+    run_log=lambda res, log, **kw: log(res["per_decision_leaves"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

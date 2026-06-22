@@ -61,7 +61,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,7 +68,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "g_core"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_g_core"
@@ -120,12 +119,6 @@ def get_seed() -> G.Grounded:
     Used by the SEED path (manifest `trust=False` / pg-down) as a `Fixed` declared-spread prior; the
     MEASURED path (measure()/run() running the C++ bench) is the shrinkable `QuantileLaw`."""
     return G.GEN_PER_CORE_LEAVES
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="producer_leaves_per_core", units=get_seed().unit,
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _run_cpp_bench(reps: int) -> tuple[list[float], int]:
@@ -234,33 +227,19 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_rep_leaves_per_sec"], name=NAME)   # bootstrap median SE over the pool
 
 
-def measure(reps: int = 8) -> "_est.Estimate":
-    """Measure g_core (RUN the C++ gen-ceiling bench, eval mocked, sole-workload) and return its
-    harmonized k=1 SHRINKABLE median `Estimate` (§6 Phase 4: `measure()` returns the `Estimate` the
-    bench DECLARES — the driver/untrusted_drive `set_estimate`s it directly). `reps` sizes the
-    measurement pool (the budget the Neyman loop passes — more reps tightens g_core's SE -> the
-    generation-arm CI). TIMING-SENSITIVE — pinned (taskset -c 0); never during the fan-out."""
-    return _estimate_from_raw(_measure_raw(reps=reps))
-
-
-def run(reps: int = 8) -> dict[str, Any]:
-    """Measure g_core (RUN the C++ gen-ceiling bench) and LOG it to postgres as a harmonized k=1
-    SHRINKABLE median `Estimate` (§6 Phase 3): `QuantileLaw(p=0.5)` with a BOOTSTRAP median SE over the
-    per-rep leaves/s/core pool (§7.A), `family=EMPIRICAL`, `kind='median'`. The per-rep readings are
-    logged as raw PROVENANCE — the variance authority is `estimate.cov`, so the headline rate is NOT
-    double-logged as a sample row (§5.2 de-dup). Returns the raw provenance dict. TIMING-SENSITIVE —
-    operator-invoked, pinned (taskset -c 0), never during the fan-out."""
-    res = _measure_raw(reps=reps)            # ONE measurement (Est + provenance pool)
-    est = _estimate_from_raw(res)            # the SAME Estimate measure() returns (P1)
-    cfg = {"kind": "cpp_gen_ceiling_measured", "config": res["config"], "reps": res["reps"],
-           "n_tasks": res["n_tasks"], "leaf_requests_total": res["leaf_requests_total"],
-           "lpd_cross_read": res["lpd"], "g_core_leaves_per_core_median": res["g_core_leaves_per_core"]}
-    with logged_run(NAME, quantity="producer_leaves_per_core", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2): the raw per-rep readings. The headline rate lives in
-        # estimate.theta_hat[0] (the SSOT), the median SE in estimate.cov.
-        log(res["per_rep_leaves_per_sec"], sample_size=1)
-    return res
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# TIMING-SENSITIVE — measure()/run() RUN the C++ gen-ceiling bench (eval mocked, taskset -c 0); the
+# `reps` budget threads through measure_raw (its own default sizes the pool). run() logs the per-rep
+# leaves/s/core pool as raw PROVENANCE (the variance authority is estimate.cov — §5.2 de-dup).
+_B = _scaffold(
+    name=NAME, quantity="producer_leaves_per_core", module_path=MODULE_PATH, description=_DESC,
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"kind": "cpp_gen_ceiling_measured", "config": res["config"], "reps": res["reps"],
+                            "n_tasks": res["n_tasks"], "leaf_requests_total": res["leaf_requests_total"],
+                            "lpd_cross_read": res["lpd"], "g_core_leaves_per_core_median": res["g_core_leaves_per_core"]},
+    run_log=lambda res, log, **kw: log(res["per_rep_leaves_per_sec"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

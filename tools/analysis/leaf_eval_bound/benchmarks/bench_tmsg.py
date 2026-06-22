@@ -44,8 +44,6 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Any
 
@@ -54,7 +52,7 @@ from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the har
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
 from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "tmsg_us_leaf"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_tmsg"
@@ -74,12 +72,6 @@ def get_seed() -> G.Grounded:
     SEED path (manifest `trust=False` / pg-down) as a `Fixed` declared-spread prior; the MEASURED path
     (measure()/run() timing the live codec) is the shrinkable `QuantileLaw`."""
     return G.MSG_PER_LEAF_US
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="transport_msg_cost_per_leaf", units=get_seed().unit,
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(budget: int = 64, s_leaves: int = _S_LEAVES) -> dict[str, Any]:
@@ -159,34 +151,17 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_leaf_us"], name=NAME)   # bootstrap median SE over the per-leaf pool
 
 
-def measure(budget: int = 64, s_leaves: int = _S_LEAVES) -> "_est.Estimate":
-    """Measure tmsg_us_leaf (RUN the live inference-wire codec) and return its harmonized k=1 SHRINKABLE
-    median `Estimate` (§6 Phase 4: `measure()` returns the `Estimate` the bench DECLARES — the
-    driver/untrusted_drive `set_estimate`s it directly). `budget` sizes the measurement pool (the budget
-    the Neyman loop passes — more windows tightens tmsg's SE). TIMING-SENSITIVE — pinned (taskset -c 0);
-    never during the fan-out."""
-    return _estimate_from_raw(_measure_raw(budget=budget, s_leaves=s_leaves))
-
-
-def run(budget: int = 64, s_leaves: int = _S_LEAVES) -> dict[str, Any]:
-    """Measure tmsg_us_leaf (RUN the live inference-wire codec) and LOG it to postgres as a harmonized
-    k=1 SHRINKABLE median `Estimate` (§6 Phase 3): `QuantileLaw(p=0.5)` with a BOOTSTRAP median SE over
-    the per-leaf framing-cost pool (§7.A), `family=EMPIRICAL`, `kind='median'`. The per-leaf readings
-    are logged as raw PROVENANCE — the variance authority is `estimate.cov`, so the headline is NOT
-    double-logged as a sample row (§5.2 de-dup). Returns the raw provenance dict. TIMING-SENSITIVE —
-    operator-invoked, pinned (taskset -c 0), never during the fan-out."""
-    res = _measure_raw(budget=budget, s_leaves=s_leaves)   # ONE measurement (Est + provenance pool)
-    est = _estimate_from_raw(res)            # the SAME Estimate measure() returns (P1)
-    cfg = {"kind": "inference_wire_codec_measured", "codec": "inference_wire_memcpy",
-           "s_leaves": res["s_leaves"], "budget": res["budget"], "frames_per_window": _FRAMES_PER_WINDOW,
-           "encode_us": res["encode_us"], "decode_us": res["decode_us"],
-           "tmsg_us_leaf_median": res["tmsg_us_leaf_median"]}
-    with logged_run(NAME, quantity="transport_msg_cost_per_leaf", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2): the raw per-leaf readings. The headline lives in estimate.theta_hat[0]
-        # (the SSOT), the median SE in estimate.cov.
-        log(res["per_leaf_us"], sample_size=1)
-    return res
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+_B = _scaffold(
+    name=NAME, quantity="transport_msg_cost_per_leaf", module_path=MODULE_PATH, description=_DESC,
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"kind": "inference_wire_codec_measured", "codec": "inference_wire_memcpy",
+                            "s_leaves": res["s_leaves"], "budget": res["budget"], "frames_per_window": _FRAMES_PER_WINDOW,
+                            "encode_us": res["encode_us"], "decode_us": res["decode_us"],
+                            "tmsg_us_leaf_median": res["tmsg_us_leaf_median"]},
+    run_log=lambda res, log, **kw: log(res["per_leaf_us"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

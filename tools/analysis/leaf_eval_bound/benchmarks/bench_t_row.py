@@ -22,15 +22,13 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any, Optional
 
 
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.contract import grounding as G  # noqa: E402
 from leaf_eval_bound.benchmarks.estimators import fit_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "t_row_us"
 # The co-fit PARTNER: t_row (the slope) and iota (the intercept) are the SAME staged `time = intercept +
@@ -53,13 +51,6 @@ _IN_DIM, _HIDDEN, _N_ACTIONS = 241, 256, 65
 def get_seed() -> G.Grounded:
     """The v1 seed (the DISTRUST fallback): the staged run_microbatch slope fit, 4.317 us/row."""
     return G.SERVE_SLOPE_US
-
-
-def register_self() -> Any:
-    """Register this quantity's definition row (idempotent). Returns the definition id."""
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="serve_per_row_cost", units=get_seed().unit,
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
@@ -98,36 +89,31 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
 
 
-def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> "_est.Estimate":
-    """Measure t_row and return its harmonized k=2 fit `Estimate` (§6 Phase 4: `measure()` returns the
-    `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no guessing which list
-    is the estimate). The raw design-point dict is the bench's internal `_measure_raw()` provenance (read by
-    `run()` for the audit rows). TIMING-SENSITIVE — pin the process to one core (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(batches=batches, iters=iters, repeat=repeat))
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# run()'s body has an INTERMEDIATE (batches_used -> medians) and a run-knob (sample_size=iters), so the
+# config + log hooks are DEFs that recompute that intermediate VERBATIM from `res` (and the threaded `kw`,
+# defaults applied). A lambda can't hold the statements; the recompute is behavior-identical.
+def _run_config(res, **kw):
+    batches_used = res["batches"]
+    return {"batches": batches_used, "iters": kw["iters"], "repeat": kw["repeat"],
+            "fit_slope_us_per_row": res["slope_us_per_row"], "fit_intercept_us": res["intercept_us"],
+            "fit_r2": res["r2"], "bench": "run_microbatch_staged"}
 
 
-def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure t_row and LOG it to postgres as a harmonized k=2 fit `Estimate` (§6 Phase 3): the staged-fit
-    slope/intercept with their −0.81 off-diagonal, t_row's SLOPE as component 0. The per-width medians are
-    logged as raw-design-point PROVENANCE — the variance authority is now `estimate.cov` (the SE comes from
-    `resid_var` + the x-design), so the headline slope scalar is NO LONGER double-logged as a sample row
-    (the §5.2 de-dup obligation: that double-log corrupts `latest_aggregate`'s count + averages a slope
-    with seven 4-digit medians). Returns the measurement dict. TIMING-SENSITIVE — operator-invoked, pinned,
-    never during the fan-out."""
-    res = _measure_raw(batches=batches, iters=iters, repeat=repeat)   # ONE measurement (Estimate + provenance)
+def _run_log(res, log, **kw):
     batches_used = res["batches"]
     medians = [res["per_width_median_us"][B] for B in batches_used]
-    # The k=2 fit Estimate, built by the SAME helper measure() returns (P1 single-home).
-    est = _estimate_from_raw(res)
-    cfg = {"batches": batches_used, "iters": iters, "repeat": repeat,
-           "fit_slope_us_per_row": res["slope_us_per_row"], "fit_intercept_us": res["intercept_us"],
-           "fit_r2": res["r2"], "bench": "run_microbatch_staged"}
-    with logged_run(NAME, quantity="serve_per_row_cost", units=get_seed().unit, description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2): the per-width medians (the raw design points), sample_size = iters behind
-        # each. The headline slope is NOT logged as a sample — it lives in estimate.theta_hat[0] (the SSOT).
-        log(medians, sample_size=iters)
-    return res
+    # PROVENANCE only (§5.2): the per-width medians (the raw design points), sample_size = iters behind
+    # each. The headline slope is NOT logged as a sample — it lives in estimate.theta_hat[0] (the SSOT).
+    log(medians, sample_size=kw["iters"])
+
+
+_B = _scaffold(
+    name=NAME, quantity="serve_per_row_cost", module_path=MODULE_PATH, description=_DESC,
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=_run_config, run_log=_run_log,
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

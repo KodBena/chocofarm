@@ -26,8 +26,6 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Any
 
@@ -35,7 +33,7 @@ from typing import Any
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
 from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "shm_spin_poll_req_drain_us"
 MODULE_PATH = "leaf_eval_bound.benchmarks.bench_shm_spin_poll_req_drain"
@@ -56,12 +54,6 @@ def get_seed() -> tuple[float, float, str]:
     mean = _B_OP_SEED * _REQ_ROW_B / _MEMCPY_BW_BYTES_PER_NS / 1000.0
     sigma = 0.5 * mean   # bandwidth uncertainty (8 B/ns conservative vs ~16 B/ns L2-resident)
     return (mean, sigma, "us")
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="serve_req_drain_copy_shm_spin_poll", units="us",
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
@@ -104,29 +96,18 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return median_estimate(res["per_cycle_us"], name=NAME)   # bootstrap median SE over the per-cycle pool
 
 
-def measure(rows: int = 256, cycles: int = 5000) -> "_est.Estimate":
-    """Measure the request-drain copy and return its harmonized k=1 median `Estimate` (§6 Phase 4: `measure()`
-    returns the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly, no
-    guessing which list is the pool). The raw pool is the bench's internal `_measure_raw()` provenance.
-    TIMING-SENSITIVE — pin the process (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(rows=rows, cycles=cycles))
-
-
-def run(rows: int = 256, cycles: int = 5000) -> dict[str, Any]:
-    """Measure the request-drain copy and LOG it as a harmonized k=1 median Estimate (QuantileLaw p=0.5,
-    bootstrap median SE, §6 Phase 3, §5.2 de-dup). TIMING-SENSITIVE — operator-invoked, pinned, never during
-    the fan-out."""
-    res = _measure_raw(rows=rows, cycles=cycles)  # ONE measurement (Estimate + provenance)
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"rows": rows, "cycles": cycles, "transport": "shm_ring_spin_poll",
-           "kind": "request_drain_copy_fallback",
-           "req_drain_us_median": res["req_drain_us_median"],
-           "note": "the cost the zero-copy ring-span drain avoids; charged only in the copy-both arm"}
-    with logged_run(NAME, quantity="serve_req_drain_copy_shm_spin_poll", units="us", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2 de-dup): the headline median lives in estimate.theta_hat[0], not a sample row.
-        log(res["per_cycle_us"], sample_size=1)
-    return res
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above. The
+# seed is a bare (mean, sigma, unit) tuple (no .unit), so the registered unit is passed explicitly (units="us").
+_B = _scaffold(
+    name=NAME, quantity="serve_req_drain_copy_shm_spin_poll", module_path=MODULE_PATH, description=_DESC,
+    units="us", seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=lambda res, **kw: {"rows": kw["rows"], "cycles": kw["cycles"], "transport": "shm_ring_spin_poll",
+                                  "kind": "request_drain_copy_fallback",
+                                  "req_drain_us_median": res["req_drain_us_median"],
+                                  "note": "the cost the zero-copy ring-span drain avoids; charged only in the copy-both arm"},
+    run_log=lambda res, log, **kw: log(res["per_cycle_us"], sample_size=1),
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":

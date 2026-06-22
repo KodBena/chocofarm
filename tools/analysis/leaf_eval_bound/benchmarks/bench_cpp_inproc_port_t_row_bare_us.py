@@ -37,14 +37,12 @@ Public Domain (The Unlicense).
 """
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any, Optional
 
 
 from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 from leaf_eval_bound.benchmarks.estimators import fit_estimate  # noqa: E402
-from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
+from leaf_eval_bound.benchmarks.scaffold import bench as _scaffold  # noqa: E402  — move 6 wiring
 
 NAME = "cpp_inproc_port_t_row_bare_us"
 # The co-fit PARTNER: this bare-forward SLOPE and T_disp (the dispatch-floor INTERCEPT) are read off the
@@ -76,12 +74,6 @@ def get_seed() -> tuple[float, float, str]:
     (mean, sigma, unit). A (mean, sigma, unit) tuple (not a Grounded) because this is a NEW per-variant
     quantity with no leaf_eval_grounding Grounded of its own — the manifest accepts either form."""
     return (_SEED_MEAN, _SEED_SIGMA, "us/row")
-
-
-def register_self() -> Any:
-    from leaf_eval_bound.benchmarks.harness import register_quantity
-    return register_quantity(NAME, quantity="serve_per_row_cost_bare_forward", units="us/row",
-                             description=_DESC, module_path=MODULE_PATH)
 
 
 def _measure_raw(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
@@ -118,35 +110,35 @@ def _estimate_from_raw(res: dict[str, Any]) -> "_est.Estimate":
     return fit_estimate(batches_used, medians, own_name=NAME, own_role="slope", partner_name=PARTNER_NAME)
 
 
-def measure(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> "_est.Estimate":
-    """Measure cpp_inproc_port_t_row_bare_us and return its harmonized k=2 fit `Estimate` (§6 Phase 4: `measure()` returns
-    the `Estimate` the bench DECLARES — the driver/untrusted_drive consume it directly). The raw
-    design-point dict is the bench's internal `_measure_raw()` provenance. TIMING-SENSITIVE — pin (taskset -c 0)."""
-    return _estimate_from_raw(_measure_raw(batches=batches, iters=iters, repeat=repeat))
-
-
-def run(batches: Optional[list[int]] = None, iters: int = 200, repeat: int = 30) -> dict[str, Any]:
-    """Measure the bare-forward slope and LOG it to postgres (the fully_device slope as the headline reading,
-    sample_size = the fit's #widths). Records the fully_device intercept (== T_disp, for cross-consistency)
-    and the decomposition in the run config. TIMING-SENSITIVE — operator-invoked, pinned (taskset -c 0),
-    NEVER during the fan-out."""
-    res = _measure_raw(batches=batches, iters=iters, repeat=repeat)  # ONE measurement (Estimate + provenance)
+# Move 6: the shared scaffold wires register_self / measure / run from the bench-specific parts above.
+# TUPLE seed (no .unit) — the explicit registered unit is passed via units="us/row". The run cfg AND the
+# provenance log both derive an INTERMEDIATE from res (batches_used; the log also recomputes medians) that a
+# lambda can't hold, so run_config / run_log are DEFs that recompute it VERBATIM (pattern c). The `iters` /
+# `repeat` run-knobs come from the scaffold-supplied kw (defaults applied) per pattern (b).
+def _run_config(res, **kw):
     batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
-    medians = [res["per_width_median_us"][B] for B in batches_used]
-    # The k=2 fit Estimate, the bare-forward slope as component 0; T_disp_us the partner with the
-    # off-diagonal. SAME fully_device fit T_disp logs, only the component order differs (§4.2).
-    est = _estimate_from_raw(res)  # the SAME Estimate measure() returns (P1)
-    cfg = {"batches": batches_used, "iters": iters, "repeat": repeat, "variant": "fully_device",
+    return {"batches": batches_used, "iters": kw["iters"], "repeat": kw["repeat"], "variant": "fully_device",
            "fully_device_intercept_us": res["intercept_us"], "fit_slope_us_per_row": res["slope_us_per_row"],
            "fit_r2": res["r2"], "decomposition": res["decomposition"], "bench": "mlp_lowlatency",
            "note": "bare-forward slope (no run_microbatch concat, output device-resident); the inproc-port "
                    "t_row. T_disp is THIS fit's intercept (one fit, two read-offs)."}
-    with logged_run(NAME, quantity="serve_per_row_cost_bare_forward", units="us/row", description=_DESC,
-                    module_path=MODULE_PATH, config=cfg, estimate=est) as log:
-        # PROVENANCE only (§5.2): the fully_device per-width medians. The headline slope is NOT logged as a
-        # sample — it lives in estimate.theta_hat[0] (the SSOT).
-        log(medians, sample_size=iters)
-    return res
+
+
+def _run_log(res, log, **kw):
+    batches_used = [B for B in res["batches"] if B in res["per_width_median_us"]]
+    medians = [res["per_width_median_us"][B] for B in batches_used]
+    # PROVENANCE only (§5.2): the fully_device per-width medians. The headline slope is NOT logged as a
+    # sample — it lives in estimate.theta_hat[0] (the SSOT).
+    log(medians, sample_size=kw["iters"])
+
+
+_B = _scaffold(
+    name=NAME, quantity="serve_per_row_cost_bare_forward", module_path=MODULE_PATH, description=_DESC,
+    units="us/row",
+    seed=get_seed, measure_raw=_measure_raw, estimate_from_raw=_estimate_from_raw,
+    run_config=_run_config, run_log=_run_log,
+)
+register_self, measure, run = _B.register_self, _B.measure, _B.run
 
 
 if __name__ == "__main__":
