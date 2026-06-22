@@ -1,25 +1,18 @@
 """
-tests/test_alloc_kink_gradient.py
-=================================
+tests/test_alloc_kink.py
+========================
 
-Isolated unit tests for the two sub-modules lifted out of `neyman_driver.py` into the
-`alloc` sub-package (the responsibility-refactor's first increment — move 4 + the §5
-gradient Port; `docs/design/leaf-eval-bound-responsibility-refactor.md`):
+Isolated unit tests for `alloc.kink.assess_min_kink` — the Clark-1961 min()-kink closed form (the
+responsibility-refactor's move 4; `docs/design/leaf-eval-bound-responsibility-refactor.md`) —
+exercised DIRECTLY on synthetic arms + a synthetic Σ (no `NeymanDriver`, no `step()`, no live
+measurement). This is the unit-testability the lift was for: the §8 reproduction targets
+(E[min] / sd / Φ(−t)) are pinned at the pure-function level, so a regression in the Clark math
+surfaces here without the whole driver. (The end-to-end equivalence — that the driver's `step()` is
+unchanged by the lift — is the separate oracle in `test_neyman_driver_phase2.py`; the gradient
+backend `alloc.gradient.jax_gradient` is covered by `tests/test_jax_f_equivalence.py`.)
 
-  * `alloc.kink.assess_min_kink` — the Clark-1961 min()-kink closed form, exercised
-    DIRECTLY on synthetic arms + a synthetic Σ (no `NeymanDriver`, no `step()`, no live
-    measurement). This is the unit-testability the lift was for: the §8 reproduction
-    targets (E[min] / sd / Φ(−t)) are pinned at the pure-function level, so a regression in
-    the Clark math surfaces here without the whole driver. (The end-to-end behavioral
-    equivalence — that the driver's `step()` is unchanged by the lift — is the separate
-    oracle in `test_neyman_driver_phase2.py`; this file is the complementary unit lens.)
-  * `alloc.gradient.fd_gradient_dict` — the runners' numpy delta-method gradient (a central FD
-    over a `dict→float` callable). The OT-function gradient forms `gradient` / `fd_gradient` were
-    removed in the OT→JAX migration (J3); `jax.grad` is the backend now, covered by
-    `tests/test_jax_f_equivalence.py`.
-
-Run-free / fast: the kink tests are pure numpy + scipy on hand-built arrays; the gradient test is
-numpy-only. No timed bench, no DB, no network, no OpenTURNS.
+Run-free / fast: pure numpy + scipy on hand-built arrays. No timed bench, no DB, no network, no
+OpenTURNS.
 
 Public Domain (The Unlicense).
 """
@@ -39,7 +32,6 @@ _OT = os.path.join(
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
-from alloc import gradient as G  # noqa: E402
 from alloc import kink as K  # noqa: E402
 
 
@@ -119,18 +111,3 @@ def test_assess_min_kink_pfloor_gates_the_regime() -> None:
     assert K.assess_min_kink(arms, Sigma, pfloor=0.10) is not None   # 0.136 > 0.10 -> fires
     assert K.assess_min_kink(arms, Sigma, pfloor=0.20) is None       # 0.136 < 0.20 -> smooth
     assert K.KINK_PFLOOR == 1e-3                                     # the default is the driver's old floor
-
-
-# --------------------------------------------------------------------------- #
-# alloc.gradient.fd_gradient_dict — the runners' numpy delta-method gradient. (The OT-function
-# gradient forms `gradient`/`fd_gradient` were removed in migration J3; jax.grad is the backend,
-# covered by tests/test_jax_f_equivalence.py.)
-# --------------------------------------------------------------------------- #
-def test_fd_gradient_dict_matches_closed_form() -> None:
-    """The numpy-dict FD gradient over `model.throughput_numpy` (the runners' delta-method path): a
-    central FD of `fn(dict) -> float`, returned keyed by input name. ∇(3·a − 1.5·b) = {a: 3, b: −1.5}."""
-    def fn(d: dict[str, float]) -> float:
-        return 3.0 * d["a"] - 1.5 * d["b"]
-    g = G.fd_gradient_dict(fn, ["a", "b"], {"a": 2.0, "b": 5.0})
-    assert g["a"] == pytest.approx(3.0, rel=1e-4)
-    assert g["b"] == pytest.approx(-1.5, rel=1e-4)

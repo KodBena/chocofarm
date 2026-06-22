@@ -81,17 +81,11 @@ vs what is still a seed. The benches are registered + written + left runnable (t
 an operator runs each pinned, taskset -c 0, sole-workload; the manifest's trusted flag then flips
 to True automatically with no model edit).
 
-ON THE NUMPY FALLBACK (precise, not overclaimed). The HEADLINE and CONSERVATIVE bounds are pure
-numpy (each model's `throughput_numpy`), so they need NO openturns. The CI half-width + the
-VARIANCE ranking have a numpy delta-method fallback (`_HAS_OT=False`) that runs without ever
-calling openturns. HOWEVER three of the five variant models inherit the v1 family's TOP-LEVEL
-`from neyman_driver import NeymanDriver` (model_cycletime does the same), and `neyman_driver`
-hard-requires openturns at import — so on a host with openturns genuinely ABSENT those three
-models cannot be imported at all, and this runner cannot enumerate them. That is an inherited v1
-property (the v1 throughput_bound.py runner has it too), NOT a regression introduced here, and is
-moot in this environment (openturns 1.27 is present). The `_HAS_OT=False` branch therefore covers
-the realistic degradation — openturns importable but the driver step raising — not a fully
-openturns-free host.
+HOW THE BOUND IS COMPUTED. The HEADLINE + CONSERVATIVE bounds and the binding-stage logic are pure
+numpy over each model's diagnostics; the CI half-width + the VARIANCE ranking are the JAX-driven
+`NeymanDriver` step (the OT→JAX migration — this runner imports no openturns, and the old numpy
+delta-method fallback retired with the single-f collapse, J4). A driver failure RAISES loudly
+(ADR-0002) — there is no silent fallback.
 
 Run: /home/bork/w/vdc/venvs/generic/bin/python tools/analysis/OpenTURNS/transport_sweep.py
 
@@ -100,7 +94,6 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import os
 import sys
 from dataclasses import dataclass, field
@@ -112,11 +105,6 @@ if _HERE not in sys.path:
 
 import leaf_eval_grounding as G  # noqa: E402  — the single home of the references + the transfer decomposition
 import manifest  # noqa: E402   — the SSOT registry (import-clean; touches no DB on import)
-import runner_support as rs  # noqa: E402  — the shared runner numpy delta-method bound (grad+a_i+var+ci,
-# composed over the alloc.gradient seam; move 5, numpy-bound half), single-homing the _fd_gradient copy, the
-# inlined fallback recipe, and the _Z95 literal that were duplicated across the runners.
-
-_HAS_OT = importlib.util.find_spec("openturns") is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -218,7 +206,7 @@ class VariantResult:
     transfer_residual_us: float
     transfer_note: str
     ci_halfwidth: float                       # delta-method CI half-width on E[f]
-    ci_source: str                            # 'openturns' | 'numpy'
+    ci_source: str                            # 'jax' (the NeymanDriver step; the numpy fallback retired, J4)
     all_trusted: bool
     untrusted_inputs: list[str]
     variance_targets: list[tuple[str, float, int]]   # (model-input name, a_i, +samples) ranked desc
@@ -274,49 +262,26 @@ def _ci_via_driver(model: Any) -> tuple[float, str]:
     `{mean±sigma}` pilot). The grounded inputs are `Fixed`/declared-spread Estimates (`cov=[[sigma^2]]`),
     so `g^T Σ g` is byte-for-byte the old pilot's bound (the `{mean±sigma}` set's std is √2·sigma, so
     a_i/n_i = grad^2·sigma^2 either way — no `/2` bug) and the grounded mean still anchors the gradient at
-    the binding stage (the min() kink makes it point-sensitive). Returns (ci_halfwidth, 'openturns'). Falls
-    back to a numpy delta-method CI loudly (never silently) if the openturns path raises (ADR-0002)."""
-    if _HAS_OT:
-        try:
-            driver, x0 = model.build_driver(tolerance=0.1, trust=True)
-            driver.set_estimates_by_name(_model_estimates(model))
-            rec = driver.step(second_order_check=False)
-            return rec.ci_halfwidth, "openturns"
-        except Exception as exc:  # noqa: BLE001 — fall back loudly (ADR-0002), never silently
-            print(f"[transport_sweep] openturns CI path for {model.SLUG} raised "
-                  f"({type(exc).__name__}: {exc}); using numpy delta-method CI.", file=sys.stderr)
-    # numpy fallback: first-order delta-method CI at n=1/input (the v1 _numpy_bound recipe).
-    x0 = model.initial_point(trust=True)
-    names = model.INPUT_NAMES
-    sig = model.sigmas(trust=True)
-    return rs.delta_method(model.throughput_numpy, names, x0, sig).ci, "numpy"
+    the binding stage (the min() kink makes it point-sensitive). Returns (ci_halfwidth, 'jax'). A driver
+    failure RAISES (ADR-0002 — there is no silent fallback; the numpy delta-method fallback retired with
+    the single-f collapse, J4)."""
+    driver, x0 = model.build_driver(tolerance=0.1, trust=True)
+    driver.set_estimates_by_name(_model_estimates(model))
+    rec = driver.step(second_order_check=False)
+    return rec.ci_halfwidth, "jax"
 
 
 def _variance_targets(model: Any, top: int = 6) -> list[tuple[str, float, int]]:
     """The allocator's VARIANCE-CONTRIBUTION ranking (which input most tightens E[f]'s CI): (model-input
     name, a_i=(df/dx)^2*sigma^2, recommended +samples), ranked desc. Via the openturns driver step (§6
-    Phase 4 — each input fed as its harmonized `Estimate` via `set_estimates_by_name`, REPLACING the
-    fabricated 2-point `{mean±sigma}` pilot) when present, else a numpy delta-method a_i ranking. The
-    ranking reads a_i, which `g^T Σ g` over the grounded `Fixed`/declared-spread Estimates reproduces
-    byte-for-byte from the old pilot; `+samples` is 0 for a declared-spread prior (un-shrinkable — the
-    §2.3 allocator funds none, matching the numpy fallback's 0). This funds whatever BINDS (compute when
-    serve-bound, producer when generation-bound)."""
-    if _HAS_OT:
-        try:
-            driver, x0 = model.build_driver(tolerance=0.1, trust=True)
-            driver.set_estimates_by_name(_model_estimates(model))
-            rec = driver.step(second_order_check=False)
-            ranked = sorted(rec.primitives, key=lambda p: p.a, reverse=True)
-            return [(p.name, float(p.a), int(p.recommend)) for p in ranked[:top]]
-        except Exception as exc:  # noqa: BLE001
-            print(f"[transport_sweep] openturns variance-rank for {model.SLUG} raised "
-                  f"({type(exc).__name__}: {exc}); using numpy a_i ranking.", file=sys.stderr)
-    x0 = model.initial_point(trust=True)
-    names = model.INPUT_NAMES
-    sig = model.sigmas(trust=True)
-    a = rs.delta_method(model.throughput_numpy, names, x0, sig).a
-    ranked = sorted(names, key=lambda nm: a[nm], reverse=True)
-    return [(nm, float(a[nm]), 0) for nm in ranked[:top]]
+    Phase 4 — each input fed as its harmonized `Estimate` via `set_estimates_by_name`). `+samples` is 0
+    for a declared-spread prior (un-shrinkable — the §2.3 allocator funds none). This funds whatever BINDS
+    (compute when serve-bound, producer when generation-bound). A driver failure RAISES (ADR-0002)."""
+    driver, x0 = model.build_driver(tolerance=0.1, trust=True)
+    driver.set_estimates_by_name(_model_estimates(model))
+    rec = driver.step(second_order_check=False)
+    ranked = sorted(rec.primitives, key=lambda p: p.a, reverse=True)
+    return [(p.name, float(p.a), int(p.recommend)) for p in ranked[:top]]
 
 
 def _transport_targets(slug: str) -> list[tuple[str, float, bool]]:
@@ -449,7 +414,7 @@ def print_report(results: list[VariantResult]) -> None:
     print("=" * 92)
     print("LEAF-EVAL TRANSPORT-DESIGN SWEEP — first-principles throughput LOWER BOUNDS per transport")
     print("=" * 92)
-    print(f"openturns available: {_HAS_OT}   |   postgres (metric store) available: {pg}")
+    print(f"postgres (metric store) available: {pg}")
     print(f"Reference points (NOT targets — workflow-brief-neutrality):")
     print(f"  empirical plateau ~{plat:.0f} dps (user-supplied, ONE config family on the current harness)")
     print(f"  v1 Design-B cycle-time bound ~{v1['design_b_dps']:.0f} dps   |   "

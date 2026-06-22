@@ -586,16 +586,16 @@ def test_transport_sweep_estimate_feed_reproduces_the_2point_pilot_bound() -> No
     assert rank_new == rank_old                                    # the next-benchmark ranking is preserved
 
 
-def test_throughput_bound_ot_path_feeds_fixed_estimates_no_pilot() -> None:
-    """§6 Phase-4 deliverable 3: `throughput_bound._ot_bound` drives via `set_estimate` (Fixed/declared-
+def test_throughput_bound_drives_fixed_estimates_no_pilot() -> None:
+    """§6 Phase-4 deliverable 3: `throughput_bound._bound` drives via `set_estimate` (Fixed/declared-
     spread Estimates), NOT the 2-point `add_samples` pilot, and reproduces the model's f(μ̂) and the
     grounded-uncertainty CI. The grounded inputs are declared-spread priors, so the allocator funds none
-    (un-shrinkable — the §2.3 branch)."""
+    (un-shrinkable — the §2.3 branch). (`_ot_bound` was renamed `_bound` in the OT→JAX migration, J4.)"""
     _driver_deps()
     import throughput_bound as TB
     import model_capacity
 
-    driver, rec, f_mu, x0 = TB._ot_bound(model_capacity)
+    rec, f_mu, x0 = TB._bound(model_capacity)
     # the bound is the model's f at the grounded mean; the CI is the grounded-uncertainty spread.
     assert f_mu == pytest.approx(model_capacity.throughput_numpy(x0), rel=1e-9)
     assert rec.var_estimate > 0.0 and math.isfinite(rec.ci_halfwidth)

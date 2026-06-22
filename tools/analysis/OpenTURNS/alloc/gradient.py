@@ -2,23 +2,16 @@
 tools/analysis/OpenTURNS/alloc/gradient.py
 ==========================================
 
-The gradient-backend SEAM — the ONE home of "the gradient of the scalar model function `f`
-at a point" (the responsibility refactor §5;
-`docs/design/leaf-eval-bound-responsibility-refactor.md`). After the OpenTURNS→JAX migration
-the gradient is JAX autodiff:
+The gradient-backend SEAM — the ONE home of "the gradient of the scalar model function `f` at a
+point" (the responsibility refactor §5; `docs/design/leaf-eval-bound-responsibility-refactor.md`).
+After the OpenTURNS→JAX migration the gradient is JAX autodiff, and it is now the ONLY gradient:
 
-  * `jax_gradient` — `jax.grad` of a JAX-traceable scalar `f(x_array)` (the driver's form, a
-    model's `throughput_jax`). Analytic reverse-mode autodiff; THE gradient backend. (It
-    replaced the OpenTURNS analytic `f.gradient()` + central-FD fallback that lived here — OT
-    itself fell back to FD through the model's `min()`, so jax.grad loses nothing; the arm-tie
-    is handled by the Clark closed form `alloc.kink`, never the linearization.)
-  * `fd_gradient_dict` — a central finite-difference gradient of the model's `throughput_numpy`
-    (a `dict→float` numpy callable). The runners' numpy delta-method path
-    (`runner_support.delta_method`) still uses it; it retires with the numpy fallback (migration
-    J4), leaving `jax_gradient` as the sole gradient.
+  * `jax_gradient` — `jax.grad` of a JAX-traceable scalar `f(x_array)` (the driver's form, a model's
+    `throughput_jax`). Analytic reverse-mode autodiff. It replaced the OpenTURNS analytic
+    `f.gradient()` + central-FD fallback (migration J3) and, with the single-f collapse (J4), the
+    numpy `fd_gradient_dict` that backed the runners' delta-method fallback — both retired.
 
-numpy + jax only — this module imports NO OpenTURNS (the OT-function gradient forms `gradient`
-/ `fd_gradient` and their lazy `_ot()` import were removed in migration J3).
+numpy + jax only — this module imports NO OpenTURNS.
 
 Public Domain (The Unlicense).
 """
@@ -27,22 +20,6 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import numpy as np
-
-
-def fd_gradient_dict(
-    fn: Callable[[dict[str, float]], float], names: list[str], x0: dict[str, float], rel: float = 1e-5,
-) -> dict[str, float]:
-    """Central finite-difference gradient of a numpy callable `fn(dict) -> float` at `x0`, returned as
-    `{input_name: ∂fn/∂input}`. The runners' numpy delta-method gradient over `model.throughput_numpy`
-    (`runner_support.delta_method`). Pending retirement with the numpy fallback (migration J4), after
-    which `jax_gradient` is the sole gradient. numpy-only."""
-    g: dict[str, float] = {}
-    for nm in names:
-        h = rel * max(abs(x0[nm]), 1.0)
-        xp = dict(x0); xp[nm] += h
-        xm = dict(x0); xm[nm] -= h
-        g[nm] = (fn(xp) - fn(xm)) / (2.0 * h)
-    return g
 
 
 def jax_gradient(f: Callable[..., Any], point: np.ndarray) -> np.ndarray:
