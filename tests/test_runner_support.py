@@ -11,8 +11,11 @@ each re-deriving `a_i=(grad·σ)²`, `var=Σa_i`, `ci=z·√var` and its own `_Z
 single home directly (the end-to-end byte-identical-output check on the runners is the
 complementary behavioral oracle).
 
-Fast + numpy-only by construction: `delta_method` composes the `alloc.gradient.fd_gradient_dict`
-seam (which imports openturns lazily) with the σ-weighting, so these tests need no openturns.
+Fast: the `delta_method` tests are numpy-only by construction — `delta_method` composes the
+`alloc.gradient.fd_gradient_dict` seam (which imports openturns lazily) with the σ-weighting, so they
+need no openturns. ONE further test (`test_Z95_agrees_with_the_driver_z_quantile`) cross-checks the
+`Z95` constant against the driver's z-quantile via a LOCAL `neyman_driver` import (that one does pull in
+openturns) — pinning the hack-audit's "latent z re-divergence" finding.
 
 Public Domain (The Unlicense).
 """
@@ -71,3 +74,15 @@ def test_delta_method_zero_spread_gives_zero_ci() -> None:
     dm = rs.delta_method(_linear, ["a", "b"], {"a": 1.0, "b": 1.0}, {"a": 0.0, "b": 0.0})
     assert dm.var == 0.0
     assert dm.ci == 0.0
+
+
+def test_Z95_agrees_with_the_driver_z_quantile() -> None:
+    """Consistency tie (the hack-audit's finding 1): the 95% z-multiplier is computed in TWO places —
+    `runner_support.Z95` (the runners' fixed constant) and `neyman_driver._z_from_confidence` (the
+    general confidence→z quantile, whose openturns-absent fallback hard-codes the same 95% literal).
+    They are distinct responsibilities with nothing structurally tying them, so this pins that at 95%
+    they evaluate to the same number — a future edit diverging one from the other fails loudly
+    (ADR-0002) instead of silently. The `neyman_driver` import is LOCAL (it requires openturns) so the
+    rest of this file's delta_method tests stay numpy-only."""
+    import neyman_driver as nd
+    assert nd._z_from_confidence(0.95) == pytest.approx(rs.Z95, abs=1e-12)
