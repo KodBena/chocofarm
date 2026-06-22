@@ -26,27 +26,43 @@ the code that parses it (cited per entry). Look there for a number; look here fo
 ## 0. What "production" / "the implementation we're explaining" is (read this first)
 
 This sub-project has **no standardized `--serve` production** — the message-passing impedance work was
-yak-shaved out *before* a production serving workflow was standardized. So for this part of the project,
-**"production" = the benchmark harness**: the `cpp/stage_a` overcommit / throughput sweeps
-(`overcommit_sweep.py` and kin) — an in-process `StageAServer` (the **real** `ValueMLP` forward,
-`jit_forward_core`) pinned 1 server : 3 producer cores, driven by the C++ `wire-ab-bench` producer over
-the **pipelined-bucket** wire, with **`N` (overcommit, `--trees-per-thread`) as the swept operating knob**.
-It is the maintainer's *window into how the eventual mature AZ loop will look* once the implementation
-stops leaving ≥100% throughput on the table.
+yak-shaved out *before* a serving workflow was standardized. "Production" — the operational reality the
+leaf-eval model is reconciled against — is the **control lab**: `cpp/stage_a/control_lab/`
+(`lab_harness.py`). It is a **closed-loop control system, not a fixed pipeline**:
 
-Two consequences that **supersede any `--serve`-centric reading** below (§5) and in the Step-0 record:
+- One in-process `LabServer` (a `StageAServer` subclass — the **real** `ValueMLP` forward `jit_forward_core`,
+  `--e-policy padmax` = the production-aligned *staged* device-resident forward) pinned to core 0; one
+  continuous C++ Gumbel-AZ producer (`wire-ab-bench --lab-decision`, 3 cores) streaming real search over the
+  pipelined wire.
+- On **every forward** a **`Controller` (an issue-gate policy)** reads each producer thread's
+  `(ready, inflight, rtt_us, server_rows_per_forward)` and returns a per-thread **allow/deny** bit — *issue
+  now, or hold to coalesce a fatter batch* — riding back on the reply wire. **This gate IS the message-passing
+  impedance control;** it shapes `B` (rows/forward) and the throughput.
+- The lab scores many controller **methods** (`methods/`: `bang_bang`, `contextual_bandit`, `a2c`,
+  `reinforce`, `whittle_rmab`, `vegas`, …) back-to-back over one warm stream, dps the reward, logging to the
+  host `control_research` PostgreSQL between trials.
 
-- **`N` (overcommit) is LIVE**, not dead. `StrictBarrier` / `N=1` is the *baseline arm* of the sweep, not
-  "the production default." The `--serve` / `cpp_executor` deployment path the C++ comments call "the
-  production default" is **not this sub-project's production** (it was never standardized) — an aside.
-- **The operating readings already exist.** The harness emits, per swept cell, `server_mean_rows_per_fwd`
-  (= the model's **B**, from `StageAServer.n_forwards`/`n_real_rows`), `dps`, `dps_per_core`, and
-  `wire_mean_rows_per_msg`. So the loop's top-line and `B` observations are *free* (no port needed); only
-  the per-stage costs (`tau_io`, `t_row`, `T_disp`) still need decomposition.
+**So `B` is a CONTROLLED variable, not a fixed input** — the controller's whole job is to shape it. The
+**`AllAllow` controller** (allow every thread every forward) is byte-identical to the fixed-D runner — the
+A/B **baseline arm**. `N` (`--trees-per-thread`) survives only as a *fixed producer-geometry* knob, **not**
+the operating variable (the gate is). The fixed-N `overcommit_sweep.py` — a self-described *throwaway* bench
+— is a **different** harness and is **not** "production"; any reading that says "production = overcommit_sweep,
+N is the swept knob" is superseded (this entry and the Step-0 record both said it once; both are corrected here).
 
-A representative operating point (1:3 pinning, `n_sims=256`, 3 threads): `N=1` strict → B≈28, dps≈86;
-`N=8` pipelined → B≈179, dps≈158; `N=9` → B≈201, dps≈157 (saturating). The model's optimistic bound is
-≈456 dps and the server's fast region is B≈192 — so the gap to explain is ≈456 (model) vs ≈158 (harness).
+**The value of control is regime-dependent** (verified — `step-0-synthesis-and-path-forward.md`): under the
+default drain-all path (`chunk_floor` off) the gate is largely inert and the methods sit at *parity* with
+`AllAllow` (≈96 dps at `pool_batch=192`, 30 s); under the **convoy regime** (`chunk_floor`/depth>1) the gate
+bites and the controllers **dominate** (`AllAllow` collapses, controllers recover ~3–7×). The model's
+optimistic ceiling ≈456 dps is a *modeled* upper bound at an operating point that **exists nowhere as a
+runnable config**. Do not carry a single "X dps" as *the* production number — every such number is config-
+and regime-specific (claims-measured-vs-interpreted).
+
+> **The two deep findings (synthesis note):** (1) the static model `f=min(stages)` with a *fixed* `B_op`
+> describes an *open-loop, fixed* operating point; the implementation is a *controller searching for the best
+> one* — **the model does not model control.** (2) "The operating point we are explaining" has **no single
+> home** — a codebase-level ADR-0012 SSOT violation (the config is multiply-homed across the harness family;
+> the model's operating point is joined to the harness only by prose). Both are why "production" took three
+> corrections — see `docs/notes/leaf-eval-loop/step-0-synthesis-and-path-forward.md`.
 
 ---
 
@@ -57,7 +73,7 @@ never carry one file's reading into another.
 
 | Symbol | The trap |
 | --- | --- |
-| **`N`** | **Overloaded three ways — the footgun.** (1) In the **wire serve path** (`runner_wire_batched.hpp`), `N` = `trees_per_thread`, the **overcommit multiplier** (N independent `TreeState`s per producer thread) — **LIVE: it is the swept operating knob of this project's production harness (§0)**; `StrictBarrier`/`N=1` is the sweep's *baseline*, not a "production default." (2) In the **belief/env path** (`collected_set.hpp`, `env.hpp`), `N` = the **world / treasure count**, structurally `≤ 32` (the world-mask packs into a `uint32`). (3) In featurization (`feature_compute.hpp`), `N` is a feature/action dimension. The structural field name `trees_per_thread` is unambiguous; the footgun is the bare shorthand "`N`" plus the word "production" (§0) — the blind-model's *"deployed default = strict-barrier, N=1"* conflated the non-standardized `--serve` path with this project's actual production (the sweep harness, where N is the live knob). |
+| **`N`** | **Overloaded three ways — the footgun.** (1) In the **wire serve / producer path** (`runner_wire_batched.hpp`), `N` = `trees_per_thread`, the **overcommit multiplier** (N independent `TreeState`s per producer thread). In `control_lab` (production, §0) it is a **fixed producer-geometry knob — NOT the operating variable**: the operating variable is the issue-**gate**, and the baseline is the `AllAllow` controller, not `N=1`. (2) In the **belief/env path** (`collected_set.hpp`, `env.hpp`), `N` = the **world / treasure count**, structurally `≤ 32` (the world-mask packs into a `uint32`). (3) In featurization (`feature_compute.hpp`), `N` is a feature/action dimension. The structural field name `trees_per_thread` is unambiguous; the footgun is the bare shorthand "`N`" plus the word "production" — which has misled this loop **three** times (`--serve` "N dead" → overcommit_sweep "N the swept knob" → control_lab "N a fixed geometry knob, the gate is the variable"). The overcommit *mechanism itself* was also silently redefined across sweeps (`trees_per_thread` knob vs native `K`) — see the SSOT note. |
 | **`B` / `B_op`** | `B` (model symbol) = `B_op` (registry quantity) = **rows per forward** — the serve batch width. The *model* evaluates it at a full bucket (`B_op≈256`); the harness's realized rows/forward is a **different, measured** number — `server_mean_rows_per_fwd` (emitted per swept cell, §0). NB `mean_rows_per_msg` / `wire_rows_per_msg` is rows/**message**, NOT rows/forward (the server coalesces across messages). Do not assume model-`B` = realized-`B`: their gap is the central operating-point question. |
 | **`K`** | `K` = `fibers_per_thread` = `ceil(pool_batch / pool_threads)` — the per-thread in-flight **slot count** in the strict path (§5). It is *not* the model's `B`, though under `StrictBarrier` the realized rows/forward is close to `K`. (Beware: `K` also appears in C++ profiling comments as an unrelated profile label, e.g. "the K=16 profile.") |
 | **`L` vs `LPD`** | Same quantity: **leaves per decision**. `L` is the model symbol; `LPD` / `leaves_per_decision` is the registry quantity name. |
@@ -153,10 +169,12 @@ From `docs/design/leaf-eval-impl-to-model-diagnostic-loop.md` and the witness-lo
 
 ## 5. The serving implementation (what we are explaining)
 
-**Read §0 first.** For this sub-project "production" is the **harness** (the pipelined-bucket sweep, `N`
-live), *not* the `--serve` path. The loci below are correct code facts, but the "`StrictBarrier` is the
-production DEFAULT" / "`N` ignored" framing describes the non-standardized `--serve` deployment — the
-harness drives the **`PipelinedBucket`** path where `N` and `wire_rows_per_msg` are live.
+**Read §0 first.** For this sub-project "production" is **`control_lab`** (the closed-loop issue-gate
+controller, §0) — not the `--serve` path, and not the fixed-N `overcommit_sweep`. The serve-path loci below
+are correct code facts (control_lab's `LabServer` is a `StageAServer` subclass over the same `jit_forward_core`),
+but the "`StrictBarrier` is the production DEFAULT" / "`N` ignored" framing describes the non-standardized
+`--serve` deployment; control_lab drives the `PipelinedBucket` path with a per-forward `Controller` gate, so
+**`B` is controlled, not a fixed operating point.**
 
 The running actor is a persistent **C++ Gumbel-AZ** process generating episodes; leaf evaluation goes
 by one of two paths.
