@@ -41,7 +41,7 @@ TWO HONEST CAVEATS (this is a MECHANISM test, not a trustworthy measurement):
      honest; this driver is unchanged by it (same samplers, real numbers).
 
 Run (sole-workload):
-    /home/bork/w/vdc/venvs/generic/bin/python tools/analysis/leaf_eval_bound/untrusted_drive.py [slug]
+    /home/bork/w/vdc/venvs/generic/bin/python -m leaf_eval_bound.runners.untrusted_drive [slug]   (from tools/analysis)
         slug in {zmq_baseline, shm_spin_poll, futex_wake, lockfree_mpsc, cpp_inproc_port}
         default: zmq_baseline
     Env knobs: UD_PILOT (pilot budget/input, default 32), UD_ROUNDS (max rounds, default 4),

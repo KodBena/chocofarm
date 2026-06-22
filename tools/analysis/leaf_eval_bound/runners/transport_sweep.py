@@ -87,7 +87,7 @@ numpy over each model's diagnostics; the CI half-width + the VARIANCE ranking ar
 delta-method fallback retired with the single-f collapse, J4). A driver failure RAISES loudly
 (ADR-0002) — there is no silent fallback.
 
-Run: /home/bork/w/vdc/venvs/generic/bin/python tools/analysis/leaf_eval_bound/transport_sweep.py
+Run: /home/bork/w/vdc/venvs/generic/bin/python -m leaf_eval_bound.runners.transport_sweep   (from tools/analysis, or PYTHONPATH=tools/analysis)
 
 Public Domain (The Unlicense).
 """

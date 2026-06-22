@@ -20,7 +20,7 @@ trusted=True), not drawing more samples of a fixed prior. The gradient is `jax.g
 model's `throughput_jax` (the OT→JAX migration — this runner imports no OpenTURNS, and the old
 numpy delta-method fallback/cross-check retired with the single-f collapse, J4).
 
-Run: /home/bork/w/vdc/venvs/generic/bin/python tools/analysis/leaf_eval_bound/throughput_bound.py
+Run: /home/bork/w/vdc/venvs/generic/bin/python -m leaf_eval_bound.runners.throughput_bound   (from tools/analysis, or PYTHONPATH=tools/analysis)
 
 Public Domain (The Unlicense).
 """
