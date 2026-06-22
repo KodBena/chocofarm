@@ -314,9 +314,9 @@ def test_quantile_and_fixed_estimates_flow_through_the_driver_step() -> None:
     round to zero — a distinct mechanism, not the allocator)."""
     pytest.importorskip("scipy")
 
-    from neyman_driver import NeymanDriver
+    from alloc.driver import AllocationDriver
     f = lambda x: 2.0 * x[0] + 3.0 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
     med_est = BC.median_estimate(_skewed_pool(base=10.0), name="x0")   # a QuantileLaw input
     pin_est = BC.pin_estimate(5.0, 2.0, name="x1")                     # a Fixed declared-spread input
     d.set_estimate(0, med_est)

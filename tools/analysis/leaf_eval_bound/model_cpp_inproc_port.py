@@ -11,9 +11,9 @@ sketched it at ~620 dps; this is the FULL model on the shared spine). It compose
 serialized-serve-cycle structure the v1 cycle-time model (model_cycletime.py) uses —
 `cycle_us = T_disp + wakeup + tau_io + B_eff*t_row`, `dps = min(N_gen*R_gen, 1e6*B/(cycle*L))`
 evaluated at a FULL bucket (the serve sawtooth's peak) — with THIS transport's (tau_io, wakeup,
-msg-cost) profile substituted. It is one model module the generic `NeymanDriver` consumes (ADR-0012
+msg-cost) profile substituted. It is one model module the generic `AllocationDriver` consumes (ADR-0012
 P1/P2: the driver owns no model; this module owns ITS math + reads every input through the manifest
-SSOT, never a hand-copied literal; the NeymanDriver owns allocation; bench_store owns SQL).
+SSOT, never a hand-copied literal; the AllocationDriver owns allocation; bench_store owns SQL).
 
 WHAT THIS TRANSPORT MOVES (vs the ZMQ baseline; the rest of the cycle is INVARIANT):
 
@@ -217,13 +217,13 @@ NEEDS_MEASUREMENT: dict[str, bool] = {nm: (not t) for nm, t in trusted_flags(tru
 
 
 def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[Any, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` (over the JAX `f` (`throughput_jax`), the per-input costs) + the resolved initial
+    """Factory: a configured `AllocationDriver` (over the JAX `f` (`throughput_jax`), the per-input costs) + the resolved initial
     point. `tolerance` is the target CI half-width on E[f] in dps. `trust` selects live-vs-seed inputs. Imported
     lazily (deferred to keep this module import-cheap)."""
-    from neyman_driver import NeymanDriver
+    from alloc.driver import AllocationDriver
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     cost_list = [_COST[nm] for nm in INPUT_NAMES]
-    driver = NeymanDriver(
+    driver = AllocationDriver(
         f, costs=cost_list, tolerance=tolerance, names=INPUT_NAMES,
         confidence=0.95, growth_cap=3.0,
     )
@@ -417,7 +417,7 @@ if __name__ == "__main__":
           f"{SLUG}_wakeup_us >> {SLUG}_tmsg_us_leaf.")
     print(f"    (b) VARIANCE-CONTRIBUTION (the allocator's data-driven c_i ranking): once SERVE-bound the cycle "
           f"is compute-dominated (B*t_row at the bare slope ~= {256*3.092:.0f}us of the ~{256*3.092+68.84+41.1:.0f}us "
-          f"cycle), so t_row and L (then B) carry the largest a_i=(df/dx)^2*sigma^2 and the NeymanDriver funds "
+          f"cycle), so t_row and L (then B) carry the largest a_i=(df/dx)^2*sigma^2 and the AllocationDriver funds "
           f"them first — surface BOTH: design-priority says measure tau_io + the gather to pin the transport; "
           f"variance says measure the bare t_row / L to pin E[f]. The two agree the transport terms are settled "
           f"once tau_io + the gather-elision are known; the residual CI is then a SERVE-physics (t_row/L) question.")

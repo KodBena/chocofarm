@@ -9,7 +9,7 @@ reply ring. It composes the SAME serialized-serve-cycle structure the v1 cycle-t
 (model_cycletime.py) uses — `cycle_us = T_disp + tau_io + B_eff*t_row`,
 `dps = min(N_gen*R_gen, 1e6*B/(cycle*L))` evaluated at a FULL bucket (the serve sawtooth's
 peak) — with THIS transport's (tau_io, wakeup, msg-cost) profile substituted. It is one model
-module the generic `NeymanDriver` consumes (ADR-0012 P1/P2: the driver owns no model; this
+module the generic `AllocationDriver` consumes (ADR-0012 P1/P2: the driver owns no model; this
 module owns ITS math + reads every input through the manifest SSOT, never a hand-copied
 literal).
 
@@ -177,13 +177,13 @@ def untrusted_inputs(trust: bool = True) -> list[str]:
 
 
 def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[Any, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` (over the JAX `f` (`throughput_jax`), the per-input costs) + the resolved initial
+    """Factory: a configured `AllocationDriver` (over the JAX `f` (`throughput_jax`), the per-input costs) + the resolved initial
     point. `tolerance` is the target CI half-width on E[f] in dps. `trust` selects live-vs-seed inputs.
     Imported lazily (deferred to keep this module import-cheap)."""
-    from neyman_driver import NeymanDriver
+    from alloc.driver import AllocationDriver
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     cost_list = [_COST[nm] for nm in INPUT_NAMES]
-    driver = NeymanDriver(
+    driver = AllocationDriver(
         f, costs=cost_list, tolerance=tolerance, names=INPUT_NAMES,
         confidence=0.95, growth_cap=3.0,
     )

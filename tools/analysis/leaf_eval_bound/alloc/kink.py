@@ -2,7 +2,7 @@
 tools/analysis/leaf_eval_bound/alloc/kink.py
 ======================================
 
-The Clark-1961 min()-KINK machinery — lifted out of `neyman_driver.py` as a PURE,
+The Clark-1961 min()-KINK machinery — lifted out of `alloc/driver.py` as a PURE,
 self-contained module (the responsibility-refactor's move 4;
 `docs/design/leaf-eval-bound-responsibility-refactor.md` §2.3-D / §3 move 4). It owns the
 §4.1 binding-margin diagnostic + the Clark-1961 closed-form `E[min]` / `Var[min]`: given a
@@ -12,7 +12,7 @@ allocation driver uses near an arg-min tie — or None in the smooth regime.
 
 It depends on NOTHING in the driver but the arm capacities + their covariances (numpy + a
 lazy `scipy.stats.norm` for Φ/φ): the driver supplies the arms (it owns the `arms_fn`
-adapter, `NeymanDriver._model_arms`, that reads them off the model) and Σ; this module
+adapter, `AllocationDriver._model_arms`, that reads them off the model) and Σ; this module
 supplies the statistics. That is what makes it unit-testable on synthetic arm covariances
 without an OpenTURNS `f`, and what keeps it INDEPENDENT of the gradient backend: the
 planned OpenTURNS→JAX swap (§5) touches the smooth-gradient path only — the kink consumes
@@ -44,7 +44,7 @@ def assess_min_kink(
     (deterministic, O(1), NO Monte-Carlo) the kink path uses.
 
     `arms` is the model's min()-arms at the evaluation point, as `[(capacity, ∇capacity_ndarray), …]`
-    — the driver extracts them via its `arms_fn` adapter (`NeymanDriver._model_arms`) and passes them
+    — the driver extracts them via its `arms_fn` adapter (`AllocationDriver._model_arms`) and passes them
     here; absent a visible-min model the driver passes None (and a single arm is < 2), so this returns
     None — the honest default, never a fabricated tie. `Sigma` is the joint input covariance (the §2.2
     Σ). `pfloor` is the binding-margin trigger: the contender's arg-min probability `Φ(t)` must reach it

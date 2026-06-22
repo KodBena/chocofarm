@@ -3,7 +3,7 @@ tools/analysis/leaf_eval_bound/model_cycletime.py
 ===========================================
 
 Design-B: the CYCLE-TIME / LATENCY lower bound on the achievable leaf-eval throughput
-(dps), as one model module the generic `NeymanDriver` consumes (ADR-0012 P1/P2). It
+(dps), as one model module the generic `AllocationDriver` consumes (ADR-0012 P1/P2). It
 derives the SAME bound as Design-A by a different route — composing the single
 serialized server's per-forward CYCLE from named latency terms rather than fitting a
 leaves/s curve — so the two numbers agreeing is the cross-check, and every transport
@@ -82,7 +82,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import leaf_eval_grounding as G  # noqa: E402
-from neyman_driver import NeymanDriver  # noqa: E402
+from alloc.driver import AllocationDriver  # noqa: E402
 
 # Single home of the model signature (`throughput_jax` + numpy `throughput_numpy` share it — P1).
 INPUT_NAMES = ["N_gen", "R_gen", "B", "T_disp", "T_io", "t_row", "L"]
@@ -156,12 +156,12 @@ def initial_point() -> dict[str, float]:
     return {nm: g.mean for nm, g in zip(INPUT_NAMES, _INPUTS)}
 
 
-def build_driver(tolerance: float = 5.0) -> tuple[NeymanDriver, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` + the initial point. `tolerance` = target CI
+def build_driver(tolerance: float = 5.0) -> tuple[AllocationDriver, dict[str, float]]:
+    """Factory: a configured `AllocationDriver` + the initial point. `tolerance` = target CI
     half-width on E[f] in dps."""
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     costs = [g.cost for g in _INPUTS]
-    driver = NeymanDriver(
+    driver = AllocationDriver(
         f, costs=costs, tolerance=tolerance, names=INPUT_NAMES,
         confidence=0.95, growth_cap=3.0,
     )

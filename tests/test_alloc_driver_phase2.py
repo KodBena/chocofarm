@@ -1,5 +1,5 @@
 """
-tests/test_neyman_driver_phase2.py
+tests/test_alloc_driver_phase2.py
 ==================================
 
 §6 Phase 2 of the harmonized-estimator migration
@@ -28,7 +28,7 @@ The tests cover the §6 Phase-2 deliverables and the §8 EXECUTED verification t
   * the per-family CI multiplier (§4.3) — NORMAL→z, STUDENT_T(dof)→t_dof, the mixed-family
     conservative multiplier.
 
-The `estimate`/`neyman_driver` modules live under tools/analysis/leaf_eval_bound/ (no
+The `estimate`/`alloc.driver` modules live under tools/analysis/leaf_eval_bound/ (no
 __init__.py — imported by sys.path the way manifest.py imports them), so this test
 prepends that directory. jax + cvxpy + scipy are required (the driver's deps); the
 tests skip loudly if a dep is genuinely absent rather than asserting a false pass.
@@ -54,8 +54,8 @@ if _OT not in sys.path:
 pytest.importorskip("scipy", reason="the Clark closed form needs scipy.stats.norm")
 
 import estimate as E  # noqa: E402  — the Estimate contract
-import neyman_driver as ND  # noqa: E402  — the Phase-2 driver under test
-from neyman_driver import NeymanDriver, _t_multiplier  # noqa: E402
+import alloc.driver as ND  # noqa: E402  — the Phase-2 driver under test
+from alloc.driver import AllocationDriver, _t_multiplier  # noqa: E402
 from alloc.jax_backend import jnp  # noqa: E402  — x64-enabled JAX; needed for jnp.minimum fixtures
 from alloc.gradient import jax_gradient  # noqa: E402  — for _legacy_diagonal_step
 
@@ -140,7 +140,7 @@ def test_set_estimate_rejects_non_estimate_and_bad_index() -> None:
     """ADR-0002: set_estimate validates the input contract — a non-Estimate, or an out-of-range index,
     is a loud error, never a silent accept."""
     f = lambda x: x[0] + x[1]
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
     with pytest.raises(TypeError):
         d.set_estimate(0, {"mean": 1.0})  # a bespoke dict is exactly what the contract forbids
     with pytest.raises(IndexError):
@@ -149,7 +149,7 @@ def test_set_estimate_rejects_non_estimate_and_bad_index() -> None:
 
 def test_set_estimates_by_name_unknown_name_raises() -> None:
     f = lambda x: x[0] + x[1]
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
     with pytest.raises(KeyError):
         d.set_estimates_by_name({"not_an_input": _poolwise("q", 1.0, 1.0, 10)})
 
@@ -163,11 +163,11 @@ def test_pool_and_estimate_fed_drivers_agree_on_the_mean_case() -> None:
     rng = np.random.default_rng(11)
     p0, p1 = rng.normal(10, 3, 60), rng.normal(20, 2, 45)
 
-    dp = NeymanDriver(f, costs=costs, tolerance=tol, names=["x0", "x1"], confidence=0.95)
+    dp = AllocationDriver(f, costs=costs, tolerance=tol, names=["x0", "x1"], confidence=0.95)
     dp.add_samples({0: p0, 1: p1})
     rp = dp.step(second_order_check=False)
 
-    de = NeymanDriver(f, costs=costs, tolerance=tol, names=["x0", "x1"], confidence=0.95)
+    de = AllocationDriver(f, costs=costs, tolerance=tol, names=["x0", "x1"], confidence=0.95)
     for i, pool in ((0, p0), (1, p1)):
         de.set_estimate(i, _poolwise(["x0", "x1"][i], float(pool.mean()), float(pool.var(ddof=1)),
                                      len(pool)))
@@ -197,7 +197,7 @@ def test_gtsigmag_equals_legacy_diagonal_sum_no_regression() -> None:
     pools = [rng.normal(10, 3, 60), rng.normal(20, 2, 45), rng.normal(5, 4, 80)]
     leg = _legacy_diagonal_step(f, costs, tol, names, pools)
 
-    d = NeymanDriver(f, costs=costs, tolerance=tol, names=names, confidence=0.95)
+    d = AllocationDriver(f, costs=costs, tolerance=tol, names=names, confidence=0.95)
     d.add_samples({i: pools[i] for i in range(3)})
     rec = d.step(second_order_check=False)
 
@@ -218,7 +218,7 @@ def test_gtsigmag_folds_in_the_cross_term() -> None:
     Sig01 = corr * math.sqrt(Sig00 * Sig11)
     e0 = _poolwise("x0", 10.0, s0, n0, cross={"x1": Sig01})
     e1 = _poolwise("x1", 5.0, s1, n1, cross={"x0": Sig01})
-    d = NeymanDriver(f, costs=[1.0, 1.5], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.5], tolerance=0.5, names=["x0", "x1"])
     Sigma = d._assemble_sigma([e0, e1])
     assert Sigma[0, 1] == Sigma[1, 0]
     assert math.isclose(Sigma[0, 1], Sig01, rel_tol=1e-12)
@@ -235,7 +235,7 @@ def test_assemble_sigma_rejects_disagreeing_cross_homes() -> None:
     f = lambda x: x[0] + x[1]
     e0 = _poolwise("x0", 1.0, 1.0, 10, cross={"x1": -0.05})
     e1 = _poolwise("x1", 1.0, 1.0, 10, cross={"x0": -0.09})  # disagrees with e0's -0.05
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=1.0, names=["x0", "x1"])
     with pytest.raises(ValueError):
         d._assemble_sigma([e0, e1])
 
@@ -251,7 +251,7 @@ def test_socp_reduces_to_closed_form_on_the_diagonal() -> None:
     costs = np.array([1.0, 2.5, 0.8])
     rng = np.random.default_rng(7)
     pools = [rng.normal(10, 3, 60), rng.normal(20, 2, 45), rng.normal(5, 4, 80)]
-    d = NeymanDriver(f, costs=list(costs), tolerance=0.5, names=["x0", "x1", "x2"])
+    d = AllocationDriver(f, costs=list(costs), tolerance=0.5, names=["x0", "x1", "x2"])
     d.add_samples({i: pools[i] for i in range(3)})
     ests = [d._estimate_for(i) for i in range(3)]
     Sigma = d._assemble_sigma(ests)
@@ -282,7 +282,7 @@ def test_socp_hits_v_star_on_a_nondiagonal_sigma() -> None:
     Sig01 = corr * math.sqrt(Sig00 * Sig11)
     e0 = _poolwise("x0", 10.0, s0, n0, cross={"x1": Sig01})
     e1 = _poolwise("x1", 5.0, s1, n1, cross={"x0": Sig01})
-    d = NeymanDriver(f, costs=[1.0, 1.5], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.5], tolerance=0.5, names=["x0", "x1"])
     Sigma = d._assemble_sigma([e0, e1])
     grad = np.array([2.0, 3.0])
     V = 5.0
@@ -307,7 +307,7 @@ def test_socp_sign_safe_on_mixed_sign_gradients() -> None:
     Sig01 = corr * math.sqrt(Sig00 * Sig11)
     e0 = _poolwise("x0", 10.0, s0, n0, cross={"x1": Sig01})
     e1 = _poolwise("x1", 5.0, s1, n1, cross={"x0": Sig01})
-    d = NeymanDriver(f, costs=[1.0, 1.5], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.5], tolerance=0.5, names=["x0", "x1"])
     Sigma = d._assemble_sigma([e0, e1])
     grad = np.array([-2.0, 3.0])  # MIXED sign — the trap input
     V = 5.0
@@ -324,7 +324,7 @@ def test_fixed_pin_drops_out_of_allocation() -> None:
     unchanged) — but it still contributes its a_i to the bound (via gᵀΣg). The 'don't sample dead
     inputs' branch, now for the right reason (irreducible, not merely a==0)."""
     f = lambda x: 2.0 * x[0] + 3.0 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))   # shrinkable mean
     d.set_estimate(1, _fixed("x1", 5.0, 2.0))           # un-shrinkable pin
     rec = d.step(second_order_check=False)
@@ -344,7 +344,7 @@ def test_degenerate_true_constant_contributes_zero_to_the_bound() -> None:
     driver's bound (`gᵀΣg`) must zero it: the DEGENERATE `var_contribution` is 0 even though `df/dx≠0`.
     This is the bound-side twin of `_family_multiplier` already excluding DEGENERATE."""
     f = lambda x: x[0] * x[1]  # both gradients nonzero (g=[R, N])
-    d = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
+    d = AllocationDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
     d.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))   # TRUE CONSTANT (DEGENERATE), df/dN = R = 152
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))       # declared-spread prior (NORMAL), df/dR = N = 3
     rec = d.step(second_order_check=False)
@@ -365,13 +365,13 @@ def test_degenerate_pin_removal_is_the_before_after_of_the_run_output_stall() ->
     declared-spread it WOULD contribute (the contrast that proves it is the family, not the law)."""
     f = lambda x: x[0] * x[1]
     # DEGENERATE N_gen -> 47.04 (the fix)
-    d1 = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"])
+    d1 = AllocationDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"])
     d1.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))
     d1.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
     r1 = d1.step(second_order_check=False)
     assert math.isclose(r1.ci_halfwidth, d1.z * math.sqrt(576.0), rel_tol=1e-9)
     # If N_gen were a NORMAL declared-spread (a contrived contrast) it WOULD add 57.76 -> 49.34.
-    d2 = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"])
+    d2 = AllocationDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"])
     d2.set_estimate(0, _fixed("N_gen", 3.0, 0.05))       # NORMAL, not DEGENERATE
     d2.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
     r2 = d2.step(second_order_check=False)
@@ -387,7 +387,7 @@ def test_var_floor_separates_declared_prior_from_shrinkable_variance() -> None:
     DISTINCT from the shrinkable sampling variance. A model with one shrinkable mean + one declared-
     spread pin splits `var_estimate` into `var_floor` (the pin) + `var_shrinkable` (the mean) exactly."""
     f = lambda x: 2.0 * x[0] + 3.0 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))   # shrinkable mean: a = 2²·(9/50) = 0.72
     d.set_estimate(1, _fixed("x1", 5.0, 2.0))           # declared-spread pin: a = 3²·2² = 36
     rec = d.step(second_order_check=False)
@@ -403,7 +403,7 @@ def test_var_floor_blocks_target_when_prior_exceeds_tolerance() -> None:
     True and `converged` stays False — the CI honestly rests on the prior; the driver does NOT falsely
     converge on the shrinkable part alone (the false-SAT §2.3 forbids), it SURFACES why it cannot."""
     f = lambda x: x[0] * x[1]
-    d = NeymanDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
+    d = AllocationDriver(f, costs=[0.5, 30.0], tolerance=1.0, names=["N_gen", "R_gen"], confidence=0.95)
     d.set_estimate(0, _degenerate("N_gen", 3.0, 0.05))   # the true constant (out of the bound)
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))       # the declared prior, floor = 576
     rec = d.step(second_order_check=False)
@@ -418,7 +418,7 @@ def test_all_mean_report_has_no_floor_line_no_regression() -> None:
     """No-regression: an all-mean model (no Fixed input) has var_floor=0 and its report shows NO floor
     line — the §7.D surface is additive, visually inert on the case it does not apply to."""
     f = lambda x: 3.0 * x[0] - 1.5 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))
     d.set_estimate(1, _poolwise("x1", 20.0, 4.0, 50))
     rec = d.step(second_order_check=False)
@@ -464,7 +464,7 @@ def test_floored_fit_is_defunded_by_the_allocator_and_the_nudge() -> None:
     and the nudge funded the worst contributor — the over-funding this removes."""
     names = ["slope_us", "tau_io_us", "T_disp_us", "B_op"]
     f = lambda x: 1000000.0 / (x[2] + x[1] + x[3] * x[0])
-    d = NeymanDriver(f, costs=[50.0, 5.0, 1.0, 1.0], tolerance=5.0, names=names)
+    d = AllocationDriver(f, costs=[50.0, 5.0, 1.0, 1.0], tolerance=5.0, names=names)
     d.set_estimate(0, _fit(94.58, 4.317, lack_of_fit=True))      # the floored fit (dominant contributor)
     # near-certain pins so the fit is the dominant variance source.
     d.set_estimate(1, _fixed("tau_io_us", 3.2, 0.001))
@@ -503,7 +503,7 @@ def test_residual_limited_fit_is_funded() -> None:
         support=(E.Support.POSITIVE, E.Support.POSITIVE),
         family=(E.StudentT(dof=5), E.StudentT(dof=5)), kind="ols_fit")
     f = lambda x: 1000000.0 / (100.0 + 64.0 * x[0]) + 0.0 * x[1]
-    d = NeymanDriver(f, costs=[50.0, 1.0], tolerance=5.0, names=["slope_us", "p"])
+    d = AllocationDriver(f, costs=[50.0, 1.0], tolerance=5.0, names=["slope_us", "p"])
     d.set_estimate(0, est)
     d.set_estimate(1, _fixed("p", 1.0, 0.001))
     ests = [d._estimate_for(i) for i in range(2)]
@@ -521,7 +521,7 @@ def test_mean_allocation_A_is_byte_for_byte_the_pre_fix_sigma_times_n() -> None:
     machine epsilon) — so the closed-form / SOCP target the mean case produces is identical. This is the
     'keep the Poolwise mean case byte-for-byte' assertion the fix is required to preserve."""
     f = lambda x: 3.0 * x[0] - 1.5 * x[1] + 0.7 * x[2]
-    d = NeymanDriver(f, costs=[1.0, 2.5, 0.8], tolerance=0.5, names=["x0", "x1", "x2"])
+    d = AllocationDriver(f, costs=[1.0, 2.5, 0.8], tolerance=0.5, names=["x0", "x1", "x2"])
     rng = np.random.default_rng(7)
     for i, (mu, s2, n) in enumerate([(10.0, 9.0, 60), (20.0, 4.0, 45), (5.0, 16.0, 80)]):
         d.set_estimate(i, _poolwise(["x0", "x1", "x2"][i], mu, s2, n))
@@ -539,14 +539,14 @@ def test_mean_allocation_A_is_byte_for_byte_the_pre_fix_sigma_times_n() -> None:
 # --------------------------------------------------------------------------- #
 # 4. The Clark min()-kink path (§4.1) — the §8 reproduction targets.
 # --------------------------------------------------------------------------- #
-def _kink_driver(sigma_R: float) -> NeymanDriver:
+def _kink_driver(sigma_R: float) -> AllocationDriver:
     """A min(producer, serve) driver whose producer arm reads {N_gen, R_gen} (input-disjoint from the
     serve arm). producer = N_gen·R_gen with N_gen=3±0.05, R_gen=152±sigma_R; serve=428.28±2. σ₁ (the
     producer spread) propagates through N·R from the Estimate covs. The arms hook supplies the per-arm
     capacities + gradients the Clark path linearizes."""
     names = ["N_gen", "R_gen", "serve_cap"]
     f = lambda x: jnp.minimum(x[0] * x[1], x[2])
-    d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names, confidence=0.95)
+    d = AllocationDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names, confidence=0.95)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.05))
     d.set_estimate(1, _fixed("R_gen", 152.0, sigma_R))
     d.set_estimate(2, _fixed("serve_cap", 428.28, 2.0))
@@ -614,7 +614,7 @@ def test_clark_kink_funds_shrinkable_contender_input() -> None:
     a contender input the allocator can actually sample, not the futile pin-funding the pre-fix nudge did."""
     names = ["N_gen", "R_gen", "serve_cap"]
     f = lambda x: jnp.minimum(x[0] * x[1], x[2])
-    d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=2.0, names=names, confidence=0.95)
+    d = AllocationDriver(f, costs=[0.5, 30.0, 8.0], tolerance=2.0, names=names, confidence=0.95)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.01))
     # R_gen as a SHRINKABLE median pool (a real spread), tuned so producer ~ serve (a live tie).
     rng = np.random.default_rng(5)
@@ -642,7 +642,7 @@ def test_no_kink_regime_without_the_arms_hook() -> None:
     min() model WITHOUT arms_fn behaves exactly as today (kink_regime False, single-arm gᵀΣg)."""
     names = ["N_gen", "R_gen", "serve_cap"]
     f = lambda x: jnp.minimum(x[0] * x[1], x[2])
-    d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names)
+    d = AllocationDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.05))
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
     d.set_estimate(2, _fixed("serve_cap", 428.28, 2.0))
@@ -658,7 +658,7 @@ def test_run_stalls_when_nothing_fundable(capsys) -> None:
     everywhere). f=min(a*b, c) with a,b declared-spread pins binding (a*b=456) and c a high non-binding
     pin: nothing is fundable, so the loop is a fixed point, not convergence to the CI target."""
     f = lambda x: jnp.minimum(x[0] * x[1], x[2])
-    d = NeymanDriver(f, costs=[1.0, 1.0, 1.0], tolerance=0.01, names=["a", "b", "c"], confidence=0.95)
+    d = AllocationDriver(f, costs=[1.0, 1.0, 1.0], tolerance=0.01, names=["a", "b", "c"], confidence=0.95)
     ms = {0: lambda _b: _fixed("a", 3.0, 0.05), 1: lambda _b: _fixed("b", 152.0, 8.0),
           2: lambda _b: _fixed("c", 1000.0, 2.0)}
     rec = d.run(measurers=ms, pilot=10, max_rounds=20, verbose=True)
@@ -674,7 +674,7 @@ def test_kink_collapses_to_smooth_far_from_a_tie() -> None:
     the producer (456) is far above a much-lower serve (200), so no kink fires."""
     names = ["N_gen", "R_gen", "serve_cap"]
     f = lambda x: jnp.minimum(x[0] * x[1], x[2])
-    d = NeymanDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names)
+    d = AllocationDriver(f, costs=[0.5, 30.0, 8.0], tolerance=5.0, names=names)
     d.set_estimate(0, _fixed("N_gen", 3.0, 0.05))
     d.set_estimate(1, _fixed("R_gen", 152.0, 8.0))
     d.set_estimate(2, _fixed("serve_cap", 200.0, 2.0))  # serve far below producer -> no tie
@@ -695,7 +695,7 @@ def test_kink_collapses_to_smooth_far_from_a_tie() -> None:
 def test_family_multiplier_normal_is_z() -> None:
     """§4.3: an all-NORMAL set uses the z multiplier (today's behavior)."""
     f = lambda x: 3.0 * x[0] - 1.5 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, _poolwise("x0", 10.0, 9.0, 50))
     d.set_estimate(1, _poolwise("x1", 20.0, 4.0, 50))
     rec = d.step(second_order_check=False)
@@ -708,7 +708,7 @@ def test_family_multiplier_student_t_widens() -> None:
     z=1.96, a 31% wider CI honestly reported). The mixed-family case is LABELLED conservative."""
     assert _t_multiplier(5, 0.95) == pytest.approx(2.5706, abs=1e-3)
     f = lambda x: 3.0 * x[0] - 1.5 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
+    d = AllocationDriver(f, costs=[1.0, 2.0], tolerance=0.5, names=["x0", "x1"])
     d.set_estimate(0, E.Estimate(
         theta_hat=np.array([10.0]), cov=np.array([[0.5]]), names=("x0",),
         shrink=E.RegressionLaw(resid_var=1.0, XtX_inv=np.array([[1.0]]),
@@ -726,7 +726,7 @@ def test_family_multiplier_student_t_widens() -> None:
 def test_run_requires_exactly_one_of_measurers_or_samplers() -> None:
     """ADR-0002: run() takes EXACTLY ONE input contract — both, or neither, is a loud error."""
     f = lambda x: x[0]
-    d = NeymanDriver(f, costs=[1.0], tolerance=1.0, names=["x0"])
+    d = AllocationDriver(f, costs=[1.0], tolerance=1.0, names=["x0"])
     with pytest.raises(ValueError):
         d.run()  # neither
     with pytest.raises(ValueError):
@@ -738,7 +738,7 @@ def test_run_measurers_form_converges() -> None:
     """The §6 Phase-2 `measurers[i](budget) -> Estimate` form drives the loop to convergence on a smooth
     all-mean model (the form the migrated runners move to in Phase 4)."""
     f = lambda x: x[0] + 2.0 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=2.0, names=["x0", "x1"], confidence=0.95)
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=2.0, names=["x0", "x1"], confidence=0.95)
     rng = np.random.default_rng(1)
     state = {0: [], 1: []}
 
@@ -760,7 +760,7 @@ def test_run_legacy_samplers_form_still_works() -> None:
     before it moved to `measurers` -> Estimate) still drives the loop — Phase 2 is additive, the
     `add_samples` shim is kept, not a breaking change."""
     f = lambda x: x[0] + 2.0 * x[1]
-    d = NeymanDriver(f, costs=[1.0, 1.0], tolerance=2.0, names=["x0", "x1"], confidence=0.95)
+    d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=2.0, names=["x0", "x1"], confidence=0.95)
     rng = np.random.default_rng(0)
     rec = d.run(samplers={0: lambda k: rng.normal(10, 3, int(k)),
                           1: lambda k: rng.normal(5, 1, int(k))},

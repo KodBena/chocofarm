@@ -1,13 +1,13 @@
 """
-tools/analysis/leaf_eval_bound/neyman_driver.py
+tools/analysis/leaf_eval_bound/alloc/driver.py
 =========================================
 
-The GENERIC, model-agnostic Neyman optimal-allocation driver — a benchmark-budget
+The GENERIC, model-agnostic **allocation** driver (`AllocationDriver`) — a benchmark-budget
 allocator for functional uncertainty-propagation models. It owns NO specific model
 (ADR-0012 P1 single-home / P2 separation of the allocator-transport from the thing
 allocated): a concrete throughput model is a SEPARATE module (e.g.
 `examples/demo_msgpass.py`, `model_capacity.py`, `model_cycletime.py`) that builds an
-a JAX-traceable `f(x_array)` (its `throughput_jax`) and hands it to `NeymanDriver`. The synthetic demo that previously lived
+a JAX-traceable `f(x_array)` (its `throughput_jax`) and hands it to `AllocationDriver`. The synthetic demo that previously lived
 in this file (the `_demo()` impurity) was extracted to
 `tools/analysis/leaf_eval_bound/examples/demo_msgpass.py` per the ADR-0012 purification.
 
@@ -111,17 +111,18 @@ import numpy as np
 # beside the raw pool (set_estimate), reads its already-divided sampling variance off `cov`, and
 # wraps a raw pool as a `Poolwise` Estimate so a pool-fed and an Estimate-fed driver AGREE on the
 # mean case (the confirmed fixed point). It lives in this directory (no package), imported by
-# sys.path the way manifest.py imports it — so adding our directory keeps the import working
+# sys.path the way manifest.py imports it — so adding the tool root keeps the import working
 # whether the driver is imported as a sibling module or from the repo root.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_HERE = os.path.dirname(os.path.abspath(__file__))          # .../leaf_eval_bound/alloc
+_ROOT = os.path.dirname(_HERE)                              # .../leaf_eval_bound  (the tool root)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 import estimate as _est  # noqa: E402  — the Estimate contract (numpy-only; touches no DB)
 # The generic OR machinery in the `alloc` sub-package: `alloc.gradient.jax_gradient` is the JAX gradient
 # backend (the OT→JAX migration, §5 — the driver consumes a JAX-traceable `f` and differentiates it with
 # jax.grad), `alloc.kink` is the §4.1 Clark-1961 min()-kink closed form (pure, backend-independent). The
 # x64-enabled JAX handle `alloc.jax_backend.jnp` evaluates `f` at a point. All resolve via the
-# `sys.path.insert(0, _HERE)` above — `alloc` is a sub-package of this directory.
+# `sys.path.insert(0, _ROOT)` above — `alloc` is the sub-package this module now lives in (resolved from the tool root).
 from alloc import gradient as _grad, kink as _kink  # noqa: E402
 from alloc.jax_backend import jnp  # noqa: E402  — x64-enabled jnp for evaluating the JAX f at a point
 
@@ -247,7 +248,7 @@ class Recommendation:
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
-class NeymanDriver:
+class AllocationDriver:
     """
     Iterative optimal-allocation driver for a JAX-traceable scalar function f.
 
@@ -286,7 +287,7 @@ class NeymanDriver:
     ):
         if names is None:
             raise ValueError(
-                "NeymanDriver: `names` is required — it defines the input dimension AND the order the "
+                "AllocationDriver: `names` is required — it defines the input dimension AND the order the "
                 "JAX `f` is called with (`f` takes an array ordered by `names`). The OT→JAX migration "
                 "dropped `f.getInputDimension()` (a JAX callable has no such method) — ADR-0002.")
         self.f = f
@@ -866,7 +867,7 @@ class NeymanDriver:
             import cvxpy as cp
         except ImportError as exc:
             raise ImportError(
-                "neyman_driver: the §2.3 SOCP allocation needs cvxpy (CLARABEL) for a non-diagonal Σ "
+                "alloc.driver: the §2.3 SOCP allocation needs cvxpy (CLARABEL) for a non-diagonal Σ "
                 "(a correlated/fit input). `pip install cvxpy`. (ADR-0002: a non-diagonal Σ cannot be "
                 "allocated by the diagonal closed form, so this is a loud requirement, not a fallback.)"
             ) from exc
@@ -914,7 +915,7 @@ class NeymanDriver:
                 break
         if n_sub is None:
             raise RuntimeError(
-                f"neyman_driver: the §2.3 SOCP did not yield an allocation satisfying gᵀΣ(n*)g ≈ V* "
+                f"alloc.driver: the §2.3 SOCP did not yield an allocation satisfying gᵀΣ(n*)g ≈ V* "
                 f"(V_target={V_target:.6g}) on either CLARABEL or SCS — a solver failure or a silent "
                 f"sign-fold / ill-conditioning (ADR-0002 / §8 correction 3, the assertion the `optimal` "
                 f"status cannot replace). The bound is NOT trusted; surfaced rather than swallowed.")
@@ -930,7 +931,7 @@ class NeymanDriver:
         """The diagonal closed-form Neyman allocation `n_i* ∝ √(a_i/c_i)` scaled to hit V_target — the
         SOCP's diagonal special case, used as the cvxpy-absent fallback ONLY when Σ is diagonal (where
         it is exact and equals the SOCP). `a_i = g_i²·A_i` (the per-sample variance contribution). This
-        is the legacy `neyman_driver` allocation line, preserved for the no-cvxpy diagonal path."""
+        is the legacy `alloc.driver` allocation line, preserved for the no-cvxpy diagonal path."""
         a = (g ** 2) * A
         costs = np.asarray(costs, dtype=float)
         sqrt_ac = np.sqrt(np.where(fundable, a * costs, 0.0))
@@ -968,7 +969,7 @@ class NeymanDriver:
         """
         if (measurers is None) == (samplers is None):
             raise ValueError(
-                "NeymanDriver.run: pass EXACTLY ONE of `measurers` (the §6 Phase-2 Estimate form) or "
+                "AllocationDriver.run: pass EXACTLY ONE of `measurers` (the §6 Phase-2 Estimate form) or "
                 "`samplers` (the legacy raw-pool form) — got "
                 f"{'both' if measurers is not None else 'neither'} (ADR-0002: an ambiguous input "
                 "contract is a loud error).")

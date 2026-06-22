@@ -25,7 +25,7 @@ coercion + unify on `measure() -> Estimate`. The three coupled deliverables:
      grad²·σ²` exactly — the `/2` is cancelled by the √2). A declared-spread prior is a
      `Fixed` Estimate that drops out of allocation (the §2.3 branch), un-shrinkable.
 
-The `estimate`/`neyman_driver`/`manifest`/`untrusted_drive`/`throughput_bound`/
+The `estimate`/`alloc.driver`/`manifest`/`untrusted_drive`/`throughput_bound`/
 `transport_sweep`/`bench_*` modules live under tools/analysis/leaf_eval_bound/ (no __init__.py —
 imported by sys.path the way manifest.py imports bench_store), so this test prepends those
 directories. jax + scipy + cvxpy are the driver's deps; the tests skip loudly if one
@@ -465,7 +465,7 @@ def test_old_longest_list_heuristic_craters_the_bound() -> None:
     _driver_deps()
     import reconstruct as R
     import model_zmq_baseline as model
-    from neyman_driver import NeymanDriver  # noqa: F401  (import gate)
+    from alloc.driver import AllocationDriver  # noqa: F401  (import gate)
 
     names = model.INPUT_NAMES
     x0 = model.initial_point(trust=True)

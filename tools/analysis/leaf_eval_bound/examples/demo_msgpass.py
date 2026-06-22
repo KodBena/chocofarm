@@ -2,9 +2,9 @@
 tools/analysis/leaf_eval_bound/examples/demo_msgpass.py
 =================================================
 
-The synthetic message-passing throughput demo extracted out of `neyman_driver.py`
+The synthetic message-passing throughput demo extracted out of `alloc/driver.py`
 per the ADR-0012 purification (P1 single-home / P2 separation of the allocator from
-the thing allocated). It is ONE example model the generic `NeymanDriver` consumes —
+the thing allocated). It is ONE example model the generic `AllocationDriver` consumes —
 the driver owns no model; this module owns this model. It exists to exercise the
 allocator on a deliberately heavy-tailed input (the messy context-switch cost) so the
 report visibly funds the high-variance primitive.
@@ -20,14 +20,14 @@ import sys
 
 import numpy as np
 
-# Allow running as a bare script (examples/ is a sibling of neyman_driver.py).
+# Allow running as a bare script (examples/ is a sibling of `alloc/` under the tool root).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neyman_driver import NeymanDriver  # noqa: E402
+from alloc.driver import AllocationDriver  # noqa: E402
 
 
-def build_demo() -> tuple[NeymanDriver, dict[int, object], list[str], list[float]]:
-    """Return a configured `NeymanDriver` + the per-input samplers/names/costs for the
+def build_demo() -> tuple[AllocationDriver, dict[int, object], list[str], list[float]]:
+    """Return a configured `AllocationDriver` + the per-input samplers/names/costs for the
     toy 'crude throughput' model:
 
         throughput = 1e6 / (msg_lat_us + ctx_switch_us + 1e6/infer_tput + serialize_us)
@@ -59,7 +59,7 @@ def build_demo() -> tuple[NeymanDriver, dict[int, object], list[str], list[float
         return 1e6 / (msg_lat + ctx + 1e6 / infer_tput + serialize)
     costs = [1.0, 25.0, 2.0, 0.5]   # per-sample bench cost; the ctx-switch bench is dear
 
-    driver = NeymanDriver(
+    driver = AllocationDriver(
         f, costs=costs, tolerance=2.0,   # want E[throughput] to +/- 2 msgs/sec
         names=names, confidence=0.95, growth_cap=3.0, max_batch=200_000,
     )

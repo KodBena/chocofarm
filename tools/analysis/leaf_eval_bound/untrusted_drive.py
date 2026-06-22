@@ -3,12 +3,12 @@ tools/analysis/leaf_eval_bound/untrusted_drive.py
 ===========================================
 
 Test-drive the Neyman allocation loop with EVERY input fed LIVE from its benchmark — the
-analog of the original neyman_driver demo (examples/demo_msgpass.py), except the synthetic
+analog of the original alloc.driver demo (examples/demo_msgpass.py), except the synthetic
 measurers are replaced by the real per-quantity benches and nothing is trusted/seeded: every
 value the loop consumes comes from running a benchmark right now.
 
 WHAT IT DOES (§6 Phase 4 — the harmonized `Estimate` path). For a chosen transport variant
-(model_<slug>.py), it builds that model's `NeymanDriver` (its f + manifest-grounded costs),
+(model_<slug>.py), it builds that model's `AllocationDriver` (its f + manifest-grounded costs),
 wires one MEASURER per input — `measurer[i](budget)` runs input i's bench `measure()` and
 returns the input's harmonized `Estimate` (the bench DECLARES it — §1; the driver
 `set_estimate`s it directly) — and calls `driver.run(measurers=…, pilot, max_rounds)`. The loop

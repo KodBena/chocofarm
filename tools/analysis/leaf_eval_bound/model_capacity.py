@@ -3,7 +3,7 @@ tools/analysis/leaf_eval_bound/model_capacity.py
 ==========================================
 
 Design-A: the CAPACITY / BOTTLENECK lower bound on the achievable leaf-eval throughput
-(dps), as one model module the generic `NeymanDriver` consumes (ADR-0012 P1/P2 — the
+(dps), as one model module the generic `AllocationDriver` consumes (ADR-0012 P1/P2 — the
 driver owns no model; this module owns this one).
 
 FRAMING. The leaf-eval transport is a closed pipeline of stages; the achievable optimum
@@ -74,7 +74,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import leaf_eval_grounding as G  # noqa: E402
-from neyman_driver import NeymanDriver  # noqa: E402
+from alloc.driver import AllocationDriver  # noqa: E402
 
 # Input order is the single home of the model's signature (used by both `throughput_jax`
 # and the numpy `throughput_numpy` so they cannot drift — P1).
@@ -132,12 +132,12 @@ def initial_point() -> dict[str, float]:
     return {nm: g.mean for nm, g in zip(INPUT_NAMES, _INPUTS)}
 
 
-def build_driver(tolerance: float = 5.0) -> tuple[NeymanDriver, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` (over the JAX `f` (`throughput_jax`), grounded costs) + the
+def build_driver(tolerance: float = 5.0) -> tuple[AllocationDriver, dict[str, float]]:
+    """Factory: a configured `AllocationDriver` (over the JAX `f` (`throughput_jax`), grounded costs) + the
     initial point estimate. `tolerance` is the target CI half-width on E[f] in dps."""
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     costs = [g.cost for g in _INPUTS]
-    driver = NeymanDriver(
+    driver = AllocationDriver(
         f, costs=costs, tolerance=tolerance, names=INPUT_NAMES,
         confidence=0.95, growth_cap=3.0,
     )

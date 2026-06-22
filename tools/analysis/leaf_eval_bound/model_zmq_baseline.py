@@ -5,8 +5,8 @@ tools/analysis/leaf_eval_bound/model_zmq_baseline.py
 Transport variant DESIGN-zmq_baseline: the first-principles leaf-eval throughput LOWER BOUND
 (dps) for the CURRENT ZMQ ROUTER/DEALER multipart transport — the REFERENCE every other
 transport variant (shm_spin_poll, futex_wake, lockfree_mpsc, cpp_inproc_port) is measured
-against. One model module the generic `NeymanDriver` consumes (ADR-0012 P1/P2: the driver owns
-no model; this module owns this one, the NeymanDriver owns allocation, bench_store owns SQL).
+against. One model module the generic `AllocationDriver` consumes (ADR-0012 P1/P2: the driver owns
+no model; this module owns this one, the AllocationDriver owns allocation, bench_store owns SQL).
 
 WHAT THE TRANSPORT IS (inference_server.py `_drain` / `_scatter`). poll()-block first-request
 wakeup (`self._poller.poll(timeout=_POLL_INTERVAL_MS)`), recv_multipart(NOBLOCK) greedy drain,
@@ -82,7 +82,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import manifest  # noqa: E402  — the SSOT registry contract (import-clean; touches no DB on import)
-from neyman_driver import NeymanDriver  # noqa: E402
+from alloc.driver import AllocationDriver  # noqa: E402
 
 # The transport SLUG (the registry prefix for this variant's moved terms; the comparison-table key).
 SLUG = "zmq_baseline"
@@ -195,13 +195,13 @@ COSTS: dict[str, float] = costs()
 NEEDS_MEASUREMENT: dict[str, bool] = needs_measurement(trust=True)
 
 
-def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[NeymanDriver, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` (over the JAX `f` (`throughput_jax`), manifest-grounded costs) + the
+def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[AllocationDriver, dict[str, float]]:
+    """Factory: a configured `AllocationDriver` (over the JAX `f` (`throughput_jax`), manifest-grounded costs) + the
     initial point estimate. `tolerance` is the target CI half-width on E[f] in dps. The costs are the
     model-side bench-effort weights (costs()); the pilot is drawn from the manifest means/sigmas."""
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     c = [COSTS[nm] for nm in INPUT_NAMES]
-    driver = NeymanDriver(
+    driver = AllocationDriver(
         f, costs=c, tolerance=tolerance, names=INPUT_NAMES,
         confidence=0.95, growth_cap=3.0,
     )

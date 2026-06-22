@@ -4,11 +4,11 @@ tests/test_alloc_kink.py
 
 Isolated unit tests for `alloc.kink.assess_min_kink` — the Clark-1961 min()-kink closed form (the
 responsibility-refactor's move 4; `docs/design/leaf-eval-bound-responsibility-refactor.md`) —
-exercised DIRECTLY on synthetic arms + a synthetic Σ (no `NeymanDriver`, no `step()`, no live
+exercised DIRECTLY on synthetic arms + a synthetic Σ (no `AllocationDriver`, no `step()`, no live
 measurement). This is the unit-testability the lift was for: the §8 reproduction targets
 (E[min] / sd / Φ(−t)) are pinned at the pure-function level, so a regression in the Clark math
 surfaces here without the whole driver. (The end-to-end equivalence — that the driver's `step()` is
-unchanged by the lift — is the separate oracle in `test_neyman_driver_phase2.py`; the gradient
+unchanged by the lift — is the separate oracle in `test_alloc_driver_phase2.py`; the gradient
 backend `alloc.gradient.jax_gradient` is covered by `tests/test_jax_f_equivalence.py`.)
 
 Run-free / fast: pure numpy + scipy on hand-built arrays. No timed bench, no DB, no network, no
@@ -37,7 +37,7 @@ from alloc import kink as K  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # The operating-point arms (the §8 production anchor, mirrored from
-# test_neyman_driver_phase2._kink_driver(sigma_R=8.0)): a min(producer, serve) model with
+# test_alloc_driver_phase2._kink_driver(sigma_R=8.0)): a min(producer, serve) model with
 #   producer = N_gen·R_gen,  N_gen=3±0.05,  R_gen=152±8   -> cap 456, σ₁ propagates to 25.17
 #   serve    = serve_cap,    serve_cap=428.28±2           -> cap 428.28 (the binding arm)
 # The arms are the POST-`_model_arms` shape the driver hands to assess_min_kink:

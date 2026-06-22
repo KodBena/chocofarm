@@ -51,7 +51,7 @@ import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the
 # `lstsq` threw away.
 #
 # THE COMPONENT ORDERING (the §4.2 + driver contract, the load-bearing subtlety). The driver
-# (neyman_driver.set_estimate / _assemble_sigma / reconstruct._project_estimate) reads a multi-component
+# (alloc.driver.set_estimate / _assemble_sigma / reconstruct._project_estimate) reads a multi-component
 # estimate's FIRST component as the input's marginal (theta_hat[0], cov[0,0]) and the off-diagonal
 # via `cross[partner_name]`. The 8 live `manifest.value("t_row_us")` consumers read the SLOPE mean,
 # and `value("T_disp_us")` reads the INTERCEPT mean — so the Estimate a fit bench logs must order its

@@ -5,10 +5,10 @@ tools/analysis/leaf_eval_bound/throughput_bound.py
 Runner: for EACH leaf-eval throughput lower-bound model (Design-A capacity, model_capacity.py;
 Design-B cycle-time, model_cycletime.py), compute the bound estimate E[f] with its CI and print
 the Neyman allocation — which physical quantity to benchmark next to tighten the bound. The
-models are the things transported; this runner + the generic `NeymanDriver` are the transport
+models are the things transported; this runner + the generic `AllocationDriver` are the transport
 (ADR-0012 P2 separation).
 
-The bound is computed via the `NeymanDriver` (§6 Phase 4 — each input fed as its harmonized
+The bound is computed via the `AllocationDriver` (§6 Phase 4 — each input fed as its harmonized
 `Estimate` via `driver.set_estimate`, NOT a fabricated 2-point pilot). Each grounded input is a
 `Fixed`/declared-spread `Estimate` (`cov=[[sigma^2]]` un-divided — built via reconstruct's
 seed->Estimate SSOT `reconstruct._estimate_from_seed`), so the allocation reflects the grounded
@@ -90,7 +90,7 @@ def run_model(title, model):
            for r in (64, 128, 192, 224, 256, 384, 512)}
     print("Serve sawtooth dps (real rows -> bucketed serve dps, incl. tau_io):", saw)
 
-    # The bound + the Neyman ranking via the JAX-driven NeymanDriver. Rank by a_i (the per-input share
+    # The bound + the Neyman ranking via the JAX-driven AllocationDriver. Rank by a_i (the per-input share
     # of Var(E[f])), NOT by +samples: every input is a Fixed declared-spread prior here, so the allocator
     # funds none (a prior is un-shrinkable by sampling — the §2.3 branch); a_i is the honest "which most
     # tightens the bound" signal. min() zeros the non-binding stage's inputs by design.

@@ -6,7 +6,7 @@ The TRANSPORT-DESIGN-SPACE SWEEP: the synthesis runner that, for EACH leaf-eval 
 variant (`model_<slug>.py`), computes a first-principles throughput LOWER BOUND (dps, with a
 delta-method CI), ranks the variants = the OPTIMUM-OVER-TRANSPORTS, and prints the top Neyman
 live-benchmark targets per transport (what to run sole-workload next). The five variant models
-are the things transported; this runner + the generic `NeymanDriver` are the transport
+are the things transported; this runner + the generic `AllocationDriver` are the transport
 (ADR-0012 P2 separation — the runner owns no model's math; each model owns its own).
 
 WHY A SWEEP, NOT "model the current system". Modelling ZMQ faithfully just regenerates ~200 dps
@@ -47,7 +47,7 @@ ADR-0012 P1 — these cross-variant corrections live in ONE place, not copied in
                                 forward — restoring a strict floor (the gap the lockfree/futex/cpp
                                 critiques flagged; inherited from the v1 model_cycletime spine).
         * CI            — the grounded-uncertainty delta-method CI half-width on E[f], via the
-                          model's `build_driver()` Neyman step (the JAX-driven NeymanDriver).
+                          model's `build_driver()` Neyman step (the JAX-driven AllocationDriver).
 
   (2) The PER-VARIANT TRANSFER POLICY (the per-variant fact the critiques established; declared
       here with provenance, NOT blanket-applied):
@@ -83,7 +83,7 @@ to True automatically with no model edit).
 
 HOW THE BOUND IS COMPUTED. The HEADLINE + CONSERVATIVE bounds and the binding-stage logic are pure
 numpy over each model's diagnostics; the CI half-width + the VARIANCE ranking are the JAX-driven
-`NeymanDriver` step (the OT→JAX migration — this runner imports no openturns, and the old numpy
+`AllocationDriver` step (the OT→JAX migration — this runner imports no openturns, and the old numpy
 delta-method fallback retired with the single-f collapse, J4). A driver failure RAISES loudly
 (ADR-0002) — there is no silent fallback.
 
@@ -207,7 +207,7 @@ class VariantResult:
     transfer_residual_us: float
     transfer_note: str
     ci_halfwidth: float                       # delta-method CI half-width on E[f]
-    ci_source: str                            # 'jax' (the NeymanDriver step; the numpy fallback retired, J4)
+    ci_source: str                            # 'jax' (the AllocationDriver step; the numpy fallback retired, J4)
     all_trusted: bool
     untrusted_inputs: list[str]
     variance_targets: list[tuple[str, float, int]]   # (model-input name, a_i, +samples) ranked desc
