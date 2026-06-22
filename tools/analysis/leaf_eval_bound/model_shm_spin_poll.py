@@ -105,19 +105,17 @@ _COST: dict[str, float] = {
 
 
 def throughput_numpy(x: dict[str, float]) -> float:
-    """numpy-only evaluation of f (the fallback path + the lockstep cross-check of
-    throughput_jax). SAME formula as throughput_jax. B is the FULL-bucket width (pad ~= B)."""
-    cycle_us = x["T_disp"] + x["wakeup"] + x["tau_io"] + x["B"] * x["t_row"]
-    serve = 1e6 * x["B"] / (cycle_us * x["L"])
-    producer = x["N_gen"] * x["R_gen"]
-    return float(min(producer, serve))
+    """Dict-keyed convenience eval of f, DERIVED from the single JAX home `throughput_jax`
+    (F4 / §5 -- one formula now, so the numpy view cannot drift from it). Orders x by
+    INPUT_NAMES and evaluates the one f as a float."""
+    return float(throughput_jax([x[nm] for nm in INPUT_NAMES]))
 
 
 def throughput_jax(x: Any) -> Any:
     """The single JAX-traceable throughput f (x ordered by INPUT_NAMES) — the OT→JAX migration's one home
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
-    tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy twin throughput_numpy retires with the numpy fallback in migration J4)."""
+    tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy convenience `throughput_numpy` is DERIVED from this single home (F4/§5), not a hand-written twin)."""
     from alloc.jax_backend import jnp
     N_gen, R_gen, B, T_disp, wakeup, tau_io, t_row, L = x
     cycle_us = T_disp + wakeup + tau_io + B * t_row

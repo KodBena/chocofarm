@@ -3,10 +3,9 @@ tests/test_jax_f_equivalence.py
 ===============================
 
 The OpenTURNS→JAX migration's equivalence proof (`docs/design/leaf-eval-bound-responsibility-refactor.md`
-§5): each leaf-eval model's single JAX-traceable `throughput_jax` — the OT→JAX one-home for `f` — evaluates
-IDENTICALLY to `throughput_numpy`, and `alloc.gradient.jax_gradient` (jax.grad) reproduces the gradient,
+§5): each leaf-eval model's single JAX-traceable `throughput_jax` — the OT→JAX one-home for `f` — is single-homed; `throughput_numpy` now DERIVES from it (F4, increment 3), and `alloc.gradient.jax_gradient` (jax.grad) reproduces the gradient,
 checked against an INLINE central-difference oracle (NOT the production FD functions this migration removes,
-so the test survives their deletion). This is the evidence the driver swap (the next increment) rests on.
+so the test survives their deletion). This is the single-f + autodiff evidence the bound rests on.
 
 The gradient agrees because OT itself fell back to central FD through the model `min()` (the
 "WRN - Switch to finite difference"), so jax.grad — analytic, exact through `min()` — gives the same
@@ -64,13 +63,19 @@ def test_jax_backend_is_x64() -> None:
 
 
 @pytest.mark.parametrize("modname", _MODELS)
-def test_throughput_jax_evaluates_identically_to_numpy(modname: str) -> None:
-    """The single JAX `f` reproduces `throughput_numpy` at the grounded point (the eval the bound rests on),
-    in x64 — exactly (the formulae are identical; the cross-check that the numpy + JAX homes agree)."""
+def test_throughput_numpy_derives_from_the_single_jax_f(modname: str) -> None:
+    """After F4 (increment 3) there is ONE formula: `throughput_numpy` is a thin dict-keyed adapter
+    over the single `throughput_jax`, so they agree BY CONSTRUCTION (not two hand-written twins kept
+    in lockstep). Guard the single-f invariant -- a regression that re-hand-writes a divergent numpy
+    twin fails HERE -- and that the grounded eval is sane (finite, positive). Per ADR-0002 Rule 6 we
+    assert sanity, NOT a frozen bound literal (the bound value is pinned through the driver in the
+    phase-2/phase-4 tests)."""
     M = importlib.import_module(modname)
     x0 = _x0(M)
     arr = jnp.array([x0[nm] for nm in M.INPUT_NAMES])
-    assert float(M.throughput_jax(arr)) == pytest.approx(M.throughput_numpy(x0), rel=1e-9)
+    val = float(M.throughput_jax(arr))
+    assert M.throughput_numpy(x0) == pytest.approx(val, rel=1e-12)   # the derivation invariant (one f)
+    assert np.isfinite(val) and val > 0.0                            # sane recompute (ADR-0002 Rule 6)
 
 
 @pytest.mark.parametrize("modname", _MODELS)
