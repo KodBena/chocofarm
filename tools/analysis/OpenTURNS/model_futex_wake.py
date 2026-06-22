@@ -173,6 +173,13 @@ def costs() -> dict[str, float]:
     return dict(_COST)
 
 
+def trusted_flags(trust: bool = True) -> dict[str, bool]:
+    """Per-input `trusted` bool: True iff the value is a live postgres measurement, False iff it is a seed.
+    The model BRANCHES on this to flag the bound as resting on unmeasured inputs; the Neyman loop ranks the
+    untrusted binding terms."""
+    return {nm: q.trusted for nm, q in resolve_inputs(trust=trust).items()}
+
+
 def untrusted_inputs(trust: bool = True) -> list[str]:
     """The model inputs currently resting on a SEED (trusted=False) rather than a live postgres measurement
     — the ADR-0002 honesty surface: the bound is flagged as resting on these, and the Neyman allocator ranks

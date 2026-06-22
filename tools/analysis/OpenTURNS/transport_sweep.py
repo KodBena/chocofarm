@@ -359,21 +359,13 @@ def _model_estimates(model: Any) -> dict[str, "Any"]:
 
 
 def _untrusted(model: Any) -> tuple[bool, list[str]]:
-    """(all_trusted, untrusted_input_names) — the ADR-0002 honesty surface. Accept either the variant
-    models' `untrusted_inputs()` / `trusted_flags()` or a manifest re-resolve, so the sweep reports the
-    trust state uniformly regardless of which helper a given model exposes."""
-    if hasattr(model, "untrusted_inputs"):
-        un = model.untrusted_inputs(trust=True)
-        return (len(un) == 0), un
-    if hasattr(model, "trusted_flags"):
-        tf = model.trusted_flags(trust=True)
-        return all(tf.values()), [nm for nm, t in tf.items() if not t]
-    # last resort: resolve through the model's resolve_inputs / manifest directly
-    if hasattr(model, "resolve_inputs"):
-        qs = model.resolve_inputs(trust=True)
-        un = [nm for nm, q in qs.items() if not q.trusted]
-        return (len(un) == 0), un
-    return False, list(model.INPUT_NAMES)
+    """(all_trusted, untrusted_input_names) — the ADR-0002 honesty surface. Every transport model now
+    exposes the canonical `trusted_flags(trust)` (move 3b grew it on shm_spin_poll + futex_wake), so the
+    old 3-fallback that sniffed untrusted_inputs / trusted_flags / resolve_inputs collapses to the one
+    surface. (`trusted_flags` and the models' `untrusted_inputs` both derive from the same `resolve_inputs`
+    pull, so this is byte-for-byte the old result — the untrusted list keeps its INPUT_NAMES order.)"""
+    tf = model.trusted_flags(trust=True)
+    return all(tf.values()), [nm for nm, t in tf.items() if not t]
 
 
 def evaluate_variant(variant: TransportVariant) -> VariantResult:
