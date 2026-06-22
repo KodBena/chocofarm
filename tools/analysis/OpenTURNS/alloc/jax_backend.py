@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import jax
 
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]  — jax.config.update is unstubbed
 
 import jax.numpy as jnp  # noqa: E402  — imported AFTER x64 is enabled, so jnp is float64 by default
 
