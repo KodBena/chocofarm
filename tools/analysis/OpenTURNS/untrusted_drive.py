@@ -191,18 +191,6 @@ def _make_measurer(qname: str, iters_cap: int) -> Callable[[int], "_est.Estimate
     return measure
 
 
-def _registry_qname(model, nm: str) -> str:
-    """Resolve a model input name to its registry quantity name across the two model map shapes:
-    `model_zmq_baseline` exposes `INPUT_QUANTITIES[nm] = (qname, cost)`; the other four variants
-    (`lockfree_mpsc`, `shm_spin_poll`, `futex_wake`, `cpp_inproc_port`) expose `_MANIFEST_NAME[nm] =
-    qname`. The same bridge `transport_sweep._registry_qname` uses, kept local so this test-drive
-    script has no import coupling to the sweep."""
-    iq = getattr(model, "INPUT_QUANTITIES", None)
-    if iq is not None:
-        return iq[nm][0]
-    return model._MANIFEST_NAME[nm]  # noqa: SLF001 — the variant model's registry map
-
-
 def main() -> int:
     slug = sys.argv[1] if len(sys.argv) > 1 else "zmq_baseline"
     if slug not in _VARIANTS:
@@ -216,7 +204,7 @@ def main() -> int:
     model = importlib.import_module(f"model_{slug}")
     driver, x0 = model.build_driver(tolerance=tol, trust=True)
     names = list(model.INPUT_NAMES)
-    measurers = {i: _make_measurer(_registry_qname(model, nm), iters_cap) for i, nm in enumerate(names)}
+    measurers = {i: _make_measurer(model.registry_qname(nm), iters_cap) for i, nm in enumerate(names)}
 
     print("=" * 88)
     print(f"UNTRUSTED LIVE-BENCH NEYMAN DRIVE — model_{slug}  (pilot={pilot}, rounds={rounds}, "

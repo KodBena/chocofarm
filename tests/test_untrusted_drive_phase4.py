@@ -251,15 +251,17 @@ def test_untrusted_drive_coercion_is_deleted() -> None:
 
 
 def test_registry_qname_bridges_both_model_map_shapes() -> None:
-    """`untrusted_drive` must resolve a model input -> its registry quantity for BOTH model map shapes:
-    `model_zmq_baseline` exposes `INPUT_QUANTITIES[nm]=(qname,cost)`; the other four variants expose
-    `_MANIFEST_NAME[nm]=qname`. `python untrusted_drive.py lockfree_mpsc` regressed here with an
-    AttributeError (no INPUT_QUANTITIES) — the `_registry_qname` bridge closes it."""
+    """Every manifest model exposes a uniform `registry_qname(nm) -> str` resolving each input to its
+    registry quantity (refactor move 3a). The model now OWNS its registry coupling regardless of internal
+    map shape — `model_zmq_baseline` over `INPUT_QUANTITIES[nm]=(qname,cost)`, the other four over
+    `_MANIFEST_NAME[nm]=qname` — so the runner-side `_registry_qname` shim (and its verbatim copy in
+    untrusted_drive) is DELETED, not sniffing the shape. `python untrusted_drive.py lockfree_mpsc` once
+    regressed here with an AttributeError (no INPUT_QUANTITIES); the uniform method closes that by
+    construction (a model missing `registry_qname` is now an import-time AttributeError, not a runtime one)."""
     import importlib
-    import untrusted_drive as U
     for slug in ("zmq_baseline", "lockfree_mpsc", "shm_spin_poll", "futex_wake", "cpp_inproc_port"):
         model = importlib.import_module("model_" + slug)
-        qs = [U._registry_qname(model, nm) for nm in model.INPUT_NAMES]  # raises if any input is unmapped
+        qs = [model.registry_qname(nm) for nm in model.INPUT_NAMES]  # raises if any input is unmapped
         assert len(qs) == len(model.INPUT_NAMES)
         assert all(isinstance(q, str) and q for q in qs), f"{slug}: an input resolved to an empty qname"
 

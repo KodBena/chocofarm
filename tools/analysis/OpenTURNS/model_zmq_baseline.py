@@ -146,6 +146,14 @@ def _resolve(trust: bool = True) -> dict[str, "manifest.Quantity"]:
     return out
 
 
+def registry_qname(nm: str) -> str:
+    """The registry quantity name model-input `nm` pulls from — the model's ONE coupling to the registry,
+    exposed uniformly (refactor move 3a). Replaces the runner-side `_registry_qname` shim (which sniffed
+    INPUT_QUANTITIES vs _MANIFEST_NAME) and its verbatim copy in untrusted_drive — the duplicated P1 the
+    refactor note and the out-of-frame hack-audit flagged. Here the map is INPUT_QUANTITIES[nm]=(qname,cost)."""
+    return INPUT_QUANTITIES[nm][0]
+
+
 def initial_point(trust: bool = True) -> dict[str, float]:
     """The grounded mean point f is first evaluated at (mu_hat). Pulled from the manifest (measured
     if a sole-workload run has populated the quantity, else its seed)."""

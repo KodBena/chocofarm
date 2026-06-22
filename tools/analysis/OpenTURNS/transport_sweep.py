@@ -345,16 +345,6 @@ def _model_sigmas(model: Any) -> dict[str, float]:
     return dict(model.SIGMAS)
 
 
-def _registry_qname(model: Any, nm: str) -> str:
-    """The REGISTRY quantity name a model input `nm` pulls from. The v1-style `model_zmq_baseline` exposes
-    `INPUT_QUANTITIES[nm] = (qname, cost)`; the other variants expose `_MANIFEST_NAME[nm] = qname`. Accept
-    either (uniform across the family — the model's ONE coupling to the registry)."""
-    iq = getattr(model, "INPUT_QUANTITIES", None)
-    if iq is not None:
-        return iq[nm][0]
-    return model._MANIFEST_NAME[nm]  # noqa: SLF001 — the variant model's registry map
-
-
 def _model_estimates(model: Any) -> dict[str, "Any"]:
     """The §6 Phase-4 input feed: `{model_input_name: manifest.Estimate}` for `driver.set_estimates_by_name`,
     REPLACING the fabricated 2-point `{mean±sigma}` pilot. Each input is resolved to its harmonized
@@ -365,7 +355,7 @@ def _model_estimates(model: Any) -> dict[str, "Any"]:
     set's sample-std is √2·sigma, so a_i/n_i = grad^2·sigma^2 either way — the spec REFUTED a claimed `/2`
     bug). A declared-spread prior is un-shrinkable, so the §2.3 allocator funds none; the design-priority /
     variance rankings (which read a_i) are unchanged."""
-    return {nm: manifest.estimate(_registry_qname(model, nm), trust=True) for nm in model.INPUT_NAMES}
+    return {nm: manifest.estimate(model.registry_qname(nm), trust=True) for nm in model.INPUT_NAMES}
 
 
 def _untrusted(model: Any) -> tuple[bool, list[str]]:

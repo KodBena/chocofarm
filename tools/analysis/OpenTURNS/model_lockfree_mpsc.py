@@ -149,6 +149,14 @@ def resolve_inputs(trust: bool = True) -> dict[str, manifest.Quantity]:
     return {nm: manifest.quantity(_MANIFEST_NAME[nm], trust=trust) for nm in INPUT_NAMES}
 
 
+def registry_qname(nm: str) -> str:
+    """The registry quantity name model-input `nm` pulls from — the model's ONE coupling to the registry,
+    exposed uniformly (refactor move 3a). Replaces the runner-side `_registry_qname` shim (which sniffed
+    INPUT_QUANTITIES vs _MANIFEST_NAME) and its verbatim copy in untrusted_drive — the duplicated P1 the
+    refactor note and the out-of-frame hack-audit flagged. Here the map is _MANIFEST_NAME[nm]=qname."""
+    return _MANIFEST_NAME[nm]
+
+
 def initial_point(trust: bool = True) -> dict[str, float]:
     """The resolved mean point f is first evaluated at. trust=True uses live measurements where they exist;
     trust=False forces the v1/first-principles seeds."""
