@@ -120,6 +120,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import estimate as _est  # noqa: E402  — the Estimate contract (numpy-only; touches no DB)
+# The generic OR machinery lifted out of this file into the `alloc` sub-package (the responsibility
+# refactor, docs/design/leaf-eval-bound-responsibility-refactor.md): `alloc.gradient` is the §5
+# gradient-backend Port (OT analytic `f.gradient()` + a finite-difference fallback — the ONE site the
+# planned JAX swap replaces), `alloc.kink` is the §4.1 Clark-1961 min()-kink closed form (pure, backend-
+# independent). Both resolve via the `sys.path.insert(0, _HERE)` above — `alloc` is a sub-package of
+# this directory (no top-level `__init__.py` yet; the package conversion is a later refactor increment).
+from alloc import gradient as _grad, kink as _kink  # noqa: E402
 
 # cvxpy (CLARABEL) backs the §2.3 cost-constrained c-optimal SOCP allocation (the sign-safe
 # Q = diag(g)·R·diag(g) form, native to mixed-sign gradients). scipy.stats.norm backs the §4.1
@@ -388,26 +395,15 @@ class NeymanDriver:
         )
 
     # ------------------------------------------------------------------ #
-    # Gradient (OT analytic if present, else central FD on f)
+    # Gradient — the IMPLEMENTATION is lifted to `alloc.gradient` (the §5 gradient-backend Port: OT
+    # analytic `f.gradient()` with a central-FD fallback; the ONE site the planned JAX swap replaces).
+    # This stays as the driver's THIN binding of that seam to its own f / d / fd_rel_step, because
+    # `step()` and the phase-2 tests call `d._gradient(mu)` directly — the public surface is preserved.
+    # (The old private `_fd_gradient` method is gone: its body is now `alloc.gradient.fd_gradient`, the
+    # single home of the FD fallback, reached through `gradient()` above — no driver-local copy remains.)
     # ------------------------------------------------------------------ #
     def _gradient(self, point: np.ndarray) -> np.ndarray:
-        try:
-            g = self.f.gradient(ot.Point(point))
-            return np.array([g[i, 0] for i in range(self.d)], dtype=float)
-        except Exception:
-            return self._fd_gradient(point)
-
-    def _fd_gradient(self, point: np.ndarray) -> np.ndarray:
-        g = np.empty(self.d)
-        f0_pt = point.copy()
-        for i in range(self.d):
-            h = self.fd_rel_step * max(abs(point[i]), 1.0)
-            xp = f0_pt.copy(); xp[i] += h
-            xm = f0_pt.copy(); xm[i] -= h
-            yp = float(self.f(ot.Point(xp))[0])
-            ym = float(self.f(ot.Point(xm))[0])
-            g[i] = (yp - ym) / (2.0 * h)
-        return g
+        return _grad.gradient(self.f, point, dim=self.d, fd_rel_step=self.fd_rel_step)
 
     # ------------------------------------------------------------------ #
     # Optional curvature diagnostic via TaylorExpansionMoments
@@ -491,7 +487,10 @@ class NeymanDriver:
         estimate = float(self.f(ot.Point(mu))[0])  # the hard-min point value f(μ̂)
 
         # --- §4.1 the min()-kink path: binding-margin diagnostic + Clark closed form (no MC) --- #
-        kink = self._kink_assessment(mu, grad, Sigma, estimate)
+        # The Clark-1961 machinery is lifted to `alloc.kink` (refactor move 4): read the model's min()-arms
+        # via the `arms_fn` adapter (`_model_arms` — driver state) and hand them + Σ to the pure assessor.
+        # Returns None outside the kink regime (the smooth path below), unchanged from the inline version.
+        kink = _kink.assess_min_kink(self._model_arms(mu), Sigma)
         kink_regime = kink is not None
         if kink_regime:
             var_est = kink["var_min"]             # Clark Var[min] supersedes the single-arm gᵀΣg
@@ -794,88 +793,6 @@ class NeymanDriver:
             best_label = f"conservative t(dof={dof_used})"
         return best_mult, best_label
 
-    def _kink_assessment(
-        self, mu: np.ndarray, grad: np.ndarray, Sigma: np.ndarray, hard_min: float
-    ) -> Optional[dict]:
-        """§4.1 — the `min()`-kink binding-margin diagnostic + the Clark-1961 closed form. Returns None
-        (the smooth regime — today's behavior) unless `f` is a `min()` whose SECOND-tightest arm is
-        within a statistically-plausible tie of the binding arm, in which case it returns the Clark
-        moments (deterministic, O(1), NO Monte-Carlo) the kink path uses.
-
-        Mechanism. The model exposes its `min()` arms via the `self.arms_fn` hook (set by a model's
-        `build_driver`) as `[(capacity, {input_name: ∂capacity/∂input}), …]` (a Phase-3 model surface;
-        absent it, the driver cannot see the arms and stays in the smooth regime — the honest default,
-        never a fabricated tie). Each arm is linearized to `Normal(μ_k, σ_k²)` with `μ_k = capacity_k(μ̂)`,
-        `σ_k² = ∇capacity_kᵀ Σ ∇capacity_k`, cross-covariance `∇c_aᵀ Σ ∇c_b`. The two tightest arms drive
-        Clark's exact `min`-moments: `a = SD(c_bind − c_contender)`, `t = (μ_bind − μ_contender)/a`,
-        `E[min] = μ_bind·Φ(−t) + μ_contender·Φ(t) − a·φ(t)`, and `Var[min]` from the second moment. An
-        arm is the realized min iff it is the smaller draw, so `P(binding is min) = Φ(−t)` (the larger
-        weight) and `P(contender is min) = Φ(t)` (the arg-min-flip probability). The `kink_regime` fires
-        when `P(contender is min) = Φ(t)` exceeds a small floor (a live arg-min flip). The both-arm
-        allocation gradient is `Φ(±t)`-weighted (the SSTA criticality weights, summing to 1).
-        """
-        arms = self._model_arms(mu)
-        if arms is None or len(arms) < 2:
-            return None  # not a visible-min model -> smooth regime (today's behavior)
-
-        # Each arm: (capacity μ_k, σ_k = sqrt(∇c_kᵀ Σ ∇c_k)).  Cross-cov via the same Σ.
-        caps = np.array([c for (c, _g) in arms], dtype=float)
-        arm_grads = [np.asarray(g, dtype=float) for (_c, g) in arms]
-        arm_var = np.array([float(g @ Sigma @ g) for g in arm_grads])
-        arm_sd = np.sqrt(np.maximum(arm_var, 0.0))
-
-        # The binding arm is the realized min; the contender is the next-tightest capacity.
-        order = np.argsort(caps)
-        b, s = int(order[0]), int(order[1])  # binding, second
-        mu_b, mu_s = float(caps[b]), float(caps[s])
-        sd_b, sd_s = float(arm_sd[b]), float(arm_sd[s])
-        cov_bs = float(arm_grads[b] @ Sigma @ arm_grads[s])
-
-        # Degenerate / measure-zero guards (ADR-0002 honest about the one pathological case): if the
-        # spread of (binding − contender) is ~0 there is no resolvable tie scale; treat as smooth.
-        a_kink = math.sqrt(max(sd_b ** 2 + sd_s ** 2 - 2.0 * cov_bs, 0.0))
-        if a_kink <= 1e-12:
-            return None
-
-        from scipy.stats import norm  # deterministic Φ, φ — no draws (ADR-0002 loud if scipy absent)
-        # Clark's min-moments via min(X,Y) = −max(−X,−Y), arms (binding=b, contender=s) standardized
-        # by the SD of their difference. t = (μ_b − μ_s)/a. An arm is the realized min iff it is the
-        # SMALLER draw, so P(b is min) = P(b < s) = Φ((μ_s−μ_b)/a) = Φ(−t) (the binding arm, smaller
-        # mean, usually wins); P(s is min) = Φ(t) (the contender's arg-min-flip probability). The
-        # criticality weights Φ(−t), Φ(t) sum to 1.
-        t = (mu_b - mu_s) / a_kink
-        P_b_min = float(norm.cdf(-t))   # P(binding arm is the min)   = Φ(−t)   (the larger weight)
-        P_s_min = float(norm.cdf(t))    # P(contender is the min)     = Φ(t)    (the flip probability)
-        phi_t = float(norm.pdf(t))
-        E_min = mu_b * P_b_min + mu_s * P_s_min - a_kink * phi_t
-        E_sq = ((mu_b ** 2 + sd_b ** 2) * P_b_min
-                + (mu_s ** 2 + sd_s ** 2) * P_s_min
-                - (mu_b + mu_s) * a_kink * phi_t)
-        var_min = max(E_sq - E_min ** 2, 0.0)
-
-        # The binding-margin trigger: enter the kink regime only when the contender has a live chance
-        # of being the realized min (Φ(t) = P(contender is min) above a small floor — a statistically-
-        # plausible tie). Far from a tie this →0 and we return None (smooth; the analytic single-arm
-        # gradient is honest, the non-binding arm's df/dx = 0 is correct, behavior is exactly today's).
-        p_nonbinding_max = P_s_min
-        if p_nonbinding_max < _KINK_PFLOOR:
-            return None
-
-        # The Φ(±t)-weighted both-arm allocation gradient (SSTA criticality; weights sum to 1). Only
-        # the two tightest arms carry weight; the rest are far and drop out (Φ→0). This funds the
-        # previously-zero-weighted contender arm's inputs near the tie, curing the dead-gradient.
-        grad_weighted = P_b_min * arm_grads[b] + P_s_min * arm_grads[s]
-        return {
-            "E_min": float(E_min),
-            "var_min": float(var_min),
-            "p_nonbinding_max": float(p_nonbinding_max),
-            "t": float(t),
-            "a": float(a_kink),
-            "grad_weighted": grad_weighted,
-            "binding": b,
-            "contender": s,
-        }
-
     def _model_arms(self, point: np.ndarray) -> Optional[list]:
         """The `min()` arms of `f` at `point`, as `[(capacity, ∇capacity_ndarray), …]`, IF the model
         exposes them via an `arms(point_dict)` hook (a Phase-3 model surface — `model_*.stage_capacities`
@@ -1117,14 +1034,8 @@ class NeymanDriver:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-# §4.1: the kink regime fires only when a non-binding min()-arm has at least this probability of being
-# the realized min (Φ(−t) ≥ floor) — a statistically-plausible tie, not numerical noise. Below it the
-# contender is effectively never the min and the analytic single-arm gradient is honest (today's
-# behavior). 1e-3 keeps the seed 8.6%-margin tie (Φ(−t)≈0.136) firing while not triggering on a
-# comfortably-bound arm.
-_KINK_PFLOOR = 1e-3
-
-
+# (The §4.1 kink-regime probability floor `_KINK_PFLOOR` moved to `alloc.kink.KINK_PFLOOR` with the
+# Clark machinery it gates — refactor move 4. The driver no longer references it directly.)
 def _z_from_confidence(confidence: float) -> float:
     try:
         return float(ot.Normal().computeQuantile(0.5 + confidence / 2.0)[0])
