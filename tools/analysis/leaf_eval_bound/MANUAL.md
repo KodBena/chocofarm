@@ -228,7 +228,7 @@ Concretely: a **new cycle** is a new `model_<slug>.py` (its `f` and how its inpu
 interface and joins the sweep. The five steps:
 
 | Step | You write | Where |
-| — | — | — |
+| --- | --- | --- |
 | 1. Write `f` | the throughput function (your decomposition) + the input list | `models/model_<slug>.py` |
 | 2. Classify inputs | measured / prior / constant, per input | (a decision; recorded in step 4) |
 | 3. Write a bench | one `bench_*.py` per *measured* input that doesn't exist yet | `benchmarks/bench_*.py` |
@@ -290,7 +290,7 @@ Every input to `f` sits on one axis, `Estimability` (the single home of the meas
 decision — `grounded_types.py`):
 
 | `Estimability` | Meaning | Becomes | Funded by the allocator? |
-| — | — | — | — |
+| --- | --- | --- | --- |
 | `MEASURED` | a runnable bench measures it live | a **shrinkable** Estimate (median or fit) | **yes** — more measurement tightens it |
 | `PRIOR` | an engineering-judgement value, no runnable bench yet | a `Fixed` Estimate, `family=NORMAL` | no — its spread is irreducible until you build the bench |
 | `CONSTANT` | a true deployment/layout fact (e.g. `n_gen = 3` cores) | a `Fixed` Estimate, `family=DEGENERATE`, ~0 bound contribution | no — it drops out of allocation |
@@ -313,7 +313,7 @@ scaffold wires them.
 The six you write:
 
 | Name | Type | Role |
-| — | — | — |
+| --- | --- | --- |
 | `NAME` | `str` | the registry quantity name (unique). Slug-prefix it if it could collide across variants. |
 | `MODULE_PATH` | `str` | this module's dotted import path (the manifest re-imports by it) |
 | `_DESC` | `str` | a human description |
@@ -325,7 +325,7 @@ The estimator you call inside `_estimate_from_raw` is the whole classification d
 concrete. Three factories (`estimators.py`), one per shape:
 
 | Call | Use when the quantity is… | Produces | Shrinkable? |
-| — | — | — | — |
+| --- | --- | --- | --- |
 | `pin_estimate(value, sigma, *, name, constant)` | a config fact or an engineering prior (no live pool) | `Fixed` (`kind='pin'` if `constant`, else `'declared_spread'`) | no |
 | `median_estimate(pool, *, name)` | a sampled latency / cost / rate (a pool of readings) | `QuantileLaw`, bootstrap median SE, `family=EMPIRICAL` | **yes** — more readings → tighter |
 | `fit_estimate(rows, medians_us, *, own_name, own_role, partner_name)` | a per-row OLS regression `time = intercept + slope·rows` | `RegressionLaw` (k=2: own coeff + partner), Student-t | only by widening the x-design |
@@ -740,7 +740,7 @@ computes.
 There are three runners. All run from `tools/analysis`:
 
 | Runner | Command | What it does | Trust |
-| — | — | — | — |
+| --- | --- | --- | --- |
 | `throughput_bound` | `python -m leaf_eval_bound.runners.throughput_bound` | both static models, seeded, cross-checked | SEEDED |
 | `transport_sweep` | `python -m leaf_eval_bound.runners.transport_sweep` | 5 transport variants × 3 honesty levels; optimum-over-transports | SEEDED |
 | `untrusted_drive` | `python -m leaf_eval_bound.runners.untrusted_drive [slug]` | the live-bench loop: measure every input now, allocate, re-measure | UNTRUSTED + confounded |
