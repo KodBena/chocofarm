@@ -150,3 +150,31 @@ def test_fd_gradient_matches_analytic_on_a_nonlinear_function() -> None:
     g_fd = G.fd_gradient(f, x, dim=2)
     assert g_analytic == pytest.approx([5.0, 2.0], abs=1e-9)
     assert g_fd == pytest.approx([5.0, 2.0], rel=1e-4)
+
+
+def test_fd_gradient_dict_matches_closed_form() -> None:
+    """The numpy-dict form (move 5: the runners' OT-absent fallback gradient over `model.throughput_numpy`,
+    formerly copied verbatim in throughput_bound + transport_sweep): a central FD of `fn(dict) -> float`,
+    returned keyed by input name. ∇(3·a − 1.5·b) = {a: 3, b: −1.5}."""
+    def fn(d: dict[str, float]) -> float:
+        return 3.0 * d["a"] - 1.5 * d["b"]
+    g = G.fd_gradient_dict(fn, ["a", "b"], {"a": 2.0, "b": 5.0})
+    assert g["a"] == pytest.approx(3.0, rel=1e-4)
+    assert g["b"] == pytest.approx(-1.5, rel=1e-4)
+
+
+def test_fd_gradient_dict_agrees_with_the_ot_form() -> None:
+    """The two forms of the ONE seam differentiate the SAME f and must AGREE: the OT-array form on a
+    SymbolicFunction and the numpy-dict form on its Python twin give the same gradient. (This is the
+    invariant the planned JAX swap rests on — it collapses the two into one `jax.grad`; they had better
+    match today.) f = a·b ⇒ ∇ = (b, a) = (5, 2)."""
+    names = ["a", "b"]
+    x = {"a": 2.0, "b": 5.0}
+    f_ot = ot.SymbolicFunction(names, ["a*b"])
+
+    def fn(d: dict[str, float]) -> float:        # the numpy twin of f_ot
+        return d["a"] * d["b"]
+    g_ot = G.gradient(f_ot, np.array([x[nm] for nm in names]), dim=2)
+    g_dict = G.fd_gradient_dict(fn, names, x)
+    assert g_ot == pytest.approx([5.0, 2.0], abs=1e-9)
+    assert [g_dict[nm] for nm in names] == pytest.approx(list(g_ot), rel=1e-4)

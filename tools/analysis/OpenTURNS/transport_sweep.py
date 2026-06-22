@@ -104,7 +104,7 @@ import importlib.util
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any  # (Callable dropped with the runner _fd_gradient — move 5; Optional was already unused)
 
 import numpy as np
 
@@ -114,6 +114,9 @@ if _HERE not in sys.path:
 
 import leaf_eval_grounding as G  # noqa: E402  — the single home of the references + the transfer decomposition
 import manifest  # noqa: E402   — the SSOT registry (import-clean; touches no DB on import)
+from alloc import gradient as _grad  # noqa: E402  — the shared gradient-backend seam: fd_gradient_dict (the
+# numpy-dict form). The runner-local _fd_gradient copy is gone, single-homed in alloc.gradient (move 5); OT
+# is imported lazily there, so this import is safe on the openturns-absent host this fallback path exists for.
 
 _HAS_OT = importlib.util.find_spec("openturns") is not None
 _Z95 = 1.959963984540054
@@ -289,7 +292,7 @@ def _ci_via_driver(model: Any) -> tuple[float, str]:
     x0 = model.initial_point(trust=True)
     names = model.INPUT_NAMES
     sig = _model_sigmas(model)
-    grad = _fd_gradient(model.throughput_numpy, names, x0)
+    grad = _grad.fd_gradient_dict(model.throughput_numpy, names, x0)
     var = sum((grad[nm] * sig[nm]) ** 2 for nm in names)
     return _Z95 * float(np.sqrt(max(var, 0.0))), "numpy"
 
@@ -316,7 +319,7 @@ def _variance_targets(model: Any, top: int = 6) -> list[tuple[str, float, int]]:
     x0 = model.initial_point(trust=True)
     names = model.INPUT_NAMES
     sig = _model_sigmas(model)
-    grad = _fd_gradient(model.throughput_numpy, names, x0)
+    grad = _grad.fd_gradient_dict(model.throughput_numpy, names, x0)
     a = {nm: (grad[nm] * sig[nm]) ** 2 for nm in names}
     ranked = sorted(names, key=lambda nm: a[nm], reverse=True)
     return [(nm, float(a[nm]), 0) for nm in ranked[:top]]
@@ -449,21 +452,6 @@ def _variant_contrasts(model: Any) -> dict[str, Any]:
             except Exception as exc:  # noqa: BLE001 — a contrast that fails is shown, not swallowed
                 out[helper] = f"<{type(exc).__name__}: {exc}>"
     return out
-
-
-# --------------------------------------------------------------------------- #
-# numpy helpers (the openturns-absent path; also the lockstep cross-check).
-# --------------------------------------------------------------------------- #
-def _fd_gradient(fn: Callable[[dict[str, float]], float], names: list[str],
-                 x0: dict[str, float], rel: float = 1e-5) -> dict[str, float]:
-    """Central finite-difference gradient of a numpy callable fn(dict) at x0."""
-    g: dict[str, float] = {}
-    for nm in names:
-        h = rel * max(abs(x0[nm]), 1.0)
-        xp = dict(x0); xp[nm] += h
-        xm = dict(x0); xm[nm] -= h
-        g[nm] = (fn(xp) - fn(xm)) / (2.0 * h)
-    return g
 
 
 # --------------------------------------------------------------------------- #

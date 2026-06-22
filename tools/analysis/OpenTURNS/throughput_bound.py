@@ -44,20 +44,12 @@ import leaf_eval_grounding as G  # noqa: E402
 import manifest  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
 import model_capacity  # noqa: E402
 import model_cycletime  # noqa: E402
+from alloc import gradient as _grad  # noqa: E402  — the shared gradient-backend seam: fd_gradient_dict
+# (the numpy-dict form). The runner-local _fd_gradient copy is gone, single-homed in alloc.gradient (the
+# responsibility-refactor move 5; OT imported lazily there, so this import is safe on an openturns-absent host).
 
 _HAS_OT = importlib.util.find_spec("openturns") is not None
 _Z95 = 1.959963984540054
-
-
-def _fd_gradient(fn, x_names, x0, rel=1e-5):
-    """Central finite-difference gradient of a numpy callable fn(dict) at x0."""
-    g = {}
-    for nm in x_names:
-        h = rel * max(abs(x0[nm]), 1.0)
-        xp = dict(x0); xp[nm] += h
-        xm = dict(x0); xm[nm] -= h
-        g[nm] = (fn(xp) - fn(xm)) / (2.0 * h)
-    return g
 
 
 def _numpy_bound(model, sigmas, costs):
@@ -65,7 +57,7 @@ def _numpy_bound(model, sigmas, costs):
     x0 = model.initial_point()
     names = model.INPUT_NAMES
     f0 = model.throughput_numpy(x0)
-    grad = _fd_gradient(model.throughput_numpy, names, x0)
+    grad = _grad.fd_gradient_dict(model.throughput_numpy, names, x0)
     a = {nm: (grad[nm] * sigmas[nm]) ** 2 for nm in names}     # a_i = (df/dx_i)^2 sigma_i^2
     var = sum(a.values())                                       # Var(E[f]) at n_i=1 each
     ci = _Z95 * np.sqrt(max(var, 0.0))
