@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/model_cpp_inproc_port.py
+tools/analysis/leaf_eval_bound/models/model_cpp_inproc_port.py
 =================================================
 
 Transport variant CPP-INPROC-PORT: the leaf-eval throughput LOWER BOUND (dps) for the C++

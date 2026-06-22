@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/model_lockfree_mpsc.py
+tools/analysis/leaf_eval_bound/models/model_lockfree_mpsc.py
 ===============================================
 
 Transport variant LOCKFREE-MPSC: the leaf-eval throughput LOWER BOUND (dps) for a LOCK-FREE

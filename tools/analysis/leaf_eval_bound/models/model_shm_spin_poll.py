@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/model_shm_spin_poll.py
+tools/analysis/leaf_eval_bound/models/model_shm_spin_poll.py
 ===============================================
 
 Transport variant SHM-SPIN-POLL: the leaf-eval throughput LOWER BOUND (dps) for a SHARED-

@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/model_capacity.py
+tools/analysis/leaf_eval_bound/models/model_capacity.py
 ==========================================
 
 Design-A: the CAPACITY / BOTTLENECK lower bound on the achievable leaf-eval throughput

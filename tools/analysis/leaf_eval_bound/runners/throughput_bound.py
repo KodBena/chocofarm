@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/throughput_bound.py
+tools/analysis/leaf_eval_bound/runners/throughput_bound.py
 ============================================
 
 Runner: for EACH leaf-eval throughput lower-bound model (Design-A capacity, model_capacity.py;

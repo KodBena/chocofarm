@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/estimate.py
+tools/analysis/leaf_eval_bound/contract/estimate.py
 ====================================
 
 The harmonized statistical contract every leaf-eval benchmark exposes: ONE frozen,

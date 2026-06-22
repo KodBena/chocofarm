@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/model_base.py
+tools/analysis/leaf_eval_bound/models/model_base.py
 ============================================
 
 The TYPED contract a leaf-eval TRANSPORT-VARIANT model satisfies — the `TransportModel` Protocol

@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/model_futex_wake.py
+tools/analysis/leaf_eval_bound/models/model_futex_wake.py
 ============================================
 
 Transport variant FUTEX-WAKE: the leaf-eval throughput LOWER BOUND (dps) for a SHARED-MEMORY

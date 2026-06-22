@@ -1,5 +1,5 @@
 """
-tools/analysis/leaf_eval_bound/manifest.py
+tools/analysis/leaf_eval_bound/store/manifest.py
 ====================================
 
 The SSOT REGISTRY of measurable physical quantities for the leaf-eval transport-design
