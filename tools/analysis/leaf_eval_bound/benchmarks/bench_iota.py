@@ -30,7 +30,8 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import fit_estimate, logged_run  # noqa: E402
+from estimators import fit_estimate  # noqa: E402
+from harness import logged_run  # noqa: E402
 
 NAME = "iota_us"
 # The co-fit PARTNER: iota (the intercept) and t_row (the slope) are the SAME staged fit (measure()
@@ -38,7 +39,7 @@ NAME = "iota_us"
 # INTERCEPT as component 0 (the marginal manifest.value("iota_us") projects) and t_row_us the partner
 # carrying the −0.81 off-diagonal (§4.2) — the SAME fit t_row logs, only the component order differs.
 PARTNER_NAME = "t_row_us"
-WARMUP = 8   # harness warmup phase (bench_common.warm): burn cold-compile forwards before measuring
+WARMUP = 8   # harness warmup phase (harness.warm): burn cold-compile forwards before measuring
 MODULE_PATH = "benchmarks.bench_iota"
 _DESC = ("SERVE fixed per-forward cost (us): the intercept of the staged run_microbatch JAX forward "
          "(time = iota + t_row*rows). JAX-forward-only floor (dispatch + output pull + input); contains "
@@ -51,7 +52,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from bench_common import register_quantity
+    from harness import register_quantity
     return register_quantity(NAME, quantity="serve_fixed_forward_cost", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

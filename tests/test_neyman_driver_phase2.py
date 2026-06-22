@@ -111,13 +111,13 @@ def _degenerate(name: str, value: float, sigma: float) -> E.Estimate:
 def _median(pool, name: str) -> E.Estimate:
     """A k=1 QuantileLaw (median) Estimate from a raw pool — a SHRINKABLE input whose typed marginal is
     `−cov/n < 0` (the order-statistic 1/n law), so the allocator funds it. Built via the Phase-3
-    `bench_common.median_estimate` (the real bootstrap-SE path)."""
+    `estimators.median_estimate` (the real bootstrap-SE path)."""
     import os as _os
     import sys as _sys
     _bench = _os.path.join(_OT, "benchmarks")
     if _bench not in _sys.path:
         _sys.path.insert(0, _bench)
-    import bench_common as _bc
+    import estimators as _bc
     return _bc.median_estimate(list(pool), name=name)
 
 
@@ -446,7 +446,7 @@ def _fit(intercept: float, slope: float, *, lack_of_fit: bool, name="slope_us", 
     _bench = _os.path.join(_OT, "benchmarks")
     if _bench not in _sys.path:
         _sys.path.insert(0, _bench)
-    import bench_common as _bc
+    import estimators as _bc
     x = np.asarray(DESIGN, dtype=float)
     if lack_of_fit:
         med = [float(v) for v in (intercept + slope * x + 0.0009 * x ** 2)]  # quadratic truth, line fit

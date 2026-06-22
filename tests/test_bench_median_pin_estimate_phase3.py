@@ -20,11 +20,11 @@ These tests cover the Phase-3 deliverables WITHOUT a live timed measurement (the
 benches are timing-sensitive; the median's Estimate SHAPE + bootstrap SE are
 exercised on a SYNTHESIZED pool, the pin's on the recorded seed — §8 discipline):
 
-  * `bench_common.median_estimate` — the bootstrap median SE is a REAL bootstrap
+  * `estimators.median_estimate` — the bootstrap median SE is a REAL bootstrap
     (it differs from `s²/n` on a skewed pool), the `QuantileLaw` is self-consistent
     (its implied `p(1−p)/(n·f̂²)` equals the bootstrap `cov`), the contract fields,
     the jsonb round-trip, and FAIL-LOUD on a pool with no defensible variance;
-  * `bench_common.pin_estimate` — the declared σ is recovered un-divided, the
+  * `estimators.pin_estimate` — the declared σ is recovered un-divided, the
     DEGENERATE/NORMAL family split, the round-trip, FAIL-LOUD;
   * the §5.2 DE-DUP — a median bench's `run()` logs ONLY the raw pool as provenance
     (the headline median is NOT double-logged as a sample row);
@@ -36,7 +36,7 @@ unreachable, self-cleaning), proving `manifest.estimate('tau_io_us')` returns th
 `QuantileLaw` Estimate (source 'postgres(estimate)', NOT the Phase-1 legacy Poolwise
 reconstruction) and `manifest.estimate('B_op')` the `Fixed` one with σ=64 in `cov`.
 
-The `estimate`/`bench_common`/`bench_<name>` modules live under
+The `estimate`/`estimators`/`bench_<name>` modules live under
 tools/analysis/leaf_eval_bound/ (no __init__.py — imported by sys.path, the way manifest.py
 imports bench_store), so this test prepends those directories to sys.path.
 
@@ -60,7 +60,7 @@ for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import bench_common as BC  # noqa: E402  — the median_estimate/pin_estimate helpers under test
+import estimators as BC  # noqa: E402  — the median_estimate/pin_estimate helpers under test
 import estimate as E  # noqa: E402  — the contract
 
 

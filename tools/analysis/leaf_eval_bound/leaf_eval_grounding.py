@@ -83,7 +83,7 @@ class Grounded:
 #
 # needs_measurement=True on BOTH (MEASURED quantities, NOT true constants — `constant` stays
 # its default False): iota (the intercept) and slope/t_row are the SAME k=2 staged-forward
-# OLS fit that bench_iota.py / bench_t_row.py now RUN LIVE (bench_common.fit_estimate over the
+# OLS fit that bench_iota.py / bench_t_row.py now RUN LIVE (estimators.fit_estimate over the
 # production `run_microbatch` forward at a width sweep -> a SHRINKABLE RegressionLaw Estimate
 # with the −0.81 slope/intercept off-diagonal, the SE from resid_var + the x-design — NOT the
 # 12.0us/0.5us hand-literals below, and NOT the stored JSON, which carries only intercept/slope/

@@ -46,7 +46,9 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import collect_pool, logged_run, median_estimate  # noqa: E402
+from estimators import median_estimate  # noqa: E402
+from pools import collect_pool  # noqa: E402
+from harness import logged_run  # noqa: E402
 
 NAME = "shm_spin_poll_wakeup_us"
 MODULE_PATH = "benchmarks.bench_shm_spin_poll_wakeup"
@@ -66,7 +68,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from bench_common import register_quantity
+    from harness import register_quantity
     return register_quantity(NAME, quantity="wakeup_latency_shm_spin_poll", units="us",
                              description=_DESC, module_path=MODULE_PATH)
 
@@ -79,7 +81,7 @@ def _measure_raw(trials: int = 20000) -> dict[str, Any]:
     polls past (it jumps to the latest counter value) and DROPS torn 64-bit stamp reads — so the per-batch
     reading count is NOT promised by `trials`, and at a tiny allocator budget it can fall below
     median_estimate's >= 2 floor (the ~/shm_spin_poll_fail crash: budget 6 -> 1 reading -> raise).
-    `bench_common.collect_pool` therefore owns the floor: it re-runs the producer/server batch at growing
+    `pools.collect_pool` therefore owns the floor: it re-runs the producer/server batch at growing
     effort until the accumulated pool reaches min_readings (RCA fix #2 — the READING COUNT is floored, not
     the requested effort). Returns {'wakeup_us_median', 'per_trial_us', 'trials'}. Imports numpy +
     shared_memory lazily. Pin two cores (taskset -c 0,1) for the faithful cross-core coherence read.

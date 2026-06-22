@@ -71,7 +71,9 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import logged_run, median_estimate, window_pool  # noqa: E402
+from estimators import median_estimate  # noqa: E402
+from pools import window_pool  # noqa: E402
+from harness import logged_run  # noqa: E402
 
 NAME = "lockfree_mpsc_tmsg_us_leaf"
 MODULE_PATH = "benchmarks.bench_lockfree_mpsc_tmsg"
@@ -100,7 +102,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from bench_common import register_quantity
+    from harness import register_quantity
     return register_quantity(NAME, quantity="transport_msg_cost_per_leaf_lockfree_mpsc", units="us",
                              description=_DESC, module_path=MODULE_PATH)
 

@@ -95,15 +95,13 @@ def _all_bench_modules() -> list:
     mods = []
     for path in sorted(glob.glob(os.path.join(_BENCH, "bench_*.py"))):
         name = os.path.splitext(os.path.basename(path))[0]
-        if name == "bench_common":
-            continue
         mods.append(__import__(name))
     return mods
 
 
 # The bench-body SHRINK-LAW classifier, single-homed (ADR-0012 P1) so the class-level guards below — the
 # shrinkable=>sizable guard AND the Grounded-estimability agreement guard — read a bench's pin-vs-shrinkable
-# from ONE place, not two copies of the same AST walk. A bench's shrink law is which bench_common builder its
+# from ONE place, not two copies of the same AST walk. A bench's shrink law is which estimators builder its
 # `_estimate_from_raw` calls: `pin_estimate` -> Fixed; `median_estimate` -> QuantileLaw; `fit_estimate` ->
 # RegressionLaw.
 _ESTIMATOR_BUILDERS = ("pin_estimate", "median_estimate", "fit_estimate")
@@ -111,7 +109,7 @@ _SHRINKABLE_BUILDERS = frozenset({"median_estimate", "fit_estimate"})   # the no
 
 
 def _bench_estimator_builders(mod) -> set:
-    """The bench_common estimator builder(s) `mod._estimate_from_raw` calls — the run-free AST classifier of a
+    """The estimators-module estimator builder(s) `mod._estimate_from_raw` calls — the run-free AST classifier of a
     bench's shrink law (no live timed run / postgres / C++ binary). Returns the called subset of
     `_ESTIMATOR_BUILDERS`; a bench calling none is a loud failure (ADR-0002: classify it, never silently
     mis-rank). `result & _SHRINKABLE_BUILDERS` is truthy iff the bench is shrinkable (non-Fixed)."""
@@ -129,7 +127,7 @@ def _bench_estimator_builders(mod) -> set:
     }
     known = called & set(_ESTIMATOR_BUILDERS)
     assert known, (
-        f"{mod.__name__}._estimate_from_raw calls no known bench_common estimator builder (expected one of "
+        f"{mod.__name__}._estimate_from_raw calls no known estimators-module estimator builder (expected one of "
         f"{_ESTIMATOR_BUILDERS}) — classify it; ADR-0002: fail loud, never silently mis-rank a bench's "
         f"shrinkability")
     return known
@@ -268,13 +266,13 @@ def test_registry_qname_bridges_both_model_map_shapes() -> None:
 
 def test_sizing_kwargs_single_home_includes_budget_and_leaves() -> None:
     """ADR-0012 P1 (single home): the recognized sizing-kwarg list lives ONCE, in
-    `bench_common.SIZING_KWARGS`; `untrusted_drive._ITERS_KW` ALIASES it. The `is` check proves there is no
-    second literal — the duplicate (untrusted_drive._ITERS_KW vs the inline tuple in bench_common.warm)
+    `harness.SIZING_KWARGS`; `untrusted_drive._ITERS_KW` ALIASES it. The `is` check proves there is no
+    second literal — the duplicate (untrusted_drive._ITERS_KW vs the inline tuple in harness.warm)
     that let `budget`/`leaves` go unrecognized in one path. It must cover `budget` (the drive's own
     canonical lever name — its measurer wrapper is `def measure(budget)`) and `leaves` (the cpp-inproc tmsg
     knob), else a SHRINKABLE tmsg bench shows budget-kw None and the loop cannot size it."""
     import untrusted_drive as U
-    import bench_common as BC
+    import harness as BC
     assert U._ITERS_KW is BC.SIZING_KWARGS, "ADR-0012 P1: _ITERS_KW must ALIAS the single home, not re-list"
     assert "budget" in BC.SIZING_KWARGS, "the drive's own lever name `budget` must be a recognized knob"
     assert "leaves" in BC.SIZING_KWARGS, "the cpp-inproc tmsg `leaves` knob must be a recognized knob"
@@ -283,19 +281,19 @@ def test_sizing_kwargs_single_home_includes_budget_and_leaves() -> None:
 def test_every_shrinkable_bench_is_sizable_by_the_driver() -> None:
     """CLASS-LEVEL discovery guard (ADR-0011 Rule 4 — keyed on the PREDICATE, discovered by glob,
     never a hand-list): for EVERY bench module, IF its measure() declares a SHRINKABLE Estimate then
-    measure() MUST expose a recognized `bench_common.SIZING_KWARGS` member — else the driver detects
+    measure() MUST expose a recognized `harness.SIZING_KWARGS` member — else the driver detects
     budget-kw None and runs it at a fixed default (the shrinkable-but-un-sizable trap; the original
     `budget`/`leaves` bug). This SUPERSEDES the per-instance tmsg modname list (the RCA
     `docs/notes/leaf-eval-estimator-pin-cascade-rca.md` names that enumeration as the smoking gun: an
     instance list fails open at the next instance). A bench is shrinkable iff its `_estimate_from_raw`
-    builds the Estimate with a non-pin bench_common builder (`median_estimate` -> QuantileLaw /
+    builds the Estimate with a non-pin estimators builder (`median_estimate` -> QuantileLaw /
     `fit_estimate` -> RegressionLaw); a `pin_estimate`-only bench is Fixed and AUTO-EXEMPT (B_op,
     n_gen — the honest pins are never asked to be sizable, which sidesteps the unsolved "a runnable
     bench exists" signal). Classified by AST of the bench body (the single-homed estimator builder it
     calls) so NO live timed run / postgres / C++ binary is needed; a bench calling no known builder
     fails LOUD (ADR-0002) rather than being silently mis-ranked."""
     import inspect
-    import bench_common as BC
+    import harness as BC
     n_shrinkable = 0
     for mod in _all_bench_modules():
         if not (_bench_estimator_builders(mod) & _SHRINKABLE_BUILDERS):
@@ -305,7 +303,7 @@ def test_every_shrinkable_bench_is_sizable_by_the_driver() -> None:
         kw = next((k for k in BC.SIZING_KWARGS if k in params), None)
         assert kw is not None, (
             f"{mod.__name__} is SHRINKABLE but measure({list(params)}) exposes no recognized sizing kwarg — "
-            f"the driver shows budget-kw None and cannot size it. Name the knob a `bench_common.SIZING_KWARGS` "
+            f"the driver shows budget-kw None and cannot size it. Name the knob a `harness.SIZING_KWARGS` "
             f"member (the budget-kw bug, now caught over the class).")
     assert n_shrinkable >= 10, (
         f"discovery reached only {n_shrinkable} shrinkable benches (expected >=10: the tmsg family + the median "
@@ -318,7 +316,7 @@ def test_every_race_based_collector_bench_uses_the_pool_floor() -> None:
     for RCA fix #2: a RACE-BASED collector bench — one that spawns a producer/consumer `threading.Thread`
     in `_measure_raw`, so its realized reading count is DECOUPLED from the requested effort and can fall
     below median_estimate's >= 2 floor at a tiny allocator budget (the ~/shm_spin_poll_fail crash) — MUST
-    floor its pool via `bench_common.collect_pool`. Detected by AST of `_measure_raw` (a `Thread(...)` call
+    floor its pool via `pools.collect_pool`. Detected by AST of `_measure_raw` (a `Thread(...)` call
     => race; a `collect_pool(...)` call => floored), so NO live timed run is needed. Symmetric to the
     shrinkable=>sizable guard: a NEW race bench that forgets the floor fails HERE, not at a tiny-budget crash
     in production. (`Thread`-in-_measure_raw is the proxy for "race collector": the 4 wakeup benches are the
@@ -343,7 +341,7 @@ def test_every_race_based_collector_bench_uses_the_pool_floor() -> None:
         assert "collect_pool" in calls, (
             f"{mod.__name__} is a RACE-based collector (spawns a producer/consumer Thread in _measure_raw, so "
             f"its realized pool count is decoupled from the budget) but does NOT floor via "
-            f"bench_common.collect_pool — at a tiny allocator budget its pool underflows median_estimate's "
+            f"pools.collect_pool — at a tiny allocator budget its pool underflows median_estimate's "
             f">= 2 floor (the ~/shm_spin_poll_fail crash). Wrap the batch in collect_pool (RCA fix #2).")
     assert n_race >= 4, (
         f"expected at least the 4 known race-based wakeup collectors (shm_spin_poll, futex_wake, "
@@ -497,7 +495,7 @@ def test_untrusted_drive_estimate_path_is_sane(monkeypatch) -> None:
     _driver_deps()
     import manifest as M
     import untrusted_drive as U
-    import bench_common as BC
+    import estimators as BC
     import model_zmq_baseline as model
 
     qof = {nm: model.INPUT_QUANTITIES[nm][0] for nm in model.INPUT_NAMES}

@@ -69,13 +69,13 @@ if _HERE not in sys.path:
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the typed value measurers return)
 import manifest  # noqa: E402  — the SSOT registry: name -> bench module_path
 sys.path.insert(0, os.path.join(_HERE, "benchmarks"))
-import bench_common  # noqa: E402  — the harness warmup phase (warm())
+import harness  # noqa: E402  — the harness warmup phase (warm())
 import leaf_eval_grounding as _G  # noqa: E402  — seed iota/t_row, to predict the slow JAX-fit ETAs
 
 # The recognized "how many units" keyword a bench's measure() exposes so the loop can size the batch to
-# the allocator's k by passing it. SINGLE HOME (ADR-0012 P1) is bench_common.SIZING_KWARGS — aliased here,
+# the allocator's k by passing it. SINGLE HOME (ADR-0012 P1) is harness.SIZING_KWARGS — aliased here,
 # never re-listed (the duplicate that left `budget`/`leaves`-named tmsg benches showing budget-kw "None").
-_ITERS_KW = bench_common.SIZING_KWARGS
+_ITERS_KW = harness.SIZING_KWARGS
 
 _VARIANTS = ("zmq_baseline", "shm_spin_poll", "futex_wake", "lockfree_mpsc", "cpp_inproc_port")
 
@@ -159,7 +159,7 @@ def _make_measurer(qname: str, iters_cap: int) -> Callable[[int], "_est.Estimate
     estimate, is a loud failure at this seam (ADR-0002), never silently coerced into a plausible-looking
     bound (the cratered `E[f]≈11.9` that motivated this phase)."""
     mod = _bench_module(qname)
-    bench_common.warm(mod)   # run the bench's advertised warmup phase ONCE (opt-in; no-op if none)
+    harness.warm(mod)   # run the bench's advertised warmup phase ONCE (opt-in; no-op if none)
     fn = getattr(mod, "measure", None)
     if fn is None:
         raise AttributeError(

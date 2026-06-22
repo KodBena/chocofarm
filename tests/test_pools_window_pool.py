@@ -1,8 +1,8 @@
 """
-tests/test_bench_common_window_pool.py
-======================================
+tests/test_pools_window_pool.py
+===============================
 
-`bench_common.window_pool` — the shared DETERMINISTIC WINDOW-LOOP pool builder (RCA fix #2,
+`pools.window_pool` — the shared DETERMINISTIC WINDOW-LOOP pool builder (RCA fix #2,
 the DRY half; `docs/notes/leaf-eval-estimator-pin-cascade-rca.md` §5.1/§5.2c): the ONE home of
 the `for _ in range(N): pool.append(measure_one_window())` idiom the leaf-eval median benches
 (the tau_io family, gather, req_drain, zmq_baseline_wakeup, the tmsg family) hand-copied ≈12
@@ -35,7 +35,7 @@ for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import bench_common as BC  # noqa: E402
+import pools as BC  # noqa: E402
 
 
 def test_runs_one_call_per_window_in_order() -> None:

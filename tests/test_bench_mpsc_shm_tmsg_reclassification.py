@@ -218,7 +218,7 @@ def test_get_seed_is_the_distrust_fallback_and_unchanged(modname: str) -> None:
 
 @pytest.mark.parametrize("modname", _MODULES)
 def test_pin_estimate_no_longer_imported(modname: str) -> None:
-    """The punt's structural tell was `from bench_common import ... pin_estimate`; the fix drops it (the
+    """The punt's structural tell was `from estimators import ... pin_estimate`; the fix drops it (the
     measured path is a `median_estimate`). A regression that re-introduces the pin would re-bind the name."""
     B = _mod(modname)
     assert not hasattr(B, "pin_estimate")

@@ -37,7 +37,9 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import logged_run, median_estimate, window_pool  # noqa: E402
+from estimators import median_estimate  # noqa: E402
+from pools import window_pool  # noqa: E402
+from harness import logged_run  # noqa: E402
 
 NAME = "shm_spin_poll_req_drain_us"
 MODULE_PATH = "benchmarks.bench_shm_spin_poll_req_drain"
@@ -61,7 +63,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from bench_common import register_quantity
+    from harness import register_quantity
     return register_quantity(NAME, quantity="serve_req_drain_copy_shm_spin_poll", units="us",
                              description=_DESC, module_path=MODULE_PATH)
 

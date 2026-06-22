@@ -1,8 +1,8 @@
 """
-tests/test_bench_common_collect_pool.py
-=======================================
+tests/test_pools_collect_pool.py
+================================
 
-`bench_common.collect_pool` — the shared race-collector POOL FLOOR (RCA fix #2,
+`pools.collect_pool` — the shared race-collector POOL FLOOR (RCA fix #2,
 `docs/notes/leaf-eval-estimator-pin-cascade-rca.md`): a `len(pool) >= min_readings`
 guarantee for a producer/consumer wakeup bench whose realized reading count is
 DECOUPLED from the requested effort (it coalesces edges + drops torn reads, so a small
@@ -33,7 +33,7 @@ for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import bench_common as BC  # noqa: E402
+import pools as BC  # noqa: E402
 
 
 def test_first_batch_meets_floor_no_retry() -> None:

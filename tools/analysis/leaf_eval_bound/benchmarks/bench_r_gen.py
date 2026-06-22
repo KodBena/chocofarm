@@ -56,7 +56,8 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
 import leaf_eval_grounding as G  # noqa: E402
-from bench_common import logged_run, median_estimate  # noqa: E402
+from estimators import median_estimate  # noqa: E402
+from harness import logged_run  # noqa: E402
 
 NAME = "R_gen"
 MODULE_PATH = "benchmarks.bench_r_gen"
@@ -106,7 +107,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from bench_common import register_quantity
+    from harness import register_quantity
     return register_quantity(NAME, quantity="producer_decisions_per_core", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

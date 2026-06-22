@@ -15,7 +15,7 @@ These tests cover the Phase-3 deliverables WITHOUT the live timed measurement (t
 are timing-sensitive; the Estimate SHAPE + cov are exercised on the recorded 7-point design
 and synthesized per-width medians — the correlation is design-determined, §8):
 
-  * `bench_common.fit_estimate` builds the k=2 fit Estimate: `cov = resid_var·(AᵀA)⁻¹` with
+  * `estimators.fit_estimate` builds the k=2 fit Estimate: `cov = resid_var·(AᵀA)⁻¹` with
     `Corr(slope, intercept) = −0.8114` on the real design `[32,64,128,192,256,384,512]`, the
     three `(AᵀA)⁻¹` entries matching their closed forms, `RegressionLaw`/`StudentT(dof=5)`,
     `kind='ols_fit'`, and the partner off-diagonal mirrored into `cross`;
@@ -32,7 +32,7 @@ self-cleaning of its synthetic instances), proving `manifest.estimate('t_row_us'
 k=2 fit Estimate (not the Phase-1 legacy Poolwise reconstruction) and the §5.2 DE-DUP holds
 (only the per-width medians as provenance rows, the headline scalar NOT double-logged).
 
-The `estimate`/`bench_common`/`bench_<name>` modules live under tools/analysis/leaf_eval_bound/
+The `estimate`/`estimators`/`bench_<name>` modules live under tools/analysis/leaf_eval_bound/
 (no __init__.py — imported by sys.path, the way manifest.py imports bench_store), so this
 test prepends those directories to sys.path.
 
@@ -56,7 +56,7 @@ for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import bench_common as BC  # noqa: E402  — the fit_estimate helper under test
+import estimators as BC  # noqa: E402  — the fit_estimate helper under test
 import estimate as E  # noqa: E402  — the contract
 
 # The real 7-point design the spec §8 corroborating check fixes the −0.8114 to.

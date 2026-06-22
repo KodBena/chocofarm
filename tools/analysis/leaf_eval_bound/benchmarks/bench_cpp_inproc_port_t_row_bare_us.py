@@ -47,7 +47,8 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from bench_common import fit_estimate, logged_run  # noqa: E402
+from estimators import fit_estimate  # noqa: E402
+from harness import logged_run  # noqa: E402
 
 NAME = "cpp_inproc_port_t_row_bare_us"
 # The co-fit PARTNER: this bare-forward SLOPE and T_disp (the dispatch-floor INTERCEPT) are read off the
@@ -82,7 +83,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from bench_common import register_quantity
+    from harness import register_quantity
     return register_quantity(NAME, quantity="serve_per_row_cost_bare_forward", units="us/row",
                              description=_DESC, module_path=MODULE_PATH)
 
