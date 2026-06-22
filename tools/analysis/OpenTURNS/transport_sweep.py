@@ -288,7 +288,7 @@ def _ci_via_driver(model: Any) -> tuple[float, str]:
     # numpy fallback: first-order delta-method CI at n=1/input (the v1 _numpy_bound recipe).
     x0 = model.initial_point(trust=True)
     names = model.INPUT_NAMES
-    sig = _model_sigmas(model)
+    sig = model.sigmas(trust=True)
     return rs.delta_method(model.throughput_numpy, names, x0, sig).ci, "numpy"
 
 
@@ -313,7 +313,7 @@ def _variance_targets(model: Any, top: int = 6) -> list[tuple[str, float, int]]:
                   f"({type(exc).__name__}: {exc}); using numpy a_i ranking.", file=sys.stderr)
     x0 = model.initial_point(trust=True)
     names = model.INPUT_NAMES
-    sig = _model_sigmas(model)
+    sig = model.sigmas(trust=True)
     a = rs.delta_method(model.throughput_numpy, names, x0, sig).a
     ranked = sorted(names, key=lambda nm: a[nm], reverse=True)
     return [(nm, float(a[nm]), 0) for nm in ranked[:top]]
@@ -335,14 +335,6 @@ def _transport_targets(slug: str) -> list[tuple[str, float, bool]]:
                   f"({type(exc).__name__}: {exc}).", file=sys.stderr)
             out.append((qname, float("nan"), False))
     return out
-
-
-def _model_sigmas(model: Any) -> dict[str, float]:
-    """The model's per-input sigma map. The variant models expose `sigmas(trust=True)`; the v1-style
-    models expose a module-level `SIGMAS` dict. Accept either (uniform consumption across the family)."""
-    if hasattr(model, "sigmas"):
-        return model.sigmas(trust=True)
-    return dict(model.SIGMAS)
 
 
 def _model_estimates(model: Any) -> dict[str, "Any"]:
