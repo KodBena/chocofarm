@@ -9,7 +9,7 @@ the driver owns no model; this module owns this model. It exists to exercise the
 allocator on a deliberately heavy-tailed input (the messy context-switch cost) so the
 report visibly funds the high-variance primitive.
 
-Run: `python tools/analysis/OpenTURNS/examples/demo_msgpass.py` (requires openturns).
+Run: `python tools/analysis/OpenTURNS/examples/demo_msgpass.py` (requires jax + scipy).
 
 Public Domain (The Unlicense).
 """
@@ -22,8 +22,6 @@ import numpy as np
 
 # Allow running as a bare script (examples/ is a sibling of neyman_driver.py).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import openturns as ot  # noqa: E402  (after the sys.path shim, by design)
 
 from neyman_driver import NeymanDriver  # noqa: E402
 
@@ -56,10 +54,9 @@ def build_demo() -> tuple[NeymanDriver, dict[int, object], list[str], list[float
     samplers = {0: s_msg_lat, 1: s_ctx_switch, 2: s_infer_tput, 3: s_serialize}
     names = ["msg_lat_us", "ctx_switch_us", "infer_tput", "serialize_us"]
 
-    f = ot.SymbolicFunction(
-        ["msg_lat", "ctx", "infer_tput", "serialize"],
-        ["1e6 / (msg_lat + ctx + 1e6/infer_tput + serialize)"],
-    )
+    def f(x):  # JAX-traceable; x ordered by `names` (msg_lat, ctx, infer_tput, serialize)
+        msg_lat, ctx, infer_tput, serialize = x
+        return 1e6 / (msg_lat + ctx + 1e6 / infer_tput + serialize)
     costs = [1.0, 25.0, 2.0, 0.5]   # per-sample bench cost; the ctx-switch bench is dear
 
     driver = NeymanDriver(

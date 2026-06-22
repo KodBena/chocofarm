@@ -13,12 +13,13 @@ gradient Port; `docs/design/leaf-eval-bound-responsibility-refactor.md`):
     the Clark math surfaces here without the whole driver. (The end-to-end behavioral
     equivalence — that the driver's `step()` is unchanged by the lift — is the separate
     oracle in `test_neyman_driver_phase2.py`; this file is the complementary unit lens.)
-  * `alloc.gradient.gradient` / `fd_gradient` — the gradient-backend seam (the OT-analytic
-    path and the central-FD fallback), on a SymbolicFunction whose gradient is known in
-    closed form.
+  * `alloc.gradient.fd_gradient_dict` — the runners' numpy delta-method gradient (a central FD
+    over a `dict→float` callable). The OT-function gradient forms `gradient` / `fd_gradient` were
+    removed in the OT→JAX migration (J3); `jax.grad` is the backend now, covered by
+    `tests/test_jax_f_equivalence.py`.
 
-Run-free / fast: the kink tests are pure numpy + scipy on hand-built arrays; the gradient
-tests build a trivial OpenTURNS SymbolicFunction. No timed bench, no DB, no network.
+Run-free / fast: the kink tests are pure numpy + scipy on hand-built arrays; the gradient test is
+numpy-only. No timed bench, no DB, no network, no OpenTURNS.
 
 Public Domain (The Unlicense).
 """
@@ -38,7 +39,6 @@ _OT = os.path.join(
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
-import openturns as ot  # noqa: E402
 from alloc import gradient as G  # noqa: E402
 from alloc import kink as K  # noqa: E402
 
@@ -122,59 +122,15 @@ def test_assess_min_kink_pfloor_gates_the_regime() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# alloc.gradient — the gradient-backend seam (OT analytic + central-FD fallback).
+# alloc.gradient.fd_gradient_dict — the runners' numpy delta-method gradient. (The OT-function
+# gradient forms `gradient`/`fd_gradient` were removed in migration J3; jax.grad is the backend,
+# covered by tests/test_jax_f_equivalence.py.)
 # --------------------------------------------------------------------------- #
-def test_gradient_analytic_matches_closed_form_linear() -> None:
-    """A linear SymbolicFunction has an exact analytic gradient: ∇(3·x0 − 1.5·x1) = (3, −1.5), constant
-    everywhere. `gradient` returns it via OT's `f.gradient()` (the analytic path)."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["3*x0 - 1.5*x1"])
-    g = G.gradient(f, np.array([2.0, 5.0]), dim=2)
-    assert g == pytest.approx([3.0, -1.5], abs=1e-9)
-
-
-def test_gradient_defaults_dim_from_the_function() -> None:
-    """`dim` is optional — it defaults to `f.getInputDimension()` (the driver passes its cached d; a bare
-    caller need not)."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["3*x0 - 1.5*x1"])
-    g = G.gradient(f, np.array([2.0, 5.0]))
-    assert g == pytest.approx([3.0, -1.5], abs=1e-9)
-
-
-def test_fd_gradient_matches_analytic_on_a_nonlinear_function() -> None:
-    """The central-FD fallback reproduces the analytic gradient: ∇(x0·x1) = (x1, x0) = (5, 2) at (2, 5).
-    `fd_gradient` (the OT-analytic fallback, used when `f.gradient()` raises) agrees with `gradient`'s
-    analytic value to FD tolerance — the two paths the seam must keep consistent."""
-    f = ot.SymbolicFunction(["x0", "x1"], ["x0*x1"])
-    x = np.array([2.0, 5.0])
-    g_analytic = G.gradient(f, x, dim=2)
-    g_fd = G.fd_gradient(f, x, dim=2)
-    assert g_analytic == pytest.approx([5.0, 2.0], abs=1e-9)
-    assert g_fd == pytest.approx([5.0, 2.0], rel=1e-4)
-
-
 def test_fd_gradient_dict_matches_closed_form() -> None:
-    """The numpy-dict form (move 5: the runners' OT-absent fallback gradient over `model.throughput_numpy`,
-    formerly copied verbatim in throughput_bound + transport_sweep): a central FD of `fn(dict) -> float`,
-    returned keyed by input name. ∇(3·a − 1.5·b) = {a: 3, b: −1.5}."""
+    """The numpy-dict FD gradient over `model.throughput_numpy` (the runners' delta-method path): a
+    central FD of `fn(dict) -> float`, returned keyed by input name. ∇(3·a − 1.5·b) = {a: 3, b: −1.5}."""
     def fn(d: dict[str, float]) -> float:
         return 3.0 * d["a"] - 1.5 * d["b"]
     g = G.fd_gradient_dict(fn, ["a", "b"], {"a": 2.0, "b": 5.0})
     assert g["a"] == pytest.approx(3.0, rel=1e-4)
     assert g["b"] == pytest.approx(-1.5, rel=1e-4)
-
-
-def test_fd_gradient_dict_agrees_with_the_ot_form() -> None:
-    """The two forms of the ONE seam differentiate the SAME f and must AGREE: the OT-array form on a
-    SymbolicFunction and the numpy-dict form on its Python twin give the same gradient. (This is the
-    invariant the planned JAX swap rests on — it collapses the two into one `jax.grad`; they had better
-    match today.) f = a·b ⇒ ∇ = (b, a) = (5, 2)."""
-    names = ["a", "b"]
-    x = {"a": 2.0, "b": 5.0}
-    f_ot = ot.SymbolicFunction(names, ["a*b"])
-
-    def fn(d: dict[str, float]) -> float:        # the numpy twin of f_ot
-        return d["a"] * d["b"]
-    g_ot = G.gradient(f_ot, np.array([x[nm] for nm in names]), dim=2)
-    g_dict = G.fd_gradient_dict(fn, names, x)
-    assert g_ot == pytest.approx([5.0, 2.0], abs=1e-9)
-    assert [g_dict[nm] for nm in names] == pytest.approx(list(g_ot), rel=1e-4)

@@ -76,26 +76,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import leaf_eval_grounding as G  # noqa: E402
 from neyman_driver import NeymanDriver  # noqa: E402
 
-# Input order is the single home of the model's signature (used by both the symbolic
-# function and the numpy fallback so they cannot drift — P1).
+# Input order is the single home of the model's signature (used by both `throughput_jax`
+# and the numpy `throughput_numpy` so they cannot drift — P1).
 INPUT_NAMES = ["g_core", "n_gen", "LPD", "iota_us", "slope_us", "tau_io_us", "B_op",
                "tmsg_us_leaf"]
 
-# The throughput EXPRESSION, single-homed as a string (muParser/ExprTk grammar). min() of
-# the three stage capacities. SERVE denominator carries the extra tau_io_us term.
-THROUGHPUT_EXPR = (
-    "min("
-    "  n_gen*g_core/LPD ,"                                              # GENERATION
-    "  (B_op/((iota_us + slope_us*B_op + tau_io_us)*1e-6))/LPD ,"       # SERVE (full bucket)
-    "  1.0/(LPD*tmsg_us_leaf*1e-6)"                                     # TRANSPORT
-    ")"
-)
-
-
 def throughput_numpy(x: dict[str, float]) -> float:
-    """The numpy-only evaluation of f (the fallback path when openturns is absent, and the
-    cross-check that the symbolic formula evaluates to the same number). SAME formula as
-    THROUGHPUT_EXPR — kept in lockstep by construction."""
+    """The numpy-only evaluation of f (the fallback path, and the
+    cross-check that the formula evaluates to the same number). SAME formula as
+    throughput_jax — kept in lockstep by construction."""
     gen = x["n_gen"] * x["g_core"] / x["LPD"]
     fwd_us = x["iota_us"] + x["slope_us"] * x["B_op"] + x["tau_io_us"]
     serve = (x["B_op"] / (fwd_us * 1e-6)) / x["LPD"]
@@ -107,7 +96,7 @@ def throughput_jax(x: Any) -> Any:
     """The single JAX-traceable throughput f (x ordered by INPUT_NAMES) — the OT→JAX migration's one home
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
-    tests/test_jax_f_equivalence.py). Supersedes THROUGHPUT_EXPR + throughput_numpy once the driver consumes it."""
+    tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy twin throughput_numpy retires with the numpy fallback in migration J4)."""
     from alloc.jax_backend import jnp
     g_core, n_gen, LPD, iota_us, slope_us, tau_io_us, B_op, tmsg_us_leaf = x
     gen = n_gen * g_core / LPD
@@ -143,15 +132,8 @@ def initial_point() -> dict[str, float]:
     return {nm: g.mean for nm, g in zip(INPUT_NAMES, _INPUTS)}
 
 
-def build_symbolic_function() -> Any:
-    """The model as an `ot.SymbolicFunction` over INPUT_NAMES (the form the driver
-    consumes). Imported lazily so this module stays import-clean without openturns."""
-    import openturns as ot
-    return ot.SymbolicFunction(INPUT_NAMES, [THROUGHPUT_EXPR])
-
-
 def build_driver(tolerance: float = 5.0) -> tuple[NeymanDriver, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` (over the symbolic f, grounded costs) + the
+    """Factory: a configured `NeymanDriver` (over the JAX `f` (`throughput_jax`), grounded costs) + the
     initial point estimate. `tolerance` is the target CI half-width on E[f] in dps."""
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     costs = [g.cost for g in _INPUTS]

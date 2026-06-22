@@ -452,10 +452,11 @@ def test_make_measurer_requires_measure_not_run(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 # 3. THE EXECUTED PROOF: the un-trusted drive now produces a SANE E[f] (11.9 is GONE).
 # --------------------------------------------------------------------------- #
-def _ot():
-    ot = pytest.importorskip("openturns", reason="the driver requires openturns")
-    pytest.importorskip("scipy", reason="the Clark closed form needs scipy.stats")
-    return ot
+def _driver_deps() -> None:
+    """Gate the driver tests on the driver's ACTUAL deps (jax for the gradient, scipy for the Clark closed
+    form + the CI quantiles) — the OT→JAX migration retired the openturns requirement."""
+    pytest.importorskip("jax", reason="the driver's gradient is jax.grad")
+    pytest.importorskip("scipy", reason="the Clark closed form + CI quantiles need scipy.stats")
 
 
 def test_old_longest_list_heuristic_craters_the_bound() -> None:
@@ -463,7 +464,7 @@ def test_old_longest_list_heuristic_craters_the_bound() -> None:
     the t_row dict — the row-count x-axis `[32…512]` (mean ~224) — and fed it as the `t_row` pool, so the
     driver evaluated `f` with `t_row ≈ 224` instead of the slope `4.317`. The bound CRATERS (E[f] ≪ the
     sane ~428). This is the failure Phase 4 removes; we reproduce it to anchor the contrast."""
-    ot = _ot()
+    _driver_deps()
     import manifest as M
     import model_zmq_baseline as model
     from neyman_driver import NeymanDriver  # noqa: F401  (import gate)
@@ -493,7 +494,7 @@ def test_untrusted_drive_estimate_path_is_sane(monkeypatch) -> None:
     SANE `E[f]` (the binding serve capacity ~428, NOT the cratered ~11.9). The benches' measure() are
     mocked to their DECLARED Estimates (timing-free), so this exercises the real Phase-4 loop without a
     live timed run. The contrast vs the old heuristic (the test above) is the deliverable."""
-    ot = _ot()
+    _driver_deps()
     import manifest as M
     import untrusted_drive as U
     import bench_common as BC
@@ -565,7 +566,7 @@ def test_transport_sweep_estimate_feed_reproduces_the_2point_pilot_bound() -> No
     """§6 Phase-4 deliverable 3: `transport_sweep._model_estimates` feeds each input its manifest `Estimate`
     via `set_estimates_by_name`, REPLACING the 2-point pilot — and the bound (var, ci) is byte-for-byte the
     old pilot's (the spec's no-`/2`-bug fixed point), and the variance ranking (by a_i) is identical."""
-    _ot()
+    _driver_deps()
     import transport_sweep as TS
     import model_zmq_baseline as model
 
@@ -590,7 +591,7 @@ def test_throughput_bound_ot_path_feeds_fixed_estimates_no_pilot() -> None:
     spread Estimates), NOT the 2-point `add_samples` pilot, and reproduces the model's f(μ̂) and the
     grounded-uncertainty CI. The grounded inputs are declared-spread priors, so the allocator funds none
     (un-shrinkable — the §2.3 branch)."""
-    _ot()
+    _driver_deps()
     import throughput_bound as TB
     import model_capacity
 

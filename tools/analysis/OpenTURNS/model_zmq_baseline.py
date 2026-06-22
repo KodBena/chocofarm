@@ -87,7 +87,7 @@ from neyman_driver import NeymanDriver  # noqa: E402
 # The transport SLUG (the registry prefix for this variant's moved terms; the comparison-table key).
 SLUG = "zmq_baseline"
 
-# Single home of the model signature (symbolic + numpy fallback share it — P1). The order is the
+# Single home of the model signature (`throughput_jax` + numpy `throughput_numpy` share it — P1). The order is the
 # contract; INPUT_QUANTITIES maps each model-input name 1:1 to the REGISTRY quantity it pulls.
 INPUT_NAMES = ["N_gen", "R_gen", "B", "T_disp", "tau_io", "wakeup", "t_row", "L", "tmsg"]
 
@@ -107,21 +107,9 @@ INPUT_QUANTITIES: dict[str, tuple[str, float]] = {
     "tmsg":   (f"{SLUG}_tmsg_us_leaf", 2.0),  # NON-BINDING transport-capacity arm (ranks last)
 }
 
-# The throughput EXPRESSION, single-homed as a string (muParser/ExprTk grammar). The min() of the
-# producer ceiling, the serialized-serve cycle (carrying tau_io + wakeup), and the NON-BINDING
-# transport capacity. SERVE is evaluated at a FULL bucket (pad ~= B).
-THROUGHPUT_EXPR = (
-    "min("
-    "  N_gen*R_gen ,"                                                      # GENERATION (producer ceiling)
-    "  1e6 * B / ((T_disp + tau_io + wakeup + B*t_row) * L) ,"            # SERVE cycle (full bucket)
-    "  1.0/(L*tmsg*1e-6)"                                                  # TRANSPORT capacity (non-binding)
-    ")"
-)
-
-
 def throughput_numpy(x: dict[str, float]) -> float:
-    """numpy-only evaluation of f (the fallback path + the lockstep cross-check of the symbolic
-    formula). SAME formula as THROUGHPUT_EXPR. B is the FULL-bucket width (pad ~= B). The transport
+    """numpy-only evaluation of f (the fallback path + the lockstep cross-check of
+    throughput_jax). SAME formula as throughput_jax. B is the FULL-bucket width (pad ~= B). The transport
     capacity is a separate non-binding min arm."""
     producer = x["N_gen"] * x["R_gen"]
     cycle_us = x["T_disp"] + x["tau_io"] + x["wakeup"] + x["B"] * x["t_row"]
@@ -134,7 +122,7 @@ def throughput_jax(x: Any) -> Any:
     """The single JAX-traceable throughput f (x ordered by INPUT_NAMES) — the OT→JAX migration's one home
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
-    tests/test_jax_f_equivalence.py). Supersedes THROUGHPUT_EXPR + throughput_numpy once the driver consumes it."""
+    tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy twin throughput_numpy retires with the numpy fallback in migration J4)."""
     from alloc.jax_backend import jnp
     N_gen, R_gen, B, T_disp, tau_io, wakeup, t_row, L, tmsg = x
     producer = N_gen * R_gen
@@ -207,15 +195,8 @@ COSTS: dict[str, float] = costs()
 NEEDS_MEASUREMENT: dict[str, bool] = needs_measurement(trust=True)
 
 
-def build_symbolic_function() -> Any:
-    """The model as an `ot.SymbolicFunction` over INPUT_NAMES (the form the driver consumes).
-    Imported lazily so this module stays import-clean without openturns."""
-    import openturns as ot
-    return ot.SymbolicFunction(INPUT_NAMES, [THROUGHPUT_EXPR])
-
-
 def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[NeymanDriver, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` (over the symbolic f, manifest-grounded costs) + the
+    """Factory: a configured `NeymanDriver` (over the JAX `f` (`throughput_jax`), manifest-grounded costs) + the
     initial point estimate. `tolerance` is the target CI half-width on E[f] in dps. The costs are the
     model-side bench-effort weights (costs()); the pilot is drawn from the manifest means/sigmas."""
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)

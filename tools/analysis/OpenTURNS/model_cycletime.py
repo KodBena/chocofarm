@@ -84,22 +84,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import leaf_eval_grounding as G  # noqa: E402
 from neyman_driver import NeymanDriver  # noqa: E402
 
-# Single home of the model signature (symbolic + numpy fallback share it — P1).
+# Single home of the model signature (`throughput_jax` + numpy `throughput_numpy` share it — P1).
 INPUT_NAMES = ["N_gen", "R_gen", "B", "T_disp", "T_io", "t_row", "L"]
 
-# T_disp + T_io + B*t_row is the per-forward cycle (us); 1e6*B/(cycle*L) is dps; the min
-# with the producer ceiling N_gen*R_gen caps it. Single-homed as a string.
-THROUGHPUT_EXPR = (
-    "min("
-    "  N_gen*R_gen ,"
-    "  1e6 * B / ((T_disp + T_io + B*t_row) * L)"
-    ")"
-)
-
-
 def throughput_numpy(x: dict[str, float]) -> float:
-    """numpy-only evaluation of f (the fallback path + the lockstep cross-check of the
-    symbolic formula). SAME formula as THROUGHPUT_EXPR. B is taken as the FULL-bucket
+    """numpy-only evaluation of f (the fallback path + the lockstep cross-check of
+    throughput_jax). SAME formula as throughput_jax. B is taken as the FULL-bucket
     width (pad ~= B)."""
     cycle_us = x["T_disp"] + x["T_io"] + x["B"] * x["t_row"]
     serve = 1e6 * x["B"] / (cycle_us * x["L"])
@@ -111,7 +101,7 @@ def throughput_jax(x: Any) -> Any:
     """The single JAX-traceable throughput f (x ordered by INPUT_NAMES) — the OT→JAX migration's one home
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
-    tests/test_jax_f_equivalence.py). Supersedes THROUGHPUT_EXPR + throughput_numpy once the driver consumes it."""
+    tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy twin throughput_numpy retires with the numpy fallback in migration J4)."""
     from alloc.jax_backend import jnp
     N_gen, R_gen, B, T_disp, T_io, t_row, L = x
     cycle_us = T_disp + T_io + B * t_row
@@ -164,11 +154,6 @@ NEEDS_MEASUREMENT: dict[str, bool] = {nm: g.needs_measurement
 
 def initial_point() -> dict[str, float]:
     return {nm: g.mean for nm, g in zip(INPUT_NAMES, _INPUTS)}
-
-
-def build_symbolic_function() -> Any:
-    import openturns as ot
-    return ot.SymbolicFunction(INPUT_NAMES, [THROUGHPUT_EXPR])
 
 
 def build_driver(tolerance: float = 5.0) -> tuple[NeymanDriver, dict[str, float]]:

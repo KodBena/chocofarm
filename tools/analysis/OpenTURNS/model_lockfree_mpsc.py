@@ -86,21 +86,11 @@ WAKEUP_NAME = "lockfree_mpsc_wakeup_us"
 TMSG_NAME = "lockfree_mpsc_tmsg_us_leaf"
 GATHER_NAME = "lockfree_mpsc_gather_us"     # the gather-elision contrast term (the dominant uncertainty; NOT a separate cycle term)
 
-# The model signature — single home (the symbolic function + the numpy fallback share it, P1). The cycle is
+# The model signature — single home (`throughput_jax` + the numpy fallback `throughput_numpy` share it, P1). The cycle is
 # T_disp + wakeup + tau_io + B*t_row; dps = min(producer, serve, transport-capacity). WAKEUP is a NAMED
 # additive term (the brief names it separately) even though it is ~0 — so the structure makes the hybrid
 # transport's saturation-regime zero-wakeup explicit. tmsg is the NON-BINDING transport-capacity arm.
 INPUT_NAMES = ["N_gen", "R_gen", "B", "T_disp", "wakeup", "tau_io", "t_row", "L", "tmsg"]
-
-# The throughput EXPRESSION, single-homed as a string (muParser grammar). SAME shape as model_zmq_baseline,
-# with the WAKEUP term added into the cycle, tau_io being the MPSC term, and the NON-BINDING transport arm.
-THROUGHPUT_EXPR = (
-    "min("
-    "  N_gen*R_gen ,"                                                   # GENERATION (producer ceiling)
-    "  1e6 * B / ((T_disp + wakeup + tau_io + B*t_row) * L) ,"        # SERVE cycle (full bucket)
-    "  1.0/(L*tmsg*1e-6)"                                              # TRANSPORT capacity (non-binding)
-    ")"
-)
 
 # The manifest quantity name each model input is pulled from (1:1 with INPUT_NAMES). The invariant inputs
 # carry the baseline registered names; the moved terms carry the prefixed mpsc names. This map is the model's
@@ -127,8 +117,8 @@ _COST: dict[str, float] = {
 
 
 def throughput_numpy(x: dict[str, float]) -> float:
-    """numpy-only evaluation of f (the fallback path + the lockstep cross-check of the symbolic formula).
-    SAME formula as THROUGHPUT_EXPR. B is the FULL-bucket width (pad ~= B). The transport capacity is a
+    """numpy-only evaluation of f (the fallback path + the lockstep cross-check of
+    throughput_jax). SAME formula as throughput_jax. B is the FULL-bucket width (pad ~= B). The transport capacity is a
     separate non-binding min arm."""
     producer = x["N_gen"] * x["R_gen"]
     cycle_us = x["T_disp"] + x["wakeup"] + x["tau_io"] + x["B"] * x["t_row"]
@@ -141,7 +131,7 @@ def throughput_jax(x: Any) -> Any:
     """The single JAX-traceable throughput f (x ordered by INPUT_NAMES) — the OT→JAX migration's one home
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
-    tests/test_jax_f_equivalence.py). Supersedes THROUGHPUT_EXPR + throughput_numpy once the driver consumes it."""
+    tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy twin throughput_numpy retires with the numpy fallback in migration J4)."""
     from alloc.jax_backend import jnp
     N_gen, R_gen, B, T_disp, wakeup, tau_io, t_row, L, tmsg = x
     producer = N_gen * R_gen
@@ -207,20 +197,10 @@ SIGMAS: dict[str, float] = sigmas(trust=True)
 COSTS: dict[str, float] = costs()
 
 
-# --------------------------------------------------------------------------- #
-# OpenTURNS / driver surface (mirrors model_zmq_baseline / model_shm_spin_poll).
-# --------------------------------------------------------------------------- #
-def build_symbolic_function() -> Any:
-    """The model as an `ot.SymbolicFunction` over INPUT_NAMES (the form the driver consumes). Imported lazily
-    so this module stays import-clean without openturns."""
-    import openturns as ot
-    return ot.SymbolicFunction(INPUT_NAMES, [THROUGHPUT_EXPR])
-
-
 def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[Any, dict[str, float]]:
-    """Factory: a configured `NeymanDriver` (over the symbolic f, the per-input costs) + the resolved
+    """Factory: a configured `NeymanDriver` (over the JAX `f` (`throughput_jax`), the per-input costs) + the resolved
     initial point. `tolerance` is the target CI half-width on E[f] in dps. `trust` selects live-vs-seed
-    inputs. Imported lazily (the driver pulls in openturns)."""
+    inputs. Imported lazily (deferred to keep this module import-cheap)."""
     from neyman_driver import NeymanDriver
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     cost_list = [_COST[nm] for nm in INPUT_NAMES]
