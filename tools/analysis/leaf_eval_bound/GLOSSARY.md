@@ -23,6 +23,33 @@ the code that parses it (cited per entry). Look there for a number; look here fo
 
 ---
 
+## 0. What "production" / "the implementation we're explaining" is (read this first)
+
+This sub-project has **no standardized `--serve` production** — the message-passing impedance work was
+yak-shaved out *before* a production serving workflow was standardized. So for this part of the project,
+**"production" = the benchmark harness**: the `cpp/stage_a` overcommit / throughput sweeps
+(`overcommit_sweep.py` and kin) — an in-process `StageAServer` (the **real** `ValueMLP` forward,
+`jit_forward_core`) pinned 1 server : 3 producer cores, driven by the C++ `wire-ab-bench` producer over
+the **pipelined-bucket** wire, with **`N` (overcommit, `--trees-per-thread`) as the swept operating knob**.
+It is the maintainer's *window into how the eventual mature AZ loop will look* once the implementation
+stops leaving ≥100% throughput on the table.
+
+Two consequences that **supersede any `--serve`-centric reading** below (§5) and in the Step-0 record:
+
+- **`N` (overcommit) is LIVE**, not dead. `StrictBarrier` / `N=1` is the *baseline arm* of the sweep, not
+  "the production default." The `--serve` / `cpp_executor` deployment path the C++ comments call "the
+  production default" is **not this sub-project's production** (it was never standardized) — an aside.
+- **The operating readings already exist.** The harness emits, per swept cell, `server_mean_rows_per_fwd`
+  (= the model's **B**, from `StageAServer.n_forwards`/`n_real_rows`), `dps`, `dps_per_core`, and
+  `wire_mean_rows_per_msg`. So the loop's top-line and `B` observations are *free* (no port needed); only
+  the per-stage costs (`tau_io`, `t_row`, `T_disp`) still need decomposition.
+
+A representative operating point (1:3 pinning, `n_sims=256`, 3 threads): `N=1` strict → B≈28, dps≈86;
+`N=8` pipelined → B≈179, dps≈158; `N=9` → B≈201, dps≈157 (saturating). The model's optimistic bound is
+≈456 dps and the server's fast region is B≈192 — so the gap to explain is ≈456 (model) vs ≈158 (harness).
+
+---
+
 ## ⚠ Contested & overloaded symbols (read first)
 
 These are the ones that have bitten. A symbol below means **different things in different files** —
@@ -30,8 +57,8 @@ never carry one file's reading into another.
 
 | Symbol | The trap |
 | --- | --- |
-| **`N`** | **Overloaded three ways.** (1) In the **wire serve path** (`runner_wire_batched.hpp`), `N` = `trees_per_thread`, the **overcommit multiplier** (§5). (2) In the **belief/env path** (`collected_set.hpp`, `env.hpp`), `N` = the **world / treasure count**, structurally `≤ 32` (the world-mask packs into a `uint32`). (3) In featurization (`feature_compute.hpp`), `N` is a feature/action dimension. **Stale framing (flagged 2026-06-23):** the blind-model SYNTHESIS's *"deployed default = strict-barrier, N=1"* is the **outdated** formal model — under the current code `N` is a `PipelinedBucket`-only knob and is **ignored under the `StrictBarrier` default**, so "the default is N=1" conflates two modes. Whether `N` is even live in production is the consultation's open question #2 (unresolved). |
-| **`B` / `B_op`** | `B` (model symbol) = `B_op` (registry quantity) = **rows per forward** — the serve batch width. The *model* evaluates it at a full bucket; the *implementation*'s realized rows/forward is a **different, measured** number (`mean_rows_per_msg`, §5). Do not assume they are equal — their gap is the contested operating point (consultation §7.4). |
+| **`N`** | **Overloaded three ways — the footgun.** (1) In the **wire serve path** (`runner_wire_batched.hpp`), `N` = `trees_per_thread`, the **overcommit multiplier** (N independent `TreeState`s per producer thread) — **LIVE: it is the swept operating knob of this project's production harness (§0)**; `StrictBarrier`/`N=1` is the sweep's *baseline*, not a "production default." (2) In the **belief/env path** (`collected_set.hpp`, `env.hpp`), `N` = the **world / treasure count**, structurally `≤ 32` (the world-mask packs into a `uint32`). (3) In featurization (`feature_compute.hpp`), `N` is a feature/action dimension. The structural field name `trees_per_thread` is unambiguous; the footgun is the bare shorthand "`N`" plus the word "production" (§0) — the blind-model's *"deployed default = strict-barrier, N=1"* conflated the non-standardized `--serve` path with this project's actual production (the sweep harness, where N is the live knob). |
+| **`B` / `B_op`** | `B` (model symbol) = `B_op` (registry quantity) = **rows per forward** — the serve batch width. The *model* evaluates it at a full bucket (`B_op≈256`); the harness's realized rows/forward is a **different, measured** number — `server_mean_rows_per_fwd` (emitted per swept cell, §0). NB `mean_rows_per_msg` / `wire_rows_per_msg` is rows/**message**, NOT rows/forward (the server coalesces across messages). Do not assume model-`B` = realized-`B`: their gap is the central operating-point question. |
 | **`K`** | `K` = `fibers_per_thread` = `ceil(pool_batch / pool_threads)` — the per-thread in-flight **slot count** in the strict path (§5). It is *not* the model's `B`, though under `StrictBarrier` the realized rows/forward is close to `K`. (Beware: `K` also appears in C++ profiling comments as an unrelated profile label, e.g. "the K=16 profile.") |
 | **`L` vs `LPD`** | Same quantity: **leaves per decision**. `L` is the model symbol; `LPD` / `leaves_per_decision` is the registry quantity name. |
 | **`T`** | In the serve path, `T` = `pool_threads` = OS worker threads (§5). In a model's fit, `T_disp` is a *different* `T` (dispatch, §2). Read the subscript. |
@@ -125,6 +152,11 @@ From `docs/design/leaf-eval-impl-to-model-diagnostic-loop.md` and the witness-lo
 ---
 
 ## 5. The serving implementation (what we are explaining)
+
+**Read §0 first.** For this sub-project "production" is the **harness** (the pipelined-bucket sweep, `N`
+live), *not* the `--serve` path. The loci below are correct code facts, but the "`StrictBarrier` is the
+production DEFAULT" / "`N` ignored" framing describes the non-standardized `--serve` deployment — the
+harness drives the **`PipelinedBucket`** path where `N` and `wire_rows_per_msg` are live.
 
 The running actor is a persistent **C++ Gumbel-AZ** process generating episodes; leaf evaluation goes
 by one of two paths.

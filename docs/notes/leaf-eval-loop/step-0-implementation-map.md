@@ -139,3 +139,45 @@ four decisions to you:
 
 **On your gate:** proceed to **Step 1** (pin the implementation's top-line DPS under a named, frozen config —
 which path, which `--pool-threads`/`--pool-batch`), or send this back.
+
+---
+
+## Correction (2026-06-23) — the implementation is the HARNESS, not `--serve`
+
+The maintainer corrected the target after reading this map: **there is no standardized `--serve`
+production**; for this sub-project, **"production" = the benchmark harness** (`cpp/stage_a/overcommit_sweep.py`
+and kin — the in-process `StageAServer` real-net forward + the C++ `wire-ab-bench` producer over the
+**pipelined-bucket** wire, with `N` = `--trees-per-thread` the swept operating knob). See GLOSSARY §0.
+This map was built against the `--serve`/`StrictBarrier` deployment path — the wrong target. What changes,
+and what holds:
+
+**Corrected:**
+- **"Deployed = StrictBarrier, N dead in production"** → production is the harness; **`N` is the live
+  operating knob** (the swept variable); `StrictBarrier`/`N=1` is the sweep's *baseline arm*. (The WireMode
+  code facts are right; the "production default" reading was the wrong path.)
+- **"the telemetry doesn't exist on production / Step 2 needs passive ports"** → the harness **already
+  emits** the operating readings per swept cell: `server_mean_rows_per_fwd` (= the model's **B**, from
+  `StageAServer.n_forwards`/`n_real_rows`), `dps`, `dps_per_core`, `wire_mean_rows_per_msg`. The top-line
+  and `B` observations are **free** — the "less than you thought." Step 2 needs ports only for the per-stage
+  costs the harness does *not* split out (chiefly `tau_io`/`t_row`/`T_disp`).
+- **"R_gen/L measure the DetNet bench path"** → the *harness producer* is `wire-ab-bench` running the
+  **real** search over the real wire+server (not `DetNet`), so the harness exercises the real producer
+  end-to-end. The leaf-eval tool's *seeded* `R_gen`/`L` still come from the separate `search_runtime_bench`
+  (`DetNet`) — so the bench-`R_gen` ≠ harness-producer-rate distinction holds, but the harness is the
+  faithful boundary.
+- **The serve-side loci HOLD.** The harness's `StageAServer` is the same `inference_server` forward
+  (`jit_forward_core`), so `T_disp`/`t_row`/`B` map to the same code; only the *driver* (pipelined, not
+  strict) and the *telemetry-already-exists* facts change.
+
+**Holds:**
+- **`tau_io` form finding** — the harness reports `dps` + `B` + `rows/msg`, not the drain/decode/scatter
+  cost; `tau_io` still has no clean isolated live observation (the named-limitation stands).
+- **The B↔S coupling** the consultation flagged (§7a) is realized in the harness as the server coalescing
+  + the `--min-coalesce` (S_min) / `--min-forward-rows` (θ) floor machinery — and the sweep can **A/B it**
+  directly (it is a swept/flagged knob), a gift for Step 3.
+
+**Operating data already in hand** (the maintainer's run; 1:3 pinning, `n_sims=256`, 3 threads): `N=1`
+strict → B≈28, dps≈86; `N=8` → B≈179, dps≈158; `N=9` → B≈201, dps≈157 (saturating). Model optimistic
+≈456 dps, server fast region B≈192. **So Step 1 is effectively already in hand** — the harness pins the
+top-line DPS + B under a named config. The live questions are the ≈456-vs-≈158 gap and the N-saturation
+at B≈180–200, well below the model's `B_op≈256` full bucket.
