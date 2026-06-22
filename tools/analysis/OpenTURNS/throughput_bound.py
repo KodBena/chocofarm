@@ -44,12 +44,11 @@ import leaf_eval_grounding as G  # noqa: E402
 import manifest  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
 import model_capacity  # noqa: E402
 import model_cycletime  # noqa: E402
-from alloc import gradient as _grad  # noqa: E402  — the shared gradient-backend seam: fd_gradient_dict
-# (the numpy-dict form). The runner-local _fd_gradient copy is gone, single-homed in alloc.gradient (the
-# responsibility-refactor move 5; OT imported lazily there, so this import is safe on an openturns-absent host).
+import runner_support as rs  # noqa: E402  — the shared runner numpy delta-method bound (grad+a_i+var+ci,
+# composed over the alloc.gradient seam; move 5, numpy-bound half). The runner-local _fd_gradient copy, the
+# _numpy_bound delta-method recipe, and the _Z95 literal are single-homed in runner_support now.
 
 _HAS_OT = importlib.util.find_spec("openturns") is not None
-_Z95 = 1.959963984540054
 
 
 def _numpy_bound(model, sigmas, costs):
@@ -57,13 +56,10 @@ def _numpy_bound(model, sigmas, costs):
     x0 = model.initial_point()
     names = model.INPUT_NAMES
     f0 = model.throughput_numpy(x0)
-    grad = _grad.fd_gradient_dict(model.throughput_numpy, names, x0)
-    a = {nm: (grad[nm] * sigmas[nm]) ** 2 for nm in names}     # a_i = (df/dx_i)^2 sigma_i^2
-    var = sum(a.values())                                       # Var(E[f]) at n_i=1 each
-    ci = _Z95 * np.sqrt(max(var, 0.0))
+    dm = rs.delta_method(model.throughput_numpy, names, x0, sigmas)  # grad + a_i + var + ci (the shared bound)
     # Neyman: n_i* proportional to sqrt(a_i/c_i). Rank desc; report the proportions.
-    weight = {nm: np.sqrt(a[nm] / costs[nm]) if a[nm] > 0 else 0.0 for nm in names}
-    return x0, f0, grad, a, var, ci, weight
+    weight = {nm: np.sqrt(dm.a[nm] / costs[nm]) if dm.a[nm] > 0 else 0.0 for nm in names}
+    return x0, f0, dm.grad, dm.a, dm.var, dm.ci, weight
 
 
 def _print_neyman_table(names, sigmas, costs, grad, a, weight, needs_meas):

@@ -106,20 +106,17 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any  # (Callable dropped with the runner _fd_gradient — move 5; Optional was already unused)
 
-import numpy as np
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import leaf_eval_grounding as G  # noqa: E402  — the single home of the references + the transfer decomposition
 import manifest  # noqa: E402   — the SSOT registry (import-clean; touches no DB on import)
-from alloc import gradient as _grad  # noqa: E402  — the shared gradient-backend seam: fd_gradient_dict (the
-# numpy-dict form). The runner-local _fd_gradient copy is gone, single-homed in alloc.gradient (move 5); OT
-# is imported lazily there, so this import is safe on the openturns-absent host this fallback path exists for.
+import runner_support as rs  # noqa: E402  — the shared runner numpy delta-method bound (grad+a_i+var+ci,
+# composed over the alloc.gradient seam; move 5, numpy-bound half), single-homing the _fd_gradient copy, the
+# inlined fallback recipe, and the _Z95 literal that were duplicated across the runners.
 
 _HAS_OT = importlib.util.find_spec("openturns") is not None
-_Z95 = 1.959963984540054
 
 
 # --------------------------------------------------------------------------- #
@@ -292,9 +289,7 @@ def _ci_via_driver(model: Any) -> tuple[float, str]:
     x0 = model.initial_point(trust=True)
     names = model.INPUT_NAMES
     sig = _model_sigmas(model)
-    grad = _grad.fd_gradient_dict(model.throughput_numpy, names, x0)
-    var = sum((grad[nm] * sig[nm]) ** 2 for nm in names)
-    return _Z95 * float(np.sqrt(max(var, 0.0))), "numpy"
+    return rs.delta_method(model.throughput_numpy, names, x0, sig).ci, "numpy"
 
 
 def _variance_targets(model: Any, top: int = 6) -> list[tuple[str, float, int]]:
@@ -319,8 +314,7 @@ def _variance_targets(model: Any, top: int = 6) -> list[tuple[str, float, int]]:
     x0 = model.initial_point(trust=True)
     names = model.INPUT_NAMES
     sig = _model_sigmas(model)
-    grad = _grad.fd_gradient_dict(model.throughput_numpy, names, x0)
-    a = {nm: (grad[nm] * sig[nm]) ** 2 for nm in names}
+    a = rs.delta_method(model.throughput_numpy, names, x0, sig).a
     ranked = sorted(names, key=lambda nm: a[nm], reverse=True)
     return [(nm, float(a[nm]), 0) for nm in ranked[:top]]
 
