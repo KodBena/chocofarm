@@ -27,7 +27,7 @@ cites the typed signature (ADR-0012: the signature is the single source of truth
 ## Table of contents
 
 1. [Why this tool exists — and its two purposes](#1-why-this-tool-exists)
-2. [The one idea: a cycle is a min-of-stages, and the bound is the slowest stage](#2-the-one-idea)
+2. [The one idea: a cycle is a function you write — and its decomposition is a hypothesis](#2-the-one-idea)
    - [2.1 The model is a DSL; the benchmarks are its operational semantics — the path to a *witness*](#21-dsl-operational)
 3. [The package map](#3-the-package-map)
 4. [Modeling a new cycle — the five-step workflow](#4-modeling-a-new-cycle)
@@ -69,7 +69,7 @@ a well-founded conjecture, not a witness.
 
 **The refutation is operational — and the tool is built to reach it.** What actually refutes "200 is
 the roof" is a *witness*: a real cycle that runs and achieves more than 200. A model here is a
-program in a small DSL (a cycle written as a min-of-stages over grounded primitives), and **each
+program in a small DSL (a cycle written as a function over grounded primitives), and **each
 primitive's operational semantics already exists, as its benchmark** — `bench_r_gen` *is* the
 generator running; `bench_t_row` *is* the per-row serve cost being timed. So a model is not only
 *evaluable* (compose the benchmarked means → the bound) but *executable*: lower it — port it back
@@ -98,50 +98,55 @@ tool is the discipline it enforces: do not anchor on a plateau, and do not mista
 ---
 
 <a name="2-the-one-idea"></a>
-## 2. The one idea: a cycle is a min-of-stages, and the bound is the slowest stage
+## 2. The one idea: a cycle is a function, and you write it
 
-A serving cycle is a pipeline of **stages** running concurrently. Throughput is set by the
-**slowest** stage — the bottleneck. So the model of a cycle is a function
-
-```
-f(inputs) = min( stage_1(inputs), stage_2(inputs), ... )      # decisions per second (DPS)
-```
-
-and the canonical cycle (the "spine" every transport variant shares) has three stages:
+The tool's whole job is to turn a *model* of a serving cycle into a defensible throughput with an
+honest uncertainty. A model is a function
 
 ```
-producer   = N_gen * R_gen                                    # generation: cores × per-core rate
-cycle_us   = T_disp + tau_io + wakeup + B * t_row             # one serialized serve forward (microseconds)
-serve      = 1e6 * B / (cycle_us * L)                         # serve: B rows per forward / per-decision leaves
-transport  = 1.0 / (L * tmsg * 1e-6)                          # transport: per-leaf message cost
-f          = min(producer, serve, transport)
+f(inputs) -> throughput (decisions per second)
 ```
 
-Every term is a real, physically-grounded fixed cost or per-row slope. Coordination losses (RTT
-idle, convoy effects, cold-JIT) are **deliberately not** put into any stage — those are exactly
-what a *well-designed* implementation engineers away, and the bound is over the well-designed
-optimum. That is what makes `f(μ̂)` a **lower bound**: a real cycle has every cost the model has,
-plus the losses the model omits, so a real well-designed cycle achieves *at least* `f` and a real
-sloppy one reveals its sloppiness as the gap below `f`.
+whose `inputs` are physical quantities — each a benchmarked measurement or a grounded value, and
+each carrying an **uncertainty**, not just a point. Given `f` and the inputs' uncertainty, the tool
+produces, from one gradient evaluation, a bound `E[f]` with a confidence interval (Purpose 1) and a
+decomposition of which inputs' uncertainty most constrains it (Purpose 2). Uncertainty enters
+conservatively: a wider input spread widens the interval; a small-sample fit gets a fatter
+(Student-t) multiplier than a large-sample mean; a physically-impossible interval edge (a negative
+latency, a fraction above 1) is clipped to the feasible set and the clip is surfaced, never printed
+as a real value.
 
-Each input carries an **uncertainty**, not just a value. The bound is therefore a *distribution*,
-and the tool reports `E[f]` together with a confidence interval whose width comes from propagating
-the inputs' uncertainty through the gradient of `f`. Uncertainty enters the bound the conservative
-way: a wider input spread widens the interval; a small-sample fit gets a fatter (Student-t)
-multiplier than a large-sample mean; a physically-impossible interval edge (a negative latency, a
-fraction above 1) is clipped to the feasible set and the clip is surfaced, never printed as a real
-value.
+**You write `f`.** The tool does not tell you what a cycle *is* — decomposing your cycle into a
+function over measurable primitives is the modeling work, and it is the central intellectual act,
+not boilerplate to copy. Two cautions belong here, at the foundation, because they govern everything
+downstream:
 
-This is the mental model. The rest of the manual is how you *express* a cycle in it.
+- **A decomposition is a hypothesis, not a fact.** A clean, *separable* `f` is seductive and can be
+  wrong in an instructive way: writing the cycle as, say, a minimum over independent stage capacities
+  quietly asserts that each stage is an independent quantity you can measure and improve in isolation
+  — when the real cycle may have **interacting components** that a separable `f` cannot see. The shape
+  you choose *trains how you look*; choose it deliberately, and hold it loosely. Deriving the
+  decomposition — and stress-testing it — is your job, not the tool's, and not this manual's to hand you.
+- **The tool will faithfully bound whatever `f` you give it** — including an `f` that is too
+  optimistic because it omits a coupling. So a model-bound is only ever as honest as your
+  decomposition. That is precisely why a bound *motivates* but does not *prove* (§1), and why the
+  **witness** (§2.1) — running the cycle your `f` describes and clocking it — is the thing that tests
+  whether the decomposition was faithful in the first place.
+
+`f` must be JAX-traceable (so `jax.grad` yields the sensitivities). It may use `min`, products,
+sums — whatever your cycle calls for; the tool gives `min` special care because a bottleneck can be
+statistically ambiguous (§5.2), but that is a *capability*, not a prescription that a cycle must be a
+minimum of stages. **Derive your own decomposition, and be ready to be wrong about it** — the rest of
+the manual is the mechanics for doing so honestly: how to write `f` as a model (§4.1), how to bench
+its inputs (§4.3), and how to witness it (§2.1).
 
 <a name="21-dsl-operational"></a>
 ### 2.1 The model is a DSL program; the benchmarks are its operational semantics
 
-The min-of-stages formula is *denotational* — it says what number a cycle *denotes*. But a cycle
-written this way is also a small **program in a DSL**: `f` composes primitives (a generator rate, a
-per-row cost, a per-leaf message cost) under a fixed combinator (the serialized cycle, the min over
-stages). And every primitive in that DSL already has an **operational semantics written down — its
-benchmark.** `bench_r_gen` is what "run the generator" *means*; `bench_t_row` is what "pay the
+Your `f` is *denotational* — it says what number a cycle *denotes*. But it is also a small **program
+in a DSL**: `f` composes primitives (a rate, a per-row cost, a per-leaf message cost — whatever your
+cycle's terms are) with whatever combinator you wrote. And every primitive in that DSL already has an
+**operational semantics written down — its benchmark.** `bench_r_gen` is what "run the generator" *means*; `bench_t_row` is what "pay the
 per-row serve cost" *means*. A benchmark is not merely a measurement *of* a primitive; it *is* the
 primitive's executable behavior.
 
@@ -224,7 +229,7 @@ interface and joins the sweep. The five steps:
 
 | Step | You write | Where |
 | — | — | — |
-| 1. Write `f` | the throughput function (min-of-stages) + the input list | `models/model_<slug>.py` |
+| 1. Write `f` | the throughput function (your decomposition) + the input list | `models/model_<slug>.py` |
 | 2. Classify inputs | measured / prior / constant, per input | (a decision; recorded in step 4) |
 | 3. Write a bench | one `bench_*.py` per *measured* input that doesn't exist yet | `benchmarks/bench_*.py` |
 | 4. Ground + register | a `Grounded` seed per new input; run discovery registration | `contract/grounding.py` + a command |
@@ -262,10 +267,11 @@ def throughput_numpy(x: dict[str, float]) -> float:
 ```
 
 `jax.grad(throughput_jax)` is the analytic gradient the driver uses — exact, including through
-`min()` (the arg-min tie is handled separately by `alloc/kink.py`, not by the linearization). Write
-`f` as a plain min-of-stages over `jnp`; `INPUT_NAMES` is the one declaration of the signature, and
-both `throughput_jax` (unpacking positionally) and `throughput_numpy` (ordering by it) read it, so
-they cannot disagree.
+`min()` if your `f` uses it (the arg-min tie is handled separately by `alloc/kink.py`, not by the
+linearization). Write `f` as a JAX function over `jnp` — its *structure* is yours to derive (§2), not
+this manual's to dictate; `INPUT_NAMES` is the one declaration of the signature, and both
+`throughput_jax` (unpacking positionally) and `throughput_numpy` (ordering by it) read it, so they
+cannot disagree.
 
 The full model skeleton is in §4.5; read it after step 2.
 
@@ -626,13 +632,17 @@ seed it; for a transport-invariant pull (a shared physical fact) reference the e
 at import (the module-level `SIGMAS = sigmas(trust=True)` resolves eagerly) — so the seeds are not
 optional polish; the model will not import without them.
 
-**The full model skeleton** (the manifest-driven variant — drop in your `f` and input map):
+**The full model skeleton** — the framework boilerplate is concrete (copy it as-is); the
+cycle-specific parts (`INPUT_NAMES`, `INPUT_QUANTITIES`, `throughput_jax`, the breakdowns) are
+placeholders **you** fill, because they *are* the model (§2), not boilerplate:
 
 ```python
 """
 tools/analysis/leaf_eval_bound/models/model_mycycle.py
-Transport variant DESIGN-mycycle: a first-principles leaf-eval throughput LOWER BOUND (DPS) on the
-serialized-serve spine, with its own moved-term profile. Satisfies model_base.TransportModel (P8).
+Transport variant DESIGN-mycycle: a first-principles leaf-eval throughput LOWER BOUND (DPS) for THIS
+cycle's decomposition. Satisfies model_base.TransportModel (P8). The decomposition (INPUT_NAMES /
+throughput_jax / the breakdowns) is YOURS to derive and stress-test (§2) — a hypothesis about the
+system, not a law the tool or this template imposes.
 Public Domain (The Unlicense).
 """
 from __future__ import annotations
@@ -641,25 +651,27 @@ from leaf_eval_bound.store import manifest                                  # no
 from leaf_eval_bound.alloc.driver import AllocationDriver                    # noqa: E402
 
 SLUG = "mycycle"
-INPUT_NAMES = ["N_gen", "R_gen", "B", "T_disp", "tau_io", "wakeup", "t_row", "L", "tmsg"]
-INPUT_QUANTITIES: dict[str, tuple[str, float]] = {                          # input -> (registry quantity name, cost)
-    "N_gen": ("n_gen", 0.5), "R_gen": ("R_gen", 30.0), "B": ("B_op", 4.0),
-    "T_disp": ("T_disp_us", 1.0), "tau_io": (f"{SLUG}_tau_io_us", 8.0),     # SLUG-prefixed = this variant's MOVED levers
-    "wakeup": (f"{SLUG}_wakeup_us", 6.0), "t_row": ("t_row_us", 1.0),
-    "L": ("LPD", 2.0), "tmsg": (f"{SLUG}_tmsg_us_leaf", 2.0),
+
+# ── the modeling work (yours — §2 / §4.1 / §4.2): your cycle's inputs and decomposition ──────────
+INPUT_NAMES = ["<in_1>", "<in_2>", "..."]                                   # your inputs, in the order f unpacks them
+INPUT_QUANTITIES: dict[str, tuple[str, float]] = {                          # input -> (registry quantity name, bench cost)
+    "<in_1>": ("<shared_registry_quantity>", 1.0),                          # bare name = a shared quantity you REUSE
+    "<in_2>": (f"{SLUG}_<moved_lever>", 4.0),                               # SLUG-prefixed = a lever THIS cycle moves (register+seed it)
 }
 
-def throughput_jax(x: Any) -> Any:                                          # the ONE f (x ordered by INPUT_NAMES)
-    from leaf_eval_bound.alloc.jax_backend import jnp
-    N_gen, R_gen, B, T_disp, tau_io, wakeup, t_row, L, tmsg = x
-    producer  = N_gen * R_gen
-    cycle_us  = T_disp + tau_io + wakeup + B * t_row
-    serve     = 1e6 * B / (cycle_us * L)
-    transport = 1.0 / (L * tmsg * 1e-6)
-    return jnp.minimum(jnp.minimum(producer, serve), transport)            # min-of-stages: the slowest stage binds
+def throughput_jax(x: Any) -> Any:
+    """YOUR cycle's throughput as a JAX function of x (ordered by INPUT_NAMES). Deriving this is the
+    central modeling act (§2): the decomposition is a HYPOTHESIS to be witnessed (§2.1), not a fact.
+    min / products / sums are all fair game (min is kink-handled, §5.2) — but a clean separable f can
+    hide interacting components the real cycle has. Do not copy a shape from elsewhere; derive it."""
+    from leaf_eval_bound.alloc.jax_backend import jnp                       # noqa: F401
+    # in_1, in_2, ... = x
+    # return <your cycle's throughput, in DPS, as a function of the inputs>
+    raise NotImplementedError("derive this cycle's throughput function (§2)")
 
+# ── the framework boilerplate (copy as-is; it reads INPUT_NAMES / INPUT_QUANTITIES above) ─────────
 def throughput_numpy(x: dict[str, float]) -> float:
-    return float(throughput_jax([x[nm] for nm in INPUT_NAMES]))            # DERIVED — never hand-write
+    return float(throughput_jax([x[nm] for nm in INPUT_NAMES]))            # DERIVED from the one f — never hand-write
 
 def _resolve(trust: bool = True) -> dict[str, "manifest.Quantity"]:
     return {nm: manifest.quantity(INPUT_QUANTITIES[nm][0], trust=trust) for nm in INPUT_NAMES}
@@ -676,22 +688,18 @@ def build_driver(tolerance: float = 5.0, trust: bool = True):
                               tolerance=tolerance, names=INPUT_NAMES, confidence=0.95, growth_cap=3.0)
     return driver, initial_point(trust=trust)
 
-def cycle_breakdown(x: dict[str, float]) -> dict[str, float]:              # the mereological decomposition (Purpose 2)
-    disp, io, wake, comp = x["T_disp"], x["tau_io"], x["wakeup"], x["B"] * x["t_row"]
-    cycle = disp + io + wake + comp
-    return {"T_disp_us": disp, "tau_io_us": io, "wakeup_us": wake, "compute_us": comp, "cycle_us": cycle,
-            "serve_dps": 1e6 * x["B"] / (cycle * x["L"]),
-            "producer_dps": x["N_gen"] * x["R_gen"], "transport_dps": 1.0 / (x["L"] * x["tmsg"] * 1e-6)}
+# ── the diagnostic surface (yours — Purpose 2): decompose your cycle into named terms ─────────────
+def cycle_breakdown(x: dict[str, float]) -> dict[str, float]:
+    """Your cycle's per-forward cost split into NAMED terms + the candidate stage capacities (DPS) —
+    the mereological surface Purpose 2 reads. Name the terms YOUR f is built from, so the gap a witness
+    reveals is localizable to a term (and so an interacting cost has somewhere to show up)."""
+    raise NotImplementedError("decompose this cycle's per-forward cost + stage capacities (Purpose 2)")
 
 def stage_capacities(x: dict[str, float]) -> dict[str, float]:
-    cb = cycle_breakdown(x)
-    return {"GENERATION": cb["producer_dps"], "SERVE": cb["serve_dps"], "TRANSPORT": cb["transport_dps"]}
+    raise NotImplementedError("the candidate stage capacities (DPS) whose interplay sets the throughput")
 
-def serve_sawtooth(real: int, buckets=(64, 256, 512), max_batch=512, trust: bool = True) -> float:
-    x = initial_point(trust=trust)
-    pad = real if real > max_batch else next((b for b in buckets if b >= real), real)
-    cycle = x["T_disp"] + x["tau_io"] + x["wakeup"] + pad * x["t_row"]
-    return 1e6 * real / (cycle * x["L"])
+def serve_sawtooth(real: int, *, trust: bool = True) -> float:
+    raise NotImplementedError("throughput at `real` rows; expose any batching non-monotonicity here if your cycle has one")
 ```
 
 Finally, add `"leaf_eval_bound.models.model_mycycle"` to `_VARIANTS` in

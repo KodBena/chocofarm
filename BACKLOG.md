@@ -115,6 +115,39 @@ search output, P6) — out of scope for the HPO tooling that exposed it. **Accep
 f64/f32/jax search-output parity stays green; a measured drop in remote leaf-evals per episode at the
 production config; cache coherence held on the rebind-not-mutate invariant (ADR-0001).
 
+## leaf-eval — the witness/port direction + the framework↔instance question (recorded 2026-06-22, hold for a disciplined resolution)
+
+Context: the leaf-eval tool computes a model's throughput LOWER BOUND. The maintainer's framing
+(2026-06-22), now the spine of `tools/analysis/leaf_eval_bound/MANUAL.md`: a model-bound is a
+*denotational conjecture* contingent on the model being faithful — it MOTIVATES, it does not REFUTE an
+empirical claim like "~200 DPS is the roof." The refutation is *operational*: a WITNESS — a real cycle
+that runs and clears the number. The bridge is that the benchmarks ARE the operational semantics of the
+model's primitives, so a model should *lower / port* into a runnable end-to-end cycle that witnesses the
+floor (MANUAL §2.1). Two questions fall out, **worth answering but deliberately held** — the maintainer's
+call is to move ad-hoc first (next: the mereological loop explaining WHY the current implementation
+underperforms) and let that work inform a disciplined resolution, rather than pre-committing the
+architecture now:
+
+- **Q1 — what is "the DSL" / what does "port the models back into Python/C++" mean?** (a) a composition
+  harness *behind today's `f`-functions* — compose the already-benchmarked stages per `f`'s structure
+  into a runnable cycle and clock it; or (b) the stronger reading — a model authored **once** and lowered
+  to *both* the bound and an executable (a real DSL with two backends, the full force of "the benchmarks
+  entail operational semantics"). The reading chosen changes what gets built.
+- **Q2 — the witness sequence.** Proposed (not started): first *assess the lowering* (read-only — does
+  every model term have a *composable* operational bench, i.e. is the gap from "benches a stage in
+  isolation" to "runs the stage end-to-end" mechanical, and where is the DSL short?); then build the first
+  witness for one model as the proof; then generalize. "It should be easy" is a testable claim — true iff
+  the DSL is expressive enough that lowering is composition, not rewrite.
+- **The framework↔instance signal (the maintainer's corollary).** De-biasing the MANUAL (2026-06-22)
+  exposed that the conceptual sections and the model skeleton had smuggled the specific producer/serve/
+  transport cycle in as canon; the fix pushed the cycle-specific parts to placeholders, keeping only the
+  framework boilerplate concrete. That the manual *can* be taught instance-free is good — but that every
+  current model shares one spine, and a concrete model kept wanting to sit at the center, is the tell the
+  maintainer flagged: the cycle-modeling **framework** and the specific cycle **instance** may still be
+  entangled in the tool. If a future need forces the concrete model back into the framework's core, that
+  is the trigger to continue the refactor in a *separate-framework-from-instance* direction — direction
+  currently undetermined ("I know not where, at the moment").
+
 ## Retired
 
 - **NMCS parity tests** marked `skip` in `tests/test_cpp_runner.py` (2026-06-16): validated repeatedly,
