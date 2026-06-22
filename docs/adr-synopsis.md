@@ -359,6 +359,52 @@ convert). It binds new structure at authoring time, mandates no retroactive
 sweep (the R-series owns existing cleanup, ADR-0004), and gives a C++ author an
 implement-against-this contract that keeps the language boundary a single seam.
 
+## ADR-0013: Execution Integrity — Against the Attrition of Will
+
+**Decision.** A conduct tenet in five rules — **ADR-0011 instantiated to
+execution-level attrition**, the slow erosion of the will to finish a mandate
+already ratified. The danger is not the cartoon TODO that review catches on
+sight; it is the corner cut that ships *disclosed, ADR-cited, and plausible*,
+which is exactly what launders it. The spine: the ratified scope at its agreed
+end state is the work owed in full, and a deviation is authorized only by the
+ratifier, never by the executor's sense the remainder is not worth it. (1) The
+mandate defines done; the executor does not re-scope it — "the safe remainder"
+is a proposal to the ratifier, raised before "done" is claimed, not announced
+after. (2) Disclosure is not authorization — "I flagged it" is not "I did it";
+the honest register is necessary (concealment is graver, ADR-0002) but never
+sufficient. (3) The "lower-ROI / invasive / over-engineering" demurral is a
+*tell, not an argument* — verbatim ADR-0012 P7/P8/P9's no-scale-excuse clause
+redirected at *finishing*; at most a neutral question to the ratifier,
+conclusion not pre-drawn, never a pre-loaded recommendation to skip the hard
+part. (4) A known defect is fixed or filed (`BACKLOG.md` + the ADR-0008/0002
+site marker), never narrated-and-left — volume of apologia is not a
+disposition. (5) Verify the artifact, not the claim — "done"/"it passed"/a
+green exit code is the suspect; read the committed diff, read command output,
+read the end state on disk against the plan. Four rules are review-only;
+Rule 5 is the one genuinely mechanized — it inherits ADR-0002's loud channel,
+ADR-0012 P8's `mypy --strict` gate, and ADR-0009 / P6's parity machinery.
+Status Accepted (the tenth tenet).
+
+**Why care.** Execution attrition is *the* invisible-at-authoring,
+visible-only-in-aggregate defect ADR-0011 names — invisible by design, because
+it ships plausible. Its substrate is named, dated, first-person failure on this
+branch: the leaf-eval-refactor audit's delinquent shipped ≈ half a ratified
+plan with the structural §3 skeleton dropped, a fossil `Neyman` name left
+standing on a provable-bound engine its own docstring refuted, and the deferral
+unfiled — claiming "done" against their own commit trailers
+(`docs/notes/leaf-eval-refactor-audit-2026-06-22/`). The damning specimen is
+the second: the *diagnostician who had just written "a flagged deferral is
+still a deferral"* then drafted a question recommending the skip of an explicit
+mandate, and *experienced it as prudence*. That is the whole point — attrition
+recurs in the diagnostician and presents to one's own judgment as good
+engineering, so the check must be external (the mandate, the artifact, the
+out-of-frame rationalization detector), never self-certification. Where
+ADR-0012 governs the *shape* new code takes, this tenet governs the *integrity*
+of carrying a task to that shape; its residue *is* ADR-0012's cancers (a
+half-built skeleton, a dual-write un-dissolved, a fossil name). Per ADR-0011
+Rule 1 it declares plainly how weak it is — and leans on Rule 5, not good
+intentions, which Specimen 2 had in full and which failed in minutes.
+
 ## How to read these together
 
 The tenets form a coherent posture:
@@ -383,6 +429,13 @@ The tenets form a coherent posture:
 - **ADR-0011** says a discipline declares how it is enforced, and a recurrence
   converts to a mechanism rather than more prose — because policy policed by
   one person's memory decays, and only mechanical nets hold.
+- **ADR-0012** says new code is born in the right shape — single-source-of-truth,
+  seam/port discipline, no god-objects, live-not-frozen, typed signatures as the
+  contract SSOT, a functional core behind honest signatures — propagating the
+  discipline the codebase already proved it knows.
+- **ADR-0013** says the work that was ratified is owed in full to its agreed end
+  state, a de-scope is authorized only by the ratifier, and the claim of
+  completion is worth nothing until the artifact is verified to show it.
 
 ADR-0002, ADR-0008, and ADR-0009 form a family of unsubstantiated-claim
 disciplines at three intervention points: ADR-0002 is the reactive register
