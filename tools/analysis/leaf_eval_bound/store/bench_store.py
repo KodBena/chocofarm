@@ -69,7 +69,7 @@ from chocofarm.config import lab_pg_connect_timeout, lab_pg_params  # noqa: E402
 
 # The Estimate contract + its (de)serialization (estimate.py — the type SSOT, ADR-0012 P8). Imported
 # as a sibling module (no __init__.py in this dir; same pattern manifest.py uses for bench_store).
-from estimate import Estimate, from_jsonb, to_jsonb  # noqa: E402
+from leaf_eval_bound.contract.estimate import Estimate, from_jsonb, to_jsonb  # noqa: E402
 
 
 # ============================================================================================

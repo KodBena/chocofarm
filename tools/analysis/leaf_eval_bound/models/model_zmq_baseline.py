@@ -77,12 +77,9 @@ from typing import Any
 
 import numpy as np
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
 
-import manifest  # noqa: E402  — the SSOT registry contract (import-clean; touches no DB on import)
-from alloc.driver import AllocationDriver  # noqa: E402
+from leaf_eval_bound.store import manifest  # noqa: E402  — the SSOT registry contract (import-clean; touches no DB on import)
+from leaf_eval_bound.alloc.driver import AllocationDriver  # noqa: E402
 
 # The transport SLUG (the registry prefix for this variant's moved terms; the comparison-table key).
 SLUG = "zmq_baseline"
@@ -119,7 +116,7 @@ def throughput_jax(x: Any) -> Any:
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
     tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy convenience `throughput_numpy` is DERIVED from this single home (F4/§5), not a hand-written twin)."""
-    from alloc.jax_backend import jnp
+    from leaf_eval_bound.alloc.jax_backend import jnp
     N_gen, R_gen, B, T_disp, tau_io, wakeup, t_row, L, tmsg = x
     producer = N_gen * R_gen
     cycle_us = T_disp + tau_io + wakeup + B * t_row
@@ -289,7 +286,7 @@ def bound(trust: bool = True) -> dict[str, Any]:
 def ref_plateau_dps() -> float:
     """The ~203 dps empirical plateau reference (NOT a target). Single-homed in the v1 grounding
     (`leaf_eval_grounding.REF_PLATEAU_DPS`); pulled from there so there is one home for the reference."""
-    import leaf_eval_grounding as G
+    from leaf_eval_bound.contract import grounding as G
     return float(G.REF_PLATEAU_DPS)
 
 

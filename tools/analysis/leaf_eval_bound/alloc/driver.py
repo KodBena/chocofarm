@@ -112,19 +112,15 @@ import numpy as np
 # mean case (the confirmed fixed point). It lives in this directory (no package), imported by
 # sys.path the way manifest.py imports it — so adding the tool root keeps the import working
 # whether the driver is imported as a sibling module or from the repo root.
-_HERE = os.path.dirname(os.path.abspath(__file__))          # .../leaf_eval_bound/alloc
-_ROOT = os.path.dirname(_HERE)                              # .../leaf_eval_bound  (the tool root)
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-import estimate as _est  # noqa: E402  — the Estimate contract (numpy-only; touches no DB)
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the Estimate contract (numpy-only; touches no DB)
 # The generic OR machinery in the `alloc` sub-package: `alloc.gradient.jax_gradient` is the JAX gradient
 # backend (the OT→JAX migration, §5 — the driver consumes a JAX-traceable `f` and differentiates it with
 # jax.grad), `alloc.kink` is the §4.1 Clark-1961 min()-kink closed form (pure, backend-independent). The
 # x64-enabled JAX handle `alloc.jax_backend.jnp` evaluates `f` at a point. All resolve via the
 # `sys.path.insert(0, _ROOT)` above — `alloc` is the sub-package this module now lives in (resolved from the tool root).
-from alloc import gradient as _grad, kink as _kink  # noqa: E402
-from alloc.report import PrimitiveState, Recommendation  # noqa: E402  -- result containers (alloc/report.py)
-from alloc.jax_backend import jnp  # noqa: E402  — x64-enabled jnp for evaluating the JAX f at a point
+from leaf_eval_bound.alloc import gradient as _grad, kink as _kink  # noqa: E402
+from leaf_eval_bound.alloc.report import PrimitiveState, Recommendation  # noqa: E402  -- result containers (alloc/report.py)
+from leaf_eval_bound.alloc.jax_backend import jnp  # noqa: E402  — x64-enabled jnp for evaluating the JAX f at a point
 
 # cvxpy (CLARABEL) backs the §2.3 cost-constrained c-optimal SOCP allocation (the sign-safe
 # Q = diag(g)·R·diag(g) form, native to mixed-sign gradients). scipy.stats.norm backs the §4.1

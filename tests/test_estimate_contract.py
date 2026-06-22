@@ -32,12 +32,12 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
-import estimate as E  # noqa: E402  — the contract under test
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract under test
 
 
 # --------------------------------------------------------------------------- #
@@ -521,7 +521,7 @@ def test_from_jsonb_missing_key_raises() -> None:
 # --------------------------------------------------------------------------- #
 def _db_available() -> bool:
     try:
-        import bench_store
+        from leaf_eval_bound.store import bench_store
         with bench_store.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -533,7 +533,7 @@ def _db_available() -> bool:
 
 @pytest.mark.skipif(not _db_available(), reason="control_research postgres not reachable")
 def test_store_round_trip_through_jsonb_column() -> None:
-    import bench_store
+    from leaf_eval_bound.store import bench_store
     bench_store.ensure_schema()  # idempotent; also applies the Phase-0 ALTERs
     name = f"_test_estimate_rt_{uuid.uuid4().hex[:12]}"
     est = _ols_estimate()

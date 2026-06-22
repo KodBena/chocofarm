@@ -99,13 +99,10 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, cast  # (Callable dropped with the runner _fd_gradient — move 5; Optional was already unused)
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
 
-import leaf_eval_grounding as G  # noqa: E402  — the single home of the references + the transfer decomposition
-import manifest  # noqa: E402   — the SSOT registry (import-clean; touches no DB on import)
-from model_base import TransportModel  # noqa: E402  — the typed transport-variant contract (move 3)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402  — the single home of the references + the transfer decomposition
+from leaf_eval_bound.store import manifest  # noqa: E402   — the SSOT registry (import-clean; touches no DB on import)
+from leaf_eval_bound.models.model_base import TransportModel  # noqa: E402  — the typed transport-variant contract (move 3)
 
 
 # --------------------------------------------------------------------------- #
@@ -156,31 +153,31 @@ _TRANSPORT_MOVED_TERMS: dict[str, list[str]] = {
 
 VARIANTS: list[TransportVariant] = [
     TransportVariant(
-        module="model_zmq_baseline",
+        module="leaf_eval_bound.models.model_zmq_baseline",
         moves="nothing (the REFERENCE: ZMQ ROUTER/DEALER multipart, poll-block wakeup)",
         transfer_residual_us=_H2D_D2H_RESIDUAL_US,
         transfer_note="staged-slope forward; T_disp omits both H2D+D2H -> full staged residual",
     ),
     TransportVariant(
-        module="model_shm_spin_poll",
+        module="leaf_eval_bound.models.model_shm_spin_poll",
         moves="tau_io (ring memcpy, zero-copy req drain) + wakeup (~0, burnt poll core)",
         transfer_residual_us=_H2D_D2H_RESIDUAL_US,
         transfer_note="staged-slope forward; T_disp omits both H2D+D2H -> full staged residual",
     ),
     TransportVariant(
-        module="model_futex_wake",
+        module="leaf_eval_bound.models.model_futex_wake",
         moves="wakeup (FUTEX_WAKE edge handoff, no burnt core) + tau_io (= shm ring drain)",
         transfer_residual_us=_H2D_D2H_RESIDUAL_US,
         transfer_note="staged-slope forward; T_disp omits both H2D+D2H -> full staged residual",
     ),
     TransportVariant(
-        module="model_lockfree_mpsc",
+        module="leaf_eval_bound.models.model_lockfree_mpsc",
         moves="tau_io (CAS batch-dequeue + row gather charged) + wakeup (hybrid spin-then-park)",
         transfer_residual_us=_H2D_D2H_RESIDUAL_US,
         transfer_note="staged-slope forward; T_disp omits both H2D+D2H -> full staged residual",
     ),
     TransportVariant(
-        module="model_cpp_inproc_port",
+        module="leaf_eval_bound.models.model_cpp_inproc_port",
         moves="t_row (BARE fully_device slope) + tau_io (residual H2D crossing) + wakeup (~0)",
         transfer_residual_us=_OUTPUT_PULL_US,
         transfer_note="tau_io ALREADY charges the H2D input crossing -> add D2H output pull ONLY "
@@ -400,7 +397,7 @@ def _ref_v1() -> dict[str, float]:
     """The v1 reference bounds (NOT targets): Design-B cycle-time ~429, the v1 inproc-port contrast ~620
     (model_cycletime.inproc_port_contrast at full-512). Pulled live from the v1 model so the references
     track the v1 home rather than a hand-copied literal."""
-    import model_cycletime as v1
+    from leaf_eval_bound.models import model_cycletime as v1
     x0 = v1.initial_point()
     design_b = v1.throughput_numpy(x0)
     inproc = v1.inproc_port_contrast(full_batch=512)["dps_at_full_batch"]

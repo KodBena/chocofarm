@@ -37,18 +37,14 @@ import sys
 import time
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from estimators import median_estimate  # noqa: E402
-from pools import window_pool  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "futex_wake_req_drain_us"
-MODULE_PATH = "benchmarks.bench_futex_wake_req_drain_us"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_futex_wake_req_drain_us"
 _DESC = ("FUTEX-WAKE per-forward request-drain copy cost (us): memcpy B request rows out of the request ring "
          "into a contiguous (B,in_dim) input. The cost the zero-copy ring-span drain AVOIDS — charged into "
          "futex_wake_tau_io_us ONLY if zero-copy is not realized. Same ring as shm_spin_poll; the copy-both "
@@ -70,7 +66,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="serve_req_drain_copy_futex_wake", units="us",
                              description=_DESC, module_path=MODULE_PATH)
 

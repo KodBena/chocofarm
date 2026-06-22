@@ -26,15 +26,11 @@ import os
 import sys
 from typing import Any, Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-import leaf_eval_grounding as G  # noqa: E402
-from estimators import fit_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.benchmarks.estimators import fit_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "t_row_us"
 # The co-fit PARTNER: t_row (the slope) and iota (the intercept) are the SAME staged `time = intercept +
@@ -43,7 +39,7 @@ NAME = "t_row_us"
 # model consumers read this slope) and iota_us as the partner carrying the −0.81 off-diagonal (§4.2).
 PARTNER_NAME = "iota_us"
 WARMUP = 8   # harness warmup phase (harness.warm): burn cold-compile forwards before measuring
-MODULE_PATH = "benchmarks.bench_t_row"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_t_row"
 _DESC = ("SERVE per-row marginal forward cost (us/row): the slope of the staged run_microbatch JAX "
          "forward (time = iota + t_row*rows). Baseline, transport-invariant; the per-row term of the "
          "binding serve stage.")
@@ -61,7 +57,7 @@ def get_seed() -> G.Grounded:
 
 def register_self() -> Any:
     """Register this quantity's definition row (idempotent). Returns the definition id."""
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="serve_per_row_cost", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

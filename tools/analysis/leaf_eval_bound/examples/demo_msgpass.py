@@ -21,9 +21,8 @@ import sys
 import numpy as np
 
 # Allow running as a bare script (examples/ is a sibling of `alloc/` under the tool root).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alloc.driver import AllocationDriver  # noqa: E402
+from leaf_eval_bound.alloc.driver import AllocationDriver  # noqa: E402
 
 
 def build_demo() -> tuple[AllocationDriver, dict[int, object], list[str], list[float]]:

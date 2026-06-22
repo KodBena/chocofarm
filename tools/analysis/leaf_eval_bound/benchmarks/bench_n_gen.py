@@ -22,18 +22,14 @@ import os
 import sys
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-import leaf_eval_grounding as G  # noqa: E402
-from estimators import pin_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.benchmarks.estimators import pin_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "n_gen"
-MODULE_PATH = "benchmarks.bench_n_gen"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_n_gen"
 _DESC = ("Generator cores (cores): the FIXED isolation/pinning layout (1 serve + 3 gen, isolcpus 1-3 on "
          "the 4-vCPU host). A config fact (producer ceiling multiplier, aggregate = n_gen*R_gen), not a "
          "measurement. Baseline, transport-invariant.")
@@ -45,7 +41,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="generator_cores", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

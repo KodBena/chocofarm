@@ -40,18 +40,14 @@ import threading
 import time
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from estimators import median_estimate  # noqa: E402
-from pools import collect_pool  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.pools import collect_pool  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "shm_spin_poll_wakeup_us"
-MODULE_PATH = "benchmarks.bench_shm_spin_poll_wakeup"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_shm_spin_poll_wakeup"
 _DESC = ("SHM SPIN-POLL wakeup latency (us): producer bumps an atomic tail counter -> the spinning serve "
          "core observes it. NO syscall, NO context switch (a dedicated burnt poll core) — just the cross-core "
          "cache-line coherence floor (~0.1us). The lever distinguishing the spin transport from syscall-wakeup "
@@ -68,7 +64,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="wakeup_latency_shm_spin_poll", units="us",
                              description=_DESC, module_path=MODULE_PATH)
 

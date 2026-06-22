@@ -24,15 +24,15 @@ import sys
 import pytest
 
 _LEB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "tools", "analysis", "leaf_eval_bound")
+                    "tools", "analysis")
 if _LEB not in sys.path:
     sys.path.insert(0, _LEB)
 
-from model_base import TRANSPORT_MODEL_MEMBERS, TransportModel  # noqa: E402
+from leaf_eval_bound.models.model_base import TRANSPORT_MODEL_MEMBERS, TransportModel  # noqa: E402
 
 # The transport-variant family (the GROWING one). A new variant is added here AND must conform.
-_VARIANTS = ["model_zmq_baseline", "model_shm_spin_poll", "model_futex_wake",
-             "model_lockfree_mpsc", "model_cpp_inproc_port"]
+_VARIANTS = ["leaf_eval_bound.models.model_zmq_baseline", "leaf_eval_bound.models.model_shm_spin_poll", "leaf_eval_bound.models.model_futex_wake",
+             "leaf_eval_bound.models.model_lockfree_mpsc", "leaf_eval_bound.models.model_cpp_inproc_port"]
 
 
 @pytest.mark.parametrize("modname", _VARIANTS)

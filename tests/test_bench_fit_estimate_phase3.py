@@ -49,15 +49,15 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import estimators as BC  # noqa: E402  — the fit_estimate helper under test
-import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.benchmarks import estimators as BC  # noqa: E402  — the fit_estimate helper under test
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
 
 # The real 7-point design the spec §8 corroborating check fixes the −0.8114 to.
 DESIGN = [32, 64, 128, 192, 256, 384, 512]
@@ -181,7 +181,7 @@ def test_fit_estimate_jsonb_round_trips() -> None:
 # --------------------------------------------------------------------------- #
 def _db_available() -> bool:
     try:
-        import bench_store
+        from leaf_eval_bound.store import bench_store
         with bench_store.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -201,12 +201,12 @@ def test_run_logs_fit_estimate_and_manifest_reads_it_back() -> None:
     'postgres(estimate)', NOT the Phase-1 legacy reconstruction) — with the −0.8114 cov and the OWN
     quantity as component 0. The §5.2 DE-DUP is asserted: the instance carries exactly the 7 per-width
     medians as provenance, the headline scalar is NOT double-logged. Self-cleaning of its synthetic rows."""
-    import bench_store
-    import manifest as M
-    import bench_t_row
-    import bench_iota
-    import bench_t_disp
-    import bench_cpp_inproc_port_t_row_bare_us as bcpp
+    from leaf_eval_bound.store import bench_store
+    from leaf_eval_bound.store import manifest as M
+    from leaf_eval_bound.benchmarks import bench_t_row
+    from leaf_eval_bound.benchmarks import bench_iota
+    from leaf_eval_bound.benchmarks import bench_t_disp
+    from leaf_eval_bound.benchmarks import bench_cpp_inproc_port_t_row_bare_us as bcpp
 
     bench_store.ensure_schema()
     staged = {B: float(94.58 + 4.317 * B) for B in DESIGN}
@@ -267,7 +267,7 @@ def test_run_logs_fit_estimate_and_manifest_reads_it_back() -> None:
         # restore the patched `_measure_raw`s and delete the synthetic instances (keep the definitions).
         (bench_t_row._measure_raw, bench_iota._measure_raw, bench_t_disp._measure_raw, bcpp._measure_raw) = saved
         try:
-            import bench_store as _bs
+            from leaf_eval_bound.store import bench_store as _bs
             with _bs.connect() as c:
                 with c.cursor() as cur:
                     for name in ("t_row_us", "iota_us", "T_disp_us", "cpp_inproc_port_t_row_bare_us"):

@@ -53,15 +53,15 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import estimators as BC  # noqa: E402  — the median_estimate/pin_estimate helpers under test
-import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.benchmarks import estimators as BC  # noqa: E402  — the median_estimate/pin_estimate helpers under test
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
 
 
 def _skewed_pool(n: int = 1500, base: float = 20.0, sigma: float = 0.3, seed: int = 7) -> list[float]:
@@ -210,9 +210,9 @@ def test_n_gen_constant_flag_is_the_single_home_of_the_degenerate_classification
     `constant=False` still drives is the SEED/DISTRUST path (`reconstruct._estimate_from_seed`), checked
     here DB-free — the actual single-home contrast (and it does not invoke the live, timing-sensitive
     binary). See tests/test_bench_r_gen_cpp_gen_ceiling.py for the measured-path shrinkability."""
-    import leaf_eval_grounding as G
-    import bench_n_gen
-    import reconstruct as R
+    from leaf_eval_bound.contract import grounding as G
+    from leaf_eval_bound.benchmarks import bench_n_gen
+    from leaf_eval_bound.store import reconstruct as R
     assert G.N_GEN_CORES.constant is True                  # the SSOT marks n_gen a true constant
     assert G.GEN_PER_CORE_DPS.constant is False            # R_gen is a measured declared-spread prior
     # the bench derives the family from the SSOT (not a literal) — change the flag, change the family.
@@ -263,7 +263,7 @@ def test_median_bench_run_logs_only_the_pool_not_the_headline(monkeypatch) -> No
     producer `run()` consumes for BOTH the Estimate and the raw rows) is monkeypatched to a synthesized pool
     (no live timing)."""
     import contextlib
-    import bench_tau_io as B
+    from leaf_eval_bound.benchmarks import bench_tau_io as B
 
     pool = _skewed_pool()
     med = float(np.median(pool))
@@ -314,7 +314,7 @@ def test_quantile_and_fixed_estimates_flow_through_the_driver_step() -> None:
     round to zero — a distinct mechanism, not the allocator)."""
     pytest.importorskip("scipy")
 
-    from alloc.driver import AllocationDriver
+    from leaf_eval_bound.alloc.driver import AllocationDriver
     f = lambda x: 2.0 * x[0] + 3.0 * x[1]
     d = AllocationDriver(f, costs=[1.0, 1.0], tolerance=0.5, names=["x0", "x1"])
     med_est = BC.median_estimate(_skewed_pool(base=10.0), name="x0")   # a QuantileLaw input
@@ -345,7 +345,7 @@ def test_quantile_and_fixed_estimates_flow_through_the_driver_step() -> None:
 # --------------------------------------------------------------------------- #
 def _db_available() -> bool:
     try:
-        import bench_store
+        from leaf_eval_bound.store import bench_store
         with bench_store.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -364,10 +364,10 @@ def test_run_logs_median_and_pin_estimates_and_manifest_reads_them_back(monkeypa
     (source 'postgres(estimate)', NOT the Phase-1 legacy Poolwise reconstruction). The median's de-dup is
     asserted (only the pool as provenance rows). The pin recovers σ=64 in the stored cov. Self-cleaning of
     its synthetic instances."""
-    import bench_store
-    import manifest as M
-    import bench_tau_io
-    import bench_b_op
+    from leaf_eval_bound.store import bench_store
+    from leaf_eval_bound.store import manifest as M
+    from leaf_eval_bound.benchmarks import bench_tau_io
+    from leaf_eval_bound.benchmarks import bench_b_op
 
     bench_store.ensure_schema()
     pool = _skewed_pool()

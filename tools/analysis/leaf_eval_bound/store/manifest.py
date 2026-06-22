@@ -86,9 +86,6 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
 
 # bench_store is imported LAZILY (inside the functions that touch the DB) so importing the
 # manifest never opens a connection — the import-clean / graceful-degradation contract.
@@ -98,8 +95,8 @@ if _HERE not in sys.path:
 # module top PRESERVES the import-clean contract (it is the same numpy-only surface this module
 # already requires). It carries the Phase-1 Estimate seam.
 import numpy as np  # noqa: E402
-import estimate as _est  # noqa: E402
-import reconstruct  # noqa: E402  — the lifted seed/aggregate->Estimate + projection glue (move 2)
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402
+from leaf_eval_bound.store import reconstruct  # noqa: E402  — the lifted seed/aggregate->Estimate + projection glue (move 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -155,7 +152,7 @@ def postgres_available() -> bool:
     (the DB came back)."""
     global _PG_DOWN
     try:
-        import bench_store
+        from leaf_eval_bound.store import bench_store
         with bench_store.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -176,7 +173,7 @@ def _import_bench_module(module_path: str) -> Any:
     whichever the author finds natural. A missing/broken module is a loud ImportError (ADR-0002 — a
     registered quantity whose bench cannot load is a real fault, surfaced, not swallowed)."""
     if module_path.endswith(".py") or os.path.sep in module_path:
-        path = module_path if os.path.isabs(module_path) else os.path.join(_HERE, module_path)
+        path = module_path if os.path.isabs(module_path) else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), module_path)
         name = "bench_" + os.path.splitext(os.path.basename(path))[0]
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
@@ -184,7 +181,17 @@ def _import_bench_module(module_path: str) -> Any:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
-    return importlib.import_module(module_path)
+    # Normalize a pre-§3-rename registry path (`benchmarks.bench_X` / `bench_X`, written before the
+    # package nesting) to its home in the `leaf_eval_bound` package, so a registry row that predates
+    # the rename still resolves (ADR-0002: resolve by the module's real location, not fail on a
+    # stale-but-recoverable path; re-run register_all to rewrite the rows canonical).
+    mp = module_path
+    if not mp.startswith("leaf_eval_bound."):
+        if mp.startswith("benchmarks."):
+            mp = "leaf_eval_bound." + mp
+        elif mp.startswith("bench_"):
+            mp = "leaf_eval_bound.benchmarks." + mp
+    return importlib.import_module(mp)
 
 
 def _seed_from_module(module_path: str, name: str) -> tuple[float, float, str, bool]:
@@ -252,7 +259,7 @@ def discover(force: bool = False) -> dict[str, dict[str, Any]]:
         _DEF_CACHE = {}
         return _DEF_CACHE
     try:
-        import bench_store
+        from leaf_eval_bound.store import bench_store
         defs = bench_store.list_definitions()
         _DEF_CACHE = {d["name"]: d for d in defs}
     except Exception as exc:  # a SQL error on an OPEN connection is a real fault — surface it
@@ -356,7 +363,7 @@ def quantity(
     # Prefer the bench's COMPUTED Estimate (carries SE/Cov the sample aggregate cannot recover); fall
     # back to reconstructing a Poolwise Estimate from the legacy aggregate when no instance carries one.
     try:
-        import bench_store
+        from leaf_eval_bound.store import bench_store
         stored = bench_store.latest_estimate(name)
         if stored is not None:
             units = (_definition(name) or {}).get("units", "") or ""
@@ -416,7 +423,7 @@ def register(
     definition row. A design agent CAN call this, but the canonical registration is the bench module's
     own `register_self()` (so the definition and the bench live together). Returns the definition id.
     Loud if postgres is down (registration REQUIRES the DB — it is the registry write)."""
-    import bench_store
+    from leaf_eval_bound.store import bench_store
     return bench_store.register_definition(
         name, quantity=quantity, units=units, description=description, module_path=module_path)
 

@@ -55,17 +55,17 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import bench_tmsg as B  # noqa: E402  — the module under test (the v1 ZMQ-baseline codec bench)
-import bench_zmq_baseline_tmsg_us_leaf as Z  # noqa: E402  — the explicit slug-prefixed twin
-import estimate as E  # noqa: E402  — the contract
-import leaf_eval_grounding as G  # noqa: E402  — the grounding single-home
+from leaf_eval_bound.benchmarks import bench_tmsg as B  # noqa: E402  — the module under test (the v1 ZMQ-baseline codec bench)
+from leaf_eval_bound.benchmarks import bench_zmq_baseline_tmsg_us_leaf as Z  # noqa: E402  — the explicit slug-prefixed twin
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.contract import grounding as G  # noqa: E402  — the grounding single-home
 
 
 def _framing_pool(center: float = 0.166, spread: float = 0.004, n: int = 64, seed: int = 3) -> list[float]:

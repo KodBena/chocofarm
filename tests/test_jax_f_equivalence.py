@@ -26,16 +26,16 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
-from alloc.jax_backend import jnp  # noqa: E402 — importing it ENABLES x64 (before the first trace)
-import alloc.gradient as G  # noqa: E402
+from leaf_eval_bound.alloc.jax_backend import jnp  # noqa: E402 — importing it ENABLES x64 (before the first trace)
+import leaf_eval_bound.alloc.gradient as G  # noqa: E402
 
-_MODELS = ["model_capacity", "model_cycletime", "model_zmq_baseline", "model_shm_spin_poll",
-           "model_futex_wake", "model_lockfree_mpsc", "model_cpp_inproc_port"]
+_MODELS = ["leaf_eval_bound.models.model_capacity", "leaf_eval_bound.models.model_cycletime", "leaf_eval_bound.models.model_zmq_baseline", "leaf_eval_bound.models.model_shm_spin_poll",
+           "leaf_eval_bound.models.model_futex_wake", "leaf_eval_bound.models.model_lockfree_mpsc", "leaf_eval_bound.models.model_cpp_inproc_port"]
 
 
 def _x0(M: Any) -> dict:

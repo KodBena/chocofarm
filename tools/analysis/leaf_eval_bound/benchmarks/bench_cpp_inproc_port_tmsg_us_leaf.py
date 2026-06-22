@@ -33,17 +33,13 @@ import sys
 import time
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from estimators import median_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "cpp_inproc_port_tmsg_us_leaf"
-MODULE_PATH = "benchmarks.bench_cpp_inproc_port_tmsg_us_leaf"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_cpp_inproc_port_tmsg_us_leaf"
 _DESC = ("Per-leaf-amortized message cost (us/leaf) for the C++ inproc-port: a producer writes one feature row "
          "into its arena stripe + pushes a slot index onto a ready-queue (one relaxed-atomic SPSC/MPSC push) — "
          "no frame, no codec, no corr-id, no syscall. The cheapest tmsg of any variant; NON-BINDING, ranks "
@@ -64,7 +60,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="transport_msg_cost_per_leaf_cpp_inproc_port", units="us/leaf",
                              description=_DESC, module_path=MODULE_PATH)
 

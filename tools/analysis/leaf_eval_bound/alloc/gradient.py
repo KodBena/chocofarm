@@ -32,6 +32,6 @@ def jax_gradient(f: Callable[..., Any], point: np.ndarray) -> np.ndarray:
     — it is the Clark-1961 closed form (`alloc.kink`) the driver routes to near a tie, so the subgradient
     is never the bound there. No FD step-size truncation. x64 is enforced via `jax_backend` (float32 would
     drift the bound ~1e-6)."""
-    from alloc.jax_backend import grad, jnp
+    from leaf_eval_bound.alloc.jax_backend import grad, jnp
     g = grad(f)(jnp.asarray(point, dtype=float))
     return np.asarray(g, dtype=float)

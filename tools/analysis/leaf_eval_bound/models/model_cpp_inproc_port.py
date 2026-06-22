@@ -89,11 +89,8 @@ import os
 import sys
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
 
-import manifest  # noqa: E402  — the SSOT registry; every input is pulled through value()/quantity()
+from leaf_eval_bound.store import manifest  # noqa: E402  — the SSOT registry; every input is pulled through value()/quantity()
 
 # The transport SLUG + the prefixed moved-term quantity names (the single home of THIS variant's identity).
 SLUG = "cpp_inproc_port"
@@ -146,7 +143,7 @@ def throughput_jax(x: Any) -> Any:
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
     tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy convenience `throughput_numpy` is DERIVED from this single home (F4/§5), not a hand-written twin)."""
-    from alloc.jax_backend import jnp
+    from leaf_eval_bound.alloc.jax_backend import jnp
     N_gen, R_gen, B, T_disp, wakeup, tau_io, t_row, L, tmsg = x
     producer = N_gen * R_gen
     cycle_us = T_disp + wakeup + tau_io + B * t_row
@@ -216,7 +213,7 @@ def build_driver(tolerance: float = 5.0, trust: bool = True) -> tuple[Any, dict[
     """Factory: a configured `AllocationDriver` (over the JAX `f` (`throughput_jax`), the per-input costs) + the resolved initial
     point. `tolerance` is the target CI half-width on E[f] in dps. `trust` selects live-vs-seed inputs. Imported
     lazily (deferred to keep this module import-cheap)."""
-    from alloc.driver import AllocationDriver
+    from leaf_eval_bound.alloc.driver import AllocationDriver
     f = throughput_jax  # the driver consumes the JAX-traceable f directly (OT→JAX migration, §5)
     cost_list = [_COST[nm] for nm in INPUT_NAMES]
     driver = AllocationDriver(
@@ -366,7 +363,7 @@ def bound(trust: bool = True) -> dict[str, Any]:
 def ref_plateau_dps() -> float:
     """The ~203 dps empirical plateau reference (NOT a target). Single-homed in the v1 grounding; pulled from
     there so there is one home for the reference."""
-    import leaf_eval_grounding as G
+    from leaf_eval_bound.contract import grounding as G
     return float(G.REF_PLATEAU_DPS)
 
 

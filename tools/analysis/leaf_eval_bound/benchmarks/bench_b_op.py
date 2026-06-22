@@ -26,18 +26,14 @@ import os
 import sys
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-import leaf_eval_grounding as G  # noqa: E402
-from estimators import pin_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.benchmarks.estimators import pin_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "B_op"
-MODULE_PATH = "benchmarks.bench_b_op"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_b_op"
 _DESC = ("Server sustained FULL-BUCKET operating point (rows/forward): the achievable serve peak (the "
          "serve sawtooth is maximized at full buckets). v1 256 (GLOBAL MAX rows/fwd=511.5, max_batch=256). "
          "Real measurement = saturated end-to-end rows/forward histogram. Top serve-stage Neyman target.")
@@ -49,7 +45,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="serve_full_bucket_rows", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

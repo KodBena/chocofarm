@@ -49,19 +49,15 @@ import sys
 import time
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-import leaf_eval_grounding as G  # noqa: E402
-from estimators import median_estimate  # noqa: E402
-from pools import window_pool  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "tmsg_us_leaf"
-MODULE_PATH = "benchmarks.bench_tmsg"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_tmsg"
 _DESC = ("Per-leaf-amortized message-passing cost (us/leaf): request encode + reply decode of the "
          "inference wire codec over a coalesced S-leaf frame, /S (the pool MEDIAN over windows). "
          "Transport stage; NON-BINDING by a wide margin (ranks LAST for Neyman). Baseline = the ZMQ "
@@ -81,7 +77,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="transport_msg_cost_per_leaf", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

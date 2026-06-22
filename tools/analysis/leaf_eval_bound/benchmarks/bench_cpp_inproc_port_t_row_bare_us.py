@@ -41,14 +41,10 @@ import os
 import sys
 from typing import Any, Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from estimators import fit_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.benchmarks.estimators import fit_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "cpp_inproc_port_t_row_bare_us"
 # The co-fit PARTNER: this bare-forward SLOPE and T_disp (the dispatch-floor INTERCEPT) are read off the
@@ -57,7 +53,7 @@ NAME = "cpp_inproc_port_t_row_bare_us"
 # manifest.value("cpp_inproc_port_t_row_bare_us") projects) and T_disp_us the partner carrying the −0.81
 # off-diagonal (§4.2). This fit is DISTINCT from the staged (iota/t_row) fit — they must NOT cross-pair.
 PARTNER_NAME = "T_disp_us"
-MODULE_PATH = "benchmarks.bench_cpp_inproc_port_t_row_bare_us"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_cpp_inproc_port_t_row_bare_us"
 _DESC = ("BARE-forward per-row marginal cost (us/row) the C++ in-process queue-port feeds: the slope of the "
          "fully_device JAX forward (params+input staged device-resident, output on-device — no host pull, no "
          "run_microbatch concat). The ONE per-row term cpp_inproc_port moves off the staged-slope baseline "
@@ -83,7 +79,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="serve_per_row_cost_bare_forward", units="us/row",
                              description=_DESC, module_path=MODULE_PATH)
 

@@ -48,19 +48,15 @@ import sys
 import time
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-import leaf_eval_grounding as G  # noqa: E402
-from estimators import median_estimate  # noqa: E402
-from pools import window_pool  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "zmq_baseline_tau_io_us"
-MODULE_PATH = "benchmarks.bench_zmq_baseline_tau_io_us"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_zmq_baseline_tau_io_us"
 _DESC = ("ZMQ BASELINE per-forward serial serve-side I/O (us): drain(recv_multipart(NOBLOCK) x T)+"
          "decode(x T)+encode(x T)+scatter(send_multipart x T) the single-threaded server runs between "
          "forwards (inference_server.py _drain/_scatter). The DOMINANT transport lever; the reference "
@@ -80,7 +76,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="serve_transport_io_cost", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

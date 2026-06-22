@@ -62,14 +62,14 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
 
 # The two reclassified modules + the seed (mean, sigma) each get_seed() declares, for the
 # DISTRUST-fallback-unchanged check. Parametrized so each bench is exercised independently.
@@ -218,7 +218,7 @@ def test_get_seed_is_the_distrust_fallback_and_unchanged(modname: str) -> None:
 
 @pytest.mark.parametrize("modname", _MODULES)
 def test_pin_estimate_no_longer_imported(modname: str) -> None:
-    """The punt's structural tell was `from estimators import ... pin_estimate`; the fix drops it (the
+    """The punt's structural tell was `from leaf_eval_bound.benchmarks.estimators import ... pin_estimate`; the fix drops it (the
     measured path is a `median_estimate`). A regression that re-introduces the pin would re-bind the name."""
     B = _mod(modname)
     assert not hasattr(B, "pin_estimate")

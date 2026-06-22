@@ -65,18 +65,14 @@ import sys
 import time
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from estimators import median_estimate  # noqa: E402
-from pools import window_pool  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.pools import window_pool  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "lockfree_mpsc_tmsg_us_leaf"
-MODULE_PATH = "benchmarks.bench_lockfree_mpsc_tmsg"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_lockfree_mpsc_tmsg"
 _DESC = ("LOCK-FREE MPSC per-leaf message cost (us/leaf): a tail-CAS enqueue + write one request row into "
          "the reserved slot + read one reply row out (no frame envelope, no corr-id, no syscall, no codec). "
          "Transport stage; NON-BINDING by a wide margin. The MPSC variant of tmsg_us_leaf (CAS-enqueue + "
@@ -102,7 +98,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="transport_msg_cost_per_leaf_lockfree_mpsc", units="us",
                              description=_DESC, module_path=MODULE_PATH)
 

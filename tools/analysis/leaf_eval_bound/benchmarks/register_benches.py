@@ -35,9 +35,6 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 
 def discover_bench_modules() -> list[str]:
@@ -56,7 +53,7 @@ def register_all() -> list[tuple[str, str]]:
     bench raises here, it is never silently skipped; the conformance test pins the contract run-free)."""
     out: list[tuple[str, str]] = []
     for mod_name in discover_bench_modules():
-        mod = importlib.import_module(mod_name)
+        mod = importlib.import_module("leaf_eval_bound.benchmarks." + mod_name)
         def_id = mod.register_self()
         out.append((mod.NAME, str(def_id)))
     return out

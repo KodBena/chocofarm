@@ -47,17 +47,17 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import estimate as E  # noqa: E402  — the contract
-import leaf_eval_grounding as G  # noqa: E402  — the grounding SSOT under test
-import bench_iota  # noqa: E402  — the intercept bench
-import bench_t_row  # noqa: E402  — the slope bench
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.contract import grounding as G  # noqa: E402  — the grounding SSOT under test
+from leaf_eval_bound.benchmarks import bench_iota  # noqa: E402  — the intercept bench
+from leaf_eval_bound.benchmarks import bench_t_row  # noqa: E402  — the slope bench
 
 # The real staged-forward width sweep the fit times (bench_t_row/_measure_raw default).
 DESIGN = [32, 64, 128, 192, 256, 384, 512]
@@ -104,8 +104,8 @@ def test_needs_measurement_is_single_homed_across_static_and_manifest_paths() ->
     IDENTICALLY on the STATIC path (model_capacity / model_cycletime read `Grounded.needs_measurement`)
     and would on the MANIFEST path (model_zmq_baseline / model_cpp_inproc_port derive `not trusted` — a
     seed is always not-trusted, hence True). No more path-dependent 'grounded here / NEEDS-WORKLOAD there'."""
-    import model_capacity as MA
-    import model_cycletime as MB
+    from leaf_eval_bound.models import model_capacity as MA
+    from leaf_eval_bound.models import model_cycletime as MB
     # Static path: both quantities now flag NEEDS-SOLE-WORKLOAD (was iota/slope=False -> grounded).
     assert MA.NEEDS_MEASUREMENT["iota_us"] is True
     assert MA.NEEDS_MEASUREMENT["slope_us"] is True

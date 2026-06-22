@@ -71,10 +71,8 @@ from typing import Any
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import leaf_eval_grounding as G  # noqa: E402
-from alloc.driver import AllocationDriver  # noqa: E402
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.alloc.driver import AllocationDriver  # noqa: E402
 
 # Input order is the single home of the model's signature (used by both `throughput_jax`
 # and the numpy `throughput_numpy` so they cannot drift — P1).
@@ -93,7 +91,7 @@ def throughput_jax(x: Any) -> Any:
     for f (§5): `jax.grad(throughput_jax)` is the gradient (analytic, exact-through-`min()`; the arm-tie is
     handled by alloc.kink, not the linearization), evaluating identically to `throughput_numpy` (pinned in
     tests/test_jax_f_equivalence.py). The model's single f the driver consumes (the OT string THROUGHPUT_EXPR is retired; the numpy convenience `throughput_numpy` is DERIVED from this single home (F4/§5), not a hand-written twin)."""
-    from alloc.jax_backend import jnp
+    from leaf_eval_bound.alloc.jax_backend import jnp
     g_core, n_gen, LPD, iota_us, slope_us, tau_io_us, B_op, tmsg_us_leaf = x
     gen = n_gen * g_core / LPD
     fwd_us = iota_us + slope_us * B_op + tau_io_us

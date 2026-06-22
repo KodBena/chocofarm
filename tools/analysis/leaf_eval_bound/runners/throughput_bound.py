@@ -31,12 +31,10 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import leaf_eval_grounding as G  # noqa: E402
-import reconstruct  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
-import model_capacity  # noqa: E402
-import model_cycletime  # noqa: E402
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.store import reconstruct  # noqa: E402  — the seed->Estimate SSOT (_estimate_from_seed) for the §6 Phase-4 pilot
+from leaf_eval_bound.models import model_capacity  # noqa: E402
+from leaf_eval_bound.models import model_cycletime  # noqa: E402
 
 
 def _bound(model):

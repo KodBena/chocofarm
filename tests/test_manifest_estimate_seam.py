@@ -42,14 +42,14 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
-import estimate as E  # noqa: E402  — the contract
-import manifest as M  # noqa: E402  — the Phase-1 seam under test
-import reconstruct as R  # noqa: E402  — the lifted seed/aggregate->Estimate + projection (move 2)
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.store import manifest as M  # noqa: E402  — the Phase-1 seam under test
+from leaf_eval_bound.store import reconstruct as R  # noqa: E402  — the lifted seed/aggregate->Estimate + projection (move 2)
 
 
 # The real seed numbers + a spread of plausible measured aggregates (mean, sigma, n). The n==1
@@ -123,7 +123,7 @@ def test_quantity_trust_legacy_path_matches_todays_4tuple(monkeypatch, mean, sig
         def latest_aggregate(nm, *a, **k):
             return (mean, sigma, n)
 
-    monkeypatch.setitem(sys.modules, "bench_store", _FakeStore)
+    monkeypatch.setattr("leaf_eval_bound.store.bench_store", _FakeStore, raising=False)
 
     q = M.quantity("tau_io_us", trust=True)
     # the legacy 4-tuple is byte-for-byte what the pre-Phase-1 code returned.
@@ -256,7 +256,7 @@ def test_quantity_trust_prefers_stored_estimate_mean(monkeypatch) -> None:
         def latest_aggregate(nm, *a, **k):
             raise AssertionError("latest_aggregate must NOT be consulted when a stored estimate exists")
 
-    monkeypatch.setitem(sys.modules, "bench_store", _FakeStore)
+    monkeypatch.setattr("leaf_eval_bound.store.bench_store", _FakeStore, raising=False)
 
     q = M.quantity("q", trust=True)
     assert q.source == "postgres(estimate)"
@@ -279,7 +279,7 @@ def test_quantity_trust_stored_fit_projects_first_component(monkeypatch) -> None
         def latest_estimate(nm, *a, **k):
             return stored
 
-    monkeypatch.setitem(sys.modules, "bench_store", _FakeStore)
+    monkeypatch.setattr("leaf_eval_bound.store.bench_store", _FakeStore, raising=False)
 
     q = M.quantity("iota", trust=True)
     assert q.mean == 94.58
@@ -296,7 +296,7 @@ def test_quantity_trust_stored_fit_projects_first_component(monkeypatch) -> None
 # --------------------------------------------------------------------------- #
 def _db_available() -> bool:
     try:
-        import bench_store
+        from leaf_eval_bound.store import bench_store
         with bench_store.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -311,7 +311,7 @@ def test_manifest_reads_stored_estimate_through_postgres() -> None:
     """End-to-end through the real store: register a probe quantity, open an instance, set a stored
     Estimate, and confirm `manifest.quantity()` reads it back (source 'postgres(estimate)') and
     projects it to the 4-tuple. Cleans up its probe rows."""
-    import bench_store
+    from leaf_eval_bound.store import bench_store
     bench_store.ensure_schema()
     name = f"_test_manifest_seam_{uuid.uuid4().hex[:12]}"
     stored = _stored_mean_estimate()
@@ -345,7 +345,7 @@ def test_manifest_reconstructs_legacy_aggregate_through_postgres() -> None:
     """End-to-end legacy path: a probe instance with raw SAMPLES but NO stored estimate. The manifest's
     TRUST path reconstructs a Poolwise Estimate from the aggregate, and its 4-tuple equals the live
     aggregate byte-for-byte (the pool-fed / Estimate-fed fixed point, through real SQL)."""
-    import bench_store
+    from leaf_eval_bound.store import bench_store
     bench_store.ensure_schema()
     name = f"_test_manifest_legacy_{uuid.uuid4().hex[:12]}"
     values = [10.0, 12.0, 14.0, 16.0, 18.0]  # mean 14.0, a real spread, n 5

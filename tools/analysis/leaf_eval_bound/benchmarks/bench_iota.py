@@ -23,15 +23,11 @@ import os
 import sys
 from typing import Any, Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-import leaf_eval_grounding as G  # noqa: E402
-from estimators import fit_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.benchmarks.estimators import fit_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "iota_us"
 # The co-fit PARTNER: iota (the intercept) and t_row (the slope) are the SAME staged fit (measure()
@@ -40,7 +36,7 @@ NAME = "iota_us"
 # carrying the −0.81 off-diagonal (§4.2) — the SAME fit t_row logs, only the component order differs.
 PARTNER_NAME = "t_row_us"
 WARMUP = 8   # harness warmup phase (harness.warm): burn cold-compile forwards before measuring
-MODULE_PATH = "benchmarks.bench_iota"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_iota"
 _DESC = ("SERVE fixed per-forward cost (us): the intercept of the staged run_microbatch JAX forward "
          "(time = iota + t_row*rows). JAX-forward-only floor (dispatch + output pull + input); contains "
          "NO ZMQ drain/scatter (that is tau_io). Baseline, transport-invariant.")
@@ -52,7 +48,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="serve_fixed_forward_cost", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 
@@ -62,7 +58,7 @@ def _measure_raw(batches: Optional[list[int]] = None, iters: int = 200, repeat: 
     (DELEGATES to `bench_t_row._measure_raw`, which fits time = intercept + slope*rows — one measurement
     grounds BOTH the slope and the intercept). Returns its design-point dict (intercept_us is the iota
     reading). `measure()` wraps it into iota's intercept-first Estimate; `run()` uses it for both."""
-    import bench_t_row
+    from leaf_eval_bound.benchmarks import bench_t_row
     return bench_t_row._measure_raw(batches=batches, iters=iters, repeat=repeat)
 
 

@@ -28,14 +28,14 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import pools as BC  # noqa: E402
+from leaf_eval_bound.benchmarks import pools as BC  # noqa: E402
 
 
 def test_runs_one_call_per_window_in_order() -> None:

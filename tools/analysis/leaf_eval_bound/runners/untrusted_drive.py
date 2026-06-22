@@ -62,16 +62,12 @@ import sys
 import time
 from typing import Any, Callable, Optional, cast
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the typed value measurers return)
-import manifest  # noqa: E402  — the SSOT registry: name -> bench module_path
-from model_base import TransportModel  # noqa: E402  — the typed transport-variant contract (move 3)
-sys.path.insert(0, os.path.join(_HERE, "benchmarks"))
-import harness  # noqa: E402  — the harness warmup phase (warm())
-import leaf_eval_grounding as _G  # noqa: E402  — seed iota/t_row, to predict the slow JAX-fit ETAs
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the typed value measurers return)
+from leaf_eval_bound.store import manifest  # noqa: E402  — the SSOT registry: name -> bench module_path
+from leaf_eval_bound.models.model_base import TransportModel  # noqa: E402  — the typed transport-variant contract (move 3)
+from leaf_eval_bound.benchmarks import harness  # noqa: E402  — the harness warmup phase (warm())
+from leaf_eval_bound.contract import grounding as _G  # noqa: E402  — seed iota/t_row, to predict the slow JAX-fit ETAs
 
 # The recognized "how many units" keyword a bench's measure() exposes so the loop can size the batch to
 # the allocator's k by passing it. SINGLE HOME (ADR-0012 P1) is harness.SIZING_KWARGS — aliased here,
@@ -202,7 +198,7 @@ def main() -> int:
     iters_cap = int(os.environ.get("UD_ITERS_CAP", "1500"))
     tol = float(os.environ.get("UD_TOL", "5.0"))
 
-    model: TransportModel = cast(TransportModel, importlib.import_module(f"model_{slug}"))
+    model: TransportModel = cast(TransportModel, importlib.import_module(f"leaf_eval_bound.models.model_{slug}"))
     driver, x0 = model.build_driver(tolerance=tol, trust=True)
     names = list(model.INPUT_NAMES)
     measurers = {i: _make_measurer(model.registry_qname(nm), iters_cap) for i, nm in enumerate(names)}

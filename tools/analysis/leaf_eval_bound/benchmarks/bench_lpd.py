@@ -71,17 +71,14 @@ import sys
 from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-import leaf_eval_grounding as G  # noqa: E402
-from estimators import median_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.contract import grounding as G  # noqa: E402
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "LPD"
-MODULE_PATH = "benchmarks.bench_lpd"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_lpd"
 _DESC = ("Leaves per recorded decision (leaves/decision): the leaves/s -> dps divisor. LIVE = the C++ "
          "gen-ceiling sole-workload bench (search_runtime_bench, eval mocked, SerialRuntime; the per-task "
          "leaf_requests pool at sims256/m24 — each task is one decision). v1 seed 500 (a sims256/m24 "
@@ -140,7 +137,7 @@ def get_seed() -> G.Grounded:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="leaves_per_decision", units=get_seed().unit,
                              description=_DESC, module_path=MODULE_PATH)
 

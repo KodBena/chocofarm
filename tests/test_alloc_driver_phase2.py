@@ -46,18 +46,18 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
 pytest.importorskip("scipy", reason="the Clark closed form needs scipy.stats.norm")
 
-import estimate as E  # noqa: E402  — the Estimate contract
-import alloc.driver as ND  # noqa: E402  — the Phase-2 driver under test
-from alloc.driver import AllocationDriver, _t_multiplier  # noqa: E402
-from alloc.jax_backend import jnp  # noqa: E402  — x64-enabled JAX; needed for jnp.minimum fixtures
-from alloc.gradient import jax_gradient  # noqa: E402  — for _legacy_diagonal_step
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the Estimate contract
+import leaf_eval_bound.alloc.driver as ND  # noqa: E402  — the Phase-2 driver under test
+from leaf_eval_bound.alloc.driver import AllocationDriver, _t_multiplier  # noqa: E402
+from leaf_eval_bound.alloc.jax_backend import jnp  # noqa: E402  — x64-enabled JAX; needed for jnp.minimum fixtures
+from leaf_eval_bound.alloc.gradient import jax_gradient  # noqa: E402  — for _legacy_diagonal_step
 
 _HAS_CVXPY = __import__("importlib").util.find_spec("cvxpy") is not None
 
@@ -114,10 +114,10 @@ def _median(pool, name: str) -> E.Estimate:
     `estimators.median_estimate` (the real bootstrap-SE path)."""
     import os as _os
     import sys as _sys
-    _bench = _os.path.join(_OT, "benchmarks")
+    _bench = _os.path.join(_OT, "leaf_eval_bound", "benchmarks")
     if _bench not in _sys.path:
         _sys.path.insert(0, _bench)
-    import estimators as _bc
+    from leaf_eval_bound.benchmarks import estimators as _bc
     return _bc.median_estimate(list(pool), name=name)
 
 
@@ -443,10 +443,10 @@ def _fit(intercept: float, slope: float, *, lack_of_fit: bool, name="slope_us", 
     `Var(slope)` does not shrink with iters (no per_point_var). `lack_of_fit=False` is a clean line."""
     import os as _os
     import sys as _sys
-    _bench = _os.path.join(_OT, "benchmarks")
+    _bench = _os.path.join(_OT, "leaf_eval_bound", "benchmarks")
     if _bench not in _sys.path:
         _sys.path.insert(0, _bench)
-    import estimators as _bc
+    from leaf_eval_bound.benchmarks import estimators as _bc
     x = np.asarray(DESIGN, dtype=float)
     if lack_of_fit:
         med = [float(v) for v in (intercept + slope * x + 0.0009 * x ** 2)]  # quadratic truth, line fit

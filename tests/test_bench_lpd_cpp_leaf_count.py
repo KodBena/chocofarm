@@ -49,15 +49,15 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import bench_lpd as B  # noqa: E402  — the module under test
-import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.benchmarks import bench_lpd as B  # noqa: E402  — the module under test
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
 
 
 def _leaf_pool(center: float = 503.0, spread: float = 3.0, n: int = 8, seed: int = 3) -> list[float]:

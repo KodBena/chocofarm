@@ -27,12 +27,12 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
 if _OT not in sys.path:
     sys.path.insert(0, _OT)
 
-from alloc import kink as K  # noqa: E402
+from leaf_eval_bound.alloc import kink as K  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

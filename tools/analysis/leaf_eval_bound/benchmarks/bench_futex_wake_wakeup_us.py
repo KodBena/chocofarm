@@ -64,18 +64,14 @@ import os
 import sys
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from estimators import median_estimate  # noqa: E402
-from pools import collect_pool  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.pools import collect_pool  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "futex_wake_wakeup_us"
-MODULE_PATH = "benchmarks.bench_futex_wake_wakeup_us"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_futex_wake_wakeup_us"
 _DESC = ("FUTEX-WAKE wakeup latency (us): a producer FUTEX_WAKEs the parked serve thread on the ring's "
          "empty->nonempty edge -> the serve thread RETURNS from FUTEX_WAIT and resumes its drain. ONE futex "
          "syscall + a scheduler context-switch (no burnt core, vs shm_spin_poll's ~0.1us spin; comparable "
@@ -97,7 +93,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="transport_wakeup_latency_futex_wake", units=_SEED_UNIT,
                              description=_DESC, module_path=MODULE_PATH)
 

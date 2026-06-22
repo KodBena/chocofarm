@@ -47,14 +47,14 @@ import pytest
 
 _OT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "analysis", "leaf_eval_bound",
+    "tools", "analysis",
 )
-_BENCH = os.path.join(_OT, "benchmarks")
+_BENCH = os.path.join(_OT, "leaf_eval_bound", "benchmarks")
 for _p in (_OT, _BENCH):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import estimate as E  # noqa: E402  — the contract
+from leaf_eval_bound.contract import estimate as E  # noqa: E402  — the contract
 
 # The 7-point design the fit benches use; the recorded staged / fully_device fit shapes.
 DESIGN = [32, 64, 128, 192, 256, 384, 512]
@@ -152,8 +152,8 @@ def test_pin_benches_measure_returns_valid_fixed_estimate_live() -> None:
     """§6 Phase-4 deliverable 1 (PIN): a pin bench's `measure()` is timing-FREE (it reads the seed), so it
     runs fully — and returns a valid k=1 `Fixed` Estimate (a pin is a `Fixed`/declared-spread Estimate, NOT
     a faked 2-sample pool). The declared σ is recovered un-divided in `cov`."""
-    import bench_b_op
-    import bench_n_gen
+    from leaf_eval_bound.benchmarks import bench_b_op
+    from leaf_eval_bound.benchmarks import bench_n_gen
     est = bench_b_op.measure()
     assert isinstance(est, E.Estimate) and est.is_valid()
     assert isinstance(est.shrink, E.Fixed)
@@ -171,7 +171,7 @@ def test_fit_bench_measure_declares_slope_first_estimate_via_measure_raw(monkeyp
     as component 0 (theta_hat[0] ≈ 4.317 — the marginal the driver/manifest project), built by
     `_estimate_from_raw` from `_measure_raw`'s recorded dict. THIS is what cures the longest-list mis-read:
     the bench DECLARES the slope, not the row-count x-axis."""
-    import bench_t_row
+    from leaf_eval_bound.benchmarks import bench_t_row
     monkeypatch.setattr(bench_t_row, "_measure_raw", lambda **k: _staged_dict())
     est = bench_t_row.measure()
     assert isinstance(est, E.Estimate) and est.is_valid()
@@ -185,8 +185,8 @@ def test_iota_bench_measure_declares_intercept_first_via_delegated_measure_raw(m
     """§6 Phase-4 deliverable 1 (FIT, delegating): `bench_iota.measure()` returns the SAME staged fit with
     iota's INTERCEPT as component 0 (~94.58). Its `_measure_raw` delegates to `bench_t_row._measure_raw`
     (one measurement grounds both); patching the delegated source flows through."""
-    import bench_iota
-    import bench_t_row
+    from leaf_eval_bound.benchmarks import bench_iota
+    from leaf_eval_bound.benchmarks import bench_t_row
     monkeypatch.setattr(bench_t_row, "_measure_raw", lambda **k: _staged_dict())
     est = bench_iota.measure()
     assert est.k == 2 and est.names[0] == "iota_us"
@@ -196,7 +196,7 @@ def test_iota_bench_measure_declares_intercept_first_via_delegated_measure_raw(m
 def test_median_bench_measure_declares_quantile_estimate_via_measure_raw(monkeypatch) -> None:
     """§6 Phase-4 deliverable 1 (MEDIAN): `bench_tau_io.measure()` returns a k=1 `QuantileLaw` median
     Estimate over the per-cycle pool, built by `_estimate_from_raw` from `_measure_raw`'s dict."""
-    import bench_tau_io
+    from leaf_eval_bound.benchmarks import bench_tau_io
     d = _pool_dict(20.0, key="per_cycle_us")
     monkeypatch.setattr(bench_tau_io, "_measure_raw", lambda **k: d)
     est = bench_tau_io.measure()
@@ -210,7 +210,7 @@ def test_measure_and_run_share_one_estimate_builder(monkeypatch) -> None:
     they cannot disagree. We capture run()'s logged Estimate and assert it equals measure()'s — same
     theta_hat, same cov — on a shared recorded dict. (DB-free: logged_run is faked.)"""
     import contextlib
-    import bench_tau_io
+    from leaf_eval_bound.benchmarks import bench_tau_io
     d = _pool_dict(20.0, key="per_cycle_us")
     monkeypatch.setattr(bench_tau_io, "_measure_raw", lambda **k: d)
 
@@ -242,7 +242,7 @@ def test_untrusted_drive_coercion_is_deleted() -> None:
     """§6 Phase-4 deliverable 2: the `_per_sample` longest-numeric-list heuristic and the `_make_sampler`
     2-sample pad are GONE (the silent failure that cratered the bound). `_make_measurer` replaces them —
     it returns the bench's Estimate directly, nothing to guess."""
-    import untrusted_drive as U
+    from leaf_eval_bound.runners import untrusted_drive as U
     assert not hasattr(U, "_per_sample"), "the _per_sample coercion must be deleted"
     assert not hasattr(U, "_make_sampler"), "the _make_sampler 2-sample-pad path must be deleted"
     assert hasattr(U, "_make_measurer"), "the §6 Phase-4 _make_measurer must replace them"
@@ -258,7 +258,7 @@ def test_registry_qname_bridges_both_model_map_shapes() -> None:
     construction (a model missing `registry_qname` is now an import-time AttributeError, not a runtime one)."""
     import importlib
     for slug in ("zmq_baseline", "lockfree_mpsc", "shm_spin_poll", "futex_wake", "cpp_inproc_port"):
-        model = importlib.import_module("model_" + slug)
+        model = importlib.import_module("leaf_eval_bound.models.model_" + slug)
         qs = [model.registry_qname(nm) for nm in model.INPUT_NAMES]  # raises if any input is unmapped
         assert len(qs) == len(model.INPUT_NAMES)
         assert all(isinstance(q, str) and q for q in qs), f"{slug}: an input resolved to an empty qname"
@@ -271,8 +271,8 @@ def test_sizing_kwargs_single_home_includes_budget_and_leaves() -> None:
     that let `budget`/`leaves` go unrecognized in one path. It must cover `budget` (the drive's own
     canonical lever name — its measurer wrapper is `def measure(budget)`) and `leaves` (the cpp-inproc tmsg
     knob), else a SHRINKABLE tmsg bench shows budget-kw None and the loop cannot size it."""
-    import untrusted_drive as U
-    import harness as BC
+    from leaf_eval_bound.runners import untrusted_drive as U
+    from leaf_eval_bound.benchmarks import harness as BC
     assert U._ITERS_KW is BC.SIZING_KWARGS, "ADR-0012 P1: _ITERS_KW must ALIAS the single home, not re-list"
     assert "budget" in BC.SIZING_KWARGS, "the drive's own lever name `budget` must be a recognized knob"
     assert "leaves" in BC.SIZING_KWARGS, "the cpp-inproc tmsg `leaves` knob must be a recognized knob"
@@ -293,7 +293,7 @@ def test_every_shrinkable_bench_is_sizable_by_the_driver() -> None:
     calls) so NO live timed run / postgres / C++ binary is needed; a bench calling no known builder
     fails LOUD (ADR-0002) rather than being silently mis-ranked."""
     import inspect
-    import harness as BC
+    from leaf_eval_bound.benchmarks import harness as BC
     n_shrinkable = 0
     for mod in _all_bench_modules():
         if not (_bench_estimator_builders(mod) & _SHRINKABLE_BUILDERS):
@@ -365,7 +365,7 @@ def test_grounded_estimability_agrees_with_the_bench_body() -> None:
     module it owns), with `constant`/`needs_measurement` DERIVED from `estimability` (so the punt cannot be
     authored — there is no second flag to disagree)."""
     import importlib
-    import leaf_eval_grounding as G
+    from leaf_eval_bound.contract import grounding as G
     assert hasattr(G, "Estimability"), (
         "fix #1 NOT YET IMPLEMENTED: leaf_eval_grounding must expose the single-home `Estimability` axis "
         "(CONSTANT/MEASURED/PRIOR) and each Grounded must carry `estimability` + `module` (the bench module it "
@@ -375,7 +375,7 @@ def test_grounded_estimability_agrees_with_the_bench_body() -> None:
         f"expected the leaf-eval Grounded quantities (iota/slope/tau_io/LPD/g_core/R_gen/n_gen/B_op/tmsg); "
         f"discovered {len(grounded)} — the vars(G) discovery scan regressed")
     for g in grounded:
-        builders = _bench_estimator_builders(importlib.import_module(g.module))
+        builders = _bench_estimator_builders(importlib.import_module("leaf_eval_bound.benchmarks." + g.module))
         shrinkable = bool(builders & _SHRINKABLE_BUILDERS)
         if g.estimability is G.Estimability.MEASURED:
             assert shrinkable, (
@@ -393,8 +393,8 @@ def test_make_measurer_returns_estimate_and_rejects_non_estimate(monkeypatch) ->
     (P2). A bench whose measure() returns a non-Estimate (a bespoke dict — exactly the old failure) is a
     loud TypeError at the seam; an invalid Estimate a loud ValueError. NEVER a coerced pool."""
     import types
-    import untrusted_drive as U
-    import bench_b_op
+    from leaf_eval_bound.runners import untrusted_drive as U
+    from leaf_eval_bound.benchmarks import bench_b_op
 
     # the happy path: a real pin bench measure() -> a valid Fixed Estimate (B_op resolves to bench_b_op).
     m = U._make_measurer("B_op", iters_cap=10)
@@ -440,7 +440,7 @@ def test_make_measurer_requires_measure_not_run(monkeypatch) -> None:
     AttributeError (run() persists to postgres and is not the un-trusted path). The pre-Phase-4 fallback to
     run() is removed (it returned a dict and would have logged)."""
     import types
-    import untrusted_drive as U
+    from leaf_eval_bound.runners import untrusted_drive as U
     fake = types.SimpleNamespace(NAME="q", run=lambda **k: {})   # has run(), no measure()
     monkeypatch.setattr(U, "_bench_module", lambda qname: fake)
     with pytest.raises(AttributeError):
@@ -463,9 +463,9 @@ def test_old_longest_list_heuristic_craters_the_bound() -> None:
     driver evaluated `f` with `t_row ≈ 224` instead of the slope `4.317`. The bound CRATERS (E[f] ≪ the
     sane ~428). This is the failure Phase 4 removes; we reproduce it to anchor the contrast."""
     _driver_deps()
-    import reconstruct as R
-    import model_zmq_baseline as model
-    from alloc.driver import AllocationDriver  # noqa: F401  (import gate)
+    from leaf_eval_bound.store import reconstruct as R
+    from leaf_eval_bound.models import model_zmq_baseline as model
+    from leaf_eval_bound.alloc.driver import AllocationDriver  # noqa: F401  (import gate)
 
     names = model.INPUT_NAMES
     x0 = model.initial_point(trust=True)
@@ -493,10 +493,10 @@ def test_untrusted_drive_estimate_path_is_sane(monkeypatch) -> None:
     mocked to their DECLARED Estimates (timing-free), so this exercises the real Phase-4 loop without a
     live timed run. The contrast vs the old heuristic (the test above) is the deliverable."""
     _driver_deps()
-    import manifest as M
-    import untrusted_drive as U
-    import estimators as BC
-    import model_zmq_baseline as model
+    from leaf_eval_bound.store import manifest as M
+    from leaf_eval_bound.runners import untrusted_drive as U
+    from leaf_eval_bound.benchmarks import estimators as BC
+    from leaf_eval_bound.models import model_zmq_baseline as model
 
     qof = {nm: model.INPUT_QUANTITIES[nm][0] for nm in model.INPUT_NAMES}
 
@@ -565,8 +565,8 @@ def test_transport_sweep_estimate_feed_reproduces_the_2point_pilot_bound() -> No
     via `set_estimates_by_name`, REPLACING the 2-point pilot — and the bound (var, ci) is byte-for-byte the
     old pilot's (the spec's no-`/2`-bug fixed point), and the variance ranking (by a_i) is identical."""
     _driver_deps()
-    import transport_sweep as TS
-    import model_zmq_baseline as model
+    from leaf_eval_bound.runners import transport_sweep as TS
+    from leaf_eval_bound.models import model_zmq_baseline as model
 
     names = model.INPUT_NAMES
     x0 = model.initial_point(trust=True)
@@ -590,8 +590,8 @@ def test_throughput_bound_drives_fixed_estimates_no_pilot() -> None:
     grounded-uncertainty CI. The grounded inputs are declared-spread priors, so the allocator funds none
     (un-shrinkable — the §2.3 branch). (`_ot_bound` was renamed `_bound` in the OT→JAX migration, J4.)"""
     _driver_deps()
-    import throughput_bound as TB
-    import model_capacity
+    from leaf_eval_bound.runners import throughput_bound as TB
+    from leaf_eval_bound.models import model_capacity
 
     rec, f_mu, x0 = TB._bound(model_capacity)
     # the bound is the model's f at the grounded mean; the CI is the grounded-uncertainty spread.

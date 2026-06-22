@@ -28,12 +28,8 @@ from typing import Sequence
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)  # the leaf_eval_bound dir (holds bench_store, estimate, leaf_eval_grounding)
-for _p in (_PARENT, _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the type SSOT, ADR-0012 P8)
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (the type SSOT, ADR-0012 P8)
 
 
 # ============================================================================================

@@ -66,17 +66,13 @@ import sys
 import time
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.dirname(_HERE), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
-from estimators import median_estimate  # noqa: E402
-from harness import logged_run  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — the harmonized Estimate contract (measure() returns one — §6 Phase 4)
+from leaf_eval_bound.benchmarks.estimators import median_estimate  # noqa: E402
+from leaf_eval_bound.benchmarks.harness import logged_run  # noqa: E402
 
 NAME = "lockfree_mpsc_tau_io_us"
-MODULE_PATH = "benchmarks.bench_lockfree_mpsc_tau_io"
+MODULE_PATH = "leaf_eval_bound.benchmarks.bench_lockfree_mpsc_tau_io"
 _DESC = ("LOCK-FREE MPSC server per-forward serial transport cost (us): batch-dequeue T ready nodes "
          "(CAS pops, no syscall/broker/codec envelope), GATHER the B scattered request rows into a "
          "contiguous (B,in_dim) input, memcpy the B reply rows into per-producer reply slots. The "
@@ -125,7 +121,7 @@ def get_seed() -> tuple[float, float, str]:
 
 
 def register_self() -> Any:
-    from harness import register_quantity
+    from leaf_eval_bound.benchmarks.harness import register_quantity
     return register_quantity(NAME, quantity="serve_transport_io_cost_lockfree_mpsc", units="us",
                              description=_DESC, module_path=MODULE_PATH)
 

@@ -30,13 +30,9 @@ import uuid
 from typing import Any, Callable, Iterator, Mapping, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)  # the leaf_eval_bound dir (holds bench_store, estimate, leaf_eval_grounding)
-for _p in (_PARENT, _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import bench_store  # noqa: E402
-import estimate as _est  # noqa: E402  — for the logged_run `estimate` annotation (the harmonized contract)
+from leaf_eval_bound.store import bench_store  # noqa: E402
+from leaf_eval_bound.contract import estimate as _est  # noqa: E402  — for the logged_run `estimate` annotation (the harmonized contract)
 
 
 def repo_git_sha() -> Optional[str]:
