@@ -43,10 +43,9 @@ gradient; the tie itself is handled by the Clark closed form `alloc.kink`, never
 linearisation — so the old TaylorExpansionMoments curvature diagnostic was DROPPED, not
 ported). x64 is enforced (`alloc.jax_backend`; the tool is float64 throughout).
 
-Dependencies: numpy, jax (the autodiff backend, x64), scipy.stats (the Clark Φ/φ), cvxpy
-(the §2.3 SOCP). openturns is still imported for the z / Student-t CI quantiles
-(`_z_from_confidence` / `_t_multiplier`) ONLY — that remaining OT use migrates to scipy in a
-later increment, after which the tool imports no OpenTURNS.
+Dependencies: numpy, jax (the autodiff backend, x64), scipy.stats (the Clark Φ/φ and the
+z / Student-t CI quantiles), cvxpy (the §2.3 SOCP). This module imports NO OpenTURNS — the
+OT→JAX migration is complete for the driver (f/gradient via jax.grad, z/t via scipy.stats).
 
 Author's note: this allocates effort to shrink the CI on E[f] (the expected
 ceiling). It does NOT shrink sigma_f = sqrt(sum_i a_i), the genuine run-to-run
@@ -106,13 +105,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
-
-try:
-    import openturns as ot
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "neyman_driver requires openturns: pip install openturns"
-    ) from exc
 
 # estimate.py is the harmonized-estimator TYPE SSOT (the `Estimate` contract + ShrinkLaw /
 # Support / CIFamily). §6 Phase 2 consumes it: the driver now accepts one `Estimate` per input
@@ -1026,26 +1018,19 @@ class NeymanDriver:
 # (The §4.1 kink-regime probability floor `_KINK_PFLOOR` moved to `alloc.kink.KINK_PFLOOR` with the
 # Clark machinery it gates — refactor move 4. The driver no longer references it directly.)
 def _z_from_confidence(confidence: float) -> float:
-    try:
-        return float(ot.Normal().computeQuantile(0.5 + confidence / 2.0)[0])
-    except Exception:
-        return 1.959963984540054  # 95% fallback
+    """The two-sided normal CI multiplier z_{1−α/2} for `confidence = 1−α`, via scipy. (The OT→JAX
+    migration retired the OpenTURNS `ot.Normal` quantile — scipy reproduces it to machine epsilon.)"""
+    from scipy.stats import norm
+    return float(norm.ppf(0.5 + confidence / 2.0))
 
 
 def _t_multiplier(dof: int, confidence: float) -> float:
-    """The two-sided Student-t CI multiplier `t_{dof, 1−α/2}` for `confidence = 1−α` (§4.3). Uses
-    OpenTURNS' Student quantile (the project's already-present stats surface, matching `_z_from_confidence`'s
-    use of `ot.Normal`); falls back to scipy then to z if the OT path is unavailable. dof≥1 enforced
-    upstream (StudentT's ctor); a 7-point fit is dof=5 → t≈2.571 vs z=1.96 (the honest 31% widening)."""
-    p = 0.5 + confidence / 2.0
-    try:
-        return float(ot.Student(float(dof)).computeQuantile(p)[0])
-    except Exception:
-        try:
-            from scipy.stats import t as _student_t
-            return float(_student_t.ppf(p, df=dof))
-        except Exception:
-            return _z_from_confidence(confidence)
+    """The two-sided Student-t CI multiplier `t_{dof, 1−α/2}` for `confidence = 1−α` (§4.3), via scipy.
+    (The OT→JAX migration retired the OpenTURNS `ot.Student` quantile — scipy reproduces it to machine
+    epsilon.) dof≥1 enforced upstream (StudentT's ctor); a 7-point fit is dof=5 → t≈2.571 vs z=1.96 (the
+    honest 31% widening)."""
+    from scipy.stats import t as _student_t
+    return float(_student_t.ppf(0.5 + confidence / 2.0, df=dof))
 
 
 def _report_sigma(est: "_est.Estimate") -> float:
