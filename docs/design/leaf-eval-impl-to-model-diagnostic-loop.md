@@ -799,3 +799,47 @@ biggest is first.
   omits a coordination cost" from "the implementation is slack"), or does the loop run in its degraded
   form (still able to find fidelity faults and operating-point form faults, but not to cleanly
   partition the gap) indefinitely?
+
+---
+
+## Addendum (2026-06-23) — the implementation is a CONTROLLED system (`control_lab`)
+
+This advisory was authored against an *open-loop, fixed-config* implementation. Step 0 then established
+(maintainer-corrected, thrice) that "production" is **`control_lab`** (`cpp/stage_a/control_lab/lab_harness.py`)
+— a **closed-loop issue-gate control system**: on every forward a `Controller` returns a per-thread allow/deny
+bit (issue now vs hold to coalesce), maximizing dps; the lab scores controller methods (`bang_bang`,
+`contextual_bandit`, …). Full synthesis + verified numbers: `docs/notes/leaf-eval-loop/step-0-synthesis-and-path-forward.md`.
+The body above is left intact (ADR-0005 Rule 8); this records what the control re-grounding changes.
+
+**Re-grounded (load-bearing):**
+- **§1 / §3 (the implementation map).** The "two production paths" (serial / wire-batched) and the
+  strict-barrier/N=1 framing are the pre-control_lab target. control_lab is a *third* shape: a `LabServer`
+  (`StageAServer` subclass) running an injected `Controller` on each forward boundary. The stage *loci* hold
+  (same `jit_forward_core`); the map gains a controller/gate row and reads its telemetry from
+  `lab_session-*.json` / the `control_research` Postgres, not the `--serve` drivers.
+- **§7.4 (the operating-point form fault — the flagship worked instance).** Its premise ("the implementation
+  runs at a fixed ~54 rows/forward; evaluate `f` at the realized `B`, or call it an under-batched config") is
+  invalidated: `B` is **not** a fixed point the implementation occupies — it is **controlled per forward**, a
+  distribution the active method sets. The fault reclassifies (below).
+- **§5.1 (the witness).** "The witness does not exist yet … the single biggest piece of net-new work" is now
+  only half true: **control_lab is already an operational, instrumented, clocked end-to-end cycle on the real
+  stages with passive Postgres egress** — i.e. a *partial witness* (exactly the "passive ports parsed offline"
+  the witness-lowering review prescribes). `gap_B` (witness − implementation) is partly *measured already* as
+  the `AllAllow` → best-controller delta. The §11.1 build cost is **lower** than assumed.
+
+**New finding (absent from the body — the headline):** **the model does not model control.** `f=min(stages)`
+with a fixed `B_op` denotes a *fixed* cycle; the implementation is a *controlled* cycle whose decision variable
+is `B`. This is neither a fidelity fault (no benchmark lies), nor a classic form fault (no missing *cost* term),
+nor exactly the §7a coupling-example — it is a **missing control law**, and it is the §7a `B↔S`-coupling example
+made concrete (the lab *is* a controller on that loop). The value-of-control (`AllAllow` → best method) is a
+*measured, regime-dependent* quantity structurally invisible to the model.
+
+**Prerequisite the maintainer surfaced (gates everything):** "the operating point we are explaining" has **no
+single home** — a codebase-level ADR-0012 SSOT violation (the config is multiply-homed across the harness
+family; the model's operating point is joined to the harness only by prose). Until that single home exists, the
+§7 discriminator cannot fire honestly — it would attribute a *config-mismatch artifact* as a model/bench fault.
+See the synthesis note's "path forward (0)."
+
+**Holds:** §2 (the benchmark is the shared term), the §7.1 three-number discriminator *as a method*, §8 (gate),
+§9 (token economy), §10 F1–F6 — all control-agnostic; only the *object* (control_lab, controlled-`B`) and the
+*worked instances* (§1, §7.4) change. The §0 honesty accounting is a point-in-time record — not retro-edited.

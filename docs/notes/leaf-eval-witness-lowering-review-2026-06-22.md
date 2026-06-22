@@ -86,3 +86,19 @@ unchanged in kind, and now far better-costed.
 **Net:** a genuine, load-bearing contribution to the witness design. If/when the witness is built,
 adopt the adequacy-witness framing and the descending ladder; and weigh the implementation-refactor
 cost — not just a model-lowering — in the build-vs-degraded call.
+
+---
+
+## Note (2026-06-23) — `control_lab` is a partial witness, which lowers the build cost
+
+Step 0's re-grounding (production = `control_lab`, the closed-loop issue-gate control lab —
+`docs/notes/leaf-eval-loop/step-0-synthesis-and-path-forward.md`) softens the "build cost" caveat above.
+`control_lab` is already an operational, instrumented, **clocked** end-to-end cycle running the *real* stages
+(the `StageAServer` real-net forward + the `wire-ab-bench` producer over the pipelined wire), with **passive
+Postgres egress** (the `lab_trial` / `metrics_series` blobs) — i.e. exactly the "passive ports parsed offline"
+this review's point 3 prescribes, **already built**. So a substantial *down-payment on the witness exists*:
+the ladder's lower rungs (real stages, real composition, real coordination) are partly in place, and `gap_B`
+is partly *measured already* (the `AllAllow` → best-controller delta). This **lowers** the build arm of the
+consultation's §11.1 decision that the review (biased toward ambition) had raised — though the per-stage
+decomposition (a `tau_io` port; the carve-at-joints) and the *adequacy* framing remain to be built. The
+descending-ladder design is unaffected; control_lab is its partial realization, not a substitute.

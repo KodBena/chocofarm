@@ -181,3 +181,33 @@ strict → B≈28, dps≈86; `N=8` → B≈179, dps≈158; `N=9` → B≈201, dp
 ≈456 dps, server fast region B≈192. **So Step 1 is effectively already in hand** — the harness pins the
 top-line DPS + B under a named config. The live questions are the ≈456-vs-≈158 gap and the N-saturation
 at B≈180–200, well below the model's `B_op≈256` full bucket.
+
+---
+
+## Amendment (2026-06-23, later) — production is `control_lab`, not `overcommit_sweep` (supersedes the correction above)
+
+The correction above re-grounded to `overcommit_sweep.py` and used ≈158. **Both are superseded.** The
+maintainer re-grounded again: `overcommit_sweep.py` is a self-described *throwaway* bench; "production" is
+**`control_lab`** (`cpp/stage_a/control_lab/lab_harness.py`) — a **closed-loop issue-gate control system**.
+On every forward a `Controller` returns a per-thread allow/deny bit (issue now vs hold to coalesce), and the
+lab scores controller **methods** (`bang_bang`, `contextual_bandit`, …) by dps. Full synthesis + the verified
+numbers + the path forward: `step-0-synthesis-and-path-forward.md`. The deltas to this map:
+
+- **`B` is a CONTROLLED variable, not a fixed input.** The operating variable is the **gate**; `N`
+  (`--trees-per-thread`) is a fixed producer-geometry knob; the baseline is the **`AllAllow`** controller.
+- **The magnitude was wrong (158).** That was the different (throwaway) harness, and ≈158 vs ≈190 within it
+  was run-to-run **drift** at identical config, not a real number. control_lab's value-of-control is
+  **regime-dependent** (verified, config-named): parity with `AllAllow` under drain-all (≈96 dps at
+  `pool_batch=192`, 30 s); ~3–7× under the convoy (`chunk_floor`/depth>1) regime. Do **not** carry a single
+  "production dps" — every number is config+regime-specific (claims-measured-vs-interpreted).
+- **New finding (the headline):** the static model `f=min(stages)` with a fixed `B_op` **does not model
+  control**. This re-grounds the consultation's §7.4 "operating-point form fault": `B` is not a fixed
+  under-batched point the implementation "happens to occupy" — it is the quantity the system *controls*.
+- **The serve-side loci HOLD** (control_lab's `LabServer` is a `StageAServer` subclass over the same
+  `jit_forward_core`); the **`tau_io` form finding HOLDS** (still no isolated live observation); the **B↔S
+  coupling** is now the *realized control loop*, and the lab's `chunk_floor` A/B toggles the regime where the
+  gate bites — the Step-3 lever.
+- **The root** (the maintainer's insight): "production" was unpinnable because of a codebase-level ADR-0012
+  **SSOT violation** — the operating config is multiply-homed across the harness family and the model's
+  operating point is joined to the harness only by prose. Fix that single home first (synthesis note §"path
+  forward (0)"). Until then, the loop's gap numbers pair values from different worlds.
