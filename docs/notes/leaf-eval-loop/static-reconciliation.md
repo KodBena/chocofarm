@@ -10,6 +10,27 @@ Public Domain (The Unlicense).
 
 # Static reconciliation — the re-scoping + the first result (2026-06-23)
 
+> **⚠ CORRECTION (2026-06-23, later) — the quantitative verdict below was a mis-evaluation; read this first.**
+> The "model @ realized B" numbers in this note (381 dps at B=95.7; the "+285 dps integration gap"; the
+> "padmax **FORM fault**"; the symbol `F`) came from calling `model_cycletime.throughput_jax` — the
+> **full-bucket** `f` (`B·t_row`, grounded at `B = SERVE_FULL_BUCKET = 256`, where `pad(B) ≈ B`) — at the
+> realized **non-full** `B = 95.7`. The model's own docstring warns this is unsound (serve-vs-`B` is "a
+> SAWTOOTH, NOT monotone"). **The model already models padding:** `serve_sawtooth(real, max_batch)` charges
+> `pad·t_row` for the cost and `real` for the throughput — exactly the "fix" I claimed was missing. Applied
+> correctly to the lab's **padmax** regime, `serve_sawtooth(96, pad=512) = 83.5 dps` — a valid **lower bound**
+> that the realized **99.5** *exceeds* (as a lower bound must). **So there is no form fault and no integration
+> loss at this operating point;** the model is sound, and the eventlog (`dt_us ≈ 512·t_row`, width=512)
+> *confirms* its pad-aware view rather than exposing a defect. The real, surviving finding is the **operating
+> point**: the implementation runs *under-filled* (real ≈ 96 of a 512 pad, ~19%), low on the serve_sawtooth
+> curve; the ceiling (429) is, as the docstring states, "contingent on reaching full-bucket feed (high N)" —
+> the overcommit lever. The genuine action is **not** a model form fix but **regime-correct evaluation** (use
+> the padmax pad via `serve_sawtooth`) — the SSOT/operating-point work (the regime + `max_batch` as
+> first-class fields). `F ≈ 228 µs` is **retracted** (a 2-point-fit artifact from small-width curvature; the
+> model's floor is `T_disp = 68.84`, MEASURED, R²≈0.997, and at W=512 the model's compute 2298 µs matches the
+> measured 2204 within 4%). The body below is kept as the point-in-time investigation record (ADR-0005
+> Rule 8); this banner supersedes its form-fault verdict. **`W` and `T_io` are real and now in the GLOSSARY**
+> (`W` = `B_eff` = `pad(B)`, the compute width; `T_io` = Design-B's name for the existing `tau_io`).
+
 ## The re-scoping (maintainer-clarified)
 
 This yak-shave exists to **isolate the static throughput / systems-integration problem (ours) from the
