@@ -10,6 +10,12 @@ Public Domain (The Unlicense).
 
 # Step 4 — the T_io decomposition: the inter-forward gap grows with B (2026-06-23)
 
+> **Resolved by Step 5 (`step-5-wire-isolation.md`):** the gap is the **producer's search-wait** (~85%), NOT
+> the wire `T_io`. An isolated ZMQ benchmark shows the pure wire is only **10-17%** of the gap (a ~113 µs fixed
+> ZMQ-IO-thread cost + ~0.29 µs/row). So the B-scaling "`T_io`" below is the producer's *search* (more leaves →
+> more Gumbel-AZ search), and the right model term is a **coordination/overlap** term (poor producer↔server
+> pipelining, msgs/forward≈1), not a bigger `T_io`. The wire reading in this note is an upper-bound mislabel.
+
 Step 3 found dps grows **sub-linearly** in B (filling the pad does not reach the model's ceiling). Step 4
 instruments *why*: a `CHOCO_EVENTLOG` decomposition of the realized forward into its **COMPUTE** (`dt_us`) and
 the **inter-forward GAP** (`period − dt_us` — the server's *non-compute* time per forward: drain / decode /
