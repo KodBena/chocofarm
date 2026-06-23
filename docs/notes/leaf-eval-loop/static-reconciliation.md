@@ -139,6 +139,16 @@ operating-point-not-well-defined disease, surfaced at the cost term. The padmax-
 by a *regime-correct* model — the apparent 4× gap was the bucket-regime compute width. The large *unexplained*
 losses live in the **convoy** regime (AllAllow → 11), which is `control_lab`'s control domain, out of our
 static scope. Artifacts preserved under `~/w/vdc/chocobo/runs/control_lab/step2-static/` (eventlog, session
-JSON, `parse_eventlog.py`). **Open confirm (cheap):** a `--e-policy bucket` A/B should show `width` tracking
-the bucket (snapping with B) and `dt_us = T_disp + width·t_row` across multiple widths — proving `dt_us`
-tracks the *compute width* (so `t_row` faithful, the fault purely the width variable).
+JSON, `parse_eventlog.py`).
+
+**Confirm (done 2026-06-23) — the `--e-policy bucket` A/B settles it** (`step2-bucket/`, widths snap to
+{64, 256}). `dt_us` tracks the **compute width, definitively not B**: at width=256 with B=**134**, `dt_us`=1130 µs;
+at width=512 with B=**95**, `dt_us`=2204 µs — a *higher* useful B at a *lower* width costs *less* compute, so the
+cost is the padded width, not the useful rows (the clincher the padmax-only run could not give). A 3-point fit
+(widths 64/256/512) is `dt_us ≈ 228 + 3.80·width`: the slope (3.80) brackets `t_row`=4.32 (faithful within ~12%),
+and the intercept (~228 µs) shows the fixed per-forward floor is ~3× the grounded `T_disp`=68.84 — a
+device-transfer/staging overhead the model under-counts (a **secondary** refinement on top of the primary
+width fault). **Primary verdict stands: FORM fault, the compute-width variable.** So the regime-correct serve
+form is `serve = 1e6·B / ((F + W·t_row + T_io)·L)` with the **compute width** `W` (= `max_batch` under padmax,
+the snapped bucket under `bucket`) and a fixed floor `F ≈ 228 µs` — both first-class operating-point fields,
+neither derivable from B alone.
