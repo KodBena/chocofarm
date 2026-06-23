@@ -20,6 +20,22 @@ concern, one recorded as not-applicable). Numbering is preserved across all
 eleven because chocofarm's code cites ADR-0002 and ADR-0004 by number. See
 "How a fork consumes this corpus" at the end.
 
+## ADR-0000: The Alpha and the Omega — Type-Driven Design (Provisional)
+
+**Decision.** The root the corrective trio descends from: all design is
+type-driven, and on any defect the FIRST move is two questions *before* a fix —
+**(a) what type would make this class unrepresentable?** (apply it in full:
+ADR-0012's shape + ADR-0013's integrity) and **(b) what operational lapse let it
+happen?**, where *operational ≈ executive* — what the **maintainer** failed to
+mechanize, not implementer error (an ADR-0011 violation is structurally the
+executive's to own; convert it to a mechanism). A patch authored without asking
+(a) and (b) is itself a defect. ADR-0011 / 0012 / 0013 are three facets of this one
+root — net / shape / integrity; ADR-0014 is the escape hatch when the reflex stalls.
+The reflex is review-only (declared so per ADR-0011 Rule 1); its *answers* inherit
+the trio's mechanized gates. Provisional (emergency); the ADR-0008 tension — whether
+"the root they descend from" is a distinct ADR or a meta-frame, and whether numbering
+it 0000 is itself a clean classification — is flagged open.
+
 ## ADR-0001: Immutability, Copy-on-Write, and Rebind-not-Mutate
 
 **Decision.** Three named seams handle mutable-looking state: (1) the belief
@@ -358,6 +374,43 @@ upstream of ADR-0011 (structure born clean is structure no mechanism must later
 convert). It binds new structure at authoring time, mandates no retroactive
 sweep (the R-series owns existing cleanup, ADR-0004), and gives a C++ author an
 implement-against-this contract that keeps the language boundary a single seam.
+
+## ADR-0013: Execution Integrity — Against the Attrition of Will
+
+**Decision.** ADR-0011 instantiated to execution-level attrition: the ratified
+scope is the work owed, in full, to its ratified end; a de-scope is authorized
+only by the ratifier, never the executor; and a completion claim is worthless
+until the artifact is verified. Five rules — (1) the mandate defines done, the
+executor does not re-scope it; (2) disclosure is not authorization; (3) the
+"lower-ROI / invasive / over-engineering" demurral on already-mandated work is a
+tell, not an argument; (4) a known defect is fixed or filed (`BACKLOG.md`), never
+narrated-and-left; (5) **verify the artifact, not the claim** (the one genuinely
+mechanized rule). Provenance: named, dated, first-person failures on this branch
+(the leaf-eval-refactor audit; a diagnostician committing attrition minutes after
+diagnosing it). **Amended 2026-06-24 ("fair dealing runs both ways"):** the tenet
+forbids silently narrowing a mandate AND maliciously executing a mandate found to
+be wrong — a wrong spec is renegotiated upward, not ground out to the letter; and
+independent, mandate-blocking correct fixes are done as a matter of course (bug-free
+code is simpler to reason about), not bargained. Mostly review-only, declared so per
+ADR-0011 Rule 1.
+
+## ADR-0014: Request a Second Opinion When a Problem Resists Resolution (Provisional)
+
+**Decision.** ADR-0011 turned **inward on the executor**: when a problem resists
+resolution — a fix lands on the wrong target and the failure recurs across a
+second/third in-frame attempt — that recurrence is the trigger to request a
+**second opinion from an independent (Opus) subagent**. **License, not mandate**
+(judicious; blindly spawning a subagent for everything, or offloading thought to
+avoid it, is the malicious compliance ADR-0013's amendment forbids). Composes with
+ADR-0013 (asking for help when genuinely stumped is what a professional does) and
+serves ADR-0000 (the unseen type and the locked frame are the same blindness).
+LLM-specific and operationalized for it: trigger on an **observable pattern** (≥2
+mis-targeted attempts), not a feeling, because the locked faculty cannot notice its
+own lock; and brief the second agent for **independence** — give it the evidence,
+do not lead the witness (over-leading collapses N perspectives into one×M).
+Review-only and self-applied. Provisional (emergency); the ADR-0008 genre-fit
+question (distinct tenet vs. application-note of 0011+0013) is flagged open, not
+resolved under bandwidth pressure.
 
 ## How to read these together
 

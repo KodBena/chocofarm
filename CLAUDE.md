@@ -24,6 +24,10 @@ the work lives in the git log and the branch, not in immutable prose.)
 
 The ADRs are load-bearing, not advisory. In particular:
 
+- **ADR-0000 (type-driven design — the Alpha and the Omega; provisional)** is the
+  root the others descend from: on any defect, ask FIRST *what type would make this
+  class unrepresentable* (apply it in full) and *what executive/operational lapse let
+  it happen* (mechanize it) — before asking how to fix it.
 - **ADR-0002 (fail loudly)** governs error handling everywhere — it is the
   registry the code's 16+ `ADR-0002` citations point at.
 - **ADR-0004 (minimal-touch)** governs editing under partial visibility (the
@@ -32,6 +36,12 @@ The ADRs are load-bearing, not advisory. In particular:
   authored and maintained.
 - **ADR-0006 (source-file headers)** governs the per-file module-docstring
   header convention (path + purpose + Public Domain).
+- **ADR-0013 (execution integrity)** governs carrying a mandate to its ratified
+  end: verify the artifact not the claim, disclosure is not authorization, and fair
+  dealing both ways (no attrition; no malicious compliance with a spec found wrong).
+- **ADR-0014 (second opinion when stumped; provisional)** licenses requesting an
+  independent (Opus) second opinion when a problem resists resolution across repeated
+  mis-targeted attempts — judiciously, as a professional does, not as blind reflex.
 
 A contribution that fights any of these is wrong by default; if a specific
 case appears to warrant deviation, name it explicitly and ask before
