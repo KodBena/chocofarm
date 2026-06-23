@@ -76,3 +76,49 @@ several (redundant overcommit search; producer-feed limits), not a finding.
    serve-path improvement that closes the throughput gap *and* makes the model's ceiling reachable/testable.
    A C++ change to the serve path (the maintainer's call).
 3. Document and move on (the structural finding — the fill ceiling is gated/entangled — stands on its own).
+
+## Step-3 (post-fix) — the ceiling test, RUN (2026-06-23)
+
+The drain-overshoot was **fixed** (the drain caps at max_batch by deferring a straddling request; `_drain`,
+commit `dd8fa21`, regression-tested), so the sweep runs past N=2. Re-run (`step3-nsweep-fixed/`, AllAllow,
+padmax, `--secs 8`):
+
+| N | slots | B (rows/fwd) | dps_window | model 0.87·B | dps/model | crash |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 192 | 95 | 98.6 | 82.6 | 1.19 | no |
+| 2 | 384 | 160 | 65.2 | 139.1 | 0.47 | no |
+| 3 | 576 | 210 | 86.6 | 182.4 | 0.47 | no |
+| 4 | 768 | 277 | 140.4 | 240.8 | 0.58 | no |
+| 6 | 1152 | — | — | — | — | **producer crash** |
+
+- **The fill lever works** (M): overcommit fills B **95 → 277** (2.9×) across N=1→4 — clean, monotonic. N=3,4
+  (576, 768 slots), which crashed pre-fix, now run clean.
+- **But dps grows SUB-LINEARLY**: dps **99 → 140** (1.4×) — about *half* B's growth. The model's `serve ∝ 0.87·B`
+  **over-predicts**: realized is ~0.47–0.58× the model at N≥2 (vs 1.19× at N=1). **The model's full-fill ceiling
+  (~445 at B=512) is not reached** — at B=277 the realized 140 is far below the model's 241, and the trend is
+  sub-linear, so B=512 would not reach it either.
+- **This firms the provisional T_io lead** (Result 3 above): the 2-point hint (dps slower than B) now holds
+  across **4 points**. The model (constant `T_io`) is missing a cost that **GROWS with the coalesced rows B** —
+  the `T_io` (drain/decode/scatter, the UNMEASURED term) scaling hypothesis. **Direction robust (4 points);
+  magnitude provisional** — `dps_window` is noisy (the N=2 dip to 65; `dps_samp` ±230–450; the 8 s window is
+  transient-prone at high overcommit). The deferral my fix added is *not* the cause: the cap barely binds at
+  B≤277 < 512, so most drains don't defer.
+- **N=6 (1152 slots): a SEPARATE producer-side crash** — the C++ producer's pool warmup fails (`zmq_msg_recv …
+  Resource temporarily unavailable`), not the server fix. It caps the static sweep at N≤4 (B≈277) for now
+  (BACKLOG: "producer pool-warmup fails at very high overcommit").
+
+**Honest accounting (claims-measured-vs-interpreted):** B (M, means over ~2000 forwards, clean). `dps_window`
+(M but ~±10–15% run-to-run + transient-prone — the sub-linear DIRECTION is robust over 4 points, the exact
+ratios provisional). The `T_io`-scaling MECHANISM is a hypothesis (candidates: `T_io ∝ B`; a producer-feed
+limit at high B; redundant overcommit search). The N=6 crash is producer-side (verified: the producer log, not
+a server `TypeError`).
+
+**What it means for the project's question:** the model's optimistic ceiling is **not reached by filling the
+pad** — static throughput grows sub-linearly in the batch width, so there is a real, *unmodeled* cost that
+**scales with B**. That cost — not the operating point (corrected earlier) and not a coordination idle
+(refuted at Step 2) — is where the model and reality now diverge, and it is the next thing to measure.
+
+**Next (Step 4, to firm the mechanism):** an eventlog decomposition at N=2 vs N=4 (the existing `CHOCO_EVENTLOG`
+`FWD`/`DRAIN` instrument) — does the inter-forward gap (the `T_io`/idle between forwards) grow with B? If yes,
+`T_io ∝ B` is the form/grounding fix (and a direct measurement of the model's top unmeasured term). Longer
+windows would also cut the `dps_window` noise.
