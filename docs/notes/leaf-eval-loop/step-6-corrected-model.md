@@ -10,6 +10,14 @@ ADR-0005 point-in-time record; ADR-0006 header; ADR-0009 substantiation (validat
 
 # Step 6 — the corrected model: the serialized producer-server round-trip (2026-06-23)
 
+> **Corrected (2026-06-23) by an analytic firewall — see `firewall-zmq-ceiling-consult.md` +
+> `integration-throughput-model.md`:** the wire is **hidden** behind the forward, not a serialized cycle term.
+> The binding inter-forward gap is the **consumer's per-message cost** (`c_msg·m`, ~50 µs × messages coalesced),
+> and the integration ceiling is the **serial consumer loop** (drain→forward→scatter), not the transport. The
+> serialized-sum form below is right in *spirit* (the gap adds to the per-forward period) but **mis-attributes**
+> the gap to the wire; `gen`/`wire` as critical-path terms are superseded. See the integration-throughput model
+> for the corrected quantities and the dominant lever (pipeline the consumer, +16–30%, transport untouched).
+
 The impl→model loop's capstone. **Question:** the implementation does ~96–168 dps where the model's
 `min(stages)` says ~456 — *why?* Steps 0–5 walked it to a measured, grounded answer and a validated fix.
 
