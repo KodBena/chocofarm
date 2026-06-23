@@ -148,6 +148,32 @@ architecture now:
   is the trigger to continue the refactor in a *separate-framework-from-instance* direction — direction
   currently undetermined ("I know not where, at the moment").
 
+## serve drain overshoots max_batch → AOT forward crash at high overcommit (found 2026-06-23)
+
+`InferenceServer._drain` (`chocofarm/az/inference_server.py:545-562`) checks the cap at request-boundary
+granularity — `while total_rows < self._max_batch` (`:548`) runs *before* the recv, then `total_rows +=
+X.shape[0]` (`:562`) adds the whole next request — so a request straddling the cap overshoots (e.g. 480 + 96
+= 576 > max_batch=512). `run_microbatch` then pads only `if pad_to > B` (`:271`), so a 576-row batch hits the
+512-AOT-compiled forward → `TypeError: float32[512,241] called with [576,241]` (`:445`). This **violates the
+invariant the code itself documents** (`:546-547` "up to the max_batch cap"; `:269` "the drain caps the total
+at max_batch, so this only ever pads UP") and is an ADR-0002 fail-loud breach (a cryptic JAX crash, not a clear
+config error). **It is a PYTHON serve-path bug** — the producer is C++, the drain/forward is Python.
+
+- **Repro:** `lab_harness.py --trees-per-thread N` with slots (= threads·N·⌈pool_batch/threads⌉) > max_batch,
+  drain-all + padmax. N≥3 at pool_batch=192 / 3 threads (576 slots) crashes; N=1,2 (192, 384) are safe.
+  Artifacts: `~/w/vdc/chocobo/runs/control_lab/step3-nsweep/`. Detail: `docs/notes/leaf-eval-loop/step-3-nsweep.md`.
+- **Why it blocks work:** it caps the overcommit fill lever below max_batch, so the model's full-fill ceiling
+  (B→512) cannot be tested in the static drain-all path — the open question the N-sweep was meant to answer.
+- **Fix (small, Python, fully-visible file):** partition the drained requests so each forward ≤ max_batch —
+  either `_forward_groups` chunks each group to ≤ max_batch, or `_drain` defers a straddling request to the
+  next forward (a 1-request lookahead buffer). `_scatter` (1:1 in drained order) is unaffected.
+- **Residual:** a SINGLE request whose `B_i` alone > max_batch (per-thread issue > 512, e.g. N≥9 at 3 threads)
+  needs the chunked-forward path (forward in ≤max_batch chunks, concatenate the real rows) OR a loud reject —
+  handle or fail loud, never silently crash.
+- **Status:** surfaced 2026-06-23 as the completion path of the N-sweep mandate; recommended to fix. Escalated
+  (not silently done) because it touches the shared production serve path and this was a doc/investigation
+  session — the maintainer authorizes the cross-cutting serve-path change (scope discipline; ADR-0013).
+
 ## Retired
 
 - **NMCS parity tests** marked `skip` in `tests/test_cpp_runner.py` (2026-06-16): validated repeatedly,
