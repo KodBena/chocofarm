@@ -265,6 +265,96 @@ def test_run_microbatch_refuses_ragged_batch():
         run_microbatch(lambda p, x, ym, ys: x.sum(1).reshape(-1, 1), {}, 0.0, 1.0, requests)
 
 
+# ===========================================================================
+# ALWAYS-ON 4 (zmq-gated, NO server/network) — the drain CAPS at max_batch.
+# The regression guard for the 2026-06-23 N-sweep crash: at high overcommit the drain accumulated PAST
+# max_batch (the cap was checked before the recv but the whole request was added after), and run_microbatch
+# pads only UP — so a >max_batch batch hit the AOT-compiled fixed-shape forward and crashed. The drain now
+# defers a straddling request whole to the next forward (restoring the invariant the docstring asserts).
+# Driven through InferenceServer._drain in isolation (`__new__` + a fake socket, the staging test's pattern).
+# ===========================================================================
+class _FakeSock:
+    """Stand-in ROUTER for `_drain`: hands back queued multipart frames, then raises `zmq.Again` (nothing
+    more queued) — so the drain logic runs with no real socket bound."""
+    def __init__(self, frames):
+        self._frames = list(frames)
+
+    def recv_multipart(self, flags=0):
+        import zmq
+        if self._frames:
+            return self._frames.pop(0)
+        raise zmq.Again()
+
+
+class _FakePoller:
+    def poll(self, timeout=0):
+        return True   # the first bounded block always "sees" a request
+
+
+def _drain_server(max_batch):
+    """An InferenceServer with ONLY the fields `_drain` reads, no socket bound (the staging test's `__new__`
+    pattern). Floor OFF (θ=0) — `_drain` is the single greedy pass plus the new cap-deferral."""
+    from chocofarm.az.inference_server import InferenceServer
+    srv = InferenceServer.__new__(InferenceServer)
+    srv._max_batch = max_batch
+    srv._min_forward_rows = 0
+    srv._max_queue_delay_ms = 0.0
+    srv._pending = None
+    srv._stop = False
+    srv._poller = _FakePoller()
+    srv._POLL_INTERVAL_MS = 1
+    return srv
+
+
+def _req_frames(ident, X):
+    """A REQ-style multipart frame `[ident][b""][payload]` the drain parses (ident, empty envelope, payload)."""
+    return [ident, b"", wire.encode_request(X)]
+
+
+@pytest.mark.skipif(not _pyzmq_available(), reason="the drain cap test needs zmq.Again (no server is bound)")
+def test_drain_caps_at_max_batch_and_defers_straddler():
+    """REGRESSION (the 2026-06-23 N-sweep crash): the drain must NEVER return more than max_batch rows — a
+    request that would straddle the cap is DEFERRED WHOLE to the next drain (held in `_pending`), so the
+    fixed-shape forward never gets an oversized matmul. Three 2-row requests at max_batch=5: the first drain
+    takes 4 rows (two requests) and defers the third; the second drain returns the deferred one. All three
+    serve exactly once, none crosses the cap. The PRE-FIX code returned all 6 rows in one drain → the crash."""
+    X = np.ones((2, 4), dtype=np.float32)
+    srv = _drain_server(max_batch=5)
+    srv._sock = _FakeSock([_req_frames(f"r{i}".encode(), X) for i in range(3)])
+
+    d1 = srv._drain()
+    rows1 = sum(int(x.shape[0]) for _i, _e, x in d1)
+    assert rows1 <= 5, f"drain returned {rows1} rows, exceeding max_batch=5 (the overshoot crash)"
+    assert rows1 == 4 and len(d1) == 2          # two 2-row requests fit; a third would straddle 5
+    assert srv._pending is not None             # the straddling third is held over, not dropped
+
+    d2 = srv._drain()
+    rows2 = sum(int(x.shape[0]) for _i, _e, x in d2)
+    assert rows2 <= 5 and rows2 == 2 and len(d2) == 1   # the deferred third, alone
+    assert srv._pending is None
+    idents = [i for grp in (d1, d2) for (i, _e, _x) in grp]
+    assert sorted(idents) == [b"r0", b"r1", b"r2"]      # served once each — no drop, no duplicate
+
+
+@pytest.mark.skipif(not _pyzmq_available(), reason="the drain reject test needs zmq.Again (no server is bound)")
+def test_drain_rejects_single_request_wider_than_max_batch():
+    """ADR-0002: a SINGLE request wider than max_batch cannot be padded down or split in the drain — it is
+    REJECTED loudly (a logged drop; the client's RPC times out) rather than handed to the fixed-shape forward
+    as an oversized matmul (the cryptic XLA shape-crash). It must not appear in the drained batch; a valid
+    request behind it still serves."""
+    srv = _drain_server(max_batch=4)
+    big = np.ones((6, 4), dtype=np.float32)            # one request, 6 rows > max_batch=4
+    small = np.ones((2, 4), dtype=np.float32)
+    srv._sock = _FakeSock([_req_frames(b"big", big), _req_frames(b"ok", small)])
+
+    d = srv._drain()
+    rows = sum(int(x.shape[0]) for _i, _e, x in d)
+    assert rows <= 4
+    idents = [i for (i, _e, _x) in d]
+    assert b"big" not in idents          # the oversized request is rejected, never forwarded
+    assert b"ok" in idents               # the valid request behind it still serves
+
+
 def test_params_from_manifest_blob_matches_valuemlp_params():
     """The jax-free param reconstruction (manifest+blob → flat dict) yields ValueMLP._params() cast to
     float32 — the server's inference precision (the SSOT bar; the f64 wire weights are cast ONCE here at

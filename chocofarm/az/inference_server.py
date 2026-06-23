@@ -501,6 +501,9 @@ class InferenceServer:
         self._poller.register(self._sock, zmq.POLLIN)
         self._stop = False
         self._closed = False
+        # A request held over from a drain that would have straddled the max_batch cap (set in `_drain`,
+        # consumed at the next drain's start) — so the cap is honored ACROSS drains without dropping it.
+        self._pending: "DrainedRequest | None" = None
 
     def _drain(self) -> list[DrainedRequest]:
         """Greedy-drain (design §3): BLOCK until ≥1 request is queued, then drain ALL currently-queued
@@ -540,11 +543,22 @@ class InferenceServer:
             return []
         drained: list[DrainedRequest] = []
         total_rows = 0   # the concatenated row count across drained requests (each carries B_i leaves)
+        # A request held over from the PRIOR drain (it would have straddled the max_batch cap) leads this
+        # batch — so the cap is honored ACROSS drains and the request is never dropped, only deferred one
+        # forward (it keeps its 1:1 reply). This restores the invariant the docstring and run_microbatch both
+        # assert ("the drain caps the total at max_batch, so this only ever pads UP"): overcommit beyond the
+        # cap coalesces across forwards instead of building one oversized, uncompiled forward (ADR-0002).
+        if self._pending is not None:
+            drained.append(self._pending)
+            total_rows += int(self._pending[2].shape[0])
+            self._pending = None
         theta = self._min_forward_rows                            # live floor target (P4 — read per-drain)
         deadline_ns = (time.monotonic_ns() + int(self._max_queue_delay_ms * 1_000_000)) if theta > 0 else 0
+        deferred = False   # a straddling request was held over — forward the capped batch now, do not wait
         while True:
-            # Drain everything CURRENTLY queued (NOBLOCK), up to the max_batch cap — the cap bounds the
-            # matmul even with the floor on (an unbounded burst cannot build an oversized forward).
+            # Drain everything CURRENTLY queued (NOBLOCK), up to the max_batch cap. The cap GENUINELY bounds
+            # the matmul: a request that would push past it is deferred whole (below), so even an unbounded
+            # overcommit burst cannot build an oversized forward.
             while total_rows < self._max_batch:
                 try:
                     frames = self._sock.recv_multipart(flags=zmq.NOBLOCK)
@@ -558,11 +572,26 @@ class InferenceServer:
                 except Exception as exc:   # malformed request: loud reject of THIS frame, batch unaffected
                     self._reject(ident, exc)
                     continue
+                rows = int(X.shape[0])
+                if rows > self._max_batch:
+                    # A SINGLE request wider than the AOT-compiled forward cannot be padded down or split
+                    # here — reject it LOUDLY (ADR-0002) rather than hand the fixed-shape forward an oversized
+                    # matmul (the cryptic XLA shape-crash). Chunked-forward handling for this case: BACKLOG.
+                    self._reject(ident, ValueError(
+                        f"request of {rows} rows exceeds max_batch={self._max_batch}: the forward is compiled "
+                        f"for one fixed width and cannot take an oversized single request"))
+                    continue
+                if drained and total_rows + rows > self._max_batch:
+                    # Would straddle the cap: defer it WHOLE to the next drain, forward the capped batch now.
+                    self._pending = (ident, envelope, X)
+                    deferred = True
+                    break
                 drained.append((ident, envelope, X))
-                total_rows += X.shape[0]
-            # Floor decision: forward now if the floor is OFF, θ is reached, or the cap is hit; otherwise
-            # block BRIEFLY (bounded by the remaining delay) for the next producer's RTT to land, re-drain.
-            if theta <= 0 or total_rows >= theta or total_rows >= self._max_batch:
+                total_rows += rows
+            # Floor decision: forward now if a request was deferred (the batch is capped), the floor is OFF, θ
+            # is reached, or the cap is hit; otherwise block BRIEFLY (bounded by the remaining delay) for the
+            # next producer's RTT to land, re-drain.
+            if deferred or theta <= 0 or total_rows >= theta or total_rows >= self._max_batch:
                 break
             remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns < 1_000_000:   # <1ms of the hard delay left — forward now, never spin the tail

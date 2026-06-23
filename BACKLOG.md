@@ -148,7 +148,7 @@ architecture now:
   is the trigger to continue the refactor in a *separate-framework-from-instance* direction — direction
   currently undetermined ("I know not where, at the moment").
 
-## serve drain overshoots max_batch → AOT forward crash at high overcommit (found 2026-06-23)
+## serve drain overshoots max_batch → AOT crash at high overcommit — FIXED 2026-06-23 (residual: oversized-single-request chunking)
 
 `InferenceServer._drain` (`chocofarm/az/inference_server.py:545-562`) checks the cap at request-boundary
 granularity — `while total_rows < self._max_batch` (`:548`) runs *before* the recv, then `total_rows +=
@@ -170,9 +170,25 @@ config error). **It is a PYTHON serve-path bug** — the producer is C++, the dr
 - **Residual:** a SINGLE request whose `B_i` alone > max_batch (per-thread issue > 512, e.g. N≥9 at 3 threads)
   needs the chunked-forward path (forward in ≤max_batch chunks, concatenate the real rows) OR a loud reject —
   handle or fail loud, never silently crash.
-- **Status:** surfaced 2026-06-23 as the completion path of the N-sweep mandate; recommended to fix. Escalated
-  (not silently done) because it touches the shared production serve path and this was a doc/investigation
-  session — the maintainer authorizes the cross-cutting serve-path change (scope discipline; ADR-0013).
+- **Status: FIXED 2026-06-23** (maintainer-authorized): `_drain` now caps at max_batch by deferring a
+  straddling request WHOLE to the next drain (a 1-slot `self._pending` lookahead, keeping its 1:1 reply); a
+  single request wider than max_batch is loud-rejected (ADR-0002). Regression test (default suite):
+  `tests/test_zmq_inference.py::test_drain_caps_at_max_batch_and_defers_straddler` (+ the reject test).
+  Verified: serve tests green; the N-sweep N=3,4 (576, 768 slots) now run clean (`step3-nsweep-fixed/`).
+- **RESIDUAL (still deferred):** a SINGLE request whose `B_i` > max_batch is loud-rejected, NOT chunked. The
+  chunked-forward path (forward an oversized request in ≤max_batch chunks, concatenate the real rows) is the
+  remaining work — needed only at per-thread issue > max_batch (e.g. N≥~8 at 3 threads, pool_batch=192).
+
+## producer pool-warmup fails at very high overcommit (zmq EAGAIN) (found 2026-06-23)
+
+At `--trees-per-thread 6` (1152 in-flight slots; pool_batch=192 / 3 threads) the C++ producer's pool warmup
+fails — `wire-ab-bench: FATAL: pool warmup failed: WireLeafPool::poll: zmq_msg_recv failed: Resource
+temporarily unavailable` (a zmq EAGAIN during the warmup build) — the producer exits rc=1 before streaming and
+`lab_harness` fails loud ("producer exited early"). N≤4 (≤768 slots) warm up fine. This is a **PRODUCER-side**
+limit (the C++ `WireLeafPool` warmup), independent of the server-drain fix above. Likely a zmq HWM / recv
+timeout during the large pool build, or a slot ceiling. It caps the static N-sweep at N≤4 (B≈277) for now.
+Fix/investigate: the producer pool-warmup poll (raise the HWM / lengthen the warmup recv timeout / stage the
+build) — or accept N≤4 as the static range. Artifacts: `~/w/vdc/chocobo/runs/control_lab/step3-nsweep-fixed/N6/`.
 
 ## Retired
 
