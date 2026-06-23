@@ -1,0 +1,8 @@
+# Build + compilation artifacts (sources only are tracked)
+cpp/build/
+__pycache__/
+*.pyc
+*.pyo
+*.o
+*.so
+.pytest_cache/
