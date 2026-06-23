@@ -72,7 +72,12 @@ the `lab_session-*.json` + `control_research` Postgres):
 
 ## The two findings
 
-**Finding 1 — the model does not model control.** `f = min(stages)` with a *fixed* `B_op` denotes a *fixed*
+**Finding 1 — the model does not model control.** *[Re-framed 2026-06-23 — see `static-reconciliation.md`:
+this is the **intentional scope**, not a deficiency. The static throughput / systems-integration problem is
+ours; the dynamic queue control (BangBang/bandit/REINFORCE) is `control_lab`'s, deliberately isolated and
+intractable to model anyway. The model is correct not to model control; our gap is the static integration
+loss, quantified in that note (~285 dps / ~4× forward cycle at the realized operating point).]*
+`f = min(stages)` with a *fixed* `B_op` denotes a *fixed*
 cycle; the implementation *controls* `B` per forward against live state. This is neither a fidelity fault
 (no benchmark lies) nor a classic form fault (no missing *cost* term) nor the consultation's §7a
 coupling-example — it is a **missing control law**. The value-of-control (`AllAllow` → best method, a
