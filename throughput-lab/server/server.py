@@ -113,7 +113,7 @@ producer's DEALER, the echoed envelope lets the producer match the reply to its 
 and the response is server.wire.encode_response(values, logits) for THAT request's B_i rows.
 
 FAIL LOUD (ADR-0002): a malformed / oversize / wrong-width / wrong-dtype payload is rejected for THAT
-identity at the boundary (counted + logged, never zero-filled or passed downstream); a too-short
+identity at the boundary (counted in the summary, never zero-filled or passed downstream); a too-short
 envelope is a loud reject; a reply to a vanished identity is a counted peer-gone event while any other
 ZMQ error is re-raised loud; an exception inside the compute thread is fatal-and-loud, not a silent
 wedge.
@@ -388,7 +388,7 @@ class ThroughputServer:
         not truncated. An UNBOUNDED drain monopolises the IO thread under a flood, starving compute on a
         shared core and wedging stop() (see _MAX_DRAIN_PER_PASS). Each payload is decoded AND narrowed to
         the server's geometry at the boundary (decode_bounded): an oversize / wrong-width / wrong-dtype /
-        malformed frame is a loud per-identity reject (counted, logged), never passed downstream to
+        malformed frame is a loud per-identity reject (counted, surfaced in summary), never passed downstream to
         detonate at the forward, the ladder, or inside np.concatenate (ADR-0002)."""
         now = time.monotonic()
         drained = 0
@@ -399,23 +399,23 @@ class ThroughputServer:
                 return
             drained += 1
             if len(frames) < 2:
-                # A ROUTER message is at minimum [identity][payload]; fewer is a framing violation.
+                # A ROUTER message is at minimum [identity][payload]; fewer is a framing violation. The
+                # `rejects` counter is the SSOT (surfaced once in summary()); NO per-event flush'd print on
+                # the hot path — an unbounded log can block the main thread on a full pipe (see _flush_replies).
                 self.stats.rejects += 1
-                print(f"[tlab-server] REJECT malformed envelope ({len(frames)} frames)",
-                      file=sys.stderr, flush=True)
                 continue
             identity = frames[0]
             envelope = frames[1:-1]      # opaque echoed frames (here the single [corr-id])
             payload = frames[-1]
             try:
                 bounded = decode_bounded(payload, max_batch=self.cfg.max_batch, in_dim=self.cfg.in_dim)
-            except WireError as e:
-                # ADR-0002: reject THIS identity's request loudly; do not poison the batch. decode_bounded
-                # folds the oversize / wrong-width / wrong-dtype rejects in with the malformed-frame ones,
-                # so they cannot reach the forward, the ladder, or the concat.
+            except WireError:
+                # ADR-0002: reject THIS identity's request; do not poison the batch. decode_bounded folds
+                # oversize / wrong-width / wrong-dtype rejects in with the malformed-frame ones, so they
+                # cannot reach the forward, the ladder, or the concat. Counted (`rejects` is the SSOT,
+                # surfaced in summary()); NO per-event flush'd print on the hot path (it can block the main
+                # thread on a full pipe and wedge teardown — see _flush_replies).
                 self.stats.rejects += 1
-                print(f"[tlab-server] REJECT bad payload from identity {identity!r}: {e}",
-                      file=sys.stderr, flush=True)
                 continue
             self.stats.requests_recv += 1
             self.stats.rows_recv += int(bounded.X.shape[0])
@@ -425,7 +425,7 @@ class ThroughputServer:
     def _flush_replies(self) -> None:
         """Send every reply currently ready on resp_q (non-blocking get). The send blocks only if the OS
         socket buffer is full — acceptable back-pressure; the producer is reading replies. A vanished
-        producer identity (ROUTER_MANDATORY -> EHOSTUNREACH) is a counted, logged peer-gone reply (a
+        producer identity (ROUTER_MANDATORY -> EHOSTUNREACH) is a counted peer-gone reply (a
         torn-down producer at end-of-run); ANY OTHER ZMQError is NOT benign and is re-raised LOUD —
         ETERM/EFSM must never be silently reclassified as peer-gone (ADR-0002; clause 9b/c)."""
         while True:
@@ -446,9 +446,14 @@ class ThroughputServer:
                 self.stats.dropped_replies += 1
             except zmq.ZMQError as e:
                 if e.errno == zmq.EHOSTUNREACH:
+                    # A vanished producer identity (a torn-down producer at end-of-run). COUNT it — the
+                    # per-event print is deliberately REMOVED: under a flood it emitted thousands of
+                    # flush'd writes to stderr, and once the harness's (undrained) pipe filled at 64 KB the
+                    # blocking write held the GIL on the main thread, so the SIGINT handler (stop()) never
+                    # ran and the server wedged at teardown. `undeliverable` is the SSOT, surfaced once in
+                    # summary() (ADR-0000: the serve loop performs NO unbounded, downstream-gated blocking
+                    # write — a per-event flush'd log is exactly that).
                     self.stats.undeliverable += 1
-                    print(f"[tlab-server] reply undeliverable to {rep.identity!r}: {e}",
-                          file=sys.stderr, flush=True)
                 else:
                     raise
 
