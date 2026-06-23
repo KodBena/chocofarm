@@ -89,3 +89,56 @@ T_io:20, t_row:4.32, L:500}` (verified from `initial_point()`).
    per-stage timing vs the grounded values (consultation §7).
 3. **Control stays isolated.** Study the static gap at a *fixed* operating point (`AllAllow` or a frozen gate);
    the issue-gate methods are control_lab's domain. The static integration loss is the lever this project owns.
+
+## Step-2 result (2026-06-23) — the coordination hypothesis is REFUTED; the gap is a model FORM fault
+
+I ran the instrumented forward (one `AllAllow` sweep, `--secs 8 --pool-batch 192 --no-postgres
+--no-trajectory`, `CHOCO_EVENTLOG` → `step2-static/eventlog-allallow.log`; 2691 steady-state forwards) and
+decomposed each forward into its `dt_us` (compute) and the inter-forward `gap` (idle). **The hypothesis this
+note staked above — that the ~1500 µs is "coordination / idle / wire RTT the static model omits" — is
+REFUTED by the measurement.**
+
+| quantity | measured | model @ B=95.4 |
+| --- | --- | --- |
+| `dt_us` — forward COMPUTE | **2204 µs**, stable (p10–p90 2126–2294) | — |
+| `gap` — IDLE between forwards | **583 µs** (21% of the wall) | — |
+| `period` — WALL | 2787 µs | modeled cycle **501 µs** |
+| `width` — padded width the forward computes on | **512, constant (all 2691)** | model uses **B=95.4** |
+| `B` — useful rows/forward | 95.4 | 95.4 |
+
+**The forward computes on the PADDED width (`max_batch=512`), not B.** `dt_us = 2204 ≈ 512·t_row` (2212 at
+`t_row=4.32` — **`t_row` is faithful to 0.3%**), and it is *constant and independent of B* (B swings 64→128,
+`dt_us` holds ~2200). The idle is only 21% of the wall. So:
+
+- **The mechanism is a model FORM fault, not a coordination loss.** `cycle = T_disp + T_io + B·t_row` uses the
+  *useful* width B (right only if the forward computes on B rows). Under **padmax** (the production-aligned
+  regime the lab runs) the forward pads every batch to `max_batch=512` and computes on 512 rows regardless of
+  B. The model conflates two quantities that are **equal in the bucket regime but diverge under padmax**: the
+  **compute width** W (=512, drives the cost) and the **useful width** B (=95, drives the throughput).
+- **Corrected serve form** (padmax-aware, W=512): `serve = 1e6·B / ((W·t_row + T_io)·L)` = **83 dps** — vs this
+  note's 381, vs realized **99.5**. The form correction closes the gap from ~4× to ~0.84×.
+- **The "+285 dps integration gap" was a MODELING ARTIFACT, not a static integration loss.** Once the form is
+  padmax-correct, the model (~83) is *below* the realized (~99.5) — the implementation slightly *beats* the
+  corrected serve bound here. **There is no large static integration loss at the drain-all/AllAllow operating
+  point.** This **reverses this note's headline** ("the integration loss dominates") for the static point: the
+  apparent 4× gap was the model grounded for the wrong regime (bucket, W=B) while the lab runs padmax (W=512).
+
+**Secondary (provisional — inferred from the dps identity, not directly measured):** the residual (corrected
+model 83 vs realized 99.5) implies `L=500` (LPD, the self-labeled design-pin "TAUTOLOGY") is ~16% high for the
+lab's actual search (`n_sims=256` ⇒ effective leaves/decision ≈ 431). And the realized *exceeding* the
+corrected serve bound means serve is not strictly binding at this point — a small residual within grounding
+uncertainty (`L`, `t_row`), not a coordination loss. The primary form fault dwarfs it.
+
+**Form-vs-fidelity verdict: FORM** (the compute-width structure), with `t_row` *faithful* (the bench did not
+lie — it was applied to the wrong width). This is also a facet of **Finding 2 (the SSOT)**: under padmax the
+operating point carries **two** widths (compute 512, useful 95) and the model/grounding record one — the
+operating-point-not-well-defined disease, surfaced at the cost term. The padmax-aware serve form needs the
+*compute width* as a first-class operating-point field (`max_batch` under padmax, the bucket under `bucket`).
+
+**What it says about the project's question:** at the static drain-all point the throughput is well-explained
+by a *regime-correct* model — the apparent 4× gap was the bucket-regime compute width. The large *unexplained*
+losses live in the **convoy** regime (AllAllow → 11), which is `control_lab`'s control domain, out of our
+static scope. Artifacts preserved under `~/w/vdc/chocobo/runs/control_lab/step2-static/` (eventlog, session
+JSON, `parse_eventlog.py`). **Open confirm (cheap):** a `--e-policy bucket` A/B should show `width` tracking
+the bucket (snapping with B) and `dt_us = T_disp + width·t_row` across multiple widths — proving `dt_us`
+tracks the *compute width* (so `t_row` faithful, the fault purely the width variable).
