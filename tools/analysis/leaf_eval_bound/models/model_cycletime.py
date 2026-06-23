@@ -214,6 +214,40 @@ def asymptote_dps() -> float:
     return 1e6 / _T_ROW.mean / G.LEAVES_PER_DECISION.mean
 
 
+# Wire round-trip from the isolated ZMQ benchmark (tools/zmq-wire-bench, impl->model loop step-5): a ~113us
+# FIXED + ~0.3us/row cost, perf-attributed to ZMQ ipc's background-IO-thread architecture (context switches +
+# syscalls, NOT raw transit). It is only 10-17% of the per-forward gap. TODO(ADR-0002/0008 misfit): a runnable
+# bench exists, so these belong GROUNDED in grounding.py (WIRE_RTT_*), not pinned here — a documented deferral.
+_WIRE_RTT_FIXED_US = 113.1
+_WIRE_RTT_PER_ROW_US = 0.295
+
+
+def serialized_roundtrip_dps(real: int, max_batch: int = 512) -> float:
+    """The DEPTH-1 SERIALIZED round-trip bound (impl->model loop, step-4/5; 2026-06-23). `min(stages)` assumes
+    the producer and server PIPELINE (overlap) and so composes their *rates* (a max). But the lab runs at
+    msgs/forward ~= 1: the producer issues a leaf-batch and WAITS for the serve reply before searching on (the
+    leaf eval sits on the search's critical path). So the realized per-decision cycle is the SERIALIZED SUM of
+    the stages, not their max:
+
+        cycle_us(real) = serve(pad) + gen(real) + wire(real)
+            serve = T_disp + pad*t_row          # padded forward compute (pad = max_batch under padmax)
+            gen   = 1e6*real / (N_gen*g_core)    # producer's aggregate search time for `real` leaves
+            wire  = WIRE_FIXED + WIRE_ROW*real   # ZMQ round-trip (tools/zmq-wire-bench)
+        dps   = 1e6 * real / (cycle_us * L)
+
+    VALIDATED vs the lab eventlog (ADR-0009): real=154 -> 98.9 dps (measured 99.3, 0.4%); real=276 -> 149.8
+    (measured 167.6, ~11% -- the residual is PARTIAL overlap at higher overcommit, the depth-aware MVA limit
+    that interpolates depth-1 (this) to depth-inf (`throughput_jax`/`serve_sawtooth`)). The overlap-assuming
+    `serve_sawtooth` gives 135 / 242 at the same `real`, overestimating because it omits the gen+wire
+    serialization. This is the IMPLEMENTATION-FAITHFUL operating bound at depth 1; `min(stages)` is the
+    (unreached) pipelined ceiling. The gap between them is the overcommit/pipelining headroom, not model error."""
+    pad = max_batch if real <= max_batch else real
+    serve_us = _T_DISP.mean + pad * _T_ROW.mean
+    gen_us = 1e6 * real / (G.N_GEN_CORES.mean * G.GEN_PER_CORE_LEAVES.mean)
+    wire_us = _WIRE_RTT_FIXED_US + _WIRE_RTT_PER_ROW_US * real
+    return 1e6 * real / ((serve_us + gen_us + wire_us) * G.LEAVES_PER_DECISION.mean)
+
+
 if __name__ == "__main__":
     x0 = initial_point()
     print("Design-B cycle-time model — initial point:", x0)
