@@ -25,10 +25,22 @@ EP="ipc:///tmp/tlab-edps-$$.sock"; rm -f "${EP#ipc://}"; LOG="$(mktemp -t tlab-e
 # +31%, AND tighter variance (round-sync's whole-round barrier is jitter-sensitive; greedy's continuous
 # overlap smooths it). Pass `round-sync` as $5 to reproduce the baseline arm.
 K="${1:-128}"; S="${2:-14}"; NSIMS="${3:-256}"; MSG_ROWS="${4:-64}"; DRIVER="${5:-greedy}"; INFLIGHT="${6:-8}"
+# Server bucket ladder (the snap-up policy; server reads the warmed set back from the forward -> one home).
+# WARMUP/MAXBATCH override it for the server-axis bridge: WARMUP=64,256,512 MAXBATCH=512 reproduces the
+# StageAServer bucket policy {64,256,512} exactly; the defaults are the tlab server's shipped ladder.
+WARMUP="${WARMUP:-1,8,64,512,4096}"; MAXBATCH="${MAXBATCH:-4096}"
+# ADR-0011 (mechanize the finding): stamp EVERY reading with the exact code state so an attributed number
+# is always time-travellable. commit = HEAD short hash; tree = clean|dirty (dirty => the producer binary /
+# harness may not match HEAD, so the reading is NOT a reproducible artifact until committed). The maintainer's
+# rule: never record an attributed reading without its commit hash (a session-to-session discrepancy you
+# cannot pin to a code state is unattributable by construction). See robust-benchmark-statistics.
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GIT_TREE="$(test -z "$(git status --porcelain 2>/dev/null)" && echo clean || echo DIRTY)"
 for b in "$PROD" "$W"; do [ -x "$b" ] || { echo "missing $b (build -DTLAB_REAL_GENERATOR=ON)"; exit 2; }; done
 
 PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
-  --in-dim 241 --n-actions 65 --hidden 256 --max-batch 4096 --poll-timeout-ms 50 >"$LOG" 2>&1 & SRV=$!
+  --in-dim 241 --n-actions 65 --hidden 256 --max-batch "$MAXBATCH" --warmup "$WARMUP" \
+  --poll-timeout-ms 50 >"$LOG" 2>&1 & SRV=$!
 cleanup(){ kill -INT "$SRV" 2>/dev/null||true; sleep 1; kill "$SRV" 2>/dev/null||true; rm -f "${EP#ipc://}"; }
 trap cleanup EXIT
 for _ in $(seq 1 240); do grep -q READY "$LOG" && break; sleep 0.5; done
@@ -49,7 +61,7 @@ for f in "$TMP"/e1 "$TMP"/e2 "$TMP"/e3 "$TMP"/es; do
   dec=$((dec+${D:-0})); lv=$((lv+${L:-0}))
 done
 rm -rf "$TMP"
-echo "EPISODIC-STATIC (sims${NSIMS}/m24, no-early-exit, 3 gens + IDLE surplus, driver=$DRIVER inflight=$INFLIGHT, msg-rows=$MSG_ROWS, K=$K, ${S}s)"
+echo "EPISODIC-STATIC [commit=$GIT_COMMIT tree=$GIT_TREE] (sims${NSIMS}/m24, no-early-exit, 3 gens + IDLE surplus, driver=$DRIVER inflight=$INFLIGHT, msg-rows=$MSG_ROWS, ladder=[$WARMUP] max-batch=$MAXBATCH, K=$K, ${S}s)"
 echo "  decisions=$dec  ->  DPS = $((dec/S))"
 echo "  leaves=$lv  ->  leaf-rows/s = $((lv/S))   LPD ~= $((lv/(dec>0?dec:1)))"
 grep -E 'served|forwards|compute-busy|latency' "$LOG"
