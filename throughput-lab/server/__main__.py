@@ -89,9 +89,11 @@ def _build_config(argv: "list[str]") -> ServerConfig:
     p.add_argument("--profile-forward", action="store_true",
                    help="(single-thread) split each forward into h2d|jit|d2h sub-phase timers (diagnostic; "
                         "serialises the XLA pipeline so it slows the run)")
-    p.add_argument("--forward", choices=("jax", "numpy"), default="jax",
+    p.add_argument("--forward", choices=("jax", "numpy", "prod", "staged"), default="jax",
                    help="forward backend: jax (XLA-jit + bucket ladder) | numpy (forward_core in numpy, no "
-                        "XLA dispatch, no pad) -- the A/B arm for the XLA-per-call-overhead hypothesis")
+                        "XLA dispatch, no pad) | prod (DIAGNOSTIC: real production jit_forward_core) | staged "
+                        "(DIAGNOSTIC: real build_staged_forward — the actual overcommit 140k forward). prod/"
+                        "staged cross the clean-room boundary for attribution only (never shipped)")
     ns = p.parse_args(argv)
 
     # Loud validation of the few invariants argparse's types do not catch (ADR-0002 — a bad geometry

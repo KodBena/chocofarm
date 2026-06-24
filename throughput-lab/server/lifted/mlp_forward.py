@@ -344,3 +344,154 @@ class MlpForward:
         logits_np = np.asarray(logits, dtype=np.float32)[:n] if logits is not None else None
         t3 = time.monotonic()                                  # device->host pulls + slice
         return values, logits_np, (t1 - t0, t2 - t1, t3 - t2)
+
+
+# ---- DIAGNOSTIC cross-boundary arms (measurement only — ADR-0013 verify-the-artifact) -----------------
+# `ProdMlpForward`/`StagedMlpForward` run the REAL production forwards (chocofarm.az.inference_server) over
+# the SAME batches the tlab server serves, so an in-serve A/B attributes the tlab/overcommit forward-envelope
+# gap to the actual production forward (its [v|logits] ONE-pull packing, device-resident staging) rather than
+# to a guess. They DELIBERATELY cross the clean-room boundary (import chocofarm) and ONLY for this attribution
+# — never a shipped forward. The plain-jax MlpForward above stays the testbed's own clean-room compute. The
+# import is LAZY (in warmup/_prod_fn) so server's module import stays chocofarm-free until an arm is selected.
+
+class ProdMlpForward(MlpForward):
+    """The REAL production UN-STAGED forward `jit_forward_core` (the `forward_core` jitted to pack
+    `[v | logits]` into ONE device array → ONE device→host pull) run over MlpForward's bucket-ladder pack.
+    Holds params HOST-resident, so jit_forward_core re-transfers the weight dict per call (the ~45–53 µs the
+    staged path removes — see StagedMlpForward). The A/B that isolates the production forward GRAPH + the
+    one-pull pack from MlpForward's two-pull `(v, logits)` tuple, threading/ladder held identical."""
+
+    def __init__(self, params: dict[str, Any], y_mean: float, y_std: float) -> None:
+        # HOST numpy params (jit_forward_core re-transfers them each call — the un-staged production path).
+        self.params = {k: np.asarray(v, dtype=DTYPE) for k, v in params.items()}
+        self._ym: float = float(y_mean)
+        self._ys: float = float(y_std)
+        self.in_dim = int(params["W1"].shape[0])
+        self.hidden = int(params["W1"].shape[1])
+        self.has_policy = "Wp" in params
+        self.n_actions = int(params["Wp"].shape[1]) if self.has_policy else 0
+        self.has_residual = "Wr1" in params
+        self._warmed_ladder: tuple[int, ...] = ()
+        self._warmed_set: frozenset[int] = frozenset()
+        self._jfc: Any = None   # the bound production jit_forward_core (lazy import)
+
+    def _prod_fn(self) -> Any:
+        if self._jfc is None:
+            from chocofarm.az.inference_server import jit_forward_core  # diagnostic cross-boundary import
+            self._jfc = jit_forward_core
+        return self._jfc
+
+    def warmup(self, batch_sizes: "list[int]", in_dim: int) -> None:
+        """Compile + cache jit_forward_core for each bucket shape (it jits one executable per shape, exactly
+        like MlpForward's warmup), then record the ladder. `np.asarray(...)` forces the async compile."""
+        if in_dim != self.in_dim:
+            raise ValueError(f"warmup in_dim {in_dim} != net in_dim {self.in_dim} (geometry mismatch)")
+        jfc = self._prod_fn()
+        for bsz in sorted(set(batch_sizes)):
+            if bsz <= 0:
+                raise ValueError(f"warmup batch size must be >= 1, got {bsz}")
+            x = np.zeros((bsz, in_dim), dtype=np.float32)
+            np.asarray(jfc(self.params, x, self._ym, self._ys))
+        self._warmed_ladder = tuple(sorted(set(batch_sizes)))
+        self._warmed_set = frozenset(self._warmed_ladder)
+
+    def forward_batch(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None]):
+        """ONE jit_forward_core call → ONE device→host pull of the `(rows, 1+n_actions)` block (col 0 the
+        de-standardized value, cols 1.. the raw logits), sliced to the real rows. (Inherits MlpForward.pack.)"""
+        out = np.asarray(self._prod_fn()(self.params, batch.x, self._ym, self._ys), dtype=np.float32)
+        n = batch.n_real
+        values = out[:n, 0]
+        logits = out[:n, 1:] if out.shape[1] > 1 else None
+        return values, logits
+
+    def forward_batch_timed(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None, tuple[float, float, float]]):
+        """One-pull forward; the production forward fuses cast+compute+pull into one compiled call, so there
+        is no host-visible h2d/d2h split to attribute — it is all 'jit' (h2d=0, d2h=0)."""
+        t0 = time.monotonic()
+        values, logits = self.forward_batch(batch)
+        return values, logits, (0.0, time.monotonic() - t0, 0.0)
+
+
+class StagedMlpForward:
+    """The REAL production STAGED forward (build_staged_forward via the lowlatency AOT dispatcher) — the
+    ACTUAL forward overcommit_sweep's 140k baseline runs. Params are staged DEVICE-RESIDENT once (a forward
+    re-transfers only Xb), `[v | logits]` packed (ONE device→host pull), and the graph is AOT-compiled for
+    ONE fixed (pad_to, in_dim) shape (pad_to = the largest warmed bucket = the server's max_batch). So `pack`
+    pads EVERY batch to that one shape (the production pad-to-max), NOT the bucket ladder. `--forward staged`
+    is the apples-to-apples target: if it runs lean in the tlab serve loop, the tlab/overcommit gap is our
+    MlpForward wrapper (one-pull + staging), not the serve loop."""
+
+    def __init__(self, params: dict[str, Any], y_mean: float, y_std: float) -> None:
+        self._params = {k: np.asarray(v, dtype=DTYPE) for k, v in params.items()}
+        self._ym: float = float(y_mean)
+        self._ys: float = float(y_std)
+        self.in_dim = int(params["W1"].shape[0])
+        self.hidden = int(params["W1"].shape[1])
+        self.has_policy = "Wp" in params
+        self.n_actions = int(params["Wp"].shape[1]) if self.has_policy else 0
+        self.has_residual = "Wr1" in params
+        self._pad_to: int = 0
+        self._fn: Any = None
+        self._warmed_ladder: tuple[int, ...] = ()
+        self._warmed_set: frozenset[int] = frozenset()
+
+    @classmethod
+    def random_net(cls, *, in_dim: int = 241, hidden: int = 256, n_actions: int = 0,
+                   residual: bool = False, seed: int = 0) -> "StagedMlpForward":
+        return cls(_random_params(in_dim, hidden, n_actions, residual, seed), y_mean=0.0, y_std=1.0)
+
+    def warmup(self, batch_sizes: "list[int]", in_dim: int) -> None:
+        """Build the staged AOT handle for the ONE fixed shape (pad_to = max warmed bucket) and force its
+        cold compile. The staged forward has a SINGLE warmed shape — pack pads everything to it."""
+        if in_dim != self.in_dim:
+            raise ValueError(f"warmup in_dim {in_dim} != net in_dim {self.in_dim} (geometry mismatch)")
+        self._pad_to = max(batch_sizes)
+        from chocofarm.az.inference_server import build_staged_forward  # diagnostic cross-boundary import
+        self._fn = build_staged_forward(self._params, self._ym, self._ys, self._pad_to)
+        np.asarray(self._fn(self._params, np.zeros((self._pad_to, in_dim), dtype=np.float32),
+                            self._ym, self._ys))   # force the AOT compile + param staging
+        self._warmed_ladder = (self._pad_to,)
+        self._warmed_set = frozenset(self._warmed_ladder)
+
+    @property
+    def warmed_sizes(self) -> "list[int]":
+        return list(self._warmed_ladder)
+
+    def pack(self, X: "npt.NDArray[np.floating]") -> PaddedBatch:
+        """Pad to the ONE staged shape (pad_to) — production pad-to-max, not a bucket ladder. A row count
+        over pad_to, a non-2-D matrix, an in_dim mismatch, or 0 rows is a loud failure (ADR-0002)."""
+        if not self._pad_to:
+            raise RuntimeError("pack() before warmup(): no staged shape to pad into")
+        a = np.ascontiguousarray(X, dtype=np.float32)
+        if a.ndim != 2:
+            raise ValueError(f"pack expects a 2-D (n, in_dim) matrix, got shape {a.shape}")
+        n_real, in_dim = a.shape
+        if in_dim != self.in_dim:
+            raise ValueError(f"pack in_dim {in_dim} != net in_dim {self.in_dim} (geometry mismatch)")
+        if n_real == 0:
+            raise ValueError("pack got an empty (0-row) matrix")
+        if n_real > self._pad_to:
+            raise ValueError(f"batch of {n_real} rows exceeds the staged shape {self._pad_to} (raise max_batch)")
+        if n_real == self._pad_to:
+            return PaddedBatch(x=a, n_real=n_real)
+        pad = np.zeros((self._pad_to - n_real, in_dim), dtype=np.float32)
+        return PaddedBatch(x=np.concatenate([a, pad], axis=0), n_real=n_real)
+
+    def forward_batch(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None]):
+        """ONE staged call (device-resident params, only Xb transferred) → ONE device→host pull of the
+        `(pad_to, 1+n_actions)` block, sliced to the real rows."""
+        out = np.asarray(self._fn(self._params, batch.x, self._ym, self._ys), dtype=np.float32)
+        n = batch.n_real
+        values = out[:n, 0]
+        logits = out[:n, 1:] if out.shape[1] > 1 else None
+        return values, logits
+
+    def forward_batch_timed(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None, tuple[float, float, float]]):
+        """One-pull staged forward; no host-visible h2d/d2h split (all 'jit')."""
+        t0 = time.monotonic()
+        values, logits = self.forward_batch(batch)
+        return values, logits, (0.0, time.monotonic() - t0, 0.0)

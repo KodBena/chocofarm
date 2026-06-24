@@ -132,7 +132,7 @@ import numpy as np
 import numpy.typing as npt
 import zmq
 
-from server.lifted.mlp_forward import MlpForward, NumpyMlpForward
+from server.lifted.mlp_forward import MlpForward, NumpyMlpForward, ProdMlpForward, StagedMlpForward
 from server.wire import STAGE_A_IN_DIM, WireError, decode_bounded, encode_response
 
 
@@ -306,10 +306,14 @@ class ThroughputServer:
 
         # -- compute: a random net of the live geometry (throughput is a property of the SHAPES) -----
         # forward_impl selects the backend: "jax" = XLA-jit (the bucket-ladder forward), "numpy" = the same
-        # forward_core in numpy (no XLA dispatch, no pad). Both share one param builder (one home).
-        if cfg.forward_impl not in ("jax", "numpy"):
-            raise ValueError(f"forward_impl must be 'jax'|'numpy', got {cfg.forward_impl!r}")
-        _forward_cls = NumpyMlpForward if cfg.forward_impl == "numpy" else MlpForward
+        # forward_core in numpy (no XLA dispatch, no pad). "prod"/"staged" are DIAGNOSTIC cross-boundary arms
+        # (the REAL production jit_forward_core / build_staged_forward — the apples-to-apples attribution of
+        # the tlab/overcommit forward-envelope gap; never shipped). All share one param builder (one home).
+        _FORWARDS = {"jax": MlpForward, "numpy": NumpyMlpForward,
+                     "prod": ProdMlpForward, "staged": StagedMlpForward}
+        if cfg.forward_impl not in _FORWARDS:
+            raise ValueError(f"forward_impl must be one of {sorted(_FORWARDS)}, got {cfg.forward_impl!r}")
+        _forward_cls = _FORWARDS[cfg.forward_impl]
         self._forward = _forward_cls.random_net(
             in_dim=cfg.in_dim, hidden=cfg.hidden, n_actions=cfg.n_actions,
             residual=cfg.residual, seed=cfg.seed,
