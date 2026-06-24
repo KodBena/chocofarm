@@ -54,7 +54,15 @@ for b in "$PROD" "$W"; do [ -x "$b" ] || { echo "missing $b (build -DTLAB_REAL_G
 
 # SINGLE_THREAD (env, non-empty) serves on ONE thread (the production InferenceServer model) instead of the
 # two-thread IO/compute split -- the A/B arm for the two-thread-on-one-core contention test (tlab_finding #4).
-$SRVENV PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
+# NOTE (load-bearing — do NOT revert to a bare `$SRVENV PYTHONPATH=... cmd` prefix): bash does assignment-
+# prefix recognition at PARSE time on LITERAL tokens. A leading VARIABLE-expansion word (`$SRVENV`) is NOT a
+# literal `name=value`, so it terminates the assignment scan — the following literal `PYTHONPATH=...` then
+# lands in COMMAND-WORD position and bash runs it as a command ("PYTHONPATH=throughput-lab: command not found"
+# -> the server never starts -> the READY-wait hangs). This silently broke every jax/numpy run after the
+# $SRVENV prefix was added (and was the real cause of the "4-gen wedge" once mis-read as a sandbox kill).
+# `env` fixes it: with env the words are ARGS (VAR=VAL pairs env applies), not a shell assignment prefix, so
+# an empty or non-empty $SRVENV both work. Keep the `env`.
+env $SRVENV PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
   --in-dim 241 --n-actions 65 --hidden 256 --max-batch "$MAXBATCH" --warmup "$WARMUP" \
   --poll-timeout-ms 50 ${SINGLE_THREAD:+--single-thread} --forward "$FORWARD" >"$LOG" 2>&1 & SRV=$!
 cleanup(){ kill -INT "$SRV" 2>/dev/null||true; sleep 1; kill "$SRV" 2>/dev/null||true; rm -f "${EP#ipc://}"; }
