@@ -10,9 +10,15 @@
 //   Built only under -DTLAB_REAL_GENERATOR=ON (links chocofarm_core). The synthetic tlab-producer stays
 //   a standalone clean-room binary; this is the additive real-generator sibling (ADR-0012 compose).
 // Public Domain (The Unlicense).
+#include <sys/resource.h>   // setpriority / PRIO_PROCESS — per-thread nice (Linux: nice is per-task)
+#include <sys/syscall.h>    // SYS_gettid
+#include <unistd.h>         // syscall
+
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -59,6 +65,19 @@ struct ThreadStat {
     bool failed = false;
     std::string err;
 };
+
+// Renice THIS generator thread DOWN iff it is the designated one (Linux per-task nice via setpriority on
+// the thread's gettid). In the generator-bound regime, the inference server's core has idle slack; a 4th
+// generator sharing that core, reniced low, soaks the slack but yields the instant the server has a batch.
+// A no-op unless low_prio_thread names this index. Failure is non-fatal + loud-ish (ADR-0002).
+void apply_thread_priority(int thread_index, int low_prio_thread, int low_prio_nice) {
+    if (low_prio_thread < 0 || thread_index != low_prio_thread || low_prio_nice == 0) return;
+    const auto tid = static_cast<id_t>(::syscall(SYS_gettid));
+    errno = 0;
+    if (::setpriority(PRIO_PROCESS, tid, low_prio_nice) != 0)
+        std::fprintf(stderr, "[tlab-real-producer] WARN: could not renice thread %d to nice %d (errno=%d)\n",
+                     thread_index, low_prio_nice, errno);
+}
 
 // One producer thread: build its own boundary + bridge + SerialRuntime, then run real decisions from the
 // root state (varying the seed so trees differ) until the wall deadline. Each decision's leaf_requests is
@@ -275,6 +294,12 @@ int main(int argc, char** argv) {
         std::cerr << "tlab-real-producer: --driver must be round-sync|greedy, got " << driver << "\n";
         return 2;
     }
+    // Renice ONE generator thread DOWN (the generator-bound core-sharing lever): a 4th generator on the
+    // server's core, reniced, soaks its idle slack but yields to the server's forward.
+    const int low_prio_thread = opt(args, "--low-prio-thread")
+        ? std::atoi(std::string(*opt(args, "--low-prio-thread")).c_str()) : -1;
+    const int low_prio_nice = opt(args, "--low-prio-nice")
+        ? std::atoi(std::string(*opt(args, "--low-prio-nice")).c_str()) : 0;
     chocofarm::GumbelConfig cfg;
     if (auto v = opt(args, "--n-sims")) cfg.n_sims = std::atoi(std::string(*v).c_str());
     if (auto v = opt(args, "--m")) cfg.m = std::atoi(std::string(*v).c_str());
@@ -295,6 +320,7 @@ int main(int argc, char** argv) {
     const auto t0 = SteadyClock::now();
     for (int i = 0; i < threads; ++i)
         pool.emplace_back([&, i] {
+            apply_thread_priority(i, low_prio_thread, low_prio_nice);   // renice iff designated
             if (fibers > 0 && driver == "greedy")
                 run_thread_fiber_greedy(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
             else if (fibers > 0)
