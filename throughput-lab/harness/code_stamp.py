@@ -10,7 +10,7 @@ session could not be reproduced or pinned to a commit across sessions (2026-06-2
 NON-reproducible artifact: the producer binary / harness may not match HEAD, so the number is provisional
 until committed. Pairs with ADR-0009 (a captured bench number is now code-addressable).
 
-The Python sweeps (coalesce_sweep.py, topology_sweep.py, cpp/stage_a/overcommit_sweep.py) import this; the
+The Python sweeps (coalesce_sweep.py, topology_sweep.py) import this; the
 shell harness (episodic_dps.sh) MIRRORS the same two git invocations inline (`git rev-parse --short HEAD`
 and `git status --porcelain` → clean|DIRTY) — keep the two in step.
 

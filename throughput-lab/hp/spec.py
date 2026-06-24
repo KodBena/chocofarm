@@ -473,10 +473,15 @@ _TOPOLOGY: list[HParam] = [
     ),
 ]
 
-# --- OVERCOMMIT surface: the cpp/stage_a/overcommit_sweep.py parameter region ---------------------
+# --- OVERCOMMIT surface: the overcommit parameter region ------------------------------------------
+# NB: overcommit_sweep.py / server_gen_floor_grid.py were MOLTED 2026-06-25 (subsumed by throughput-lab;
+# git history). The two operating-point values that homed on overcommit_sweep.py's argparse (pool_threads=3,
+# pool_batch=64) are now NoCodeHome literals in THIS hp/ SSOT — their code-home is gone, so hp/ owns them
+# (ADR-0012 P1: one home, here a literal-with-reason). GEN_FLOOR_GRID survives only as an EVIDENCE-provenance
+# label (EvidenceRef; the drift lint never OPENS it) pointing at the molted file in git history. The live
+# runner header (RUNNER_HPP) stays — it is the kept binding for the C++ struct defaults.
 RUNNER_HPP = "cpp/include/chocofarm/runner_wire_batched.hpp"
-OC_SWEEP = "cpp/stage_a/overcommit_sweep.py"
-GEN_FLOOR_GRID = "cpp/stage_a/server_gen_floor_grid.py"
+GEN_FLOOR_GRID = "cpp/stage_a/server_gen_floor_grid.py"   # MOLTED — historical evidence source (git history)
 INFER_SERVER = "chocofarm/az/inference_server.py"
 
 _OVERCOMMIT: list[HParam] = [
@@ -558,16 +563,18 @@ _OVERCOMMIT: list[HParam] = [
                           home=PyArg(INFER_SERVER, "min_forward_rows")),),
     ),
     # pool_threads / pool_batch are the free axes; fibers_per_thread K is DERIVED (never free).
-    # pool_threads / pool_batch: the C++ struct (pool_threads=4, pool_batch=32) is the logical
-    # definition, but the OVERCOMMIT *operating point* (3 / 64) is set by the overcommit_sweep.py
-    # argparse — so the SSOT's home for the value the OVERCOMMIT region uses is the HARNESS argparse,
-    # and the drift lint checks 3/64 there. (A named binding divergence, not a silent disagreement;
-    # DESIGN.md §1.3/§1.4.)
+    # pool_threads / pool_batch: the C++ struct (pool_threads=4, pool_batch=32) is the logical definition
+    # (the kept CppField binding below), but the OVERCOMMIT *operating point* (3 / 64) was set by the
+    # overcommit_sweep.py argparse. That harness was MOLTED 2026-06-25, so the operating-point value now homes
+    # on a NoCodeHome literal in THIS SSOT (its code-home is gone; the drift lint reads the literal, not a
+    # file). The C++ struct default stays as the named binding divergence. (DESIGN.md §1.3/§1.4.)
     HParam(
         name="pool_threads", concept="producer_threads",
         surfaces=frozenset({Surface.OVERCOMMIT}), kind=Kind.PRODUCER_FLAG,
-        home=PyArg(OC_SWEEP, "threads"),
-        # the 1:3 pin fixes 3 producer threads in the overcommit harness.
+        home=NoCodeHome("OVERCOMMIT operating point: 3 producer threads (the 1:3 core pin). Its argparse "
+                        "code-home overcommit_sweep.py --threads=3 was MOLTED 2026-06-25 (subsumed by "
+                        "throughput-lab); the value is now a literal owned by this SSOT. The C++ struct "
+                        "default WireRunnerConfig::pool_threads=4 stays as the kept binding (named divergence)."),
         domain=IntSet((3,)), default=3,
         symmetry=Interchangeable("producer_threads"),
         effect=Hypothesized("the 1:3 pin (3 producer cores) sets the natural ceiling"),
@@ -577,7 +584,9 @@ _OVERCOMMIT: list[HParam] = [
     HParam(
         name="pool_batch", concept="pool_batch",
         surfaces=frozenset({Surface.OVERCOMMIT}), kind=Kind.PRODUCER_FLAG,
-        home=PyArg(OC_SWEEP, "pool_batch"),
+        home=NoCodeHome("OVERCOMMIT operating point: pool_batch=64. Its argparse code-home overcommit_sweep.py "
+                        "--pool-batch=64 was MOLTED 2026-06-25; the value is now a literal owned by this SSOT. "
+                        "The C++ struct default WireRunnerConfig::pool_batch=32 stays as the kept binding."),
         domain=IntSet((64,)), default=64,
         symmetry=Free(),
         effect=Hypothesized("sets per-thread fiber count K (concurrency width)"),

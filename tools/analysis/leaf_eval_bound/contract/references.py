@@ -13,8 +13,9 @@ Public Domain (The Unlicense).
 # the current harness; it is NOT grounded in any readable repo file (the only repo '203'
 # hits are unrelated). The nearest MEASURED production-path numbers are below.
 REF_PLATEAU_DPS = 203.0       # user-supplied empirical reference (one config family)
-REF_PRIOR_MODEL_DPS = 456.0   # overcommit_sweep.py:307 BARE LITERAL model_optimistic_dps;
-                              # adapter.md §6 calls it "an upper bound" the bench fell short of
+REF_PRIOR_MODEL_DPS = 456.0   # overcommit_sweep.py:307 BARE LITERAL model_optimistic_dps (overcommit_sweep
+                              # MOLTED 2026-06-25 — git history); adapter.md §6 calls it "an upper bound"
+                              # the bench fell short of
 # MEASURED production-path anchors (analysis_clean.txt + adapter.md §5/§7):
 REF_STRICT_BARRIER_DPS_PER_CORE = 49.0     # analysis_clean.txt strict-barrier ref
 REF_GREEDY_ASYNC_DPS_PER_CORE = 37.0       # analysis_clean.txt greedy-async ref
