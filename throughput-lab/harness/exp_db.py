@@ -637,8 +637,11 @@ def main() -> int:
             ensure_schema(conn)
             obj = json.load(sys.stdin)
             key, reading, stamp, host = _reading_from_json(obj)
-            rid = record_reading(conn, key, reading, stamp=stamp, host=host)
-            print(rid)
+            # the shell-harness front door uses the loud-but-non-fatal form: a DB blip dumps the reading under
+            # ~/w/vdc + warns, but never fails the benchmark that produced it (ADR-0002 weighed against a run).
+            rid = record_reading_safe(conn, key, reading, stamp=stamp, host=host)
+            if rid is not None:
+                print(rid)
         if a.aggregate:
             rows = aggregate(conn, tag=a.tag)
             hdr = ("config_id", "driver", "ladder", "max_batch", "msg_rows", "fibers", "n_sims",

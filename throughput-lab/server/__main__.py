@@ -83,6 +83,9 @@ def _build_config(argv: "list[str]") -> ServerConfig:
                         "latency reflects compute + wire at any timeout (see THE REPLY WAKE in server.py).")
     p.add_argument("--quiet", action="store_true",
                    help="suppress the READY line and the teardown stats summary")
+    p.add_argument("--single-thread", action="store_true",
+                   help="serve on ONE thread (drain->forward->scatter, no IO/compute split) -- the production "
+                        "InferenceServer model; the A/B arm for the two-thread-contention test")
     ns = p.parse_args(argv)
 
     # Loud validation of the few invariants argparse's types do not catch (ADR-0002 — a bad geometry
@@ -101,7 +104,7 @@ def _build_config(argv: "list[str]") -> ServerConfig:
     cfg = ServerConfig(
         bind=ns.bind, max_batch=ns.max_batch, in_dim=ns.in_dim, n_actions=ns.n_actions,
         hidden=ns.hidden, residual=ns.residual, seed=ns.seed, verbose=not ns.quiet,
-        poll_timeout_ms=ns.poll_timeout_ms,
+        poll_timeout_ms=ns.poll_timeout_ms, single_thread=ns.single_thread,
     )
     if ns.warmup is not None:
         cfg.warmup_batch_sizes = ns.warmup

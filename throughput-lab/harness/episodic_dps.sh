@@ -47,9 +47,11 @@ GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GIT_TREE="$(test -z "$(git status --porcelain 2>/dev/null)" && echo clean || echo DIRTY)"
 for b in "$PROD" "$W"; do [ -x "$b" ] || { echo "missing $b (build -DTLAB_REAL_GENERATOR=ON)"; exit 2; }; done
 
+# SINGLE_THREAD (env, non-empty) serves on ONE thread (the production InferenceServer model) instead of the
+# two-thread IO/compute split -- the A/B arm for the two-thread-on-one-core contention test (tlab_finding #4).
 PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
   --in-dim 241 --n-actions 65 --hidden 256 --max-batch "$MAXBATCH" --warmup "$WARMUP" \
-  --poll-timeout-ms 50 >"$LOG" 2>&1 & SRV=$!
+  --poll-timeout-ms 50 ${SINGLE_THREAD:+--single-thread} >"$LOG" 2>&1 & SRV=$!
 cleanup(){ kill -INT "$SRV" 2>/dev/null||true; sleep 1; kill "$SRV" 2>/dev/null||true; rm -f "${EP#ipc://}"; }
 trap cleanup EXIT
 for _ in $(seq 1 240); do grep -q READY "$LOG" && break; sleep 0.5; done
@@ -63,6 +65,10 @@ TMP="$(mktemp -d)"
 G 1 "" >"$TMP/e1" 2>&1 & a=$!; G 2 "" >"$TMP/e2" 2>&1 & b=$!; G 3 "" >"$TMP/e3" 2>&1 & c=$!
 G 0 "$W --policy idle --" >"$TMP/es" 2>&1 & d=$!
 wait "$a" "$b" "$c" "$d"
+# SIGINT the server NOW and wait for its teardown summary to flush, so the server-side stats (mean batch,
+# util) are available to the report AND the auto-record. (The EXIT trap still hard-kills it afterwards.)
+kill -INT "$SRV" 2>/dev/null
+for _ in $(seq 1 24); do grep -q 'compute-busy' "$LOG" && break; sleep 0.5; done
 
 dec=0; lv=0
 for f in "$TMP"/e1 "$TMP"/e2 "$TMP"/e3 "$TMP"/es; do
@@ -70,7 +76,25 @@ for f in "$TMP"/e1 "$TMP"/e2 "$TMP"/e3 "$TMP"/es; do
   dec=$((dec+${D:-0})); lv=$((lv+${L:-0}))
 done
 rm -rf "$TMP"
-echo "EPISODIC-STATIC [commit=$GIT_COMMIT tree=$GIT_TREE] (sims${NSIMS}/m24, no-early-exit, 3 gens + IDLE surplus, driver=$DRIVER inflight=$INFLIGHT, msg-rows=$MSG_ROWS, ladder=[$WARMUP] max-batch=$MAXBATCH, K=$K, ${S}s)"
+RPF=$(grep -oE 'mean batch [0-9.]+' "$LOG"|grep -oE '[0-9.]+'|head -1)
+UTIL=$(grep -oE '\([0-9.]+% of wall\)' "$LOG"|grep -oE '[0-9.]+'|head -1)
+# server_impl carries the threading ARM (single-thread vs two-thread). This is an ARTIFACT/treatment facet,
+# NOT a hyperparameter: it is an A/B between server designs resolved by deleting the loser, not a knob tuned
+# to a shipped optimum -- so it lives in provenance (server_impl), never in the hp/ SSOT (ADR-0008 classify).
+SERVER_IMPL="tlab-server.py:$([ -n "${SINGLE_THREAD:-}" ] && echo single-thread || echo two-thread)"
+echo "EPISODIC-STATIC [commit=$GIT_COMMIT tree=$GIT_TREE] (sims${NSIMS}/m24, no-early-exit, 3 gens + IDLE surplus, driver=$DRIVER inflight=$INFLIGHT, msg-rows=$MSG_ROWS, ladder=[$WARMUP] max-batch=$MAXBATCH, K=$K, server=$SERVER_IMPL, ${S}s)"
 echo "  decisions=$dec  ->  DPS = $((dec/S))"
 echo "  leaves=$lv  ->  leaf-rows/s = $((lv/S))   LPD ~= $((lv/(dec>0?dec:1)))"
 grep -E 'served|forwards|compute-busy|latency' "$LOG"
+# Auto-persist this reading to throughput_research (the measurement side of "commit as we go"). Best-effort:
+# exp_db --record is loud-but-non-fatal (a DB blip dumps the reading under ~/w/vdc, never fails the run).
+# Set TLAB_NO_DB=1 to skip; TLAB_TAG to label a cohort.
+if [ "${TLAB_NO_DB:-0}" != "1" ]; then
+  RID=$(printf '{"config":{"driver":"%s","server_impl":"%s","producer_bin":"tlab-real-producer","msg_rows":%s,"fibers":%s,"inflight_msgs":%s,"n_sims":%s,"m":24,"max_batch":%s,"warmup_ladder":[%s],"topology":"srv@0,gens@1,2,3,surplus@0(idle)"},"reading":{"command":"episodic_dps.sh %s","tool":"episodic_dps.sh","tag":"%s","leaf_rows_s":%s,"dps":%s,"decisions":%s,"leaves":%s,"wall_s":%s,"real_rows_per_fwd":%s,"server_util_pct":%s},"stamp":{"commit":"%s","tree":"%s"}}' \
+    "$DRIVER" "$SERVER_IMPL" "$MSG_ROWS" "$K" "$INFLIGHT" "$NSIMS" "$MAXBATCH" "$WARMUP" "$*" \
+    "${TLAB_TAG:-episodic_dps}" "$((lv/S))" "$((dec/S))" "$dec" "$lv" "$S" "${RPF:-null}" "${UTIL:-null}" \
+    "$GIT_COMMIT" "$GIT_TREE" \
+    | PYTHONPATH=throughput-lab "$PYBIN" throughput-lab/harness/exp_db.py --record 2>>"$LOG")
+  [ -n "$RID" ] && echo "  [exp_db] recorded reading_id=$RID (tag=${TLAB_TAG:-episodic_dps})" \
+                || echo "  [exp_db] not recorded — see $LOG"
+fi

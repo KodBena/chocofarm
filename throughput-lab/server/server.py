@@ -174,6 +174,13 @@ class ServerConfig:
                                                 # the wake pipe flushes a reply the instant it is ready
                                                 # (see THE REPLY WAKE in the module docstring).
     verbose: bool = True                        # print a ready line + a teardown stats summary
+    single_thread: bool = False                 # serve on ONE thread (drain->forward->scatter inline, no
+                                                # IO/compute split, no wake pipe) -- the production
+                                                # InferenceServer model. The A/B arm for the two-thread-
+                                                # contention hypothesis (tlab_finding #4): on a single pinned
+                                                # core the decoupled receiver's IO thread steals compute
+                                                # cycles; here the OS socket buffer queues the next batch
+                                                # DURING the forward instead. Same forward + ladder (one home).
 
 
 @dataclass
@@ -310,6 +317,9 @@ class ThroughputServer:
         thread becomes the IO thread — it owns the socket, drains requests, and sends replies, polling
         the ROUTER + the wake pipe with a bounded timeout so stop() takes effect within poll_timeout_ms."""
         self.stats.serve_start_mono = time.monotonic()
+        if self.cfg.single_thread:
+            self._serve_forever_single()   # its own READY + loop + teardown; no compute thread / wake pipe
+            return
         self._compute_thread.start()
         if self.cfg.verbose:
             # The harness waits on this READY line before launching the producer (do NOT start the
@@ -326,6 +336,95 @@ class ThroughputServer:
                 self._io_step(poller)
         finally:
             self._teardown()
+
+    def _serve_forever_single(self) -> None:
+        """SINGLE-THREADED serve loop (cfg.single_thread) — the production InferenceServer model: ONE thread
+        does drain -> forward -> scatter, with NO IO/compute split and NO wake pipe. The A/B arm for the
+        two-thread-contention hypothesis (tlab_finding #4): on a single pinned core the decoupled receiver's
+        IO thread steals the compute thread's cycles (inflating the in-server forward to ~1.75ms vs ~1.16ms
+        isolated); here the OS socket buffer queues the next batch DURING the forward instead — exactly what
+        the production server relies on. The forward + the bucket ladder are IDENTICAL to the two-thread path
+        (one home: self._forward); only the IO plumbing differs. Decode/reject (decode_bounded), the cap, and
+        the per-request counters mirror the two-thread path so the two arms are comparable."""
+        cap = self.cfg.max_batch
+        poller = zmq.Poller()
+        poller.register(self._sock, zmq.POLLIN)
+        if self.cfg.verbose:
+            print(f"[tlab-server] READY (single-thread) bind={self.cfg.bind} in_dim={self.cfg.in_dim} "
+                  f"hidden={self.cfg.hidden} n_actions={self.cfg.n_actions} "
+                  f"max_batch={self.cfg.max_batch} warmup={self._warmup_sizes}", flush=True)
+        # A decoded request deferred because adding it would exceed the cap — it heads the NEXT forward (the
+        # single-thread analog of _gather putting the overshoot request back on req_q; a destructive recv
+        # can't un-read, so we carry it). Counted in rows_recv when first drained, processed once.
+        pending: "tuple[bytes, list[bytes], npt.NDArray[np.float32], float] | None" = None
+        try:
+            while not self._stop.is_set():
+                # poll(0) when work is already held; else the idle timeout so stop() is noticed promptly.
+                socks = dict(poller.poll(0 if pending is not None else self.cfg.poll_timeout_ms))
+                if pending is None and socks.get(self._sock) != zmq.POLLIN:
+                    continue
+                now = time.monotonic()
+                batch: "list[tuple[bytes, list[bytes], npt.NDArray[np.float32], float]]" = []
+                n_rows = 0
+                if pending is not None:
+                    batch.append(pending)
+                    n_rows += int(pending[2].shape[0])
+                    pending = None
+                while n_rows < cap:
+                    try:
+                        frames = self._sock.recv_multipart(flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    if len(frames) < 2:
+                        self.stats.rejects += 1
+                        continue
+                    identity, envelope, payload = frames[0], frames[1:-1], frames[-1]
+                    try:
+                        bounded = decode_bounded(payload, max_batch=self.cfg.max_batch, in_dim=self.cfg.in_dim)
+                    except WireError:
+                        self.stats.rejects += 1
+                        continue
+                    rows = int(bounded.X.shape[0])
+                    self.stats.requests_recv += 1
+                    self.stats.rows_recv += rows
+                    if n_rows + rows > cap and n_rows > 0:
+                        pending = (identity, envelope, bounded.X, now)   # defer; heads the next forward
+                        break
+                    batch.append((identity, envelope, bounded.X, now))
+                    n_rows += rows
+                if not batch:
+                    continue
+                X = batch[0][2] if len(batch) == 1 else np.concatenate([b[2] for b in batch], axis=0)
+                packed = self._forward.pack(X)
+                t0 = time.monotonic()
+                values, logits = self._forward.forward_batch(packed)
+                done = time.monotonic()
+                self.stats.compute_s += done - t0
+                self.stats.note_batch(n_rows)
+                off = 0
+                for identity, envelope, Xi, recv_mono in batch:
+                    b_i = int(Xi.shape[0])
+                    v_slice = values[off:off + b_i]
+                    l_slice = logits[off:off + b_i] if logits is not None else None
+                    off += b_i
+                    frame = encode_response(v_slice, l_slice)
+                    try:
+                        self._sock.send_multipart([identity, *envelope, frame], flags=zmq.NOBLOCK)
+                        self.stats.replies_sent += 1
+                    except zmq.Again:
+                        self.stats.dropped_replies += 1          # producer recv buffer full — bounded, never wedge
+                    except zmq.ZMQError as e:
+                        if e.errno == zmq.EHOSTUNREACH:
+                            self.stats.undeliverable += 1
+                        else:
+                            raise
+                    self.stats.note_latency(done - recv_mono)
+        finally:
+            self.stats.serve_end_mono = time.monotonic()
+            self._wake_r.close(linger=0)   # bound in __init__ though unused in single-thread mode
+            self._sock.close(linger=0)
+            if self.cfg.verbose:
+                print(self.stats.summary(), file=sys.stderr, flush=True)
 
     def stop(self) -> None:
         """Signal the receive/serve loop to stop. Sets the stop flag; the IO thread notices within
