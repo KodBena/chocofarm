@@ -33,6 +33,8 @@
 #include "chocofarm/fiber_tree.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/instance.hpp"
+#include "chocofarm/issue_control_bridge.hpp"   // consolidation Gate A: REUSE the control plane (one home,
+#include "chocofarm/issue_controller.hpp"       //   ADR-0012 P1) — the same headers runner_wire_batched uses
 #include "chocofarm/search_runtime.hpp"
 
 #include "boundary.hpp"
@@ -238,7 +240,7 @@ void run_thread_fiber(int idx, const chocofarm::Environment& env, const std::str
 void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
                                const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
                                int fibers_k, int coalesce_rows, const std::string& driver,
-                               int inflight_msgs, ThreadStat& out) {
+                               int inflight_msgs, chocofarm::IssueController* ctl, ThreadStat& out) {
     if (coalesce_rows < 1) coalesce_rows = 1;
     tlab::BoundaryConfig bcfg;
     bcfg.endpoint = endpoint; bcfg.recv_timeout_ms = 10000; bcfg.n_producer_threads = 1;
@@ -334,7 +336,11 @@ void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const
             return true;
         };
         while (secs_since(t_start) < run_seconds) {
-            while (!ready.empty() && in_flight < budget) if (!send_group()) return;
+            // Gate A (consolidation): the overcommit controller gates issuance — mirror
+            // runner_wire_batched.cpp's `may_issue(tid)` refill gate (one actuation path). ctl==nullptr (no
+            // --control-endpoint) leaves the loop byte-unchanged, so the control-off arm is the exact baseline.
+            while (!ready.empty() && in_flight < budget && (!ctl || ctl->may_issue(idx)))
+                if (!send_group()) return;
             if (in_flight == 0) break;
             auto reply = boundary->recv();
             if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return; }
@@ -354,6 +360,11 @@ void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const
             }
             corr_to_group.erase(it);
             --in_flight;
+            // Gate A: publish this thread's telemetry — the bridge thread reads it each cadence and REQs the
+            // policy engine (issue_engine.py). The identity policy ignores the values (allow-all); a real
+            // control policy consumes them. Cheap relaxed atomics, off the forward's critical path.
+            if (ctl) ctl->publish(idx, in_flight, static_cast<int>(ready.size()), 0,
+                                  static_cast<long>(out.leaves), 0.0);
         }
     } else {
         // ROUND-SYNC pipe: submit every parked fiber's leaf (coalesced into coalesce_rows-row messages),
@@ -462,7 +473,9 @@ int main(int argc, char** argv) {
                      "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n"
                      "  --inflight-msgs N (default 8) = greedy-episodic pipe depth (coalesced msgs in flight; round-sync ignores)\n"
                      "  --episodic = run real episodes (step the env per executed action); DPS = decisions/s\n"
-                     "  --no-early-exit = substitute Terminate so episodes run full-length (cfg.no_early_exit)\n";
+                     "  --no-early-exit = substitute Terminate so episodes run full-length (cfg.no_early_exit)\n"
+                     "  --control-endpoint <ipc://...> = inject the overcommit control plane (issue_engine.py peer);\n"
+                     "      --controller-cadence-ms M (default 5) = control-loop tick. Absent = control off (baseline).\n";
         return 2;
     }
     const int threads = opt(args, "--threads") ? std::atoi(std::string(*opt(args, "--threads")).c_str()) : 3;
@@ -514,6 +527,24 @@ int main(int argc, char** argv) {
               << " seconds=" << seconds << " n_sims=" << cfg.n_sims << " m=" << cfg.m
               << " n_slots=" << chocofarm::n_action_slots(env) << " endpoint=" << *ep << "\n";
 
+    // Gate A (consolidation): optionally inject the control plane — a process-shared IssueController + an
+    // IssueControlBridge that REQs the Python policy engine (issue_engine.py) every cadence and applies the
+    // returned per-thread allow bits. REUSES the cpp/include/chocofarm headers runner_wire_batched uses (one
+    // home, ADR-0012 P1). No --control-endpoint => ctl stays null => the producer is byte-unchanged (the
+    // control-off baseline the perf-hold A/B measures against; prereg gateA-control-plane-perf-hold).
+    const auto control_ep = opt(args, "--control-endpoint");
+    const double cadence_ms = opt(args, "--controller-cadence-ms")
+        ? std::atof(std::string(*opt(args, "--controller-cadence-ms")).c_str()) : 5.0;
+    std::unique_ptr<chocofarm::IssueController> ctl;
+    std::unique_ptr<chocofarm::IssueControlBridge> bridge;
+    if (control_ep) {
+        ctl = std::make_unique<chocofarm::IssueController>(threads, inflight_msgs);
+        bridge = std::make_unique<chocofarm::IssueControlBridge>(ctl.get(), std::string(*control_ep), cadence_ms);
+        bridge->start();
+        std::cout << "tlab-real-producer: control plane ON (endpoint=" << *control_ep
+                  << " cadence_ms=" << cadence_ms << ")\n";
+    }
+
     std::vector<ThreadStat> stats(static_cast<size_t>(threads));
     std::vector<std::thread> pool;
     const std::string endpoint(*ep);
@@ -522,7 +553,7 @@ int main(int argc, char** argv) {
         pool.emplace_back([&, i] {
             apply_thread_priority(i, low_prio_thread, low_prio_nice);   // renice iff designated
             if (fibers > 0 && episodic)
-                run_thread_fiber_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, stats[static_cast<size_t>(i)]);
+                run_thread_fiber_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
             else if (fibers > 0 && driver == "greedy")
                 run_thread_fiber_greedy(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
             else if (fibers > 0)
@@ -531,6 +562,11 @@ int main(int argc, char** argv) {
                 run_thread(i, env, endpoint, cfg, seconds, in_dim, stats[static_cast<size_t>(i)]);
         });
     for (auto& th : pool) th.join();
+    if (bridge) {
+        bridge->stop();   // join the control thread before reporting (a failed bridge is loud, ADR-0002)
+        if (bridge->failed())
+            std::cerr << "tlab-real-producer: control bridge FAILED: " << bridge->error() << "\n";
+    }
     const double wall = secs_since(t0);
 
     std::uint64_t dec = 0, leaves = 0; bool any_fail = false;
@@ -543,6 +579,7 @@ int main(int argc, char** argv) {
     std::cout << "REAL-AGG threads=" << threads << " fibers=" << fibers << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " driver=" << (fibers > 0 ? driver : std::string("n/a")) << " wall_s=" << wall
+              << " control=" << (control_ep ? 1 : 0)
               << " decisions=" << dec << " leaves=" << leaves
               << " decisions_per_sec=" << dps << " leaves_per_sec=" << lps
               << " any_fail=" << (any_fail ? 1 : 0) << "\n";
