@@ -138,6 +138,17 @@ struct ParseError {
             if (!mb || *mb < 16 || *mb > 1024)
                 return std::unexpected(ParseError{"--send-queue-mb must be an integer in [16, 1024] (<=1G)"});
             cfg.send_queue_bytes = static_cast<std::size_t>(*mb) << 20;
+        } else if (flag == "--low-prio-thread") {
+            auto v = need_value(i);  if (!v) return std::unexpected(v.error());
+            auto k = parse_long(*v);
+            if (!k || *k < 0) return std::unexpected(ParseError{"--low-prio-thread must be an integer >= 0"});
+            cfg.low_prio_thread = static_cast<int>(*k);
+        } else if (flag == "--low-prio-nice") {
+            auto v = need_value(i);  if (!v) return std::unexpected(v.error());
+            auto n = parse_long(*v);
+            if (!n || *n < -20 || *n > 19)
+                return std::unexpected(ParseError{"--low-prio-nice must be an integer in [-20, 19]"});
+            cfg.low_prio_nice = static_cast<int>(*n);
         } else {
             return std::unexpected(ParseError{std::string("unknown flag: ") + std::string(flag)});
         }
@@ -159,6 +170,8 @@ void print_usage(std::ostream& os) {
        << "  --endpoint   <ipc://...|tcp://...>     (default ipc:///tmp/tlab-infer.sock)\n"
        << "  --recv-timeout-ms <ms>                 (default 5000)\n"
        << "  --send-queue-mb <MB>                   (outstanding-send byte budget cap; default 256, max 1024)\n"
+       << "  --low-prio-thread <K>                  (renice generator thread K DOWN; default none)\n"
+       << "  --low-prio-nice <N>                    (nice for that thread, [-20,19]; >0 = lower priority)\n"
        << "  --help                                 (this help)\n";
 }
 

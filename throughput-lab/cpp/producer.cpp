@@ -28,11 +28,17 @@
 
 #include "producer.hpp"
 
+#include <sys/resource.h>   // setpriority / PRIO_PROCESS — per-thread nice (Linux: nice is per-task)
+#include <sys/syscall.h>    // SYS_gettid — this thread's kernel task id
+#include <unistd.h>         // syscall
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <memory>
 #include <mutex>
@@ -49,6 +55,23 @@
 namespace tlab {
 
 namespace {
+
+// Renice the ONE designated generator thread DOWN (cfg.low_prio_thread), on Linux where `nice` is
+// per-task: setpriority(PRIO_PROCESS, gettid(), n) sets THIS thread's nice, not the process's. A no-op
+// unless this thread is the designated one and a non-zero nice is asked. Renicing DOWN (positive nice)
+// needs no privilege; a failure is surfaced loud-ish (a warning) and is non-fatal — the run continues at
+// the default priority rather than aborting the measurement (ADR-0002: surface, do not silently swallow).
+void apply_thread_priority(const ProducerConfig& cfg, int thread_index) {
+    if (cfg.low_prio_thread < 0 || thread_index != cfg.low_prio_thread || cfg.low_prio_nice == 0)
+        return;
+    const auto tid = static_cast<id_t>(::syscall(SYS_gettid));
+    errno = 0;
+    if (::setpriority(PRIO_PROCESS, tid, cfg.low_prio_nice) != 0) {
+        std::fprintf(stderr, "[tlab-producer] WARN: could not renice generator thread %d to nice %d "
+                             "(errno=%d) — running at default priority\n",
+                     thread_index, cfg.low_prio_nice, errno);
+    }
+}
 
 // A steady (monotonic) clock alias — the right clock for a duration, never wall time. Named SteadyClock to
 // avoid colliding with the C ::clock_t typedef from <ctime>.
@@ -296,7 +319,10 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
         std::vector<std::thread> threads;
         threads.reserve(static_cast<std::size_t>(cfg.n_threads));
         for (int t = 0; t < cfg.n_threads; ++t)
-            threads.emplace_back([&, t] { run_one_thread(cfg, shared, corr_seq, stats[t]); });
+            threads.emplace_back([&, t] {
+                apply_thread_priority(cfg, t);   // renice this thread DOWN iff it is the designated one
+                run_one_thread(cfg, shared, corr_seq, stats[t]);
+            });
         for (auto& th : threads) th.join();
         return stats;
     }
@@ -310,6 +336,7 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     std::optional<BoundaryError> first_err;
     for (int t = 0; t < cfg.n_threads; ++t) {
         threads.emplace_back([&, t] {
+            apply_thread_priority(cfg, t);   // renice this thread DOWN iff it is the designated one
             auto boundary = make_boundary(BoundaryTopology::PerThread, bcfg);
             if (!boundary) {
                 std::lock_guard<std::mutex> lk(err_mu);

@@ -104,6 +104,17 @@ struct ProducerConfig {
     std::string endpoint = "ipc:///tmp/tlab-infer.sock";   // the server's ZMQ ipc endpoint
     int recv_timeout_ms = 5000;                 // bounds Boundary recv()/poll() (loud timeout, P5)
     std::size_t send_queue_bytes = 256ull << 20;// TOTAL outstanding-send byte budget (back-pressure cap; <=1G)
+
+    // ---- per-thread scheduling priority (the "renice ONE generator thread" lever) ----------------
+    // A single designated generator thread can be run at a LOWER scheduling priority than its peers (and
+    // than the nice-0 inference server). The intent: when that generator SHARES a core with the inference
+    // server (or with its higher-priority peers), it YIELDS — so the forward finishes and its reply is
+    // read, and the other generators run on unaffected. On Linux `nice` is PER-TASK, so this is one
+    // thread's nice via setpriority(gettid()), not the whole process (that would be a uniform process
+    // nice — a different, coarser lever). nice is graceful/weighted: the reniced thread still runs in the
+    // slack, it just cedes under contention (vs SCHED_IDLE's binary starve, which could collapse the feed).
+    int low_prio_thread = -1;                   // index of the ONE generator thread to renice (-1 = none)
+    int low_prio_nice = 0;                       // its nice value (>0 = lower priority; 0 = no-op)
 };
 
 // Run the producer: stand up the Boundary (per `cfg.topology`/`cfg.endpoint`), spawn `cfg.n_threads`
