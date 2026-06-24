@@ -207,9 +207,10 @@ class ServerStats:
     compute_s: float = 0.0          # wall seconds spent inside forward_batch (the compute-busy time)
     prep_s: float = 0.0             # wall seconds in host-side prep (concat the gather + pack/pad) before the forward
     scatter_s: float = 0.0          # wall seconds in host-side scatter (encode_response + send) after the forward
-    h2d_s: float = 0.0              # (profile_forward) wall in the forward's host->device transfer (jnp.asarray)
-    jit_s: float = 0.0              # (profile_forward) wall in the jitted forward (_forward_both)
-    d2h_s: float = 0.0              # (profile_forward) wall in the forward's device->host pulls (np.asarray x2)
+    h2d_s: float = 0.0              # (profile_forward) wall in the forward's host->device transfer (now 0 for
+                                    #   the jax arm: the cast is FOLDED into the jit — no eager jnp.asarray)
+    jit_s: float = 0.0              # (profile_forward) wall in the jitted forward (_forward_packed, cast folded)
+    d2h_s: float = 0.0              # (profile_forward) wall in the forward's ONE device->host pull (np.asarray)
     in_server_lat_sum_s: float = 0.0   # sum of per-request drain->reply-ready latencies (the in-server time)
     in_server_lat_max_s: float = 0.0   # worst single drain->reply-ready latency
     lat_count: int = 0              # number of replies the latency was measured over

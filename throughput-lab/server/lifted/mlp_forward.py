@@ -80,20 +80,25 @@ class PaddedBatch:
 
 
 @jax.jit
-def _forward_both(params: dict[str, Any], x: Any, ym: Any, ys: Any) -> tuple[Any, Any | None]:
-    """De-standardized value + RAW logits over the ONE `forward.forward_core` (audit R11). `params`
-    is the flat weight dict keyed like `ValueMLP._params()`, so the residual block is applied iff
-    `"Wr1"` is present and the policy head iff `"Wp"` is present — exactly the toggles `forward_core`
-    keys on. Weights are passed as an ARGUMENT (not a closure) so XLA caches one compiled kernel per
-    (pytree-structure, shape, dtype) and does not recompile when weights change.
+def _forward_packed(params: dict[str, Any], x: Any, ym: Any, ys: Any) -> Any:
+    """De-standardized value + RAW logits PACKED into ONE `(B, 1+n_actions)` device array (column 0 the
+    value, columns 1.. the raw logits; `(B, 1)` value-only) over the ONE `forward.forward_core` (audit R11).
 
-    Returns `(v, logits)` where `v = v_std*ys + ym` is the de-standardized scalar value (shape (B,))
-    and `logits` is the (B, n_actions) RAW (NOT softmaxed, NOT masked) policy logits, or `None` for
-    the value-only net (`"Wp"` absent). NO legal mask, NO softmax — the testbed wire carries raw
-    logits and keeps masking client-side (see the module docstring's deliberate-divergence note)."""
+    TWO consolidations vs the old `_forward_both` two-output tuple (the in-serve A/B @6deb40c attributed
+    ~13–17% of the forward envelope to them, mirroring the production `jit_forward_core`):
+      * the host->device CAST is FOLDED IN — `x` is passed as the HOST numpy batch and cast INSIDE the jit
+        (the traced-arg convert), eliminating the eager `jnp.asarray(x)` the caller used to do as a SEPARATE
+        XLA dispatch before the forward;
+      * the value + logits are `concatenate`d into ONE array so the caller makes ONE device->host pull, not
+        two (`np.asarray(v)` then `np.asarray(logits)` were two device syncs).
+    ADR-0012 P6: a numerically-equivalent reordering of the SAME `forward_core` (the wire-parity bar holds,
+    not byte identity); P1/P7: still the one `forward_core`, only packed. `params` is the flat weight dict
+    keyed like `ValueMLP._params()` (residual iff `"Wr1"`, policy iff `"Wp"`), passed as an ARGUMENT (not a
+    closure) so XLA caches one kernel per (pytree, shape, dtype) and does not recompile when weights change.
+    NO legal mask, NO softmax — the testbed wire carries raw logits, masking client-side (module docstring)."""
     v_std, logits = forward_core(params, x, jnp)
-    v = v_std * ys + ym
-    return v, logits
+    v = jnp.reshape(v_std, (-1, 1)) * ys + ym
+    return v if logits is None else jnp.concatenate([v, logits], axis=1)
 
 
 def _random_params(in_dim: int, hidden: int, n_actions: int, residual: bool, seed: int) -> dict[str, Any]:
@@ -235,11 +240,11 @@ class MlpForward:
         for bsz in batch_sizes:
             if bsz <= 0:
                 raise ValueError(f"warmup batch size must be >= 1, got {bsz}")
-            x = jnp.zeros((bsz, in_dim), dtype=_JDTYPE)
-            v, logits = _forward_both(self.params, x, self.ym, self.ys)
-            v.block_until_ready()
-            if logits is not None:
-                logits.block_until_ready()
+            # Warm with a HOST numpy zero matrix — the SAME input type the serving path passes (so the jit
+            # caches the executable for the host-array signature; warming with a jnp array would compile a
+            # DIFFERENT traced type and force a recompile on the first real, host-fed forward).
+            x = np.zeros((bsz, in_dim), dtype=np.float32)
+            _forward_packed(self.params, x, self.ym, self.ys).block_until_ready()
         # Record the warmed ladder as THIS forward's contract: from here on `pack` may only round into
         # these shapes and `forward_batch` accepts only a PaddedBatch built off them (ADR-0012 — the
         # warmed set is the single source of truth, derived once, never re-stated where it could drift).
@@ -312,13 +317,14 @@ class MlpForward:
             raise ValueError(
                 f"PaddedBatch row count {rows} is not a warmed bucket {self._warmed_ladder} "
                 f"(a PaddedBatch must come from .pack)")
-        x = jnp.asarray(batch.x, dtype=_JDTYPE)
-        v, logits = _forward_both(self.params, x, self.ym, self.ys)
-        # Pull back to host numpy float32 (the wire encoder's dtype) and slice off the pad tail. np.asarray
-        # on a jax array blocks until ready, so the returned arrays are materialized — no dangling handle.
+        # ONE forward → ONE device→host pull of the packed `(rows, 1+n_actions)` block (the cast folded
+        # inside the jit — batch.x is passed HOST, no eager jnp.asarray). np.asarray blocks until ready, so
+        # the returned arrays are materialized. Slice off the pad tail and split column 0 (value) from
+        # columns 1.. (raw logits); a value-only net returns a single column → logits None.
+        out = np.asarray(_forward_packed(self.params, batch.x, self.ym, self.ys), dtype=np.float32)
         n = batch.n_real
-        values = np.asarray(v, dtype=np.float32)[:n]
-        logits_np = np.asarray(logits, dtype=np.float32)[:n] if logits is not None else None
+        values = out[:n, 0]
+        logits_np = out[:n, 1:] if out.shape[1] > 1 else None
         return values, logits_np
 
     def forward_batch_timed(self, batch: PaddedBatch) -> (
@@ -330,20 +336,19 @@ class MlpForward:
         absolute forward cost. Same contract/returns as forward_batch, plus the (h2d_s, jit_s, d2h_s) tuple."""
         if not isinstance(batch, PaddedBatch) or int(batch.x.shape[0]) not in self._warmed_set:
             raise ValueError("forward_batch_timed: build the batch with .pack (warmed PaddedBatch required)")
+        # The cast is now FOLDED into the jit (no separate eager h2d to time) — so the split is (0, jit, d2h):
+        # `jit` is cast+forward fused (block_until_ready forces it) and `d2h` is the one pull. Still SERIALISED
+        # (block between the compute and the pull), so the sum is an UPPER BOUND on the pipelined wall.
         t0 = time.monotonic()
-        x = jnp.asarray(batch.x, dtype=_JDTYPE)
-        x.block_until_ready()                                  # force the host->device transfer to complete
+        out = _forward_packed(self.params, batch.x, self.ym, self.ys)
+        out.block_until_ready()                                # force the fused cast+compute to complete
         t1 = time.monotonic()
-        v, logits = _forward_both(self.params, x, self.ym, self.ys)
-        v.block_until_ready()
-        if logits is not None:
-            logits.block_until_ready()                         # force the jit/compute to complete
-        t2 = time.monotonic()
+        arr = np.asarray(out, dtype=np.float32)
         n = batch.n_real
-        values = np.asarray(v, dtype=np.float32)[:n]
-        logits_np = np.asarray(logits, dtype=np.float32)[:n] if logits is not None else None
-        t3 = time.monotonic()                                  # device->host pulls + slice
-        return values, logits_np, (t1 - t0, t2 - t1, t3 - t2)
+        values = arr[:n, 0]
+        logits_np = arr[:n, 1:] if arr.shape[1] > 1 else None
+        t2 = time.monotonic()                                  # device->host pull + slice
+        return values, logits_np, (0.0, t1 - t0, t2 - t1)
 
 
 # ---- DIAGNOSTIC cross-boundary arms (measurement only — ADR-0013 verify-the-artifact) -----------------
