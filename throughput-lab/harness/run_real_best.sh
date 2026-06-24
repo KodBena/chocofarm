@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # throughput-lab/harness/run_real_best.sh — the canonical, optimal real-generator load run for this
 #   4-vCPU host, so the +18% scheduling win is not rediscovered by hand (ADR-0011: mechanize the finding;
-#   see docs/notes/tlab-real-generators-2026-06-24.md). The winning topology (measured, IQR ~0.3%):
+#   see docs/notes/tlab-real-generators-2026-06-24.md). The winning config, compounding three levers:
 #     server         -> core 0
 #     3 generators   -> cores 1, 2, 3  (one each, clean)
-#     surplus gen    -> core 0, SCHED_IDLE  (soaks the server core's ~42% idle slack, yields to forwards)
-#   All UNPRIVILEGED: SCHED_IDLE is self-settable; no cap, no root. Reports aggregate leaf-rows/s.
+#     surplus gen    -> core 0, SCHED_IDLE  (soaks the server core's idle slack; +~25%)
+#     --msg-rows 64  -> coalesce each fiber round's leaves into B<=64 messages (the static S_min floor;
+#                       ~2.9x, by collapsing the per-request CPython serve-path overhead) -- THE big lever
+#   Together ~58k leaf-rows/s, ~3.6x over the original B=1/no-surplus baseline (~16k). All UNPRIVILEGED
+#   (SCHED_IDLE self-settable; no cap, no root). Reports aggregate leaf-rows/s.
 #
-#   Usage:  run_real_best.sh [K] [SECONDS] [N_SIMS]   (defaults: 64 5 24)
+#   Usage:  run_real_best.sh [K] [SECONDS] [N_SIMS] [MSG_ROWS]   (defaults: 128 5 24 64)
 #   Public Domain (The Unlicense).
 set -euo pipefail
 
-K="${1:-64}"; SECONDS_RUN="${2:-5}"; NSIMS="${3:-24}"
+K="${1:-128}"; SECONDS_RUN="${2:-5}"; NSIMS="${3:-24}"; MSG_ROWS="${4:-64}"
 ROOT="/home/bork/w/vdc/1/chocofarm"
 PY="/home/bork/w/vdc/venvs/generic/bin/python"
 PROD="$ROOT/throughput-lab/cpp/build/tlab-real-producer"
@@ -38,7 +41,8 @@ grep -q READY "$LOG" || { echo "server never READY"; cat "$LOG"; exit 1; }
 echo "server READY (core 0); launching 3 generators + 1 SCHED_IDLE surplus, K=$K, ${SECONDS_RUN}s"
 
 gen(){ taskset -c "$1" "$PROD" --instance "$INST" --faces "$FACES" --endpoint "$EP" \
-         --threads 1 --fibers "$K" --driver round-sync --seconds "$SECONDS_RUN" --n-sims "$NSIMS"; }
+         --threads 1 --fibers "$K" --msg-rows "$MSG_ROWS" --driver round-sync \
+         --seconds "$SECONDS_RUN" --n-sims "$NSIMS"; }
 
 TMP="$(mktemp -d)"
 gen 1 >"$TMP/g1" 2>&1 & p1=$!
@@ -46,7 +50,7 @@ gen 2 >"$TMP/g2" 2>&1 & p2=$!
 gen 3 >"$TMP/g3" 2>&1 & p3=$!
 # the surplus on core 0, SCHED_IDLE (via sched_wrap; runs only in the server core's idle slack)
 taskset -c 0 "$WRAP" --policy idle -- "$PROD" --instance "$INST" --faces "$FACES" --endpoint "$EP" \
-  --threads 1 --fibers "$K" --driver round-sync --seconds "$SECONDS_RUN" --n-sims "$NSIMS" \
+  --threads 1 --fibers "$K" --msg-rows "$MSG_ROWS" --driver round-sync --seconds "$SECONDS_RUN" --n-sims "$NSIMS" \
   >"$TMP/gs" 2>&1 & ps=$!
 # wait ONLY for the generators — a bare `wait` would also wait on the server (SRV), which runs until the
 # EXIT-trap SIGINT, deadlocking. The generators self-terminate at --seconds; then we tear the server down.
