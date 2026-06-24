@@ -192,6 +192,43 @@ mechanisms are not re-litigated.
   (recurrence → mechanism); `FeatureLayout` (R6) is the worked proof of the
   tenet+mechanism pairing; its §5 measure-first deflation is Rule 3.
 
+## Amendments
+
+### 2026-06-24 — Empirical readings carry their code state (the commit-stamp net)
+
+A "+31%" throughput win (the greedy vs round-sync episodic driver) banked from a
+single session failed to reproduce, and could not be pinned to a commit, on a
+controlled re-measurement — an attributed reading with no record of the code that
+produced it is **unattributable by construction**. This is the
+invisible-at-authoring/visible-only-in-aggregate defect this tenet names, in the
+empirical-measurement domain: the per-reading provenance was offloaded to the
+operator's memory (anti-pattern G), and it decayed across the very first session
+boundary.
+
+Per **Rule 2** (recurrence → mechanism, not more prose) and **Rule 4** (a net
+quantifies over the *class*, not the instance): the measuring harness itself
+emits, on **every** reading, the git commit short-hash + tree state
+(`clean | DIRTY`) of the checkout that produced it. A `DIRTY` tree marks a
+non-reproducible artifact — the producer binary / harness may not match `HEAD`,
+so the number is provisional until committed. The net keys on the class of *all
+readings* (the harness stamps unconditionally), not on an enumeration of the ones
+someone remembered to label.
+
+- **Enforcement surface (Rule 1):** run-time, at the harness — the stamp is
+  emitted with the number, not left to review or recall.
+- **Measure-first (Rule 3):** the trigger was itself a measurement failure (an
+  unreproducible bench delta), and the mechanism is the lightest proportionate
+  one (two `git` reads), not a heavier provenance system.
+- **Worked instances (one home, ADR-0012 P1):** `throughput-lab/harness/code_stamp.py`
+  is the single Python home, imported by `coalesce_sweep.py`, `topology_sweep.py`,
+  and `cpp/stage_a/overcommit_sweep.py`; `throughput-lab/harness/episodic_dps.sh`
+  mirrors the same two `git` invocations inline.
+- **Pairs with ADR-0009** (perf-investigation discipline): a captured bench number
+  is now code-addressable — the sibling of ADR-0009's captured-bench requirement.
+
+Provenance: the maintainer's contribution, 2026-06-24, during the throughput-lab
+driver-attribution work.
+
 ## License
 
 Public Domain (The Unlicense).

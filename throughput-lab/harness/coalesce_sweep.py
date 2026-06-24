@@ -15,6 +15,9 @@ Public Domain (The Unlicense).
 import json, os, re, signal, subprocess, sys, time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # sibling import of the shared ADR-0011 stamp
+from code_stamp import code_stamp, code_stamp_str           # noqa: E402
+
 ROOT = Path("/home/bork/w/vdc/1/chocofarm")
 PY = "/home/bork/w/vdc/venvs/generic/bin/python"
 PROD = str(ROOT / "throughput-lab/cpp/build/tlab-real-producer")
@@ -68,10 +71,11 @@ for r in rows:
     print(f"  msg_rows={r['msg_rows']:>4}  {r['leaves_per_sec']:>10,.0f} leaf-rows/s  "
           f"requests={r['server_requests']:>7}  forwards={r['forwards']:>5}  "
           f"mean_batch={r['mean_batch']:>6.1f}  srv_matmul={r['compute_busy_pct']:>4.0f}%", flush=True)
-(OUT / "results.json").write_text(json.dumps(rows, indent=2))
+(OUT / "results.json").write_text(json.dumps({"code_stamp": code_stamp(), "rows": rows}, indent=2))
 base = rows[0]["leaves_per_sec"] or 1
 lines = ["# Static coalescing-floor sweep (msg-rows) — real config, surplus on\n",
-         f"server@0 + 3 gens@1,2,3 + SCHED_IDLE surplus@0, K={K}, {SECONDS}s, n_sims={NSIMS}, production build\n",
+         f"server@0 + 3 gens@1,2,3 + SCHED_IDLE surplus@0, K={K}, {SECONDS}s, n_sims={NSIMS}, "
+         f"production build [{code_stamp_str()}]\n",
          "| msg-rows | leaf-rows/s | vs M=1 | server requests | forwards | mean batch | srv matmul% |",
          "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
 for r in rows:

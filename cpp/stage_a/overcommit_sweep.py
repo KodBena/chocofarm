@@ -43,6 +43,7 @@ import uuid
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # worktree root
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for stage_a_server
+sys.path.insert(0, os.path.join(REPO, "throughput-lab", "harness"))  # shared ADR-0011 code_stamp (one home)
 
 import chocofarm.config  # noqa: F401,E402 — XLA/OMP single-thread pin BEFORE jax init (SSOT)
 
@@ -58,6 +59,8 @@ from chocofarm.az.transport import RedisTransport, connect, pack_net  # noqa: E4
 from chocofarm.model.env import Environment  # noqa: E402
 
 from stage_a_server import BUCKETS, StageAServer  # noqa: E402
+
+from code_stamp import code_stamp  # noqa: E402 — ADR-0011: stamp every reading with its code state
 
 AB_BENCH = os.path.join(REPO, "cpp", "build", "chocofarm-wire-ab-bench")
 INSTANCE = os.path.join(REPO, "chocofarm", "data", "instance.json")
@@ -304,7 +307,9 @@ def main() -> int:
         "min_coalesce": a.min_coalesce,
         "min_forward_rows": a.min_forward_rows, "max_queue_delay_ms": a.max_queue_delay_ms,
         "threads": a.threads, "server_core": a.server_core, "producer_cores": a.producer_cores,
-        "serve_fast_region_B": 192, "model_optimistic_dps": 456, "cells": {},
+        "serve_fast_region_B": 192, "model_optimistic_dps": 456,
+        "code_stamp": code_stamp(REPO),   # ADR-0011: pin this reading to the worktree's code state (DIRTY => not reproducible)
+        "cells": {},
     }
     for arm in cell_keys:
         cell = [r for r in records if r["arm"] == arm]
@@ -325,8 +330,10 @@ def main() -> int:
     with open(out_json, "w") as f:
         json.dump({"summary": summary, "records": records}, f, indent=2)
 
+    _st = summary["code_stamp"]
     print("\n==== OVERCOMMIT INCREMENT (i) SWEEP — 1:3 pinning, greedy bucketed drain ====", flush=True)
-    print(f"  (server fast region B~=192; model optimistic dps~=456; baseline = strict-barrier)\n",
+    print(f"  [code: commit={_st['commit']} tree={_st['tree']}]  "
+          f"(server fast region B~=192; model optimistic dps~=456; baseline = strict-barrier)\n",
           flush=True)
     hdr = (f"  {'cell':<18} {'N':>2}  {'rows/forward (mean+/-std [min-max])':<34}  "
            f"{'dps':<22}  {'dps/core':>8}  {'iter_wall(s)':>12}")

@@ -41,6 +41,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # sibling import of the shared ADR-0011 stamp
+from code_stamp import code_stamp, code_stamp_str           # noqa: E402
+
 ROOT = Path("/home/bork/w/vdc/1/chocofarm")
 PYBIN = "/home/bork/w/vdc/venvs/generic/bin/python"
 PRODUCER = ROOT / "throughput-lab/cpp/build/tlab-real-producer"
@@ -168,7 +171,7 @@ def main() -> int:
     if args.filter:
         configs = [c for c in configs if args.filter in c["tag"]]
     print(f"running {len(configs)} configs x {args.reps} rep(s), fibers={args.fibers}, "
-          f"seconds={args.seconds}", flush=True)
+          f"seconds={args.seconds} [{code_stamp_str()}]", flush=True)
 
     samples: dict[str, list[float]] = {c["config_id"]: [] for c in configs}
     meta = {c["config_id"]: c for c in configs}
@@ -190,11 +193,11 @@ def main() -> int:
         rows.append({"config_id": cid, "tag": meta[cid]["tag"], "leaves_per_sec_median": med,
                      "n": len(xs), "samples": xs})
     rows.sort(key=lambda r: -r["leaves_per_sec_median"])
-    (outdir / "results.json").write_text(json.dumps(rows, indent=2))
+    (outdir / "results.json").write_text(json.dumps({"code_stamp": code_stamp(), "rows": rows}, indent=2))
 
     lines = ["# Topology sweep — leaf-rows/s by config (median)\n",
              f"fibers={args.fibers}, {args.seconds}s, n_sims={args.n_sims}, reps={args.reps}, "
-             f"latnice slice={args.slice_ns}ns\n",
+             f"latnice slice={args.slice_ns}ns [{code_stamp_str()}]\n",
              "| rank | leaves/s | config_id | tag |", "| ---: | ---: | --- | --- |"]
     for i, r in enumerate(rows, 1):
         lines.append(f"| {i} | {r['leaves_per_sec_median']:,.0f} | {r['config_id']} | {r['tag']} |")
