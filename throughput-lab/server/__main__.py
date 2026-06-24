@@ -95,6 +95,10 @@ def _build_config(argv: "list[str]") -> ServerConfig:
                         "(DIAGNOSTIC: real build_staged_forward — the actual overcommit 140k forward) | null "
                         "(PROBE: zero-compute, returns shaped zeros — isolates the serve-loop ceiling). prod/"
                         "staged/null are measurement-only (never shipped)")
+    p.add_argument("--net", default="",
+                   help="Gate B: serve a REAL trained net from this AZ .npz checkpoint (MlpForward.from_npz) "
+                        "instead of a random net — gives tlab measurements direct AZ-loop relevance. Empty = "
+                        "random net. Only valid with --forward jax. Geometry is derived from the checkpoint.")
     ns = p.parse_args(argv)
 
     # Loud validation of the few invariants argparse's types do not catch (ADR-0002 — a bad geometry
@@ -114,7 +118,7 @@ def _build_config(argv: "list[str]") -> ServerConfig:
         bind=ns.bind, max_batch=ns.max_batch, in_dim=ns.in_dim, n_actions=ns.n_actions,
         hidden=ns.hidden, residual=ns.residual, seed=ns.seed, verbose=not ns.quiet,
         poll_timeout_ms=ns.poll_timeout_ms, single_thread=ns.single_thread,
-        profile_forward=ns.profile_forward, forward_impl=ns.forward,
+        profile_forward=ns.profile_forward, forward_impl=ns.forward, net_path=ns.net,
     )
     if ns.warmup is not None:
         cfg.warmup_batch_sizes = ns.warmup

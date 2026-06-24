@@ -185,6 +185,9 @@ class ServerConfig:
     forward_impl: str = "jax"                   # "jax" = MlpForward (XLA-jit + bucket ladder); "numpy" =
                                                 # NumpyMlpForward (forward_core in numpy, NO XLA dispatch, NO
                                                 # pad) -- the A/B arm for the XLA-per-call-overhead hypothesis.
+    net_path: str = ""                          # Gate B: load a REAL trained net from this AZ .npz checkpoint
+                                                # (MlpForward.from_npz) instead of a random net -- gives tlab
+                                                # measurements direct AZ-loop relevance. Empty => random_net.
     profile_forward: bool = False               # (single-thread only) split each forward into h2d|jit|d2h
                                                 # sub-phase timers -- localizes the in-serve forward inflation.
                                                 # SERIALISES the XLA pipeline (blocks between phases) so it
@@ -316,10 +319,20 @@ class ThroughputServer:
         if cfg.forward_impl not in _FORWARDS:
             raise ValueError(f"forward_impl must be one of {sorted(_FORWARDS)}, got {cfg.forward_impl!r}")
         _forward_cls = _FORWARDS[cfg.forward_impl]
-        self._forward = _forward_cls.random_net(
-            in_dim=cfg.in_dim, hidden=cfg.hidden, n_actions=cfg.n_actions,
-            residual=cfg.residual, seed=cfg.seed,
-        )
+        if cfg.net_path:
+            # Gate B: serve the REAL trained net from an AZ checkpoint (geometry derived from the weights;
+            # warmup() validates in_dim matches the producer's features). Only the real forwards load weights
+            # (jax/numpy); the diagnostic arms (prod/staged/null) are shape-only — a net_path with them is a
+            # configuration error surfaced now (ADR-0002), not a silently-ignored flag.
+            if not hasattr(_forward_cls, "from_npz"):
+                raise ValueError(f"--net is only supported with --forward jax (the production forward), not "
+                                 f"{cfg.forward_impl!r}")
+            self._forward = _forward_cls.from_npz(cfg.net_path)
+        else:
+            self._forward = _forward_cls.random_net(
+                in_dim=cfg.in_dim, hidden=cfg.hidden, n_actions=cfg.n_actions,
+                residual=cfg.residual, seed=cfg.seed,
+            )
 
         # -- the two-thread split: req_q (IO -> compute), resp_q (compute -> IO); stats_done is the
         # teardown done-signal (clause 8: the real join, replacing the timed-join fiction) ------------

@@ -291,6 +291,26 @@ class MlpForward:
         identity de-standardization (0, 1) — the value is meaningless in the lab, the matmul is not."""
         return cls(_random_params(in_dim, hidden, n_actions, residual, seed), y_mean=0.0, y_std=1.0)
 
+    @classmethod
+    def from_npz(cls, path: str) -> "MlpForward":
+        """Load a REAL (trained) net from an AZ checkpoint `.npz` (consolidation Gate B — give throughput-lab
+        direct AZ-loop relevance: measure on the real net a worker serves, not a throwaway random one). The
+        archive is `ValueMLP.save`'s layout: the flat weight keys (`W1,b1,W2,b2[,Wr1..],Wv,bv[,Wp,bp]`) the
+        SAME `forward_core` consumes (so it slots straight into __init__, no transcription — ADR-0012 P1/P6),
+        plus `_yscale = [y_mean, y_std]` (the TRAINED de-standardization, unlike random_net's identity (0,1))
+        and `_meta` (geometry, derived from the weights themselves; not re-stated here). Underscore-prefixed
+        keys are metadata, not weights. The geometry the producer's features must match (in_dim, n_actions)
+        is validated downstream by warmup()'s in_dim check + the wire response width (ADR-0002, fail loud)."""
+        z = np.load(path, allow_pickle=False)
+        if "W1" not in z.files:
+            raise ValueError(f"from_npz({path}): no 'W1' weight — not a ValueMLP checkpoint (ADR-0002)")
+        params = {k: z[k] for k in z.files if not k.startswith("_")}
+        if "_yscale" in z.files:
+            ym, ys = float(z["_yscale"][0]), float(z["_yscale"][1])
+        else:
+            ym, ys = 0.0, 1.0   # a checkpoint without the de-standardization scalars => identity (loud-safe)
+        return cls(params, y_mean=ym, y_std=ys)
+
     # -- compute --------------------------------------------------------------------------------------
 
     def warmup(self, batch_sizes: "list[int]", in_dim: int) -> None:
