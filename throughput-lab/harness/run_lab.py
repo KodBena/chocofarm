@@ -11,15 +11,18 @@ For each sweep cell (topology x mode x ...):
   1. pick a fresh ipc endpoint (ipc:///tmp/tlab-{pid}-{seq}.sock) so concurrent / sequential runs do
      not collide on a stale unix socket;
   2. launch the server: `python -m server --bind <endpoint> [--n-actions A] [--in-dim D] ...`
-     (interpreter /home/bork/w/vdc/venvs/generic/bin/python, PYTHONPATH=throughput-lab) and WAIT for
-     its `[tlab-server] READY ...` line on stdout before launching the producer (do NOT start the
-     producer before warmup or the first batches pay XLA compile and the throughput is mis-measured,
+     (interpreter /home/bork/w/vdc/venvs/generic/bin/python, PYTHONPATH=throughput-lab), its
+     stdout+stderr REDIRECTED TO A PER-CELL FILE (never a pipe — a pipe the harness cannot drain during
+     the producer run back-pressures a flooding server and wedges the single thread that must run its
+     SIGINT handler; see _ServerLog and docs/consults/2026-06-24-pipe-wedge-defense-in-depth.md), and
+     TAIL that file for the `[tlab-server] READY ...` line before launching the producer (do NOT start
+     the producer before warmup or the first batches pay XLA compile and the throughput is mis-measured,
      ADR-0009);
   3. run the producer: `cpp/build/tlab-producer --endpoint <endpoint> --topology <A|B> --mode
      <decoupled|coupled> --threads N --rate HZ --rows B --seconds S` and parse its machine-readable
      `RESULT thread=... ...` (per thread) and `AGGREGATE ...` (one) lines;
-  4. tear down the server cleanly (SIGINT -> bounded stop()); capture its teardown stats line
-     (`[tlab-server] served ...`) from stderr;
+  4. tear down the server cleanly (SIGINT -> bounded stop()); read its teardown stats line
+     (`[tlab-server] served ...`) from the same redirect file once the process is reaped;
   5. emit a parse-friendly record (JSON) of the cell: (topology, mode, threads, rate, rows) ->
      (requested vs ACHIEVED aggregate throughput, per-thread latency p50/p99, server forward count /
      mean batch / compute utilization).
@@ -59,6 +62,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -135,35 +139,78 @@ class CellResult:
     replicate_served_hz: "list[float]" = field(default_factory=list)     # replies_recv/seconds (SERVED, honest)
 
 
-def _wait_for_ready(proc: subprocess.Popen, server_lines: "list[str]", timeout_s: float) -> bool:
-    """Block until the server prints its READY line on stdout, or it dies, or timeout. Every server
-    stdout line is appended to `server_lines` so nothing is lost (the teardown stats arrive later, but
-    READY may be interleaved with warmup logging). Returns True iff READY was seen."""
+class _ServerLog:
+    """The server subprocess's stdout+stderr, redirected by the harness to a real FILE rather than a
+    PIPE. A regular-file write() never back-pressures its writer (a pipe blocks once its ~64 KB buffer
+    fills and nobody drains it — and the harness CANNOT drain it during the producer run, when its main
+    thread is parked inside subprocess.run(producer)); so with a file the server can never block
+    mid-write while holding the single thread that must run its SIGINT handler. The teardown wedge is
+    thereby UNREPRESENTABLE, not merely avoided by the discipline "never add a hot-path print" — the
+    output sink is a type that is total on write (ADR-0000; consult
+    docs/consults/2026-06-24-pipe-wedge-defense-in-depth.md). This is the consumer-side dual of the
+    server's own "no unbounded downstream-gated write on the serve loop" invariant.
+
+    The child writes; this object tails the same file incrementally, yielding only NEWLINE-TERMINATED
+    lines (a tail can otherwise observe a half-written line — print() is not atomic across its text and
+    its trailing newline). The server runs PYTHONUNBUFFERED so each line lands in the file promptly
+    despite block-buffering-to-a-file (a file write is free, so unbuffered costs nothing here)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._rf = open(path, "r")            # a private read handle; the child holds the write fd
+        self._buf = ""
+
+    def read_lines(self) -> "list[str]":
+        """Every COMPLETE (newline-terminated) line appended since the last call; a trailing partial
+        line is held back in the buffer until its newline arrives (so READY/stats are never split)."""
+        chunk = self._rf.read()
+        if not chunk:
+            return []
+        self._buf += chunk
+        *complete, self._buf = self._buf.split("\n")
+        return complete
+
+    def final(self) -> str:
+        """Any leftover non-newline-terminated remainder — read only after the process has exited and
+        been reaped (no more bytes will arrive). '' if the last line was newline-terminated."""
+        rest, self._buf = self._buf, ""
+        return rest
+
+    def close(self) -> None:
+        self._rf.close()
+
+
+def _wait_for_ready(
+    log: "_ServerLog", proc: subprocess.Popen, server_lines: "list[str]", timeout_s: float
+) -> bool:
+    """Tail the server's redirect file until its READY line appears, or it dies, or timeout. Every line
+    read is appended to `server_lines` so nothing is lost (READY may be interleaved with warmup logging;
+    the teardown stats arrive much later and are read by _drain_remaining). Returns True iff READY was
+    seen."""
     deadline = time.monotonic() + timeout_s
-    assert proc.stdout is not None
     while time.monotonic() < deadline:
-        line = proc.stdout.readline()
-        if line == "":
-            # EOF on stdout — the server exited before READY.
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.01)
+        new = log.read_lines()
+        if new:
+            server_lines.extend(new)
+            if any(_READY_RE.search(ln) for ln in new):
+                return True
             continue
-        server_lines.append(line.rstrip("\n"))
-        if _READY_RE.search(line):
-            return True
+        if proc.poll() is not None:
+            # the server exited before READY — absorb any final bytes, then give up.
+            server_lines.extend(log.read_lines())
+            return False
+        time.sleep(0.01)
     return False
 
 
-def _drain_remaining(proc: subprocess.Popen, sink: "list[str]") -> None:
-    """After the server has been asked to stop, read whatever it printed (the teardown stats summary is
-    emitted to stderr; we merged stderr into stdout via the Popen below, so it shows up here)."""
-    assert proc.stdout is not None
-    try:
-        for line in proc.stdout:
-            sink.append(line.rstrip("\n"))
-    except Exception:  # noqa: BLE001 — best-effort drain on teardown
-        pass
+def _drain_remaining(log: "_ServerLog", sink: "list[str]") -> None:
+    """After the server has stopped and been reaped (so the OS has flushed all of its output to the
+    redirect file), read everything that remains — including a final non-newline-terminated line, if
+    any — for the teardown stats summary."""
+    sink.extend(log.read_lines())
+    rest = log.final()
+    if rest:
+        sink.append(rest)
 
 
 def _parse_server_stats(lines: "list[str]", cell: CellResult) -> None:
@@ -182,6 +229,20 @@ def _parse_server_stats(lines: "list[str]", cell: CellResult) -> None:
             cell.server_forwards = int(m.group(1))
             cell.server_mean_batch_rows = float(m.group(2))
             cell.server_max_batch_rows = int(m.group(3))
+
+
+def _resolve_server_log_dir(args: argparse.Namespace) -> Path:
+    """Where the per-cell server redirect logs live. Explicit --server-log-dir wins; else next to
+    --json-out (so a sweep's server logs sit under its run dir, never discarded — the experiment-output
+    convention); else a process-scoped temp dir for ad-hoc smoke runs."""
+    if args.server_log_dir:
+        d = Path(args.server_log_dir)
+    elif args.json_out:
+        d = Path(args.json_out).parent / "server-logs"
+    else:
+        d = Path(tempfile.gettempdir()) / f"tlab-server-logs-{os.getpid()}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _run_one_cell(
@@ -211,6 +272,10 @@ def _run_one_cell(
     server_lines: "list[str]" = []
     server_env = dict(os.environ)
     server_env["PYTHONPATH"] = str(LAB_ROOT) + os.pathsep + server_env.get("PYTHONPATH", "")
+    # Unbuffered child stdout/stderr: redirecting to a FILE (below) flips Python's default from line- to
+    # block-buffering, which would otherwise hold READY / the teardown stats in the child's buffer until
+    # it fills or exits. A file write is free, so unbuffered costs nothing and keeps the tail prompt.
+    server_env["PYTHONUNBUFFERED"] = "1"
     server_cmd = [
         PYTHON, "-m", "server",
         "--bind", endpoint,
@@ -230,13 +295,20 @@ def _run_one_cell(
           f"threads={args.threads} rate={args.rate}hz rows={args.rows} "
           f"seconds={args.seconds} (x{args.replicates}) ===", file=sys.stderr, flush=True)
 
-    # stderr -> stdout so the server's READY (stdout) and teardown stats (stderr) arrive on one stream.
+    # Redirect the server's stdout+stderr to a per-cell FILE, never a pipe (see _ServerLog: a pipe the
+    # harness cannot drain during the run wedges the server's SIGINT thread). The file is preserved
+    # under the run dir (--server-log-dir, else next to --json-out, else a temp dir) — never discarded.
+    server_log_dir = _resolve_server_log_dir(args)
+    server_log_path = server_log_dir / f"tlab-server-{os.getpid()}-{seq}.log"
+    server_log_fh = open(server_log_path, "w")
+    # stderr -> stdout so the server's READY (stdout) and teardown stats (stderr) land in one file.
     proc = subprocess.Popen(
-        server_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        env=server_env, text=True, bufsize=1,
+        server_cmd, stdout=server_log_fh, stderr=subprocess.STDOUT, env=server_env,
     )
+    server_log_fh.close()              # the child holds its own dup of the fd; the parent's copy is done
+    server_log = _ServerLog(server_log_path)
     try:
-        if not _wait_for_ready(proc, server_lines, args.server_ready_timeout_s):
+        if not _wait_for_ready(server_log, proc, server_lines, args.server_ready_timeout_s):
             cell.note = (f"server never reported READY within {args.server_ready_timeout_s}s "
                          f"(exit={proc.poll()}); last server lines: {server_lines[-5:]}")
             return cell
@@ -258,9 +330,21 @@ def _run_one_cell(
                 "--seconds", str(args.seconds),
                 "--recv-timeout-ms", str(args.recv_timeout_ms),
             ]
+            if args.producer_low_prio_thread is not None and args.producer_low_prio_nice:
+                # Renice ONE specific generator thread DOWN (per-thread nice, inside the producer) — the
+                # "one generator yields to inference under shared-core contention" lever (see producer.hpp).
+                prod_cmd += ["--low-prio-thread", str(args.producer_low_prio_thread),
+                             "--low-prio-nice", str(args.producer_low_prio_nice)]
             if args.producer_cores:
                 # Pin the load generator to the producer cores (disjoint from the server core).
                 prod_cmd = ["taskset", "-c", str(args.producer_cores)] + prod_cmd
+            if args.producer_nice:
+                # Run the producer at a LOWER scheduling priority than the (nice-0) server, so that when
+                # the server's XLA forward and the generators contend for a SHARED core, the generator
+                # yields and the inference thread finishes first — the generators self-throttle to keep
+                # the server fed without starving its compute (nice is graceful/weighted, not the binary
+                # SCHED_IDLE which could starve the feed). Composes outside taskset: nice -n N taskset...
+                prod_cmd = ["nice", "-n", str(args.producer_nice)] + prod_cmd
             try:
                 prod = subprocess.run(
                     prod_cmd, capture_output=True, text=True,
@@ -319,8 +403,10 @@ def _run_one_cell(
             proc.wait(timeout=args.server_stop_timeout_s)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()        # reap so the OS flushes the killed child's remaining writes to the file
             cell.note = (cell.note + " | " if cell.note else "") + "server did not stop on SIGINT; killed"
-        _drain_remaining(proc, server_lines)
+        _drain_remaining(server_log, server_lines)   # process reaped -> all its output is in the file
+        server_log.close()
         try:
             os.unlink(sock_path)
         except FileNotFoundError:
@@ -384,6 +470,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--producer-cores", default=None,
                    help="pin the PRODUCER (load) process to this taskset cpu list, e.g. 1,2,3 "
                         "(default: unpinned). Mirrors the main harness's --producer-cores.")
+    p.add_argument("--producer-nice", type=int, default=0,
+                   help="run the producer at this nice value (0=default). >0 yields to the nice-0 "
+                        "server under shared-core contention, so generators self-throttle to keep the "
+                        "server fed rather than fighting its XLA forward for the core (default: %(default)s).")
+    p.add_argument("--producer-low-prio-thread", type=int, default=None,
+                   help="renice ONE specific generator thread (this index) DOWN inside the producer "
+                        "(per-thread nice). The 'one generator yields, the others run on' lever; needs "
+                        "--producer-low-prio-nice > 0 to take effect (default: none).")
+    p.add_argument("--producer-low-prio-nice", type=int, default=0,
+                   help="the nice value for --producer-low-prio-thread ([-20,19]; >0 = lower priority; "
+                        "default: %(default)s).")
     p.add_argument("--server-ready-timeout-s", type=float, default=120.0,
                    help="max wait for the server READY line, covering XLA warmup (default: %(default)s)")
     p.add_argument("--server-stop-timeout-s", type=float, default=10.0,
@@ -393,6 +490,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(covers calibration + tail-drain; default: %(default)s)")
     p.add_argument("--json-out", default=None,
                    help="write the per-cell records as a JSON array to this path (also stdout always)")
+    p.add_argument("--server-log-dir", default=None,
+                   help="dir for the per-cell server stdout/stderr redirect logs (default: next to "
+                        "--json-out, else a temp dir). The harness tails these for READY + teardown "
+                        "stats; a file sink cannot back-pressure the server (see _ServerLog).")
     return p
 
 
