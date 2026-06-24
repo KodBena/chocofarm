@@ -70,3 +70,40 @@ add_executable(tlab-producer
 )
 target_include_directories(tlab-producer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(tlab-producer PRIVATE zmq_lib Threads::Threads)
+
+# ================================================================================================
+#  THE REAL-GENERATOR LEAF SOURCE (opt-in: -DTLAB_REAL_GENERATOR=ON) — the fork-in-the-road work.
+#  Couples the lab to the PARENT chocofarm_core (env / gumbel / search_runtime / fiber primitives) so
+#  the producer can drive REAL Gumbel-AZ searches as the load, routing each leaf through OUR
+#  tlab::Boundary (NOT the parent's wire client — we keep our near-optimal static coupling and test the
+#  real DYNAMIC leaf-production against it). Gated so the default synthetic build stays standalone /
+#  clean-room (ADR-0012 compose: the real source is an ADDITIVE leaf-source plug, not a replacement).
+#  chocofarm_core is the PREBUILT static lib in the parent cpp/build (rebuild it first if stale:
+#  `cmake --build cpp/build --target chocofarm_core`); boost.context backs the fiber multiplexer.
+# ================================================================================================
+option(TLAB_REAL_GENERATOR "Build the real-generator (chocofarm search) leaf source" OFF)
+if(TLAB_REAL_GENERATOR)
+  get_filename_component(CHOCO_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../.. ABSOLUTE)
+  set(CHOCO_CORE_INCLUDE ${CHOCO_REPO_ROOT}/cpp/include)
+  find_library(CHOCO_CORE_LIB chocofarm_core PATHS ${CHOCO_REPO_ROOT}/cpp/build NO_DEFAULT_PATH)
+  if(NOT CHOCO_CORE_LIB)
+    message(FATAL_ERROR "TLAB_REAL_GENERATOR=ON but libchocofarm_core not found under "
+                        "${CHOCO_REPO_ROOT}/cpp/build — build it: cmake --build cpp/build --target chocofarm_core")
+  endif()
+  # chocofarm_core links nlohmann_json + hiredis + zmq + threads transitively; resolve the ones the
+  # lab does not already carry (hiredis for redis — linked though the lab never uses it; json header-only).
+  find_library(HIREDIS_LIB hiredis)
+  find_package(Boost QUIET COMPONENTS context)
+  if(Boost_FOUND)
+    set(TLAB_BOOST_CONTEXT Boost::context)
+  else()
+    find_library(BOOST_CONTEXT_LIBRARY boost_context REQUIRED)
+    set(TLAB_BOOST_CONTEXT ${BOOST_CONTEXT_LIBRARY})
+  endif()
+
+  # The build-coupling PROOF smoke (run one real SerialRuntime decision over a local DetNet).
+  add_executable(tlab-real-gen-smoke real_gen_smoke.cpp)
+  target_include_directories(tlab-real-gen-smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CHOCO_CORE_INCLUDE})
+  target_link_libraries(tlab-real-gen-smoke PRIVATE
+    ${CHOCO_CORE_LIB} ${TLAB_BOOST_CONTEXT} ${HIREDIS_LIB} zmq_lib Threads::Threads)
+endif()
