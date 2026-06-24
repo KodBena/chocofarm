@@ -33,7 +33,7 @@ The search drives leaf eval through an injected `NetEvaluator` port. Because tha
 A single search is reply-bound (a tree blocks on each leaf's value). The fiber multiplexer runs K trees per thread, keeping K leaves in flight so the server can batch. Result (robust, IQR ~1%): K=1 ≈ K=0 (no overhead), K=128 → **5.8×**; a saturating asymptote, not a mode. The greedy-async refinement was *refuted* (round-sync ≥ greedy) — the bottleneck wasn't pipeline idle.
 
 ### 1d. The first (wrong) bottleneck read
-We saw the server at ~58% matmul and a throughput plateau and concluded: **generator-bound** — the 3 search cores must be saturated, the server starved. **This was an inference, never a measurement.** (See §6, Lesson 1 — it cost the most.)
+We saw the server at ~58% matmul and a throughput plateau and concluded: **generator-bound** — the 3 search cores must be saturated, the server starved. **This was an inference, never a measurement.** (See §4, Lesson 1 — it cost the most.)
 
 ### 1e. The scheduling win — consult → enumerate → control
 On a hunch the server's idle core slack was reclaimable, we commissioned a kernel-scheduler consult (ADR-0014). It diagnosed: this is **EEVDF**, where `nice` is a *share weight*, not a runnability gate — and predicted `SCHED_IDLE` (run only in true idle, yield instantly) would reclaim the slack where `nice` couldn't. We enumerated the process-topology space with a **CP-SAT** model (40 orbit-correct configs, a single-homed config space), swept it, and ran a controlled policy A/B. Verdict (IQR ~0.3%): a `SCHED_IDLE` surplus generator on the server's core, **+18–25%** — exactly as the consult predicted; `nice` +5%, `SCHED_BATCH` −1%. Unprivileged.
@@ -58,17 +58,17 @@ Three orthogonal wins, multiplying: **fibers** (enable batching) × **`SCHED_IDL
 
 ---
 
-## 7. The DPS question (lab leaf-rows/s ↔ episodic decisions/s)
+## 3. The DPS question (lab leaf-rows/s ↔ episodic decisions/s)
 
 Production cares about **DPS**. In the episodic scenario it was **190–210 in practice, with an estimated ceiling of 457** (the search-compute ceiling — DPS with leaf-eval infinitely fast). Do our wins translate?
 
-The arithmetic (conjecture, to validate — §8): at the operating point ~47 leaves/decision, hitting the **457** ceiling needs the eval path to sustain ~457 × 47 ≈ **21.5k leaf-rows/s**; the **190** practice corresponds to only ~9k. Our banked **55k** is ~6× the latter and ~2.5× the ceiling's requirement — i.e. **the eval path is no longer the limiter**. *If* the production gap (190 → 457) was the eval/coupling overhead dragging the search below its compute ceiling — which is exactly the premise that motivated this lab ("the old coupling was tacky/inefficient") — then our ~3× coalescing + scheduling wins attack precisely that, and DPS should rise toward 457.
+The arithmetic (conjecture, to validate — §5): at the operating point ~47 leaves/decision, hitting the **457** ceiling needs the eval path to sustain ~457 × 47 ≈ **21.5k leaf-rows/s**; the **190** practice corresponds to only ~9k. Our banked **55k** is ~6× the latter and ~2.5× the ceiling's requirement — i.e. **the eval path is no longer the limiter**. *If* the production gap (190 → 457) was the eval/coupling overhead dragging the search below its compute ceiling — which is exactly the premise that motivated this lab ("the old coupling was tacky/inefficient") — then our ~3× coalescing + scheduling wins attack precisely that, and DPS should rise toward 457.
 
-**This is an analysis, not a measurement.** It rests on two assumptions the episodic run must confirm: (a) the production bottleneck was the eval/transport (not the search compute or a different coupling fault), and (b) the LPD operating point. That measurement is §8.
+**This is an analysis, not a measurement.** It rests on two assumptions the episodic run must confirm: (a) the production bottleneck was the eval/transport (not the search compute or a different coupling fault), and (b) the LPD operating point. That measurement is §5.
 
 ---
 
-## 6. Lessons (the part worth keeping)
+## 4. Lessons (the part worth keeping)
 
 1. **Don't infer a bottleneck regime — measure it directly.** "Generator-bound" was inferred from an underfed server's *matmul %*; we never measured generator-core util. It was wrong, and it framed days of work. The fix is one `cat /proc/stat` away. *A throughput plateau tells you there's a wall; it does not tell you which wall.*
 2. **A surprising result needs an auditable, scriptable toggle that isolates ONE variable.** The maintainer's demand — a fixed `scenario_audit.py` flipping only `-march=native` — refuted my causal claim immediately and surfaced the §1 mislabel. Surprises must come with a reproducible proof, or they're lost to oblivion.
@@ -81,7 +81,7 @@ The arithmetic (conjecture, to validate — §8): at the operating point ~47 lea
 
 ---
 
-## 8. Open / next
+## 5. Open / next
 
 **Test `control_lab` under the bursty (episodic) regime** — the one experiment that closes the dynamic-control question *and* validates the DPS translation:
 - Build the episodic/no-early-exit workload (real episodes, state evolving, early-exit on/off).
