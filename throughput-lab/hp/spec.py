@@ -408,29 +408,31 @@ ADAPTER = "docs/design/cpp-eval-transport-adapter.md"
 # ==================================================================================================
 # THE SSOT REGISTRY
 # ==================================================================================================
-# --- TOPOLOGY surface: the scheduling/placement vocabulary hoisted from topology_enum.py ----------
+# --- TOPOLOGY surface: the scheduling/placement vocabulary (single home: hp/relations.py) ----------
 # The topology placement/policy space is structural (a joint permutation group over isolated cores x
-# generators) and lives mostly in relations.py (PlacementConstraints). The per-class SCHED-policy
-# vocabularies are the HParams here: each names the enum domain and its measured effect. The home is
-# topology_enum.py (the prior single home being hoisted into the SSOT).
-TOPO_FILE = "throughput-lab/harness/topology_enum.py"
+# generators) and lives in relations.py (PlacementConstraints + the per-role policy vocabularies).
+# The per-class SCHED-policy vocabularies are the HParams here: each names the enum domain and its
+# measured effect, and cites its `home` = the (policy, nice, latency_nice) table in relations.py (the
+# single home — ADR-0012 P1). The standalone harness/topology_enum.py CONSUMES this home; it no longer
+# re-authors the tables, so the citation points at the real producer of the values, not at the tool.
+POLICY_HOME = "throughput-lab/hp/relations.py"  # the single home of the policy triples
 
 _TOPOLOGY: list[HParam] = [
     HParam(
         name="server_policy", concept="sched_policy",
         surfaces=frozenset({Surface.TOPOLOGY}), kind=Kind.SCHEDULING,
-        home=PyField(TOPO_FILE, "SERVER_POLICIES"),
+        home=PyField(POLICY_HOME, "SERVER_POLICIES"),
         domain=EnumSet(("SCHED_OTHER_LATNICE", "SCHED_OTHER")),
         default="SCHED_OTHER_LATNICE",
         symmetry=Free(),
         effect=Unknown("OTHER_LATNICE modeled as a null-testable server option; no measured verdict"),
         bindings=(Binding(Surface.TOPOLOGY, flag="server_pol",
-                          home=PyField(TOPO_FILE, "SERVER_POLICIES")),),
+                          home=PyField(POLICY_HOME, "SERVER_POLICIES")),),
     ),
     HParam(
         name="gen_policy", concept="sched_policy",
         surfaces=frozenset({Surface.TOPOLOGY}), kind=Kind.SCHEDULING,
-        home=PyField(TOPO_FILE, "GEN_POLICIES"),
+        home=PyField(POLICY_HOME, "GEN_POLICIES"),
         domain=EnumSet(("SCHED_OTHER", "SCHED_BATCH")),
         default="SCHED_OTHER",
         # A SINGLE uniform knob applied to ALL generators: the generators are interchangeable, so
@@ -439,30 +441,35 @@ _TOPOLOGY: list[HParam] = [
         effect=Measured("-", "SCHED_BATCH -1% vs OTHER (surplus_policy_control A/B)",
                         EvidenceRef(JOURNEY, "1e/2")),
         bindings=(Binding(Surface.TOPOLOGY, flag="gen_pol",
-                          home=PyField(TOPO_FILE, "GEN_POLICIES")),),
+                          home=PyField(POLICY_HOME, "GEN_POLICIES")),),
     ),
     HParam(
         name="surplus_policy", concept="sched_policy",
         surfaces=frozenset({Surface.TOPOLOGY}), kind=Kind.SCHEDULING,
-        home=PyField(TOPO_FILE, "SURPLUS_POLICIES"),
+        home=PyField(POLICY_HOME, "SURPLUS_POLICIES"),
         domain=EnumSet(("SCHED_IDLE", "SCHED_BATCH")),
         default="SCHED_IDLE",
         symmetry=Free(),
         effect=Measured("+", "SCHED_IDLE surplus on server core +18-25%; nice/BATCH weaker",
                         EvidenceRef(JOURNEY, "1e/2")),
         bindings=(Binding(Surface.TOPOLOGY, flag="surplus_pol",
-                          home=PyField(TOPO_FILE, "SURPLUS_POLICIES")),),
+                          home=PyField(POLICY_HOME, "SURPLUS_POLICIES")),),
     ),
     HParam(
         name="surplus_present", concept="surplus_present",
         surfaces=frozenset({Surface.TOPOLOGY}), kind=Kind.SCHEDULING,
-        home=PyField(TOPO_FILE, "surplus_present"),
+        # surplus_present is a structural ENUMERATION axis (the 0/1 bool the placement model ranges
+        # over), not a value with a code-home literal: no struct field / argparse default authors it.
+        # Its default False is the "absent" baseline. NoCodeHome is the sanctioned case for a literal
+        # default with no static line (DESIGN.md §1.4); named, not buried.
+        home=NoCodeHome("surplus_present is an enumeration axis (0/1); no code-home literal — the "
+                        "default False is the absent baseline the placement model spans"),
         domain=Bool(), default=False,
         symmetry=Free(),
         effect=Measured("+", "present + SCHED_IDLE on server core = +18-25%",
                         EvidenceRef(JOURNEY, "1e/2")),
         bindings=(Binding(Surface.TOPOLOGY, flag="surplus_present",
-                          home=PyField(TOPO_FILE, "surplus_present")),),
+                          home=NoCodeHome("enumeration axis; no code-home literal")),),
     ),
 ]
 

@@ -10,11 +10,16 @@ FLOOR (the P7-strongest "generate-from-one-source" extractor is a filed deferral
 Coverage by SourceRef kind:
   - CppField : parse `<type> <field> = <value>;` in the cited .hpp.
   - PyArg    : parse the argparse `--flag` (dest) default in the cited .py.
-  - PyField  : a per-role policy tuple (SERVER_POLICIES/...): assert the descriptor default equals
-               the FIRST entry's SchedPolicy string (the index-0 default the model uses).
+  - PyField  : a per-role policy table (SERVER_POLICIES/GEN_POLICIES/SURPLUS_POLICIES) in the SINGLE
+               HOME hp/relations.py: assert the descriptor's domain (the enum of policy strings, in
+               order) and default (index-0 policy string) agree with the home, AND — the extended
+               guard — assert the home's FULL (policy, nice, latency_nice) triples match the canonical
+               reference, so a nice/latency_nice drift (e.g. `nice 10->99`) is caught, not just a
+               policy-string drift.
   - NoCodeHome: skipped (the only case a literal default is sanctioned; named, not buried).
 
-An INJECTED drift (a wrong default) must be CAUGHT — proving the lint is not vacuous.
+An INJECTED drift (a wrong default, OR a wrong nice/latnice in the home triples) must be CAUGHT —
+proving the lint is not vacuous.
 
 Run:
     PYTHONPATH=throughput-lab /home/bork/w/vdc/venvs/generic/bin/python -m pytest \
@@ -105,32 +110,57 @@ def _py_arg_default(file: str, dest: str):
     raise AssertionError(f"could not find argparse dest {dest!r} default in {file}")
 
 
-def _py_policy_first(file: str, symbol: str) -> str:
-    """For a per-role policy tuple (SERVER_POLICIES etc.) OR the surplus_present bool: return the
-    index-0 default the topology model uses."""
-    if symbol == "surplus_present":
-        return False  # the enumerated bool; default absent
+def _read_policy_triples(file: str, symbol: str):
+    """Read a per-role policy table (SERVER_POLICIES / GEN_POLICIES / SURPLUS_POLICIES) from the
+    SINGLE HOME (hp/relations.py) as a list of FULL (policy:str, nice:int|None, latency_nice:int|None)
+    triples. The relations.py tables are tuples of literals (string + ints/None), so a literal_eval of
+    the assignment RHS recovers them exactly — including nice/latency_nice, so a `nice 10->99` drift is
+    caught (the prior lint only looked at the index-0 policy string)."""
     text = _read(file)
     tree = ast.parse(text)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
+        # `SYMBOL: <annotation> = (...)`  or  `SYMBOL = (...)`
+        target_name = None
+        value = None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target_name, value = node.target.id, node.value
+        elif isinstance(node, ast.Assign):
             for t in node.targets:
-                if isinstance(t, ast.Name) and t.id == symbol:
-                    # the value is a list of tuples whose first elem is `SchedPolicy.X`.
-                    first = node.value.elts[0]                # type: ignore[attr-defined]
-                    polattr = first.elts[0]                   # SchedPolicy.OTHER_LATNICE
-                    # render SchedPolicy.NAME -> the enum's .value via the SchedPolicy class.
-                    name = polattr.attr                       # type: ignore[attr-defined]
-                    return _sched_value(text, name)
-    raise AssertionError(f"could not find policy tuple {symbol!r} in {file}")
+                if isinstance(t, ast.Name):
+                    target_name, value = t.id, node.value
+        if target_name == symbol and value is not None:
+            triples = ast.literal_eval(value)   # tuple of (str, int|None, int|None) tuples
+            return [tuple(t) for t in triples]
+    raise AssertionError(f"could not find policy table {symbol!r} in {file}")
 
 
-def _sched_value(text: str, member: str) -> str:
-    """Resolve SchedPolicy.<member> to its string value from the enum definition in the same file."""
-    m = re.search(rf"\b{member}\s*=\s*\"([^\"]+)\"", text)
-    if not m:
-        raise AssertionError(f"could not resolve SchedPolicy.{member}")
-    return m.group(1)
+def _py_policy_first(file: str, symbol: str):
+    """The index-0 default the topology model uses: for a per-role policy table, the FIRST triple's
+    policy string; for the surplus_present bool, False. (Used for the descriptor.default check.)"""
+    if symbol == "surplus_present":
+        return False  # the enumerated bool; default absent
+    return _read_policy_triples(file, symbol)[0][0]
+
+
+# The canonical (policy, nice, latency_nice) triples the SSOT semantically commits to — the auditable
+# second witness that makes the FULL-triple guard non-vacuous (relations.py is the sole code home, so
+# the lint needs an independent reference to drift against; this fixture IS that reference, named here
+# in the test, not buried). A change to relations.py's nice/latnice values WITHOUT a matching change
+# here fails the lint loudly (e.g. the `nice 10->99` injection the brief calls for).
+_EXPECTED_POLICY_TRIPLES = {
+    "SERVER_POLICIES": [
+        ("SCHED_OTHER_LATNICE", None, -20),
+        ("SCHED_OTHER", 0, None),
+    ],
+    "GEN_POLICIES": [
+        ("SCHED_OTHER", 0, None),
+        ("SCHED_BATCH", 0, None),
+    ],
+    "SURPLUS_POLICIES": [
+        ("SCHED_IDLE", None, None),
+        ("SCHED_BATCH", 10, None),
+    ],
+}
 
 
 def _py_field_value(file: str, symbol: str):
@@ -203,3 +233,54 @@ def test_lint_catches_injected_drift():
     assert wrong != expected
     # simulate a descriptor that copied a wrong literal:
     assert wrong != _home_value(bad_home), "injected drift not detectable (lint would be vacuous)"
+
+
+# --- the EXTENDED guard: the FULL (policy, nice, latency_nice) triples of the single home ----------
+RELATIONS = "throughput-lab/hp/relations.py"
+
+
+@pytest.mark.parametrize("symbol", sorted(_EXPECTED_POLICY_TRIPLES))
+def test_relations_policy_triples_match_reference(symbol):
+    """The single home (hp/relations.py) must carry exactly the canonical FULL triples — every field,
+    including nice and latency_nice. Catches a `nice 10->99` (or any nice/latnice) drift the prior
+    first-policy-string-only lint missed."""
+    home_triples = _read_policy_triples(RELATIONS, symbol)
+    expected = _EXPECTED_POLICY_TRIPLES[symbol]
+    assert home_triples == expected, (
+        f"DRIFT in the single home {RELATIONS}::{symbol}: home={home_triples} but the canonical "
+        f"reference says {expected} (ADR-0012 P1: the (policy, nice, latency_nice) triples have ONE "
+        f"home; a nice/latency_nice change must be a deliberate edit to the reference too)")
+
+
+@pytest.mark.parametrize("hp_name,symbol", [
+    ("server_policy", "SERVER_POLICIES"),
+    ("gen_policy", "GEN_POLICIES"),
+    ("surplus_policy", "SURPLUS_POLICIES"),
+])
+def test_descriptor_domain_agrees_with_home_policy_strings(hp_name, symbol):
+    """The SSOT descriptor's EnumSet domain (policy strings, in index order) must equal the policy
+    strings of the single home's triples — so the descriptor's view of the vocabulary cannot silently
+    diverge from relations.py (the home), in order or membership."""
+    reg = spec.registry()
+    p = reg[hp_name]
+    assert isinstance(p.domain, spec.EnumSet), f"{hp_name} domain is not an EnumSet"
+    home_strings = tuple(t[0] for t in _read_policy_triples(RELATIONS, symbol))
+    assert p.domain.values == home_strings, (
+        f"DRIFT: {hp_name} domain {p.domain.values} != home {RELATIONS}::{symbol} policy strings "
+        f"{home_strings} (ADR-0012 P1)")
+
+
+def test_full_triple_lint_catches_injected_nice_drift():
+    """Non-vacuity for the EXTENDED guard: a `nice 10->99` drift in SURPLUS_POLICIES MUST be caught.
+    We simulate the drift in-memory (the read-back triples with the second entry's nice mutated) and
+    assert the reference comparison fails — proving the full-triple lint is fail-loud (ADR-0002)."""
+    home = _read_policy_triples(RELATIONS, "SURPLUS_POLICIES")
+    # the live home currently agrees with the reference (guarded by the test above):
+    assert home == _EXPECTED_POLICY_TRIPLES["SURPLUS_POLICIES"]
+    # inject nice 10 -> 99 on the BATCH-at-nice surplus entry:
+    drifted = list(home)
+    pol, nice, lat = drifted[1]
+    assert nice == 10
+    drifted[1] = (pol, 99, lat)
+    assert drifted != _EXPECTED_POLICY_TRIPLES["SURPLUS_POLICIES"], (
+        "injected nice drift not detectable — the full-triple lint would be vacuous")

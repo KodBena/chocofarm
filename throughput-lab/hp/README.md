@@ -98,7 +98,7 @@ The full test suite (run from the repo root, note the PYTHONPATH):
 ```bash
 cd /home/bork/w/vdc/1/chocofarm-hpdsl
 PYTHONPATH=throughput-lab /home/bork/w/vdc/venvs/generic/bin/python -m pytest throughput-lab/hp/tests/ -q
-#   -> 25 passed
+#   -> 31 passed
 ```
 
 `--verify` runs both oracles plus the inertness self-check and **returns non-zero (exit 3),
@@ -250,38 +250,35 @@ failed (severity major) and is recorded here as a known limitation, not hidden.
    applies here too, minor, disclosed.)
 
 5. **All new source/test files carry the ADR-0006 header** (path + purpose + Public Domain),
-   verified per-file. 25/25 tests pass.
+   verified per-file. 31/31 tests pass.
 
 ### What does NOT work / known limitations
 
-1. **`topology_enum.py` is not yet refactored to *consume* the SSOT — it is still a second author
-   of the topology config space (FAILED check, severity MAJOR).** This is the ADR-0012 one-home
-   audit failure, recorded here in full rather than hidden:
-   - The topology scheduling-policy vocabulary is re-authored in **two** homes with identical
-     triples `(policy, nice, latency_nice)`:
-     `harness/topology_enum.py` (`SERVER/GEN/SURPLUS_POLICIES`) **and**
-     `hp/relations.py` (`SERVER/GEN/SURPLUS_POLICIES`).
-   - The production enumerator **derives from the duplicate, not from the cited home.** `spec.py`
-     names `topology_enum.py` as the home (`PyField(TOPO_FILE, "SERVER_POLICIES")`), but
-     `compile.py` and `topology_materialize.py` read the `relations.py` copy
-     (`rel.SERVER_POLICIES[...]`), building placements (including nice/latency_nice) from it. No
-     production `hp/` module imports `topology_enum` — only `test_topology_parity.py` does, as a
-     referee. This is exactly the DESIGN.md §10 falsifiable-claim #3 failure mode.
-   - The drift lint does **not** guard this duplicate: `test_ssot_drift.py` checks only the
-     descriptor's first-entry policy *string* against `topology_enum.py`; it ignores
-     nice/latency_nice, the 2nd entries, and `relations.py` entirely. Injecting `nice 10→99` into
-     `relations.py SURPLUS_POLICIES` left the drift lint **passing**; the drift is caught only by
-     `test_topology_parity.py`'s placement comparison, and only at the default 4/3 substrate.
-   - The topology **constraint model** also has two authors: `topology_enum.py` still contains its
-     full CP-SAT model and policy tables (and its docstring still claims to be the single home),
-     while `compile.py::_compile_topology` independently hand-reconstructs the same R1–R4/S1 model
-     in IR.
-   - *Why this is "major" but not a correctness defect today:* the two authors currently agree
-     (the parity gate passes, bit-for-bit at 4c/3g), so the enumeration is correct. The defect is
-     the one this whole exercise exists to cure — a second home that *can* drift. DESIGN.md §8
-     step 9 ("refactor `topology_enum.py` to consume the SSOT") is the last, unexecuted phase of
-     the build plan; it was gated on "only after the parity gate passes," and the parity gate now
-     passes, so the gate to do this work is open.
+1. **RESOLVED 2026-06-24 — `topology_enum.py` now *consumes* the SSOT (the topology config space is
+   single-homed).** This entry previously recorded the ADR-0012 one-home MAJOR failure; it has been
+   closed (DESIGN.md §8 step 9). The closure, for the record:
+   - The `(policy, nice, latency_nice)` triples now have ONE home: `hp/relations.py`
+     (`SERVER/GEN/SURPLUS_POLICIES`). `harness/topology_enum.py` no longer authors them — it
+     imports the tables (and the model) from `hp/`. The standalone tool deleted its own CP-SAT
+     model and policy tables; its `build_and_enumerate` now calls
+     `compile(Target(TOPOLOGY))` → `cpsat.enumerate_configs` → `topology_materialize.materialize`
+     (the same path the hp CLI uses), re-sorting to its historical emission order so `configs.json`
+     stays bit-for-bit identical.
+   - `spec.py`'s `server/gen/surplus_policy` descriptors now cite the real home
+     (`PyField(POLICY_HOME="throughput-lab/hp/relations.py", "SERVER_POLICIES")`), not the tool —
+     so the cited home is the one production reads (DESIGN.md §10 falsifiable-claim #3 satisfied).
+     `surplus_present` was reclassified to `NoCodeHome` (it is an enumeration axis, not a code-home
+     literal — the prior `PyField(topology_enum, "surplus_present")` citation pointed at a CP-SAT
+     var that no longer exists).
+   - The drift lint (`test_ssot_drift.py`) was extended to guard the **FULL** triples (policy +
+     nice + latency_nice) of the single home against a canonical in-test reference, plus a
+     descriptor-domain↔home agreement check. Demonstrated fail-loud: injecting `nice 10→99` into
+     `relations.py SURPLUS_POLICIES` now FAILS the lint (2 failed); reverted, 19 pass.
+   - `topology_enum.py`'s docstring no longer claims to be the single home (it states it is a
+     consumer). `verify_orbits` is kept as the tool's Oracle A; the pure `_canonical_key` is kept
+     only as the parity test's neutral referee.
+   - Parity is preserved bit-for-bit at 4c/3g (40 configs) and as an orbit-partition at 5c/3g; both
+     oracles green via `hp.cli --verify` (topology 40/40, overcommit 96/96).
 
 2. **The STATIC_LAB surface is scaffolded but empty.** The `variant` axis, bindings, and
    `Surface.STATIC_LAB` exist, but no per-HP descriptors are declared, so `--select static_lab`
@@ -290,9 +287,12 @@ failed (severity major) and is recorded here as a known limitation, not hidden.
    The two surfaces the brief named as acceptance targets (topology reproduction + overcommit
    selection) are complete and verified.
 
-3. **`mypy --strict` (DESIGN.md §8 step 1) was not run** — mypy is not installed in the venv. Types
-   are authored strict-friendly (frozen dataclasses, typed unions) and verified by runtime +
-   `py_compile` + the test suite, but the static gate could not be executed.
+3. **`mypy --strict` (DESIGN.md §8 step 1) is not clean across the package.** *(Corrected 2026-06-24:
+   the earlier "mypy is not installed" was wrong — mypy 2.1.0 IS in the venv and runs.)* Running
+   `MYPYPATH=. mypy --strict hp/` reports **69 errors in 10 files**, predominantly missing annotations
+   in `hp/tests/` (`no-untyped-def`, `type-arg`). The value/structure core (`spec.py`, `relations.py`)
+   is strict-friendly (frozen dataclasses, typed unions), but the package as a whole does not yet pass
+   the step-1 gate — a follow-on cleanup, not a correctness issue (runtime + the 31-test suite are green).
 
 4. **The C++/argparse default *extractor* (the P7-strongest "generate-from-one-source") is the
    filed deferral; v1 ships the P7 lint floor** (`test_ssot_drift.py`). This is the disclosed floor
