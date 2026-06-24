@@ -26,16 +26,22 @@ EP="ipc:///tmp/tlab-edps-$$.sock"; rm -f "${EP#ipc://}"; LOG="$(mktemp -t tlab-e
 # overlap), but a CLEAN +15% at the lean ladder below (greedy MIN > round-sync MAX) where the fast server
 # is coupling/RTT-limited. Greedy still wins-or-ties everywhere, so it stays the default. Pass `round-sync`
 # as $5 for the baseline arm.
-# DEFAULT K=256 (banked, journey doc Witness 3): the bridge-the-2x attribution found the tlab/overcommit
-# leaf-rows/s gap was producer batch-FILL, not compute. K=128 underfilled the 256 bucket (147 real, 58%);
-# K=256 fills it (210 real, 82%) -> +27% (74k->95k leaf-rows/s), landing in overcommit's efficient regime
-# at HIGHER util (78.8% vs ~71%). Pass K=128 as $1 for the old underfilled arm.
-K="${1:-256}"; S="${2:-14}"; NSIMS="${3:-256}"; MSG_ROWS="${4:-128}"; DRIVER="${5:-greedy}"; INFLIGHT="${6:-8}"
+# DEFAULT K=1024 MSG_ROWS=256 (banked by the HP SWEEP, DB finding #17): the producer-HP optimum on the single-
+# thread one-pull stack. K is the big lever -- a bigger fiber pool fills bigger server batches; K=1024 is the
+# KNEE (256->1024 = +~25%, ~100k->~125k; K=2048/4096 plateau). MSG_ROWS=256 (max coalescing -> fills the 256
+# max-batch) beats 128, but ONLY with K>=1024 to supply it (K=256/MSG=256 STARVES the server, util 47%). The
+# wall is the ~69% single-core serve-loop ceiling (findings #10/#11) -> ~125k is near the single-core max; more
+# throughput needs a 2nd core, not HP. (Earlier K=256/MSG=128 was Witness 3's banked best; superseded.) Pass
+# K/MSG_ROWS as $1/$4 for other arms; the 512-ladder (WARMUP/MAXBATCH) is +1-2% only.
+K="${1:-1024}"; S="${2:-14}"; NSIMS="${3:-256}"; MSG_ROWS="${4:-256}"; DRIVER="${5:-greedy}"; INFLIGHT="${6:-8}"
+# SINGLE_THREAD defaults ON (banked, finding #5: single-thread serve path +7.8% vs the two-thread split on one
+# pinned core). Unset => single-thread; pass SINGLE_THREAD= (explicit empty) for the two-thread arm.
+SINGLE_THREAD="${SINGLE_THREAD-1}"
 # Server bucket ladder (the snap-up policy; server reads the warmed set back from the forward -> one home).
-# DEFAULT = {64,256}/max-256 (banked, Witness 3): with K=256 the producer fills the 256 bucket, so CAPPING
-# at 256 (no 512) forbids the wasteful 512-spill (a ~210-row gather padded to 512 = 41% fill, a slower
-# forward for no gain). max-256 + K=256 = the well-filled efficient regime; +27% over the old K=128 banked
-# config, every replicate. (Earlier Witness 2 banked the lean {64,256,512}/512 ladder over the old
+# DEFAULT = {64,256}/max-256 (banked): with K=1024 + MSG_ROWS=256 the producer pins the 256 bucket every
+# forward (rows/fwd=256), so CAPPING at 256 (no 512) forbids the wasteful 512-spill (the HP sweep, finding #17,
+# confirmed the 512-ladder is +1-2% only — the maintainer's "last lever", minor). max-256 is the well-filled
+# efficient regime. (Earlier Witness 2 banked the lean {64,256,512}/512 ladder over the old
 # [1,8,64,512,4096] pad-tax ladder -- +25-37%; this refines it.) Override WARMUP/MAXBATCH for other arms.
 WARMUP="${WARMUP:-64,256}"; MAXBATCH="${MAXBATCH:-256}"
 # FORWARD selects the server compute backend: jax (default; XLA-jit + bucket ladder) | numpy (forward_core
