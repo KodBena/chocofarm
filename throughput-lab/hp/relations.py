@@ -38,10 +38,12 @@ class Partition:
 
 # ==================================================================================================
 # TOPOLOGY placement model — the substrate + the per-role policy vocabularies + R1-R4.
-# These mirror topology_enum.py EXACTLY (the hoist must not change the space — DESIGN.md §6).
-# The policy vocabularies are (SchedPolicy, nice, latency_nice) triples, index i <-> the i-th entry,
-# matching topology_enum.SERVER_POLICIES / GEN_POLICIES / SURPLUS_POLICIES order so the enumerated
-# config_ids match bit-for-bit.
+# This is the SINGLE HOME (ADR-0012 P1) for the per-role scheduling-policy vocabularies; both the
+# compiler (compile.py / topology_materialize.py) AND the standalone topology_enum.py CONSUME these
+# (topology_enum.py no longer authors them — DESIGN.md §6/§8 step 9). The policy vocabularies are
+# (SchedPolicy, nice, latency_nice) triples, index i <-> the i-th entry; the historical order is
+# preserved here so the standalone tool's enumerated config_ids stay bit-for-bit unchanged. The
+# drift lint (tests/test_ssot_drift.py) guards the full triples against silent edits.
 # ==================================================================================================
 SERVER_POLICIES: tuple[tuple[str, Optional[int], Optional[int]], ...] = (
     ("SCHED_OTHER_LATNICE", None, -20),
