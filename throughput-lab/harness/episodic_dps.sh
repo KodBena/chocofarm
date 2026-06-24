@@ -38,6 +38,11 @@ K="${1:-256}"; S="${2:-14}"; NSIMS="${3:-256}"; MSG_ROWS="${4:-128}"; DRIVER="${
 # config, every replicate. (Earlier Witness 2 banked the lean {64,256,512}/512 ladder over the old
 # [1,8,64,512,4096] pad-tax ladder -- +25-37%; this refines it.) Override WARMUP/MAXBATCH for other arms.
 WARMUP="${WARMUP:-64,256}"; MAXBATCH="${MAXBATCH:-256}"
+# FORWARD selects the server compute backend: jax (default; XLA-jit + bucket ladder) | numpy (forward_core
+# in numpy -- NO XLA per-call dispatch overhead, NO pad). The A/B arm for the XLA-overhead hypothesis; numpy
+# wants single-thread BLAS (OMP_NUM_THREADS=1) on the one pinned core.
+FORWARD="${FORWARD:-jax}"
+SRVENV=""; [ "$FORWARD" = numpy ] && SRVENV="OMP_NUM_THREADS=1"
 # ADR-0011 (mechanize the finding): stamp EVERY reading with the exact code state so an attributed number
 # is always time-travellable. commit = HEAD short hash; tree = clean|dirty (dirty => the producer binary /
 # harness may not match HEAD, so the reading is NOT a reproducible artifact until committed). The maintainer's
@@ -49,9 +54,9 @@ for b in "$PROD" "$W"; do [ -x "$b" ] || { echo "missing $b (build -DTLAB_REAL_G
 
 # SINGLE_THREAD (env, non-empty) serves on ONE thread (the production InferenceServer model) instead of the
 # two-thread IO/compute split -- the A/B arm for the two-thread-on-one-core contention test (tlab_finding #4).
-PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
+$SRVENV PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
   --in-dim 241 --n-actions 65 --hidden 256 --max-batch "$MAXBATCH" --warmup "$WARMUP" \
-  --poll-timeout-ms 50 ${SINGLE_THREAD:+--single-thread} >"$LOG" 2>&1 & SRV=$!
+  --poll-timeout-ms 50 ${SINGLE_THREAD:+--single-thread} --forward "$FORWARD" >"$LOG" 2>&1 & SRV=$!
 cleanup(){ kill -INT "$SRV" 2>/dev/null||true; sleep 1; kill "$SRV" 2>/dev/null||true; rm -f "${EP#ipc://}"; }
 trap cleanup EXIT
 for _ in $(seq 1 240); do grep -q READY "$LOG" && break; sleep 0.5; done
@@ -81,7 +86,7 @@ UTIL=$(grep -oE '\([0-9.]+% of wall\)' "$LOG"|grep -oE '[0-9.]+'|head -1)
 # server_impl carries the threading ARM (single-thread vs two-thread). This is an ARTIFACT/treatment facet,
 # NOT a hyperparameter: it is an A/B between server designs resolved by deleting the loser, not a knob tuned
 # to a shipped optimum -- so it lives in provenance (server_impl), never in the hp/ SSOT (ADR-0008 classify).
-SERVER_IMPL="tlab-server.py:$([ -n "${SINGLE_THREAD:-}" ] && echo single-thread || echo two-thread)"
+SERVER_IMPL="tlab-server.py:$([ -n "${SINGLE_THREAD:-}" ] && echo single-thread || echo two-thread):$FORWARD"
 echo "EPISODIC-STATIC [commit=$GIT_COMMIT tree=$GIT_TREE] (sims${NSIMS}/m24, no-early-exit, 3 gens + IDLE surplus, driver=$DRIVER inflight=$INFLIGHT, msg-rows=$MSG_ROWS, ladder=[$WARMUP] max-batch=$MAXBATCH, K=$K, server=$SERVER_IMPL, ${S}s)"
 echo "  decisions=$dec  ->  DPS = $((dec/S))"
 echo "  leaves=$lv  ->  leaf-rows/s = $((lv/S))   LPD ~= $((lv/(dec>0?dec:1)))"

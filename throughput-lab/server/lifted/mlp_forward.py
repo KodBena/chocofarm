@@ -36,6 +36,7 @@ Public Domain (The Unlicense).
 from __future__ import annotations
 
 import bisect
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -95,6 +96,92 @@ def _forward_both(params: dict[str, Any], x: Any, ym: Any, ys: Any) -> tuple[Any
     return v, logits
 
 
+def _random_params(in_dim: int, hidden: int, n_actions: int, residual: bool, seed: int) -> dict[str, Any]:
+    """Build a RANDOM net's flat param dict of the live geometry (the ONE home for both the JAX and numpy
+    forwards' random_net — ADR-0012 P1, never two param-builders that could drift). Glorot-ish small normals
+    keep the forward finite under float32; the testbed reads only the SHAPES, never the values."""
+    rng = np.random.default_rng(seed)
+
+    def w(rows: int, cols: int) -> npt.NDArray[np.floating]:
+        return (rng.standard_normal((rows, cols)) / np.sqrt(rows)).astype(DTYPE)
+
+    def b(n: int) -> npt.NDArray[np.floating]:
+        return np.zeros(n, dtype=DTYPE)
+
+    params: dict[str, Any] = {"W1": w(in_dim, hidden), "b1": b(hidden),
+                              "W2": w(hidden, hidden), "b2": b(hidden)}
+    if residual:
+        params.update({"Wr1": w(hidden, hidden), "br1": b(hidden),
+                       "Wr2": w(hidden, hidden), "br2": b(hidden)})
+    params["Wv"] = w(hidden, 1)
+    params["bv"] = b(1)
+    if n_actions > 0:
+        params["Wp"] = w(hidden, n_actions)
+        params["bp"] = b(n_actions)
+    return params
+
+
+class NumpyMlpForward:
+    """A pure-NUMPY forward of `forward_core` (xp=np) — the SAME graph MlpForward runs on JAX, but with NO XLA
+    dispatch and NO bucket/pad (numpy forwards the exact gathered row count directly). The A/B arm testing
+    whether XLA-CPU's per-call dispatch overhead (measured ~1.35 ms in-serve for a ~20 M-flop MLP — pure
+    launch latency, not arithmetic) is the serve-forward-envelope bottleneck. Mirrors MlpForward's
+    construction/`pack`/`forward_batch` seam so the server (server.py) can hold either one interchangeably
+    (cfg.forward_impl). `pack` is the identity (numpy needs no warmed shape); `warmup` only records the
+    ladder for the READY line; `forward_batch` runs forward_core over the REAL rows — no pad tax at all."""
+
+    def __init__(self, params: dict[str, Any], y_mean: float, y_std: float) -> None:
+        self.params: dict[str, Any] = {k: np.asarray(v, dtype=DTYPE) for k, v in params.items()}
+        self.ym = np.asarray(y_mean, dtype=DTYPE)
+        self.ys = np.asarray(y_std, dtype=DTYPE)
+        self.in_dim = int(params["W1"].shape[0])
+        self.hidden = int(params["W1"].shape[1])
+        self.has_policy = "Wp" in params
+        self.n_actions = int(params["Wp"].shape[1]) if self.has_policy else 0
+        self.has_residual = "Wr1" in params
+        self._warmed_ladder: tuple[int, ...] = ()
+        self._warmed_set: frozenset[int] = frozenset()
+
+    @classmethod
+    def random_net(cls, *, in_dim: int = 241, hidden: int = 256, n_actions: int = 0,
+                   residual: bool = False, seed: int = 0) -> "NumpyMlpForward":
+        return cls(_random_params(in_dim, hidden, n_actions, residual, seed), y_mean=0.0, y_std=1.0)
+
+    def warmup(self, batch_sizes: "list[int]", in_dim: int) -> None:
+        """No compile to warm (numpy has no per-shape kernel) — just record the ladder for the READY line and
+        validate the geometry, so the server's warmup call is uniform across forward impls."""
+        if in_dim != self.in_dim:
+            raise ValueError(f"warmup in_dim {in_dim} != net in_dim {self.in_dim} (geometry mismatch)")
+        self._warmed_ladder = tuple(sorted(set(batch_sizes)))
+        self._warmed_set = frozenset(self._warmed_ladder)
+
+    @property
+    def warmed_sizes(self) -> "list[int]":
+        return list(self._warmed_ladder)
+
+    def pack(self, X: "npt.NDArray[np.floating]") -> PaddedBatch:
+        """Identity-pack: numpy forwards any row count, so there is NO bucket/pad — return the REAL rows
+        (wrapped in PaddedBatch for the server's uniform seam; n_real == the row count, no pad tail)."""
+        a = np.ascontiguousarray(X, dtype=DTYPE)
+        return PaddedBatch(x=a, n_real=int(a.shape[0]))
+
+    def forward_batch(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None]):
+        """forward_core in numpy over the real rows (no pad). Returns (de-standardized values, raw logits)."""
+        v_std, logits = forward_core(self.params, batch.x, np)
+        v = (v_std * self.ys + self.ym).astype(np.float32)
+        logits_np = logits.astype(np.float32) if logits is not None else None
+        return v, logits_np
+
+    def forward_batch_timed(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None, tuple[float, float, float]]):
+        """Phase-split shim for cfg.profile_forward: numpy has no host<->device transfer, so it is all
+        'compute' (h2d=0, d2h=0) — the matmul stack timed as one phase."""
+        t0 = time.monotonic()
+        v, logits_np = self.forward_batch(batch)
+        return v, logits_np, (0.0, time.monotonic() - t0, 0.0)
+
+
 class MlpForward:
     """JAX-jit inference wrapper over `forward_core` — the server's compute stage.
 
@@ -133,31 +220,7 @@ class MlpForward:
         VALUES, only times the SHAPES). `n_actions == 0` omits the policy head (value-only, "Wp"
         absent); `residual=True` adds the keyed residual block ("Wr1"..). y_mean/y_std are the
         identity de-standardization (0, 1) — the value is meaningless in the lab, the matmul is not."""
-        rng = np.random.default_rng(seed)
-
-        def w(rows: int, cols: int) -> npt.NDArray[np.floating]:
-            # small-scale normal so a deep-ish ReLU stack stays finite under float32 (not a trained
-            # init — just a finite one); std = 1/sqrt(fan_in) is the usual stabilising scale.
-            return (rng.standard_normal((rows, cols)) / np.sqrt(rows)).astype(DTYPE)
-
-        def b(n: int) -> npt.NDArray[np.floating]:
-            return np.zeros(n, dtype=DTYPE)
-
-        params: dict[str, Any] = {
-            "W1": w(in_dim, hidden), "b1": b(hidden),
-            "W2": w(hidden, hidden), "b2": b(hidden),
-        }
-        if residual:
-            params.update({
-                "Wr1": w(hidden, hidden), "br1": b(hidden),
-                "Wr2": w(hidden, hidden), "br2": b(hidden),
-            })
-        params["Wv"] = w(hidden, 1)
-        params["bv"] = b(1)
-        if n_actions > 0:
-            params["Wp"] = w(hidden, n_actions)
-            params["bp"] = b(n_actions)
-        return cls(params, y_mean=0.0, y_std=1.0)
+        return cls(_random_params(in_dim, hidden, n_actions, residual, seed), y_mean=0.0, y_std=1.0)
 
     # -- compute --------------------------------------------------------------------------------------
 
@@ -257,3 +320,27 @@ class MlpForward:
         values = np.asarray(v, dtype=np.float32)[:n]
         logits_np = np.asarray(logits, dtype=np.float32)[:n] if logits is not None else None
         return values, logits_np
+
+    def forward_batch_timed(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None, tuple[float, float, float]]):
+        """forward_batch with per-phase timers (h2d | jit | d2h) for the serve-loop forward-envelope
+        profiling (server cfg.profile_forward). It `block_until_ready()`s BETWEEN phases to attribute each —
+        which SERIALISES the otherwise-async XLA pipeline, so the returned sum is an UPPER BOUND on the real
+        (pipelined) forward_batch wall. Use it for the RELATIVE split (where the time goes), never as the
+        absolute forward cost. Same contract/returns as forward_batch, plus the (h2d_s, jit_s, d2h_s) tuple."""
+        if not isinstance(batch, PaddedBatch) or int(batch.x.shape[0]) not in self._warmed_set:
+            raise ValueError("forward_batch_timed: build the batch with .pack (warmed PaddedBatch required)")
+        t0 = time.monotonic()
+        x = jnp.asarray(batch.x, dtype=_JDTYPE)
+        x.block_until_ready()                                  # force the host->device transfer to complete
+        t1 = time.monotonic()
+        v, logits = _forward_both(self.params, x, self.ym, self.ys)
+        v.block_until_ready()
+        if logits is not None:
+            logits.block_until_ready()                         # force the jit/compute to complete
+        t2 = time.monotonic()
+        n = batch.n_real
+        values = np.asarray(v, dtype=np.float32)[:n]
+        logits_np = np.asarray(logits, dtype=np.float32)[:n] if logits is not None else None
+        t3 = time.monotonic()                                  # device->host pulls + slice
+        return values, logits_np, (t1 - t0, t2 - t1, t3 - t2)
