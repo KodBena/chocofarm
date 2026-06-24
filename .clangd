@@ -1,0 +1,16 @@
+# clangd LSP config (https://clangd.llvm.org/config).
+#
+# The per-TU source of truth for compile flags is the compile_commands.json each CMake build emits
+# (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON, set in cpp/CMakeLists.txt and throughput-lab/cpp/CMakeLists.txt).
+# clangd auto-discovers that DB in each project's build/ subdir (cpp/build, throughput-lab/cpp/build),
+# so it resolves every .cpp — and every header reachable from an indexed .cpp — with the real -std and
+# -I flags. Include paths live ONLY in the DB (no hand-duplicated, drift-prone copy here — the SSOT).
+#
+# This file adds ONE thing the DB cannot: a -std FLOOR for a header opened in isolation before any
+# including TU is parsed. Without it clangd defaults to an older C++ standard and reports std::span /
+# std::expected as nonexistent (the dominant false-error source across this C++23 codebase).
+#
+# NOTE for the throughput-lab: its DB only carries the chocofarm/include path when configured with
+# -DTLAB_REAL_GENERATOR=ON (that option adds the dir). Configure with it ON for the real_gen_* files.
+CompileFlags:
+  Add: [-std=c++23]

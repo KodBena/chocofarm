@@ -13,6 +13,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(chocofarm_cpp_runner LANGUAGES CXX)
 
+# Emit compile_commands.json so clangd resolves each TU with its EXACT flags (-std=c++23, the -I dirs) —
+# the LSP's single source of truth, no hand-duplicated flags to drift. clangd auto-discovers it in this
+# build/ subdir. (A repo-root .clangd adds a -std floor for headers opened with no including TU in view.)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

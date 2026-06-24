@@ -9,6 +9,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(throughput_lab_producer CXX)
 
+# Emit compile_commands.json for clangd (exact per-TU flags: -std=c++23 + the -I dirs). The chocofarm
+# include path only enters this DB when configured with -DTLAB_REAL_GENERATOR=ON (that option adds it),
+# so configure with the option ON for the real_gen_* TUs to resolve. clangd auto-discovers it here.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # C++23 — the contracts (wire.hpp, boundary.hpp, producer.hpp) use the modern types ADR-0012 P9
 # mandates: std::span (C++20) for bounds-carrying views, std::expected (C++23) for typed failure,
 # std::optional (C++17) for typed absence. The brief said "C++17", but P9 — which the brief itself
