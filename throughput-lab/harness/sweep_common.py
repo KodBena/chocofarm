@@ -117,6 +117,25 @@ class CellLedger:
         return max(reps) if reps else 0.0
 
     @property
+    def rows_per_batch(self) -> int:
+        return int(self.record.get("rows_per_batch") or 1)
+
+    # ---- LEAF-ROWS/s (served_hz x rows) — the leaf-eval-MEANINGFUL throughput: actual leaves evaluated
+    # per second. req/s favours small rows (more, tinier round-trips for the same compute); rows/s is the
+    # real work rate, so the leaderboard/regression rank by THIS.
+    @property
+    def served_rows_hz(self) -> float:
+        return self.served_hz * self.rows_per_batch
+
+    @property
+    def served_rows_min(self) -> float:
+        return self.served_min * self.rows_per_batch
+
+    @property
+    def served_rows_max(self) -> float:
+        return self.served_max * self.rows_per_batch
+
+    @property
     def offered_hz(self) -> float:
         """The producer's median SEND rate. NOT throughput — a flood inflates it while the server serves
         ~0; shown next to served_hz so the send/serve gap is visible (it is the tell of a wedged cell)."""

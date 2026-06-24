@@ -3,10 +3,10 @@
 throughput-lab/harness/sweep_analyze.py — turn a finished sweep (cells/*.json) into a plain,
 readable answer to "which serving knob drives throughput, and by how much". Two views, deliberately:
 
-  1. MARGINAL MEANS (assumption-light): the mean served req/s at each level of each knob, averaged
+  1. MARGINAL MEANS (assumption-light): the mean served leaf-rows/s at each level of each knob, averaged
      over everything else. No model — just "rows=16 averaged 95k req/s, rows=1 averaged 40k". This is
      the robust view; trust it most.
-  2. OLS REGRESSION (the requested 'regression'): served_req_s ~ the knobs (treatment-coded), with
+  2. OLS REGRESSION (the requested 'regression'): served_leaf_rows_per_s ~ the knobs (treatment-coded), with
      coefficients, standard errors, t-stats, p-values, R², and a per-knob share-of-variance. Built by
      hand from numpy + scipy (no black box) so every number is auditable.
 
@@ -42,7 +42,7 @@ PRETTY = {
 
 
 def load_long(outdir: Path) -> pd.DataFrame:
-    """One row per (decoupled, VALID cell x replicate): the knobs + that replicate's served req/s.
+    """One row per (decoupled, VALID cell x replicate): the knobs + that replicate's served leaf-rows/s.
     Validity is the SHARED `CellLedger.is_valid` verdict (rows conserved, replies complete modulo the
     decoupled async tail) — the SAME rule the leaderboard uses, so the regression and the report can
     never disagree about which cells count. Replicate level (not the per-cell median) gives the
@@ -51,8 +51,8 @@ def load_long(outdir: Path) -> pd.DataFrame:
     for L in load_ledgers(outdir):
         if L.get("mode") != "decoupled" or not L.is_valid:
             continue
-        for r in L.served_replicates:                  # SERVED (completed round-trips), not the send rate
-            rows.append({**{f: L.get(f) for f in FACTORS}, "served_hz": r})
+        for r in L.served_replicates:                  # SERVED leaf-rows/s = round-trips/s x rows (the work rate)
+            rows.append({**{f: L.get(f) for f in FACTORS}, "served_rows_hz": r * L.rows_per_batch})
     return pd.DataFrame(rows)
 
 
@@ -92,7 +92,7 @@ def _ols(X: np.ndarray, y: np.ndarray) -> dict:
 def _varexp(df: pd.DataFrame, factors: "list[str]", full: dict) -> "list[tuple[str, float]]":
     """Per-factor share of variance: R^2(full) - R^2(full minus that factor). On a balanced factorial
     this is a clean 'how much does this knob explain on its own' read."""
-    y = df["served_hz"].to_numpy(float)
+    y = df["served_rows_hz"].to_numpy(float)
     out: "list[tuple[str, float]]" = []
     for f in factors:
         if df[f].nunique() < 2:
@@ -112,7 +112,7 @@ def build(outdir: Path) -> str:
     df = load_long(outdir)
     L: "list[str]" = ["# throughput-lab sweep — regression analysis (decoupled / throughput)\n"]
     L.append(
-        "_What this is:_ a plain **OLS linear regression** of served throughput — completed round-trips/s "
+        "_What this is:_ a plain **OLS linear regression** of served leaf-rows throughput — completed round-trips/s "
         "(`replies_recv/seconds`), NOT the producer send rate — on the serving "
         "knobs, plus assumption-light **marginal means**. It answers *which knob moves throughput and by "
         "how much, on average*. It is a first-order summary, **not** a mechanistic model — throughput "
@@ -127,12 +127,12 @@ def build(outdir: Path) -> str:
     varying = [f for f in FACTORS if df[f].nunique() >= 2]
     constant = [f for f in FACTORS if df[f].nunique() < 2]
     L.append(f"\nData: **{len(df)} decoupled replicate-observations** across "
-             f"{df.groupby(FACTORS).ngroups} cells. Response = served req/s. "
+             f"{df.groupby(FACTORS).ngroups} cells. Response = served leaf-rows/s. "
              f"Varying knobs: {', '.join(PRETTY[f] for f in varying) or 'none'}."
              + (f" Held constant: {', '.join(f'{PRETTY[f]}={sorted(df[f].unique())[0]}' for f in constant)}."
                 if constant else ""))
 
-    y = df["served_hz"].to_numpy(float)
+    y = df["served_rows_hz"].to_numpy(float)
     X, terms = _design(df, varying)
     fit = _ols(X, y)
     ve = _varexp(df, varying, fit)
@@ -152,12 +152,12 @@ def build(outdir: Path) -> str:
 
     # ---- 2. marginal means (robust) ----
     L.append("\n## 2. Average throughput by knob level (marginal means — no model assumptions)\n")
-    L.append("Mean served req/s at each level of each knob, averaged over all other knobs. This is the "
+    L.append("Mean served leaf-rows/s at each level of each knob, averaged over all other knobs. This is the "
              "robust view — trust it most.\n")
     L.append("| knob | level | mean req/s | std | n |")
     L.append("| --- | ---: | ---: | ---: | ---: |")
     for f in varying:
-        g = df.groupby(f)["served_hz"].agg(["mean", "std", "count"]).reset_index()
+        g = df.groupby(f)["served_rows_hz"].agg(["mean", "std", "count"]).reset_index()
         for _, row in g.iterrows():
             std = 0.0 if pd.isna(row["std"]) else row["std"]
             L.append(f"| {PRETTY[f]} | {row[f]} | {row['mean']:,.0f} | {std:,.0f} | {int(row['count'])} |")
@@ -167,7 +167,7 @@ def build(outdir: Path) -> str:
     baselines = []
     for f in varying:
         baselines.append(f"{PRETTY[f]}={sorted(df[f].unique())[0]}")
-    L.append(f"Model: `served_req_s ~ {' + '.join(PRETTY[f] for f in varying)}` (treatment-coded). "
+    L.append(f"Model: `served_leaf_rows_per_s ~ {' + '.join(PRETTY[f] for f in varying)}` (treatment-coded). "
              f"Baseline cell = {', '.join(baselines)}. "
              f"**R² = {fit['r2']:.2f}** (the model explains {_fmt_pct(fit['r2'])} of the variation in "
              f"throughput across cells), adjusted R² = {fit['adj']:.2f}, n = {fit['n']}.\n")
@@ -184,7 +184,7 @@ def build(outdir: Path) -> str:
     L.append("\n## 4. Plain-language takeaway\n")
     bullets: "list[str]" = []
     for f in varying:
-        g = df.groupby(f)["served_hz"].mean()
+        g = df.groupby(f)["served_rows_hz"].mean()
         best_lvl, worst_lvl = g.idxmax(), g.idxmin()
         delta = g.max() - g.min()
         if best_lvl == worst_lvl:
@@ -194,18 +194,18 @@ def build(outdir: Path) -> str:
     # order bullets by their swing (largest lever first)
     swings = []
     for f in varying:
-        g = df.groupby(f)["served_hz"].mean()
+        g = df.groupby(f)["served_rows_hz"].mean()
         swings.append((f, g.max() - g.min()))
     swings.sort(key=lambda kv: -kv[1])
     L.append(f"The levers, biggest first: " + ", ".join(f"**{PRETTY[f]}**" for f, _ in swings) + ".\n")
     L += bullets
     # best observed cell (echo the leaderboard's #1 for convenience)
-    cellmean = df.groupby(varying)["served_hz"].mean().reset_index().sort_values("served_hz", ascending=False)
+    cellmean = df.groupby(varying)["served_rows_hz"].mean().reset_index().sort_values("served_rows_hz", ascending=False)
     if not cellmean.empty:
         top = cellmean.iloc[0]
         cfg = ", ".join(f"{PRETTY[f]}={top[f]}" for f in varying)
         L.append(f"\n- **Best observed config** (highest mean over its replicates): {cfg} "
-                 f"→ ~{top['served_hz']:,.0f} req/s. Confirm before citing — this analysis explains the "
+                 f"→ ~{top['served_rows_hz']:,.0f} leaf-rows/s. Confirm before citing — this analysis explains the "
                  f"trend, it does not *prove* an optimum (see the caveats).")
 
     # ---- 5. caveats ----
@@ -216,7 +216,7 @@ def build(outdir: Path) -> str:
         "coefficient is an *average* effect, not a guaranteed one — check the marginal means and the "
         "leaderboard for the actual shape.\n"
         "- **`rate` is mostly a saturation flag, not a lever.** Where the requested rate over-saturates "
-        "the server, served throughput is the *server's* ceiling and rate barely moves it; a `rate` "
+        "the server, served leaf-rows throughput is the *server's* ceiling and rate barely moves it; a `rate` "
         "coefficient near zero means 'we pushed hard enough to saturate', which is what you want.\n"
         "- **Small n.** Few replicates per cell ⇒ approximate standard errors. Raise `REPLICATES` / "
         "`SECONDS_PER` to tighten them before citing a marginal effect.\n"

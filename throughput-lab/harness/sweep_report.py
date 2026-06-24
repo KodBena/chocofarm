@@ -31,15 +31,15 @@ from sweep_common import CellLedger, load_cell_file, load_ledgers
 def _leaderboard(ledgers: "list[CellLedger]", title: str) -> "list[str]":
     out = [f"\n## {title}\n"]
     out.append("| rank | topology | mode | thr | rate/thr | rows | max_batch | "
-               "served_hz (median) | min–max | offered_hz | srv_util% | lat_p50_ms | health |")
-    out.append("| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |")
+               "leaf-rows/s (median) | min–max | req/s | offered req/s | srv_util% | lat_p50_ms | health |")
+    out.append("| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |")
     for i, L in enumerate(ledgers, 1):
         out.append(
             f"| {i} | {L.get('topology')} | {L.get('mode')} | {L.get('threads')} | "
             f"{float(L.get('rate_hz_per_thread', 0)):,.0f} | {L.get('rows_per_batch')} | {L.get('max_batch')} | "
-            f"{L.served_hz:,.0f} | {L.served_min:,.0f}–{L.served_max:,.0f} | {L.offered_hz:,.0f} | "
-            f"{float(L.get('server_compute_util_pct', 0)):.0f} | {float(L.get('lat_p50_us', 0)) / 1000.0:.2f} | "
-            f"{L.health or '·'} |"
+            f"{L.served_rows_hz:,.0f} | {L.served_rows_min:,.0f}–{L.served_rows_max:,.0f} | {L.served_hz:,.0f} | "
+            f"{L.offered_hz:,.0f} | {float(L.get('server_compute_util_pct', 0)):.0f} | "
+            f"{float(L.get('lat_p50_us', 0)) / 1000.0:.2f} | {L.health or '·'} |"
         )
     return out
 
@@ -58,7 +58,7 @@ def progress_block(cell_json: str) -> str:
         tag = (L.health or "ok") if L.is_valid else f"!!{L.health or L.verdict}"
         lines.append(
             f"    {str(L.get('topology')):<11} {str(L.get('mode')):<10} "
-            f"served {L.served_hz:>9,.0f} hz (offered {L.offered_hz:>9,.0f})  "
+            f"{L.served_rows_hz:>11,.0f} rows/s ({L.served_hz:>8,.0f} req/s)  "
             f"util {float(L.get('server_compute_util_pct', 0)):>3.0f}%  "
             f"batch {float(L.get('server_mean_batch_rows', 0)):>6.1f}r  "
             f"p50 {float(L.get('lat_p50_us', 0)) / 1000.0:>8.2f}ms  {tag}"
@@ -74,8 +74,8 @@ def main(outdir_s: str) -> int:
         return 1
 
     valid = [L for L in ledgers if L.is_valid]
-    dec = sorted([L for L in valid if L.get("mode") == "decoupled"], key=lambda L: -L.served_hz)
-    cou = sorted([L for L in valid if L.get("mode") == "coupled"], key=lambda L: -L.served_hz)
+    dec = sorted([L for L in valid if L.get("mode") == "decoupled"], key=lambda L: -L.served_rows_hz)
+    cou = sorted([L for L in valid if L.get("mode") == "coupled"], key=lambda L: -L.served_rows_hz)
     bad = [L for L in ledgers if not L.is_valid]
 
     out: "list[str]" = ["# throughput-lab sweep report\n"]
@@ -83,18 +83,20 @@ def main(outdir_s: str) -> int:
     if manifest.exists():
         out.append("```\n" + manifest.read_text().strip() + "\n```\n")
     out.append(f"Cells: **{len(ledgers)}**  (valid decoupled: {len(dec)}, valid coupled: {len(cou)}, "
-               f"non-valid: {len(bad)}).  Ranked by **served_hz** = completed round-trips/s "
-               f"(`replies_recv/seconds`), the HONEST throughput — NOT the producer send rate (`offered_hz`), "
-               f"which a flood inflates while the server serves ~0. A big offered≫served gap (low srv_util) "
-               f"is the tell of a server that took the load but could not serve it. Coupled is RTT-bound by "
-               f"design and ranked separately. `health` is the reconciliation verdict (see sweep_common.CellLedger).")
+               f"non-valid: {len(bad)}).  Ranked by **leaf-rows/s** = served req/s × rows (the leaf-eval-"
+               f"meaningful work rate — req/s alone favours small rows: more, tinier round-trips for the same "
+               f"compute). `req/s` is completed round-trips (`replies_recv/seconds`); `offered req/s` is the "
+               f"producer send rate (a flood inflates it while the server serves ~0 — a big offered≫served gap "
+               f"at low srv_util is that tell). Coupled is RTT-bound, ranked separately. `health` is the "
+               f"reconciliation verdict (see sweep_common.CellLedger).")
 
     if dec:
         b = dec[0]
         out.append("\n## Best observed throughput (this grid, this run)\n")
         out.append(
-            f"**{b.served_hz:,.0f} req/s served** (min–max {b.served_min:,.0f}–{b.served_max:,.0f} over "
-            f"{len(b.served_replicates)} replicates; producer offered {b.offered_hz:,.0f}/s) at:\n\n"
+            f"**{b.served_rows_hz:,.0f} leaf-rows/s served** ({b.served_hz:,.0f} req/s; min–max "
+            f"{b.served_rows_min:,.0f}–{b.served_rows_max:,.0f} over {len(b.served_replicates)} replicates; "
+            f"producer offered {b.offered_hz:,.0f} req/s) at:\n\n"
             f"- topology **{b.get('topology')}**, mode decoupled, **{b.get('threads')} threads**, "
             f"rate {float(b.get('rate_hz_per_thread', 0)):,.0f} hz/thread, "
             f"**rows={b.get('rows_per_batch')}**, **max_batch={b.get('max_batch')}**\n"
