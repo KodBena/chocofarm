@@ -190,6 +190,23 @@ timeout during the large pool build, or a slot ceiling. It caps the static N-swe
 Fix/investigate: the producer pool-warmup poll (raise the HWM / lengthen the warmup recv timeout / stage the
 build) — or accept N≤4 as the static range. Artifacts: `~/w/vdc/chocobo/runs/control_lab/step3-nsweep-fixed/N6/`.
 
+## `Windowed` measurement type at the source — the full foreclosure of the rate-window-mismatch class (found 2026-06-24)
+
+The reference-140k faceplant (DB finding #12) was a rate computed as `whole-call-leaves / measure-window-wall`
+— numerator and denominator from *different* intervals. The ADR-0000 disposition added a construction-time
+guard in `throughput-lab/harness/exp_db.py` (`Reading.__post_init__`): a rate field (`leaf_rows_s`, `dps`,
+`forwards_s`, `lpd`) is rejected unless its count + time-span are present and the rate equals their quotient.
+That forecloses the **recorded** artifact (a provenance-less rate, the actual shape of readings 16/17) and
+makes a cross-window rate *auditable* (both operands are stored). It does **not** yet make the cross-window
+case *unrepresentable*: if a caller stores whole-call leaves *and* a measure-window wall *and* their (matching)
+quotient, the guard passes. The full foreclosure (ADR-0012 illegal-states-unrepresentable) is a **`Windowed`
+value type produced at the MEASUREMENT SITE** — `Windowed(count, elapsed_s, window_label)` capturing count and
+span over **one** interval as a unit, with `.rate` the only way to a rate; `Reading` would store `Windowed`s,
+so mixing two intervals needs two objects and there is no constructor that crosses them. Deferred because it
+touches every measurement producer (the harness, the C++ bench RESULT parse, the ad-hoc probes), not just the
+recorder. Until then: the guard + the discipline that **a baseline/target is a stamped reading, not a prose
+number, and a finding cites a `reading_id` not a bare figure** (the executive-lapse half of finding #12).
+
 ## Retired
 
 - **NMCS parity tests** marked `skip` in `tests/test_cpp_runner.py` (2026-06-16): validated repeatedly,

@@ -425,6 +425,44 @@ class Reading:
     def has_any_metric(self) -> bool:
         return any(getattr(self, f) is not None for f in self._METRIC_FIELDS) or bool(self.metrics_extra)
 
+    def __post_init__(self) -> None:
+        """FORECLOSE the reference-140k defect CLASS (ADR-0000 question (a); finding #12). That artifact was a
+        `leaf_rows_s` computed as whole-call-leaves / measure-window-wall and stored with NULL operands — a
+        rate divorced from the count and window it came from, so it could be neither recomputed nor caught,
+        then chased as a target for weeks. The class (ADR-0008 substitution test, calibrated to the class not
+        the instance): *a derived rate without — or inconsistent with — its windowed operands*. Make it
+        UNREPRESENTABLE at construction (ADR-0012 illegal-states-unrepresentable / ADR-0002 fail-loud, the
+        strongest surface): a rate field may be set only WITH its count and time-span, and must equal their
+        quotient. A cross-window rate (numerator and denominator from different intervals) cannot pass — the
+        two operands are recorded, so the reader (and this check) can see the mismatch. The fuller foreclosure
+        — a `Windowed(count, elapsed)` value the MEASUREMENT SITE produces as a unit, so count and span
+        provably share one interval — is filed in BACKLOG.md (ADR-0013 Rule 4: a real type deferred, not
+        buried); this guard catches the recorded-artifact class the faceplant actually took."""
+        def _check(rate_name: str, rate: "float | None",
+                   num_name: str, num: "float | None", den_name: str, den: "float | None") -> None:
+            if rate is None:
+                return
+            if num is None or den is None:
+                raise ValueError(
+                    f"Reading.{rate_name}={rate} has no auditable provenance — it requires {num_name} and "
+                    f"{den_name} (a rate stored without its windowed count+span is the un-recomputable, "
+                    f"un-checkable shape that produced the reference-140k artifact; ADR-0000/ADR-0002 — record "
+                    f"the operands, or omit the rate). See exp_db finding #12.")
+            if float(den) == 0.0:
+                raise ValueError(f"Reading.{rate_name}: {den_name} is 0 — cannot derive a rate (ADR-0002)")
+            expected = float(num) / float(den)
+            tol = max(0.02 * abs(expected), 1.0)   # tolerant of integer-floored harness rates (e.g. dps=dec//S)
+            if abs(float(rate) - expected) > tol:
+                raise ValueError(
+                    f"Reading.{rate_name}={rate} is INCONSISTENT with {num_name}/{den_name}={num}/{den}="
+                    f"{expected:.3f} (|Δ|>{tol:.3f}). A rate whose numerator and denominator come from DIFFERENT "
+                    f"measurement windows is the reference-140k class (finding #12): record the count and the "
+                    f"wall from the SAME window. (ADR-0000)")
+        _check("leaf_rows_s", self.leaf_rows_s, "leaves", self.leaves, "wall_s", self.wall_s)
+        _check("dps", self.dps, "decisions", self.decisions, "wall_s", self.wall_s)
+        _check("forwards_s", self.forwards_s, "forwards", self.forwards, "wall_s", self.wall_s)
+        _check("lpd", self.lpd, "leaves", self.leaves, "decisions", self.decisions)
+
 
 def _canonical(m: Mapping[str, Any]) -> Any:
     """Stable representation of a jsonb-able mapping for the content hash (sorted keys, recursively)."""
