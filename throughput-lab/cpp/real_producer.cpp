@@ -171,6 +171,85 @@ void run_thread_fiber(int idx, const chocofarm::Environment& env, const std::str
         }
     }
 }
+
+// One GREEDY-ASYNC fiber producer thread (wire_pool_bench's discipline): keep ~K leaves CONTINUOUSLY in
+// flight and process replies as they land — recv ONE, resume that fiber (it computes its next leaf), and
+// re-submit it immediately, rather than the round-synchronous barrier (submit all, wait for all). The
+// difference is overlap: in round-sync the search cores idle while the whole round's replies are awaited;
+// here a thread is always either receiving or computing a fiber's next leaf, so the search cores stay
+// busy across the RTT. Same corr->fiber routing and finished-fiber restart as the round-sync arm; the
+// ONLY change is the pipeline shape. Optional (selected by --driver greedy) so the round-sync semantics
+// are preserved for comparison.
+void run_thread_fiber_greedy(int idx, const chocofarm::Environment& env, const std::string& endpoint,
+                             const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
+                             int fibers_k, ThreadStat& out) {
+    tlab::BoundaryConfig bcfg;
+    bcfg.endpoint = endpoint;
+    bcfg.recv_timeout_ms = 10000;
+    bcfg.n_producer_threads = 1;
+    bcfg.rows = 1;
+    bcfg.in_dim = in_dim;
+    auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
+    if (!b) { out.failed = true; out.err = "boundary: " + b.error().message; return; }
+    std::unique_ptr<tlab::Boundary> boundary = std::move(*b);
+
+    const chocofarm::Loc loc{env.entry_point()};
+    const chocofarm::Belief bw = env.full_belief();
+    const chocofarm::CollectedSet coll;
+
+    std::vector<std::unique_ptr<chocofarm::TreeState>> trees;
+    trees.reserve(static_cast<size_t>(fibers_k));
+    for (int i = 0; i < fibers_k; ++i) {
+        std::vector<double> table(kGumbelTable.size());
+        for (size_t j = 0; j < kGumbelTable.size(); ++j)
+            table[j] = kGumbelTable[(j + static_cast<size_t>(i)) % kGumbelTable.size()];
+        trees.push_back(std::make_unique<chocofarm::TreeState>(cfg, env, std::move(table)));
+    }
+    for (auto& t : trees) t->start(loc, bw, coll, kLam);
+
+    std::unordered_map<tlab::wire::corr_t, int> corr_to_fiber;
+    tlab::wire::corr_t corr = static_cast<tlab::wire::corr_t>(idx) * 1'000'000'000ull + 1ull;
+    int in_flight = 0;
+    // Submit fiber i's current parked leaf, restarting it on a fresh decision if it had finished. Returns
+    // false only on a send error (out.failed set) or if a restarted fiber yielded no leaf (exhausted).
+    auto submit = [&](int i) -> bool {
+        if (!trees[static_cast<size_t>(i)]->running) {
+            out.decisions += 1;
+            trees[static_cast<size_t>(i)]->start(loc, bw, coll, kLam);
+        }
+        if (!trees[static_cast<size_t>(i)]->running) return false;  // produced no leaf (won't happen for n_sims>=1)
+        const std::span<const float> feats = trees[static_cast<size_t>(i)]->ch.features;
+        const tlab::wire::corr_t cc = corr++;
+        const tlab::LeafBatch lb{cc, 1, static_cast<tlab::wire::count_t>(feats.size()), feats};
+        if (auto s = boundary->send(lb); !s) { out.failed = true; out.err = "send: " + s.error().message; return false; }
+        corr_to_fiber.emplace(cc, i);
+        ++in_flight;
+        return true;
+    };
+
+    for (int i = 0; i < fibers_k; ++i) submit(i);   // prime: K leaves in flight
+    if (out.failed) return;
+
+    const auto t_start = SteadyClock::now();
+    while (secs_since(t_start) < run_seconds && in_flight > 0) {
+        auto reply = boundary->recv();
+        if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return; }
+        auto it = corr_to_fiber.find(reply->corr);
+        if (it == corr_to_fiber.end() || reply->preds.empty()) {
+            out.failed = true; out.err = "unmatched/empty reply corr=" + std::to_string(reply->corr); return;
+        }
+        const int i = it->second;
+        corr_to_fiber.erase(it);
+        --in_flight;
+        chocofarm::NetPrediction pred;
+        pred.value = reply->preds[0].value;
+        pred.logits = std::move(reply->preds[0].logits);
+        trees[static_cast<size_t>(i)]->resume_with(pred);   // advances to its next leaf (or finishes)
+        out.leaves += 1;
+        submit(i);                                          // re-arm this fiber -> back to ~K in flight
+        if (out.failed) return;
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -178,8 +257,9 @@ int main(int argc, char** argv) {
     auto inst_p = opt(args, "--instance"), faces_p = opt(args, "--faces"), ep = opt(args, "--endpoint");
     if (!inst_p || !faces_p || !ep) {
         std::cerr << "usage: tlab-real-producer --instance <p> --faces <p> --endpoint <ipc://...> "
-                     "[--threads N --fibers K --seconds S --n-sims K --m M --in-dim D]\n"
-                     "  --fibers 0 (default) = non-fiber baseline; K>=1 = K fibers/thread (the fiber model)\n";
+                     "[--threads N --fibers K --driver round-sync|greedy --seconds S --n-sims K --m M --in-dim D]\n"
+                     "  --fibers 0 (default) = non-fiber baseline; K>=1 = K fibers/thread (the fiber model)\n"
+                     "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n";
         return 2;
     }
     const int threads = opt(args, "--threads") ? std::atoi(std::string(*opt(args, "--threads")).c_str()) : 3;
@@ -188,6 +268,13 @@ int main(int argc, char** argv) {
     // --fibers K: 0 (default) = NON-FIBER baseline (one SerialRuntime/thread, B=1 blocking); K>=1 = the
     // FIBER model (K TreeState fibers/thread multiplexed, K leaves in flight -> server batch grows with K).
     const int fibers = opt(args, "--fibers") ? std::atoi(std::string(*opt(args, "--fibers")).c_str()) : 0;
+    // --driver: how the FIBER arm pipelines leaves. round-sync (default, preserves the committed
+    // semantics) submits a whole round then awaits it; greedy keeps ~K leaves continuously in flight.
+    const std::string driver = opt(args, "--driver") ? std::string(*opt(args, "--driver")) : "round-sync";
+    if (driver != "round-sync" && driver != "greedy") {
+        std::cerr << "tlab-real-producer: --driver must be round-sync|greedy, got " << driver << "\n";
+        return 2;
+    }
     chocofarm::GumbelConfig cfg;
     if (auto v = opt(args, "--n-sims")) cfg.n_sims = std::atoi(std::string(*v).c_str());
     if (auto v = opt(args, "--m")) cfg.m = std::atoi(std::string(*v).c_str());
@@ -197,7 +284,8 @@ int main(int argc, char** argv) {
     chocofarm::Environment env(*inst);
 
     std::cout << "tlab-real-producer: generator=real(" << (fibers > 0 ? "fiber" : "non-fiber")
-              << ") threads=" << threads << " fibers_per_thread=" << fibers
+              << ") driver=" << (fibers > 0 ? driver : std::string("n/a"))
+              << " threads=" << threads << " fibers_per_thread=" << fibers
               << " seconds=" << seconds << " n_sims=" << cfg.n_sims << " m=" << cfg.m
               << " n_slots=" << chocofarm::n_action_slots(env) << " endpoint=" << *ep << "\n";
 
@@ -207,7 +295,9 @@ int main(int argc, char** argv) {
     const auto t0 = SteadyClock::now();
     for (int i = 0; i < threads; ++i)
         pool.emplace_back([&, i] {
-            if (fibers > 0)
+            if (fibers > 0 && driver == "greedy")
+                run_thread_fiber_greedy(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
+            else if (fibers > 0)
                 run_thread_fiber(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
             else
                 run_thread(i, env, endpoint, cfg, seconds, in_dim, stats[static_cast<size_t>(i)]);
@@ -222,7 +312,8 @@ int main(int argc, char** argv) {
     }
     const double dps = wall > 0 ? static_cast<double>(dec) / wall : 0.0;
     const double lps = wall > 0 ? static_cast<double>(leaves) / wall : 0.0;
-    std::cout << "REAL-AGG threads=" << threads << " fibers=" << fibers << " wall_s=" << wall
+    std::cout << "REAL-AGG threads=" << threads << " fibers=" << fibers
+              << " driver=" << (fibers > 0 ? driver : std::string("n/a")) << " wall_s=" << wall
               << " decisions=" << dec << " leaves=" << leaves
               << " decisions_per_sec=" << dps << " leaves_per_sec=" << lps
               << " any_fail=" << (any_fail ? 1 : 0) << "\n";
