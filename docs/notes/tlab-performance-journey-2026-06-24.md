@@ -68,6 +68,15 @@ The arithmetic (conjecture, to validate — §5): at the operating point ~47 lea
 
 > **Correction (2026-06-24, same day — a worked instance of Lesson 1).** The arithmetic above used **~47 leaves/decision — the lab's n_sims=24 config**, while the production 190/457 numbers are at **sims256/m24**, where LPD is ~2×n_sims ≈ **~470 (≈10× higher)**. Redone at the right operating point: the 457 ceiling needs ~457 × 470 ≈ **215k leaf-rows/s**, so our banked 55k would be **eval-limited to ~110 DPS — *below* the 190 practice.** That **reverses the rosy conclusion**: at the real config our static coupling may *not* yet beat production, and the eval path is very plausibly still the limiter. I extrapolated from the wrong config — the exact "infer instead of measure" error this note's Lesson 1 warns against. The sign of the answer is now genuinely open, and **only the sims256 episodic measurement (§5) settles it** — which is why that measurement is the *baseline*, not a confirmation. (Caveat on the caveat: the 55k was itself measured at sims24; at sims256 the in-flight/batch dynamics differ, so the eval throughput there must also be measured, not assumed.)
 
+> **Measured (2026-06-24, `episodic_dps.sh`).** The sims256/m24 episodic-static baseline, no-early-exit, banked optimum (server@0 + 3 gens@1,2,3 + `SCHED_IDLE` surplus@0), 4-vCPU host:
+>
+> | episodic config | leaf-rows/s | LPD | **DPS** |
+> |---|---:|---:|---:|
+> | M=1 (no coalescing) | 19,538 | 712 | **27** |
+> | M=64 (banked) | 52,187 | 634 | **82** |
+>
+> **Coalescing translates to a clean 3.0× DPS win in the production-shape workload (27 → 82)** — not just the synthetic leaf-rows metric. But the deeper finding settles the correction's open sign: at 82 DPS the system is **server-compute-limited** (server 73% matmul; the ~58k leaf-rows/s server ceiling ÷ 634 LPD ≈ **~92 DPS max**), well below the **~138–184 DPS search ceiling** on this box (3–4 gen cores × the measured 46 DPS/core). So the residual bottleneck is the **server's compute, not the coupling** — meaning *any* coupling control, static or dynamic, has only ~11% headroom left (82 → ~92); the path to more DPS is a **faster server** (batch size already maxed; a GPU / lighter net / lower per-row CPython), not a smarter gate. **Production comparison:** not apples-to-apples — production's 457 ceiling ÷ our 46 DPS/core implies **~10 generation cores** vs our 4 vCPUs; per *fraction of the search ceiling*, our static coupling reaches ~82/160 ≈ **51%**, comparable to production's 190–210/457 ≈ 42–46%. The headline 190→457 gap is mostly a **core-count** difference, not a coupling deficit we can close on this host.
+
 ---
 
 ## 4. Lessons (the part worth keeping)
@@ -85,8 +94,9 @@ The arithmetic (conjecture, to validate — §5): at the operating point ~47 lea
 
 ## 5. Open / next
 
-**Test `control_lab` under the bursty (episodic) regime** — the one experiment that closes the dynamic-control question *and* validates the DPS translation:
-- Build the episodic/no-early-exit workload (real episodes, state evolving, early-exit on/off).
-- Re-run the coalescing sweep under it: if the optimum *shifts with load*, an adaptive gate (`control_lab` bang-bang) pays; if it stays flat, static M≈64 suffices and dynamic control is off the table. (Working hypothesis: bang-bang is the proxy — if it captures nothing, nothing will.)
-- Measure **DPS** directly against the 190→457 gap, confirming (or refuting) §3.
+**Done:** the episodic/no-early-exit workload is built (`--episodic`, `episodic_dps.sh`) and the **static baseline is measured — 82 DPS** (§3), the number dynamic control must beat. The DPS translation is settled: coalescing is a real 3× DPS win, but the residual bottleneck is the **server compute, not the coupling**, leaving ~11% headroom for any gate.
+
+**Next — `control_lab` (confirm the verdict the data already implies):**
+- The data says an adaptive gate has ≤~11% to win over static-82 (the server-compute ceiling, not coalescing variance, now binds). Run bang-bang anyway as the proxy: if it captures nothing, nothing will. A measured 82 → ≤~92 confirms static suffices; a surprise would itself be the finding.
 - Integration caveat: `control_lab` is invasive; if it isn't ADR-0012-composable a compile-time toggle may be needed — itself a signal about its coupling.
+- The real DPS lever, if one is wanted, is now a **faster server** (GPU / lighter net / lower per-row CPython), not the coupling — the episodic baseline localizes that cleanly.
