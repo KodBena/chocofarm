@@ -12,11 +12,16 @@
 #include <string_view>
 #include <vector>
 
+#include <memory>
+
 #include "chocofarm/env.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/instance.hpp"
 #include "chocofarm/net_evaluator.hpp"
 #include "chocofarm/search_runtime.hpp"
+
+#include "boundary.hpp"
+#include "boundary_net_evaluator.hpp"
 
 namespace {
 // The same deterministic, stateless local leaf the parent's search_runtime_bench uses — a pure function
@@ -43,10 +48,13 @@ class DetNet final : public chocofarm::NetEvaluator {
 int main(int argc, char** argv) {
     std::vector<std::string_view> args(argv, argv + argc);
     if (args.size() < 3) {
-        std::cerr << "usage: tlab-real-gen-smoke <instance.json> <faces.json> [n_sims]\n";
+        std::cerr << "usage: tlab-real-gen-smoke <instance.json> <faces.json> [n_sims] [endpoint]\n"
+                     "  no endpoint -> local DetNet (build-coupling proof);\n"
+                     "  endpoint (ipc://...) -> route each leaf through tlab::Boundary to a live server.\n";
         return 2;
     }
     const int n_sims = args.size() > 3 ? std::atoi(std::string(args[3]).c_str()) : 16;
+    const bool route = args.size() > 4;   // a 4th arg = the server endpoint -> route through the boundary
 
     auto inst = chocofarm::load_instance(args[1], args[2]);
     if (!inst) {
@@ -55,7 +63,30 @@ int main(int argc, char** argv) {
     }
     chocofarm::Environment env(*inst);
     const int n_slots = chocofarm::n_action_slots(env);
-    DetNet net(n_slots);
+
+    // The leaf evaluator: a local DetNet (no transport — the build-coupling proof), OR a
+    // BoundaryNetEvaluator that round-trips each leaf through OUR tlab::Boundary to a live server (the
+    // routing proof — the real generator driving load over the real transport).
+    DetNet det(n_slots);
+    std::unique_ptr<tlab::Boundary> boundary;
+    std::unique_ptr<tlab::BoundaryNetEvaluator> bridge;
+    const chocofarm::NetEvaluator* net = &det;
+    if (route) {
+        tlab::BoundaryConfig bcfg;
+        bcfg.endpoint = std::string(args[4]);
+        bcfg.recv_timeout_ms = 5000;
+        bcfg.n_producer_threads = 1;
+        bcfg.rows = 1;
+        bcfg.in_dim = 241;
+        auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
+        if (!b) {
+            std::cerr << "tlab-real-gen-smoke: FATAL: boundary: " << b.error().message << "\n";
+            return 1;
+        }
+        boundary = std::move(*b);
+        bridge = std::make_unique<tlab::BoundaryNetEvaluator>(*boundary);
+        net = bridge.get();
+    }
 
     chocofarm::GumbelConfig cfg;
     cfg.n_sims = n_sims;
@@ -67,7 +98,7 @@ int main(int argc, char** argv) {
     t.seed = 1;
     t.cfg = cfg;
 
-    chocofarm::SerialRuntime serial(net);
+    chocofarm::SerialRuntime serial(*net);
     std::vector<chocofarm::SearchTask> tasks{t};
     auto out = serial.run(env, std::span<const chocofarm::SearchTask>(tasks));
     if (!out) {
