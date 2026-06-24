@@ -126,6 +126,70 @@ def _random_params(in_dim: int, hidden: int, n_actions: int, residual: bool, see
     return params
 
 
+class NullForward:
+    """A ZERO-COMPUTE forward: returns correctly-SHAPED zeros instantly (no matmul, no XLA, no numpy stack). NOT
+    a real forward — a MEASUREMENT instrument that isolates the SERVE-LOOP ceiling. With compute ~free, the
+    server's max forwards/s (and rows/s) reveals the drain+pack+scatter+poll+wire overhead ALONE — the
+    non-compute floor per serve cycle. Mirrors the forward seam (random_net/warmup/pack/forward_batch) so the
+    server holds it interchangeably and the coalesce/pack path is exercised identically; only the matmul is
+    nulled. `--forward null` is a probe, never shipped. No jax/numpy-forward import — it holds only the geometry
+    the scatter needs to shape its zeros (the n_actions width)."""
+
+    def __init__(self, params: dict[str, Any], y_mean: float, y_std: float) -> None:
+        self._ym: float = float(y_mean)
+        self._ys: float = float(y_std)
+        self.in_dim = int(params["W1"].shape[0])
+        self.hidden = int(params["W1"].shape[1])
+        self.has_policy = "Wp" in params
+        self.n_actions = int(params["Wp"].shape[1]) if self.has_policy else 0
+        self.has_residual = "Wr1" in params
+        self._warmed_ladder: tuple[int, ...] = ()
+        self._warmed_set: frozenset[int] = frozenset()
+
+    @classmethod
+    def random_net(cls, *, in_dim: int = 241, hidden: int = 256, n_actions: int = 0,
+                   residual: bool = False, seed: int = 0) -> "NullForward":
+        return cls(_random_params(in_dim, hidden, n_actions, residual, seed), y_mean=0.0, y_std=1.0)
+
+    def warmup(self, batch_sizes: "list[int]", in_dim: int) -> None:
+        """No compile to warm (there is no kernel) — record the ladder so `pack` and the READY line behave like
+        a real forward, and validate the geometry (uniform with the other forwards' warmup contract)."""
+        if in_dim != self.in_dim:
+            raise ValueError(f"warmup in_dim {in_dim} != net in_dim {self.in_dim} (geometry mismatch)")
+        self._warmed_ladder = tuple(sorted(set(batch_sizes)))
+        self._warmed_set = frozenset(self._warmed_ladder)
+
+    @property
+    def warmed_sizes(self) -> "list[int]":
+        return list(self._warmed_ladder)
+
+    def pack(self, X: "npt.NDArray[np.floating]") -> PaddedBatch:
+        """Identity pack (the serve loop's gather already produced the rows; a null forward needs no warmed
+        shape) — return the real rows wrapped in PaddedBatch (n_real == row count, no pad tail)."""
+        a = np.ascontiguousarray(X, dtype=DTYPE)
+        if a.ndim != 2 or a.shape[1] != self.in_dim:
+            raise ValueError(f"pack expects (n, {self.in_dim}), got shape {a.shape}")
+        if a.shape[0] == 0:
+            raise ValueError("pack got an empty (0-row) matrix")
+        return PaddedBatch(x=a, n_real=int(a.shape[0]))
+
+    def forward_batch(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None]):
+        """Return zeros of the real shape — NO compute. (The scatter encodes whatever it gets; the throughput
+        number is the point, not the values.)"""
+        n = batch.n_real
+        values = np.zeros(n, dtype=np.float32)
+        logits = np.zeros((n, self.n_actions), dtype=np.float32) if self.has_policy else None
+        return values, logits
+
+    def forward_batch_timed(self, batch: PaddedBatch) -> (
+            tuple[npt.NDArray[np.float32], npt.NDArray[np.float32] | None, tuple[float, float, float]]):
+        """Null compute timed at ~0 (all in the 'jit' slot for the uniform (h2d, jit, d2h) contract)."""
+        t0 = time.monotonic()
+        v, l = self.forward_batch(batch)
+        return v, l, (0.0, time.monotonic() - t0, 0.0)
+
+
 class NumpyMlpForward:
     """A pure-NUMPY forward of `forward_core` (xp=np) — the SAME graph MlpForward runs on JAX, but with NO XLA
     dispatch and NO bucket/pad (numpy forwards the exact gathered row count directly). The A/B arm testing

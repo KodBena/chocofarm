@@ -132,7 +132,8 @@ import numpy as np
 import numpy.typing as npt
 import zmq
 
-from server.lifted.mlp_forward import MlpForward, NumpyMlpForward, ProdMlpForward, StagedMlpForward
+from server.lifted.mlp_forward import (
+    MlpForward, NumpyMlpForward, ProdMlpForward, StagedMlpForward, NullForward)
 from server.wire import STAGE_A_IN_DIM, WireError, decode_bounded, encode_response
 
 
@@ -311,7 +312,7 @@ class ThroughputServer:
         # (the REAL production jit_forward_core / build_staged_forward — the apples-to-apples attribution of
         # the tlab/overcommit forward-envelope gap; never shipped). All share one param builder (one home).
         _FORWARDS = {"jax": MlpForward, "numpy": NumpyMlpForward,
-                     "prod": ProdMlpForward, "staged": StagedMlpForward}
+                     "prod": ProdMlpForward, "staged": StagedMlpForward, "null": NullForward}
         if cfg.forward_impl not in _FORWARDS:
             raise ValueError(f"forward_impl must be one of {sorted(_FORWARDS)}, got {cfg.forward_impl!r}")
         _forward_cls = _FORWARDS[cfg.forward_impl]
