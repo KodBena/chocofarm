@@ -50,6 +50,8 @@ The fragmented ~42% idle on the server's core *is* reclaimable — but only by t
 
 This vindicates the ADR-0014 kernel consult's EEVDF diagnosis (`docs/consults/2026-06-24-linux-scheduler-fragmented-slack.md`): on EEVDF, `nice` is a **share weight** that can't gate fragmented slack (+5% only), and `SCHED_BATCH` *removes* wakeup-preempt credit so it contends with the server's forwards (−1%). Only a **runnability gate** — `SCHED_IDLE` (run in true idle, yield instantly) — converts the slack to generation. The path that found it: consult → CP-SAT enumeration → control.
 
+**K-stable (`k_idle_sweep.py`):** sweeping the fiber count confirms the benefit is robust, not a K=64 artifact — **+20–25% across K ∈ {16, 64, 128, 256}** (none → +idle: 12.7k→15.4k, 15.4k→18.4k, 16.9k→21.1k, 17.7k→21.6k). The surplus pushes the real-generator ceiling from ~17.7k to **~21.5k leaf-rows/s** (K=128–256, near-asymptotic).
+
 ## Privilege
 
 All of the above runs **unprivileged**: `SCHED_IDLE`/`SCHED_BATCH`/positive-nice are self-settable; the EEVDF custom `--slice` is accepted without a capability; negative nice works via an `/etc/security/limits.d` RLIMIT_NICE bump. Only `SCHED_FIFO`/`SCHED_DEADLINE` need `CAP_SYS_NICE`, confined to the audited **`sched_wrap`** helper (`setcap cap_sys_nice+ep`) — *not* the interpreter, *not* root. This kernel (6.19, EEVDF) has **no `latency_nice` field** (`sched_wrap --latency-nice` returns `E2BIG`, fail-loud); the latency lever is the custom slice.
