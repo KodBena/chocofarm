@@ -111,3 +111,16 @@ The arithmetic (conjecture, to validate — §5): at the operating point ~47 lea
 1. **Finer bucket ladder (confirmed +35%).** Make the server's default ladder dense around the live operating range (e.g. `1,8,32,64,128,256,512`) and cap `--max-batch` at the real top (512), instead of `[1,8,64,512,4096]`. This is a server default change; bank it like `run_real_best`.
 2. **Pipelined episodic driver (attributed, not yet witnessed).** Wire the greedy/`inflight_msgs`-style overlap into the `--episodic` path (the round-sync barrier is the remaining limit; both sides sit ~60% under-saturated). Measure: does it close 70k→~151k? The earlier "greedy ≈ round-sync" was regime-specific (saturated server) — re-measure here.
 3. **THEN `control_lab` / dynamic control** — only once the static coupling is genuinely at its frontier (ladder + pipelining), so bang-bang is measured against an honest static optimum, not a pad-tax-throttled one. Integration caveat: `control_lab` is invasive; if it isn't ADR-0012-composable a compile-time toggle may be needed — itself a signal about its coupling.
+
+---
+
+> **Witness (2026-06-24, later same day — item 2 measured; over-attribution in Correction 2 corrected).** The greedy/`inflight_msgs` overlap is now wired into the `--episodic` path as a `--driver` toggle, with the episode state machine kept in one home and **coalescing (`--msg-rows 64`) held identical** across both drivers — so the A/B isolates the *pipe shape* from the batch width, **within one binary against one server** (no cross-stack confound). Three interleaved replicates (sims256/m24, K=128, 12 s; commit `567ec9d`):
+>
+> | driver | DPS (reps) | median |
+> | --- | --- | --- |
+> | round-sync | 77, 64, 71 | **71** |
+> | greedy (inflight 8) | 96, 90, 93 | **93** |
+>
+> Greedy's **MIN (90) beats round-sync's MAX (77)** — a clean ADR-0009 win — at **+31%**, with markedly *tighter variance* (round-sync's submit-all/wait-all barrier is scheduling-jitter-sensitive; greedy's continuous overlap smooths it). At `--msg-rows 16` the two **tie**, so the lever lives at the banked coalescing point, not below it.
+>
+> **This corrects Correction 2's round-sync bullet:** that bullet attributed the *entire* 70k→~151k residual (~2.15×) to the barrier-vs-pipeline difference. Measured in isolation the pipe is worth **~+31%, not ~2.15×**. So the 93-vs-180 (and 70k-vs-151k) residual is **dominated by something other than the pipe** — the server (pad-tax ladder, +35% measured) plus the still-unbridged **workload/producer axis** (our `tlab-real-producer` + tlab server vs `overcommit_sweep`'s `wire-ab-bench` + `StageAServer`; the `93→180` of that paste also conflates N=1→N=9 concurrency + coalescing, *not* the pipe). The lesson repeats (Lesson 1/3): reading a lever's size off a cross-config printout (here, attributing the whole gap to the barrier) over-attributes; only the one-variable within-stack A/B sizes it. **Next:** bridge the server axis (apply StageA's `{64,256,512}` bucket policy to the tlab server, compose with greedy) and re-measure the composite before reaching for `control_lab`.
