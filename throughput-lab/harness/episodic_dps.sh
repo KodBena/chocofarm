@@ -20,15 +20,20 @@ PYBIN=/home/bork/w/vdc/venvs/generic/bin/python
 PROD=throughput-lab/cpp/build/tlab-real-producer; W=throughput-lab/cpp/build/sched_wrap
 INST=chocofarm/data/instance.json; FACES=chocofarm/data/faces.json
 EP="ipc:///tmp/tlab-edps-$$.sock"; rm -f "${EP#ipc://}"; LOG="$(mktemp -t tlab-edps-XXXX.log)"
-# DRIVER defaults to greedy: the within-stack A/B (3 interleaved replicates, msg-rows=64) banked it as a
-# clean ADR-0009 win over round-sync -- greedy ~93 DPS median vs ~71 (greedy MIN 90 > round-sync MAX 77),
-# +31%, AND tighter variance (round-sync's whole-round barrier is jitter-sensitive; greedy's continuous
-# overlap smooths it). Pass `round-sync` as $5 to reproduce the baseline arm.
+# DRIVER defaults to greedy. NOTE: the earlier "+31% clean win" was RETRACTED (an unstamped single-session
+# reading; journey doc Witness 2, commit 2ac1cef). The stamped quiet-box 2x2 shows the driver is
+# REGIME-DEPENDENT: ~+4.5% and NOT clean at the pad-tax 4096 ladder (server compute-bound, no idle to
+# overlap), but a CLEAN +15% at the lean ladder below (greedy MIN > round-sync MAX) where the fast server
+# is coupling/RTT-limited. Greedy still wins-or-ties everywhere, so it stays the default. Pass `round-sync`
+# as $5 for the baseline arm.
 K="${1:-128}"; S="${2:-14}"; NSIMS="${3:-256}"; MSG_ROWS="${4:-64}"; DRIVER="${5:-greedy}"; INFLIGHT="${6:-8}"
 # Server bucket ladder (the snap-up policy; server reads the warmed set back from the forward -> one home).
-# WARMUP/MAXBATCH override it for the server-axis bridge: WARMUP=64,256,512 MAXBATCH=512 reproduces the
-# StageAServer bucket policy {64,256,512} exactly; the defaults are the tlab server's shipped ladder.
-WARMUP="${WARMUP:-1,8,64,512,4096}"; MAXBATCH="${MAXBATCH:-4096}"
+# DEFAULT = the BANKED lean ladder {64,256,512}/max-512 (== StageAServer's policy): the stamped quiet-box
+# 2x2 (journey doc Witness 2, commit 2ac1cef) made this the DOMINANT lever -- +25% (round-sync) to +37%
+# (greedy) over the tlab server's old [1,8,64,512,4096] ladder, every replicate, by removing the pad tax
+# (a ~124-row gather padded to 512 on the old ladder). Override with WARMUP=1,8,64,512,4096 MAXBATCH=4096
+# to reproduce the old pad-tax baseline arm.
+WARMUP="${WARMUP:-64,256,512}"; MAXBATCH="${MAXBATCH:-512}"
 # ADR-0011 (mechanize the finding): stamp EVERY reading with the exact code state so an attributed number
 # is always time-travellable. commit = HEAD short hash; tree = clean|dirty (dirty => the producer binary /
 # harness may not match HEAD, so the reading is NOT a reproducible artifact until committed). The maintainer's
