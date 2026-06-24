@@ -8,7 +8,7 @@
 
 The chocofarm leaf-eval path — the search asking an inference server to evaluate leaves — had a C++ coupling that was, in the maintainer's words, "too tacky to reason about." So we built `throughput-lab/`: a clean-room **synthetic** producer→boundary→server testbed to study the *transport* in isolation, with an eye toward an eventual **dynamic** coupling controller (`control_lab`). The static coupling was hardened first; this journey is what happened when we replaced the synthetic load with the **real** chocofarm Gumbel-AZ search and chased the throughput honestly.
 
-The metric is **leaf-rows/s** (leaves evaluated per second). Its connection to the production metric, **decisions/s (DPS)**, is §7 — flagged up front because it's the point of the whole exercise.
+The metric is **leaf-rows/s** (leaves evaluated per second). Its connection to the production metric, **decisions/s (DPS)**, is §3 — flagged up front because it's the point of the whole exercise.
 
 ---
 
@@ -86,5 +86,5 @@ The arithmetic (conjecture, to validate — §5): at the operating point ~47 lea
 **Test `control_lab` under the bursty (episodic) regime** — the one experiment that closes the dynamic-control question *and* validates the DPS translation:
 - Build the episodic/no-early-exit workload (real episodes, state evolving, early-exit on/off).
 - Re-run the coalescing sweep under it: if the optimum *shifts with load*, an adaptive gate (`control_lab` bang-bang) pays; if it stays flat, static M≈64 suffices and dynamic control is off the table. (Working hypothesis: bang-bang is the proxy — if it captures nothing, nothing will.)
-- Measure **DPS** directly against the 190→457 gap, confirming (or refuting) §7.
+- Measure **DPS** directly against the 190→457 gap, confirming (or refuting) §3.
 - Integration caveat: `control_lab` is invasive; if it isn't ADR-0012-composable a compile-time toggle may be needed — itself a signal about its coupling.
