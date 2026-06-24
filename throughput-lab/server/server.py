@@ -198,6 +198,8 @@ class ServerStats:
     drained_on_stop: int = 0       # queued requests answered during teardown (clause 7) rather than dropped
     batch_hist: "dict[int, int]" = field(default_factory=dict)   # forward batch-row-count -> occurrences
     compute_s: float = 0.0          # wall seconds spent inside forward_batch (the compute-busy time)
+    prep_s: float = 0.0             # wall seconds in host-side prep (concat the gather + pack/pad) before the forward
+    scatter_s: float = 0.0          # wall seconds in host-side scatter (encode_response + send) after the forward
     in_server_lat_sum_s: float = 0.0   # sum of per-request drain->reply-ready latencies (the in-server time)
     in_server_lat_max_s: float = 0.0   # worst single drain->reply-ready latency
     lat_count: int = 0              # number of replies the latency was measured over
@@ -227,12 +229,17 @@ class ServerStats:
         util = self.compute_s / w if w > 0 else 0.0
         mean_lat_ms = (self.in_server_lat_sum_s / self.lat_count * 1e3) if self.lat_count else 0.0
         max_lat_ms = self.in_server_lat_max_s * 1e3
+        nf = self.forwards or 1   # guard the per-forward divisions (0 forwards => a no-op run)
+        prep_us, comp_us, scat_us = (self.prep_s / nf * 1e6, self.compute_s / nf * 1e6, self.scatter_s / nf * 1e6)
+        overhead_pct = (self.prep_s + self.scatter_s) / w * 100 if w > 0 else 0.0
         return (
             f"[tlab-server] served {self.requests_recv} requests / {self.rows_recv} rows in {w:.3f}s\n"
             f"              throughput: {self.requests_recv / w:,.0f} req/s  |  {self.rows_recv / w:,.0f} rows/s\n"
             f"              forwards: {self.forwards}  (mean batch {mean_batch:.1f} rows, "
             f"max {max(self.batch_hist) if self.batch_hist else 0})\n"
             f"              compute-busy: {self.compute_s:.3f}s  ({util * 100:.1f}% of wall)\n"
+            f"              per-forward (us): prep {prep_us:.0f} | compute {comp_us:.0f} | scatter {scat_us:.0f}  "
+            f"(host serve-overhead prep+scatter = {overhead_pct:.1f}% of wall)\n"
             f"              in-server latency: mean {mean_lat_ms:.2f} ms  max {max_lat_ms:.2f} ms  "
             f"(drain -> reply-ready, {self.lat_count} replies)\n"
             f"              reply ledger: sent {self.replies_sent}  |  rejects {self.rejects}  |  "
@@ -394,9 +401,11 @@ class ThroughputServer:
                     n_rows += rows
                 if not batch:
                     continue
+                tp = time.monotonic()
                 X = batch[0][2] if len(batch) == 1 else np.concatenate([b[2] for b in batch], axis=0)
                 packed = self._forward.pack(X)
                 t0 = time.monotonic()
+                self.stats.prep_s += t0 - tp           # host-side concat + pad (before the forward)
                 values, logits = self._forward.forward_batch(packed)
                 done = time.monotonic()
                 self.stats.compute_s += done - t0
@@ -419,6 +428,7 @@ class ThroughputServer:
                         else:
                             raise
                     self.stats.note_latency(done - recv_mono)
+                self.stats.scatter_s += time.monotonic() - done   # host-side encode + send (after the forward)
         finally:
             self.stats.serve_end_mono = time.monotonic()
             self._wake_r.close(linger=0)   # bound in __init__ though unused in single-thread mode
