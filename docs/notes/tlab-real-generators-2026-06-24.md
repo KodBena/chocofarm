@@ -54,6 +54,18 @@ This vindicates the ADR-0014 kernel consult's EEVDF diagnosis (`docs/consults/20
 
 **K-stable (`k_idle_sweep.py`):** sweeping the fiber count confirms the benefit is robust, not a K=64 artifact — **+20–25% across K ∈ {16, 64, 128, 256}** (none → +idle: 12.7k→15.4k, 15.4k→18.4k, 16.9k→21.1k, 17.7k→21.6k). The surplus pushes the real-generator ceiling from ~17.7k to **~21.5k leaf-rows/s** (K=128–256, near-asymptotic).
 
+### 5. The biggest lever — static producer coalescing (`--msg-rows`): ~3× (the dynamic-control verdict)
+A production-build profile (`~/plots/server-profile.svg`) showed the server's non-matmul ~50% is **CPython interpreter** (the Python serve loop: `_PyEval` ~17.5% + attr/call overhead ~8%), **not** zmq IO (syscalls <1%) — paid *per request* and *per forward*. The round-sync fiber driver sent each round's K leaves as K separate B=1 messages; `--msg-rows M` coalesces them into ceil(K/M) messages. Sweep (real config, surplus on, K=128, production):
+
+| msg-rows | leaf-rows/s | vs M=1 | server requests | srv matmul% |
+|---:|---:|---:|---:|---:|
+| 1 | 20,096 | — | 120,576 | 47% |
+| 16 | 50,667 | +152% | 19,000 | 69% |
+| **64** | **58,368** | **+190%** | 5,472 | **70%** |
+| 256 | 58,091 | +189% | 2,723 | 72% |
+
+**~2.9× (20k → 58k), saturating at M≈64.** Requests collapse 22–44× → the per-request CPython decode vanishes → the server core is freed from serve-path overhead (matmul 47%→72%). **Dynamic-control verdict:** the serve-path slack is real and large but a STATIC coalescing floor captures it, and the optimum is FLAT (M=64–256) — load-insensitive in steady load. So an adaptive gate has little to beat here; dynamic control would only pay under **bursty/variable load** (the deferred episodic/early-exit workload), which is now a concrete testable precondition, not an open assumption. Bank the static win first (candidate default M≈64 + the SCHED_IDLE surplus → ~58k, ~3.6× over the original 16k baseline).
+
 ## Privilege
 
 All of the above runs **unprivileged**: `SCHED_IDLE`/`SCHED_BATCH`/positive-nice are self-settable; the EEVDF custom `--slice` is accepted without a capability; negative nice works via an `/etc/security/limits.d` RLIMIT_NICE bump. Only `SCHED_FIFO`/`SCHED_DEADLINE` need `CAP_SYS_NICE`, confined to the audited **`sched_wrap`** helper (`setcap cap_sys_nice+ep`) — *not* the interpreter, *not* root. This kernel (6.19, EEVDF) has **no `latency_nice` field** (`sched_wrap --latency-nice` returns `E2BIG`, fail-loud); the latency lever is the custom slice.
