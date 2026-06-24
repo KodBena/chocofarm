@@ -78,7 +78,9 @@ def launch_prefix(p: dict, slice_ns: int) -> list[str]:
 
 
 def run_config(cfg: dict, *, fibers: int, seconds: float, n_sims: int, slice_ns: int, seq: int,
-               logdir: Path) -> dict:
+               logdir: Path, msg_rows: int = 1, inflight: int = 8, driver: str = "round-sync",
+               m: int = 24, episodic: bool = False, single_thread: bool = False,
+               warmup: str = "") -> dict:
     placements = cfg["placements"]
     server = next(p for p in placements if p["role"] == "server")
     gens = [p for p in placements if p["role"] != "server"]
@@ -95,7 +97,11 @@ def run_config(cfg: dict, *, fibers: int, seconds: float, n_sims: int, slice_ns:
     server_cmd = launch_prefix(server, slice_ns) + [
         PYBIN, "-m", "server", "--bind", endpoint, "--in-dim", str(IN_DIM),
         "--n-actions", str(N_ACTIONS), "--hidden", str(HIDDEN), "--max-batch", str(MAX_BATCH),
-        "--poll-timeout-ms", "50"]
+        "--poll-timeout-ms", "50", "--forward", "jax"]
+    if warmup:
+        server_cmd += ["--warmup", warmup]            # banked bucket ladder (else the server default)
+    if single_thread:
+        server_cmd += ["--single-thread"]             # banked serve mode (finding #5)
     srv = subprocess.Popen(server_cmd, stdout=slog, stderr=subprocess.STDOUT, env=senv)
     logpath = logdir / f"server-{cfg['config_id']}.log"
     ready = False
@@ -116,8 +122,13 @@ def run_config(cfg: dict, *, fibers: int, seconds: float, n_sims: int, slice_ns:
         cmd = launch_prefix(g, slice_ns) + [
             str(PRODUCER), "--instance", str(INSTANCE), "--faces", str(FACES),
             "--endpoint", endpoint, "--threads", "1", "--fibers", str(fibers),
-            "--driver", "round-sync", "--seconds", str(seconds), "--n-sims", str(n_sims),
-            "--in-dim", str(IN_DIM)]
+            "--msg-rows", str(msg_rows), "--inflight-msgs", str(inflight),
+            "--driver", driver, "--seconds", str(seconds), "--n-sims", str(n_sims),
+            "--m", str(m), "--in-dim", str(IN_DIM)]
+        if episodic:
+            cmd += ["--episodic", "--no-early-exit"]   # banked production-shape workload
+        # NB the surplus role: a surplus gen ("surplus" role) is a 4th producer the topology places + schedules
+        # (e.g. SCHED_IDLE on the server core) — it is launched here exactly like a working gen.
         procs.append((g["role"], subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)))
 
     total_leaves, walls, fails = 0, [], []
@@ -158,6 +169,15 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=1, help="replicates per config (interleaved); median reported")
     ap.add_argument("--filter", default="", help="only configs whose tag contains this substring")
     ap.add_argument("--outdir", required=True)
+    # Banked-operating-point knobs (default OFF = the legacy round-sync/non-episodic producer + default server,
+    # so old invocations are byte-unchanged). Set these to sweep TOPOLOGY at the banked greedy/episodic point.
+    ap.add_argument("--msg-rows", type=int, default=1)
+    ap.add_argument("--inflight", type=int, default=8)
+    ap.add_argument("--driver", default="round-sync", choices=("round-sync", "greedy"))
+    ap.add_argument("--m", type=int, default=24)
+    ap.add_argument("--episodic", action="store_true", help="real episodes (production-shape workload)")
+    ap.add_argument("--single-thread", action="store_true", help="banked single-thread serve mode (finding #5)")
+    ap.add_argument("--warmup", default="", help="server bucket ladder, e.g. 64,256 (else server default)")
     args = ap.parse_args()
 
     for b in (PRODUCER, SCHED_WRAP):
@@ -180,7 +200,10 @@ def main() -> int:
         for c in configs:
             seq += 1
             r = run_config(c, fibers=args.fibers, seconds=args.seconds, n_sims=args.n_sims,
-                           slice_ns=args.slice_ns, seq=seq, logdir=outdir)
+                           slice_ns=args.slice_ns, seq=seq, logdir=outdir,
+                           msg_rows=args.msg_rows, inflight=args.inflight, driver=args.driver,
+                           m=args.m, episodic=args.episodic, single_thread=args.single_thread,
+                           warmup=args.warmup)
             if r["ok"]:
                 samples[c["config_id"]].append(r["leaves_per_sec"])
             tag = r["tag"]
