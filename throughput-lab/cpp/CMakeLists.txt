@@ -32,10 +32,15 @@ endif()
 # clang-tidy modernize-*/cppcoreguidelines-* config is the per-class net when a reliquary form recurs.
 add_compile_options(-Wall -Wextra)
 
-# -march=native is INVARIABLY in our compile flags (maintainer directive): build for the host CPU so the
-# producer/search matches production-level codegen (AVX2/FMA auto-vectorization). The box is the build
-# host (non-portability is a non-concern here); mirrors the core's CHOCO_MARCH_NATIVE (cpp/CMakeLists.txt).
-add_compile_options(-march=native)
+# -march=native: ON by default (the production codegen the maintainer wants invariably — AVX2/FMA
+# auto-vectorization of the search). Exposed as an OPTION (not unconditional) for ONE reason: the
+# scenario-audit harness toggles it OFF to ISOLATE its effect on the bottleneck regime (the
+# generator-bound <-> server-bound flip must be provably attributable to this flag, not lost to oblivion).
+# Default ON keeps it invariable in normal use; mirrors the core's CHOCO_MARCH_NATIVE (cpp/CMakeLists.txt).
+option(TLAB_MARCH_NATIVE "Compile the producer for the host CPU (-march=native)" ON)
+if(TLAB_MARCH_NATIVE)
+  add_compile_options(-march=native)
+endif()
 
 # libzmq: prefer pkg-config (the usual libzmq install path), fall back to a plain find_library so the
 # build works on a host without the .pc file. The target the executable links is `zmq_lib`.
