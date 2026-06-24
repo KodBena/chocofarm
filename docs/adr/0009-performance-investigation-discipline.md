@@ -272,6 +272,38 @@ register, not the exploratory.
   applicability (no UI); its Related note points back here as the nearest
   chocofarm perf concern.
 
+## Amendments
+
+### 2026-06-24 — The throughput-lab perf surface + a captured-investigation DB (Revisit #2 + #4 fired)
+
+The hot path moved exactly as Revisit #2 anticipated — the **C++ search seam**
+(`docs/design/scaling-and-cpp-seam.md`), realized as the `throughput-lab/`
+producer→boundary→inference-server testbed. The tool surface extends accordingly:
+
+- **Canonical tools (extending §Tools):** `throughput-lab/harness/` — `episodic_dps.sh`
+  (the production-shape DPS baseline), `coalesce_sweep.py`, `topology_enum.py` +
+  `topology_sweep.py` (the CP-SAT-enumerated config space), and the forward
+  microbench. These are this register's `bench_hotpath` analogs for transport
+  throughput.
+- **Metric vocabulary (extending §Metric vocabulary):** the throughput register —
+  **leaf-rows/s** (the comparable, server-feed-rate), **DPS** (decisions/s), **real
+  rows/forward** (batch fill), **server util %**, **forwards/s**, **LPD**. These are
+  the transport-throughput comparables, distinct from the per-component wall-time and
+  the equivalence comparables already named; a throughput claim attaches them.
+
+And the substantiation requirement is now **mechanized** (Revisit #4, partially): a
+captured throughput number is no longer prose. **`throughput-lab/harness/exp_db.py`**
+(the `throughput_research` Postgres store) persists every reading with its code stamp
+(commit/tree), HP config, exact command, and replicates — so a perf claim is
+*code-addressable* and aggregated (median/IQR), never a single eyeballed number
+(`robust-benchmark-statistics`). Crucially, this register now distinguishes the
+**measurement** from the **interpretation** at the schema level: a reading
+(`tlab_reading`) is an immutable fact; a perf *claim about* it ("X is faster", "the
++31% was an artifact") is an authored, supersedable **finding** (`tlab_finding`) —
+the measured-vs-interpreted separation this tenet's honesty depends on, made
+structural so an overturned claim is auditable, not lost. (The belief-layer mechanism
+is recorded in ADR-0011's 2026-06-24 amendment; this is its perf-register face.)
+
 ## License
 
 Public Domain (The Unlicense).

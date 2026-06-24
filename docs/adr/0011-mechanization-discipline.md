@@ -229,6 +229,37 @@ someone remembered to label.
 Provenance: the maintainer's contribution, 2026-06-24, during the throughput-lab
 driver-attribution work.
 
+### 2026-06-24 — The interpretation/belief layer (the Witness chain, mechanized)
+
+A measurement is an immutable fact; an **interpretation** of it (the reading that
+motivates the next code change) is a different kind of thing — mutable, frequently
+wrong, and spanning a *set* of readings. The throughput-lab journal recorded its
+interpretations as prose **Witness/Correction** entries (Witness 1: "+31% clean
+driver win" → retracted → Witness 2: "regime-dependent +15%" → Witness 3: the full
+2× attribution). That prose chain is exactly the load-bearing knowledge offloaded to
+a form the code cannot enforce (anti-pattern G), and the wrong belief that motivated
+banking the wrong default is the cost.
+
+Per **Rule 2** (recurrence → mechanism) and **Rule 4** (a net over the *class* of all
+interpretations, not the remembered ones): the belief layer moves into a queryable,
+append-only store — `tlab_finding` (`throughput-lab/harness/exp_db.py`), a SEPARATE
+table from the `tlab_reading` measurements, so the conflation the project has been
+burned by (a reading-*of* the data recorded as the data) is **structurally
+unrepresentable** (composing with ADR-0000). A finding carries `motivation` +
+`interpretation`, a `status` in the closed vocabulary `{provisional, confirmed,
+retracted}` (ADR-0008), the commit the belief was formed against (the commit-stamp
+amendment above), and a `supersedes` link to the finding it corrects — the
+Witness→Correction step, append-only (ADR-0005: the prior belief is never rewritten;
+the current belief on a scope is the one nothing supersedes).
+
+- **Enforcement surface (Rule 1):** write-time data constraint (the `CHECK` enum, the
+  NOT-NULL interpretation, the immutable supersede-chain) + the discipline that
+  *measurements auto-record but findings are deliberately authored* — an
+  interpretation is a conscious, attributable act, not a side effect of a run.
+- **Worked instance:** the Witness 1→2→3 chain is backfilled into the store, so the
+  retracted "+31%" is itself queryable (`exp_db.py --findings`).
+- **Pairs with ADR-0009** (the measured-vs-interpreted bar, amended there same day).
+
 ## License
 
 Public Domain (The Unlicense).

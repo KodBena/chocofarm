@@ -21,7 +21,23 @@ THE SCHEMA (idempotent CREATE TABLE IF NOT EXISTS; load-bearing axes first-class
   * tlab_reading — one row per SAMPLE/replicate (right-skewed benchmark timings MUST be aggregated, never
                    recorded single; replicate_idx + the FK make median/min/max a GROUP BY). Carries the
                    provenance stamp (commit/tree/recorded_at/host), the metrics + the raw counts they derive
-                   from, the EXACT command string, the emitting tool, and a free-text tag/notes.
+                   from, the EXACT command string, the emitting tool, a free-text tag, and `notes` (see below).
+
+THE BELIEF LAYER (tlab_finding — measurement ⊥ interpretation, the discipline made structural). A reading is an
+immutable MEASUREMENT; an INTERPRETATION (what a result MEANS — the reading-of-the-result that motivates the
+next code change) is a different KIND of thing: mutable, often wrong, and about a SET of readings (a comparison),
+not one row. Conflating the two is the failure this project has been burned by (a reading-OF the data recorded
+as the data). So interpretations live in their OWN table, NEVER in tlab_reading.notes:
+  * tlab_finding — one row per authored belief, APPEND-ONLY (supersede, never rewrite — ADR-0005). Carries the
+                   `motivation` (what was tested + expected) and the `interpretation` (what was concluded), a
+                   `status` in the CLOSED vocabulary {provisional, confirmed, retracted} (ADR-0008), the commit
+                   the belief was formed against (ADR-0011), and a `supersedes` link to the finding it corrects
+                   — i.e. the journey-doc Witness/Correction chain, mechanized and queryable. The CURRENT belief
+                   on a scope is the finding nothing supersedes; the prior is left immutable (amend-by-append).
+   Division of labor: MEASUREMENTS auto-record (the harness, at the post-run flush seam); FINDINGS are
+   DELIBERATELY authored at analysis time — an interpretation is a conscious, attributable act, not a side
+   effect of a run. And `tlab_reading.notes` is for MEASUREMENT-CONDITION facts (load@end, a hiccuped rep) —
+   facts ABOUT a run, NEVER a reading OF it; it must not drift into a half-interpretation field.
 
 HP NAME ALIGNMENT (ADR-0012 P1, one home). The first-class HP columns mirror the canonical names declared in
 the SSOT (throughput-lab/hp/spec.py + hp/compile.py): driver, pool_batch, msg_rows (concept of `msg-rows`),
@@ -157,8 +173,9 @@ CREATE TABLE IF NOT EXISTS tlab_reading (
     -- Reproducibility: the EXACT command that produced the reading + which tool emitted it + a free tag.
     command       text NOT NULL,             -- the exact invocation string
     tool          text NOT NULL,             -- the emitting harness/tool (episodic_dps.sh, coalesce_sweep…)
-    tag           text,                      -- optional free-text label
-    notes         text,                      -- optional free-text notes
+    tag           text,                      -- optional free-text label (the cohort key; findings scope to it)
+    notes         text,                      -- MEASUREMENT-CONDITION facts (load@end, a hiccuped rep) — ABOUT
+                                             -- the run, NEVER an interpretation OF it (those live in tlab_finding)
 
     -- The metrics. seconds + the raw counts are recorded alongside the derived rates so a reading is
     -- self-checking (leaf_rows_s should ≈ leaves/wall_s). Nullable individually (not every tool emits
@@ -183,6 +200,38 @@ CREATE TABLE IF NOT EXISTS tlab_reading (
 CREATE INDEX IF NOT EXISTS tlab_reading_config_idx ON tlab_reading (config_id);
 CREATE INDEX IF NOT EXISTS tlab_reading_commit_idx ON tlab_reading (git_commit);
 CREATE INDEX IF NOT EXISTS tlab_reading_tag_idx    ON tlab_reading (tag);
+
+-- The BELIEF layer (measurement ⊥ interpretation). A finding is an authored INTERPRETATION, append-only:
+-- a corrected belief is a NEW row that `supersedes` the one it replaces (the Witness/Correction chain), and
+-- the prior row is NEVER mutated (amend-by-append, ADR-0005). Distinct table from tlab_reading precisely so
+-- the conflation this project has been burned by is UNREPRESENTABLE (ADR-0000).
+CREATE TABLE IF NOT EXISTS tlab_finding (
+    finding_id       bigserial PRIMARY KEY,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    -- the code state the belief was formed against (ADR-0011): travel back to what was believed at a commit.
+    git_commit       text NOT NULL,
+    git_tree         text NOT NULL CHECK (git_tree IN ('clean', 'DIRTY')),
+    host             text NOT NULL,
+    -- scope: what the finding is ABOUT — typically a tlab_reading.tag (the cohort it interprets), or a
+    -- described comparison. The common reads are "the findings on this scope" and "the current one".
+    scope            text NOT NULL,
+    -- the belief, the before/after halves of ONE unit (both authored at finding time):
+    motivation       text,                   -- what was tested + expected (the hypothesis/prior); nullable
+    interpretation   text NOT NULL,          -- what was concluded — the load-bearing field
+    -- status: the belief's self-assessment at authoring, CLOSED vocabulary (ADR-0008). A single-session
+    -- reading is provisional until an independent check corroborates; retracted withdraws a prior belief.
+    status           text NOT NULL CHECK (status IN ('provisional', 'confirmed', 'retracted')),
+    -- the Correction link: this finding supersedes a prior one. NULL = a fresh belief. The prior is left
+    -- immutable; "is X current?" == "no finding supersedes X".
+    supersedes       bigint REFERENCES tlab_finding(finding_id),
+    -- optional: the commit/edit this interpretation MOTIVATED (closes the loop interpretation -> code change).
+    motivated_change text,
+    refs             jsonb NOT NULL DEFAULT '{{}}'::jsonb,   -- optional explicit config/reading refs (long tail)
+    notes            text
+);
+CREATE INDEX IF NOT EXISTS tlab_finding_scope_idx      ON tlab_finding (scope);
+CREATE INDEX IF NOT EXISTS tlab_finding_commit_idx     ON tlab_finding (git_commit);
+CREATE INDEX IF NOT EXISTS tlab_finding_supersedes_idx ON tlab_finding (supersedes);
 """
 
 
@@ -452,7 +501,100 @@ def aggregate(conn: psycopg.Connection, tag: Optional[str] = None) -> list[tuple
 
 
 # ============================================================================================
-# CLI — ensure-schema / record (from stdin JSON) / aggregate. The shell-harness front door.
+# THE BELIEF LAYER — tlab_finding. Interpretations: append-only, supersede-don't-rewrite (ADR-0005/0011).
+# A reading (tlab_reading) is immutable FACT; a finding is a mutable, supersedable BELIEF about readings.
+# Findings are DELIBERATELY authored (an interpretation is a conscious act), never auto-emitted by a run.
+# ============================================================================================
+STATUSES = ("provisional", "confirmed", "retracted")   # closed vocabulary (ADR-0008); a CHECK mirrors it
+
+
+def record_finding(conn: psycopg.Connection, scope: str, interpretation: str, *,
+                   motivation: Optional[str] = None, status: str = "provisional",
+                   supersedes: Optional[int] = None, motivated_change: Optional[str] = None,
+                   refs: Optional[Mapping[str, Any]] = None, notes: Optional[str] = None,
+                   stamp: Optional[Mapping[str, str]] = None, host: Optional[str] = None) -> int:
+    """Append ONE authored belief (an interpretation) about a `scope` (typically a tlab_reading.tag, or a
+    described comparison). APPEND-ONLY: a finding is never rewritten — a corrected belief is a NEW finding with
+    `supersedes` set to the one it replaces (the Witness/Correction chain; ADR-0005 amend-by-append). `status`
+    is the belief's self-assessment at authoring, in the CLOSED vocabulary {provisional, confirmed, retracted}
+    (ADR-0008): a single-session reading is PROVISIONAL until an independent check corroborates it (the
+    measured-vs-interpreted discipline). Stamps commit/tree via code_stamp — the code state the belief was
+    formed against (ADR-0011). RAISES on a bad status / empty interpretation / DB fault (ADR-0002). Returns
+    the new finding_id."""
+    if status not in STATUSES:
+        raise ValueError(f"record_finding: status must be one of {STATUSES}, got {status!r}")
+    if not interpretation or not interpretation.strip():
+        raise ValueError("record_finding: interpretation is the load-bearing field — must be non-empty (ADR-0002)")
+    st = dict(stamp) if stamp is not None else code_stamp()
+    commit = st.get("commit", "unknown")
+    tree = st.get("tree", "DIRTY")
+    if tree not in ("clean", "DIRTY"):
+        raise ValueError(f"record_finding: tree must be 'clean'|'DIRTY', got {tree!r}")
+    hostname = host if host is not None else socket.gethostname()
+    with conn.cursor() as cur:
+        if supersedes is not None:
+            # the prior finding is NOT mutated (append-only) — we only point back at it. Verify it exists so a
+            # dangling supersede link is a loud error, not a silent orphan (ADR-0002).
+            cur.execute("SELECT 1 FROM tlab_finding WHERE finding_id = %s", (supersedes,))
+            if cur.fetchone() is None:
+                raise ValueError(f"record_finding: supersedes={supersedes} does not exist")
+        cur.execute(
+            """
+            INSERT INTO tlab_finding
+                (git_commit, git_tree, host, scope, motivation, interpretation, status,
+                 supersedes, motivated_change, refs, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING finding_id
+            """,
+            (commit, tree, hostname, scope, motivation, interpretation, status,
+             supersedes, motivated_change, Jsonb(dict(refs or {})), notes),
+        )
+        out = cur.fetchone()
+        if out is None:
+            raise RuntimeError("record_finding: INSERT ... RETURNING yielded no finding_id")
+        fid = int(out[0])
+    conn.commit()
+    return fid
+
+
+def supersede(conn: psycopg.Connection, prior_finding_id: int, scope: str, interpretation: str, *,
+              status: str = "confirmed", **kw: Any) -> int:
+    """Convenience: append a NEW finding that CORRECTS `prior_finding_id` (the Witness→Correction step). The
+    prior finding is left IMMUTABLE (amend-by-append); its replacement is found by following `supersedes`. The
+    new belief defaults to status='confirmed' (the corrected reading), overridable. Same kwargs as
+    record_finding (motivation, motivated_change, refs, notes, stamp, host)."""
+    return record_finding(conn, scope, interpretation, status=status, supersedes=prior_finding_id, **kw)
+
+
+def findings(conn: psycopg.Connection, scope: Optional[str] = None,
+             current_only: bool = False) -> list[tuple]:
+    """Read the belief layer (the time-travel query). `scope` filters; `current_only` returns only findings
+    nothing supersedes — the head of each correction chain, i.e. the LIVE belief. Newest first. Returns
+    (finding_id, created_at, git_commit, git_tree, scope, status, supersedes, motivation, interpretation,
+    motivated_change)."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if scope is not None:
+        clauses.append("f.scope = %s")
+        params.append(scope)
+    if current_only:
+        clauses.append("NOT EXISTS (SELECT 1 FROM tlab_finding s WHERE s.supersedes = f.finding_id)")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT f.finding_id, f.created_at, f.git_commit, f.git_tree, f.scope, f.status,
+                   f.supersedes, f.motivation, f.interpretation, f.motivated_change
+            FROM tlab_finding f {where}
+            ORDER BY f.created_at DESC, f.finding_id DESC
+            """,
+            params,
+        )
+        return cur.fetchall()
+
+
+# ============================================================================================
+# CLI — ensure-schema / record (from stdin JSON) / aggregate / findings. The shell-harness front door.
 # ============================================================================================
 def _reading_from_json(obj: Mapping[str, Any]) -> tuple[ConfigKey, Reading, Optional[dict], Optional[str]]:
     """Parse a JSON reading object (the shell CLI's stdin contract) into (ConfigKey, Reading, stamp, host).
@@ -477,9 +619,15 @@ def main() -> int:
     ap.add_argument("--aggregate", action="store_true",
                     help="print the median/min/max-per-config aggregate table")
     ap.add_argument("--tag", default=None, help="filter --aggregate to one tag")
+    ap.add_argument("--record-finding", action="store_true",
+                    help="read ONE JSON finding object (scope, interpretation, ...) from stdin and append it")
+    ap.add_argument("--findings", action="store_true",
+                    help="print the belief layer (interpretations); --scope filters, --current = live only")
+    ap.add_argument("--scope", default=None, help="filter --findings to one scope")
+    ap.add_argument("--current", action="store_true", help="--findings: only findings nothing supersedes")
     a = ap.parse_args()
-    if not (a.ensure_schema or a.record or a.aggregate):
-        ap.error("nothing to do: pass --ensure-schema and/or --record and/or --aggregate")
+    if not (a.ensure_schema or a.record or a.aggregate or a.record_finding or a.findings):
+        ap.error("nothing to do: pass --ensure-schema / --record / --aggregate / --record-finding / --findings")
     conn = connect()
     try:
         if a.ensure_schema:
@@ -499,6 +647,22 @@ def main() -> int:
             for row in rows:
                 print("\t".join("" if v is None else
                                  (f"{v:.1f}" if isinstance(v, float) else str(v)) for v in row))
+        if a.record_finding:
+            ensure_schema(conn)
+            obj = json.load(sys.stdin)        # {scope, interpretation, [motivation, status, supersedes, ...]}
+            scope = obj.pop("scope")
+            interp = obj.pop("interpretation")
+            stamp = obj.pop("stamp", None)
+            host = obj.pop("host", None)
+            fid = record_finding(conn, scope, interp, stamp=stamp, host=host, **obj)
+            print(fid)
+        if a.findings:
+            for row in findings(conn, scope=a.scope, current_only=a.current):
+                fid, ts, commit, tree, scope, status, sup, motiv, interp, change = row
+                sup_s = f" supersedes={sup}" if sup else ""
+                print(f"[{fid}] {ts:%Y-%m-%d} {commit}/{tree} <{scope}> {status.upper()}{sup_s}\n"
+                      f"      motivation: {motiv or '—'}\n      interpretation: {interp}"
+                      + (f"\n      → {change}" if change else ""))
     finally:
         conn.close()
     return 0
