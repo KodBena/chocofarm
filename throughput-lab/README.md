@@ -311,6 +311,38 @@ Built and smoke-measured by the integrate phase (2026-06-23):
 
 ---
 
+## Real-generator integration & scheduling (2026-06-24)
+
+The synthetic producer above (a calibrated `x += 1` spin) was joined by the **real**
+chocofarm Gumbel-AZ search as a load source — gated behind `-DTLAB_REAL_GENERATOR=ON`
+(links the prebuilt `chocofarm_core`), driven through *our* `tlab::Boundary` via a thin
+`BoundaryNetEvaluator` ACL. New surface: `cpp/real_producer.cpp` (`tlab-real-producer`:
+non-fiber baseline + a `--fibers K` fiber multiplexer, `--driver round-sync|greedy`),
+`cpp/boundary_net_evaluator.hpp`, `cpp/sched_wrap.cpp` (a `cap_sys_nice`-confinement
+helper), and the harness drivers `topology_enum.py` (CP-SAT config-space SSOT),
+`topology_sweep.py`, `surplus_policy_control.py`, `fiber_sweep.py`, `run_real_best.sh`.
+
+Headline findings (measured; full write-up in
+**`docs/notes/tlab-real-generators-2026-06-24.md`**):
+
+- **The real workload is generator-bound** — the 3 search cores cap throughput at
+  ~16k leaf-rows/s while the inference server sits ~58% util (starved). The bottleneck
+  is generation, not our transport.
+- **Fibers help (5.8× by K=128), never hurt** (K=1 ≈ K=0); round-sync ≥ greedy; the
+  curve is a saturating asymptote, not a mode.
+- **`SCHED_IDLE` surplus on the server's core reclaims +18.1%** (vs `nice +19` +5%,
+  `SCHED_BATCH` −1%) — an EEVDF runnability gate converts the server core's fragmented
+  ~42% idle slack to generation where a share-weight can't. Unprivileged. The optimal
+  topology (server@0, 3 gens@1,2,3, `SCHED_IDLE` surplus@0) is encoded in
+  `run_real_best.sh` (ADR-0011 — mechanize the finding).
+- **Server-on-core-0 ≈ server-on-an-isolated-core** in-guest (~2–3%) — the host
+  `isolcpus`/`irqaffinity` isolation does not translate to a benefit here.
+
+Open frontier: dynamic coupling control (a `control_lab` issue-gate acting on the real
+`ready`/`inflight` dynamics) measured against this static-coupling baseline.
+
+---
+
 ## Discipline
 
 - **ADR-0012 P7** — the wire is one truth in two views (`cpp/wire.hpp`,
