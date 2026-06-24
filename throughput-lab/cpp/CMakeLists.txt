@@ -76,6 +76,11 @@ add_executable(tlab-producer
 target_include_directories(tlab-producer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(tlab-producer PRIVATE zmq_lib Threads::Threads)
 
+# sched_wrap: a tiny libc-only privilege-confinement helper (set a sched policy/attr on self, then exec).
+# The maintainer grants ONLY this binary `cap_sys_nice` (setcap), so the cap-requiring scheduling
+# experiments run with the privilege confined here and the workload running as the user, not root.
+add_executable(sched_wrap sched_wrap.cpp)
+
 # ================================================================================================
 #  THE REAL-GENERATOR LEAF SOURCE (opt-in: -DTLAB_REAL_GENERATOR=ON) — the fork-in-the-road work.
 #  Couples the lab to the PARENT chocofarm_core (env / gumbel / search_runtime / fiber primitives) so
