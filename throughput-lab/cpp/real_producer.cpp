@@ -112,6 +112,55 @@ void run_thread(int idx, const chocofarm::Environment& env, const std::string& e
     }
 }
 
+// Drive ONE round-synchronous batch: submit the `active` fibers' parked leaves COALESCED into messages of
+// up to `coalesce_rows` leaves each (B<=M) -- K leaves become ceil(K/M) requests, fewer per-request decodes
+// server-side and fewer/bigger forwards (the static S_min coalescing floor; M=1 = the per-leaf B=1 path).
+// corr -> the group's fibers (submit order) so each B=G reply's G preds route home in order; then recv all
+// groups and resume each fiber. Returns false (out.failed set) on a transport/decode fault. Shared by the
+// root and episodic fiber drivers (ADR-0012 P1: one home for the coalescing send/recv).
+[[nodiscard]] bool drive_round(tlab::Boundary& boundary,
+                               std::vector<std::unique_ptr<chocofarm::TreeState>>& trees,
+                               const std::vector<int>& active, int coalesce_rows, int in_dim,
+                               tlab::wire::corr_t& corr, ThreadStat& out) {
+    std::unordered_map<tlab::wire::corr_t, std::vector<int>> corr_to_group;
+    std::vector<float> buf;
+    int n_msgs = 0;
+    for (size_t off = 0; off < active.size(); off += static_cast<size_t>(coalesce_rows)) {
+        const size_t g_end = std::min(active.size(), off + static_cast<size_t>(coalesce_rows));
+        buf.clear();
+        std::vector<int> group;
+        group.reserve(g_end - off);
+        for (size_t k = off; k < g_end; ++k) {
+            const std::span<const float> feats = trees[static_cast<size_t>(active[k])]->ch.features;
+            buf.insert(buf.end(), feats.begin(), feats.end());   // concat the group's feature rows
+            group.push_back(active[k]);
+        }
+        const tlab::wire::corr_t cc = corr++;
+        const auto G = static_cast<tlab::wire::count_t>(group.size());
+        corr_to_group.emplace(cc, std::move(group));
+        const tlab::LeafBatch lb{cc, G, static_cast<tlab::wire::count_t>(in_dim),
+                                 std::span<const float>(buf.data(), buf.size())};
+        if (auto s = boundary.send(lb); !s) { out.failed = true; out.err = "send: " + s.error().message; return false; }
+        ++n_msgs;   // buf is reused next group: send copies the bytes into the wire frame before returning
+    }
+    for (int r = 0; r < n_msgs; ++r) {
+        auto reply = boundary.recv();
+        if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return false; }
+        auto it = corr_to_group.find(reply->corr);
+        if (it == corr_to_group.end() || reply->preds.size() != it->second.size()) {
+            out.failed = true; out.err = "unmatched/size-mismatch reply corr=" + std::to_string(reply->corr); return false;
+        }
+        for (size_t j = 0; j < it->second.size(); ++j) {
+            chocofarm::NetPrediction pred;
+            pred.value = reply->preds[j].value;
+            pred.logits = std::move(reply->preds[j].logits);
+            trees[static_cast<size_t>(it->second[j])]->resume_with(pred);
+            out.leaves += 1;
+        }
+    }
+    return true;
+}
+
 // One FIBER producer thread: multiplex K TreeState fibers over its own Boundary, ROUND-SYNCHRONOUS
 // (wire_parallel_bench's discipline): each round, submit every parked fiber's leaf (B=1) into the DEALER,
 // let the SERVER gather the K concurrent requests into one forward, then recv the K replies and resume
@@ -165,47 +214,86 @@ void run_thread_fiber(int idx, const chocofarm::Environment& env, const std::str
         }
         if (active.empty()) break;
 
-        // Submit the parked leaves COALESCED into messages of up to `coalesce_rows` leaves each (B<=M):
-        // K leaves become ceil(K/M) requests instead of K -- fewer per-request decodes server-side AND
-        // fewer/bigger forwards (the static S_min coalescing floor; M=1 reproduces the per-leaf B=1 path).
-        // corr -> the group's fibers (in submit order) so each B=G reply's G preds route home in order.
-        std::unordered_map<tlab::wire::corr_t, std::vector<int>> corr_to_group;
-        std::vector<float> buf;
-        int n_msgs = 0;
-        for (size_t off = 0; off < active.size(); off += static_cast<size_t>(coalesce_rows)) {
-            const size_t g_end = std::min(active.size(), off + static_cast<size_t>(coalesce_rows));
-            buf.clear();
-            std::vector<int> group;
-            group.reserve(g_end - off);
-            for (size_t k = off; k < g_end; ++k) {
-                const std::span<const float> feats = trees[static_cast<size_t>(active[k])]->ch.features;
-                buf.insert(buf.end(), feats.begin(), feats.end());   // concat the group's feature rows
-                group.push_back(active[k]);
+        if (!drive_round(*boundary, trees, active, coalesce_rows, in_dim, corr, out)) return;
+    }
+}
+
+// EPISODIC fiber driver: like run_thread_fiber, but each slot runs a SEQUENCE of decisions forming an
+// EPISODE. On a completed decision the executed action steps the slot's OWN (loc, bw, collected) via
+// env.apply against a per-episode sampled true world (mirrors runner.cpp's run_episode), and the next
+// decision starts from the EVOLVED state, not the root. With cfg.no_early_exit on, a Terminate is
+// substituted unless the belief is exhausted, so episodes run to a genuine terminal (or env.max_steps).
+// This is the production-shape workload; DPS = decisions/wall. Scripted gumbel source for now (incremental
+// fidelity); a per-slot RNG samples each episode's world uniformly from the prior worlds. The per-slot
+// state vectors are RESERVED (never reallocated) so TreeState::start's by-reference captures stay valid.
+void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
+                               const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
+                               int fibers_k, int coalesce_rows, ThreadStat& out) {
+    if (coalesce_rows < 1) coalesce_rows = 1;
+    tlab::BoundaryConfig bcfg;
+    bcfg.endpoint = endpoint; bcfg.recv_timeout_ms = 10000; bcfg.n_producer_threads = 1;
+    bcfg.rows = coalesce_rows; bcfg.in_dim = in_dim;
+    auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
+    if (!b) { out.failed = true; out.err = "boundary: " + b.error().message; return; }
+    std::unique_ptr<tlab::Boundary> boundary = std::move(*b);
+
+    const int max_steps = env.max_steps();
+    const auto& worlds = env.worlds();
+    const std::size_t n_worlds = worlds.size();
+
+    std::vector<chocofarm::Loc> ep_loc; ep_loc.reserve(static_cast<size_t>(fibers_k));
+    std::vector<chocofarm::Belief> ep_bw; ep_bw.reserve(static_cast<size_t>(fibers_k));
+    std::vector<chocofarm::CollectedSet> ep_coll; ep_coll.reserve(static_cast<size_t>(fibers_k));
+    std::vector<std::uint32_t> ep_world(static_cast<size_t>(fibers_k), 0);
+    std::vector<int> ep_step(static_cast<size_t>(fibers_k), 0);
+    std::vector<std::mt19937_64> ep_rng; ep_rng.reserve(static_cast<size_t>(fibers_k));
+    std::vector<std::unique_ptr<chocofarm::TreeState>> trees; trees.reserve(static_cast<size_t>(fibers_k));
+
+    auto new_episode = [&](int i) {
+        ep_loc[static_cast<size_t>(i)] = chocofarm::Loc{env.entry_point()};
+        ep_bw[static_cast<size_t>(i)] = env.full_belief();
+        ep_coll[static_cast<size_t>(i)] = chocofarm::CollectedSet{};
+        ep_world[static_cast<size_t>(i)] = static_cast<std::uint32_t>(
+            worlds[ep_rng[static_cast<size_t>(i)]() % n_worlds]);
+        ep_step[static_cast<size_t>(i)] = 0;
+    };
+
+    for (int i = 0; i < fibers_k; ++i) {
+        ep_loc.emplace_back(env.entry_point());
+        ep_bw.emplace_back(env.full_belief());
+        ep_coll.emplace_back();
+        ep_rng.emplace_back(static_cast<std::uint64_t>(idx) * 1'000'003ull + static_cast<std::uint64_t>(i) + 1ull);
+        std::vector<double> table(kGumbelTable.size());
+        for (size_t j = 0; j < kGumbelTable.size(); ++j)
+            table[j] = kGumbelTable[(j + static_cast<size_t>(i)) % kGumbelTable.size()];
+        trees.push_back(std::make_unique<chocofarm::TreeState>(cfg, env, std::move(table)));
+    }
+    for (int i = 0; i < fibers_k; ++i) {
+        new_episode(i);
+        trees[static_cast<size_t>(i)]->start(ep_loc[static_cast<size_t>(i)], ep_bw[static_cast<size_t>(i)],
+                                             ep_coll[static_cast<size_t>(i)], kLam);
+    }
+
+    tlab::wire::corr_t corr = static_cast<tlab::wire::corr_t>(idx) * 1'000'000'000ull + 1ull;
+    const auto t_start = SteadyClock::now();
+    while (secs_since(t_start) < run_seconds) {
+        std::vector<int> active; active.reserve(static_cast<size_t>(fibers_k));
+        for (int i = 0; i < fibers_k; ++i) {
+            const size_t si = static_cast<size_t>(i);
+            if (!trees[si]->running) {                       // a decision completed -> step the episode
+                out.decisions += 1;
+                const chocofarm::Action act = trees[si]->decision.action;
+                ep_step[si] += 1;
+                const bool terminal = (act.kind == chocofarm::ActionKind::Terminate)
+                                      || ep_step[si] >= max_steps || env.empty(ep_bw[si]);
+                if (terminal) new_episode(i);                                          // fresh episode
+                else env.apply(ep_loc[si], ep_bw[si], ep_coll[si], act, ep_world[si]); // step
+                trees[si]->start(ep_loc[si], ep_bw[si], ep_coll[si], kLam);            // next decision
             }
-            const tlab::wire::corr_t cc = corr++;
-            const auto G = static_cast<tlab::wire::count_t>(group.size());
-            corr_to_group.emplace(cc, std::move(group));
-            const tlab::LeafBatch lb{cc, G, static_cast<tlab::wire::count_t>(in_dim),
-                                     std::span<const float>(buf.data(), buf.size())};
-            if (auto s = boundary->send(lb); !s) { out.failed = true; out.err = "send: " + s.error().message; return; }
-            ++n_msgs;   // buf is reused next group: send copies the bytes into the wire frame before returning
+            if (trees[si]->running) active.push_back(i);
         }
-        // Recv n_msgs replies; each B=G reply's preds route to its group's fibers in order.
-        for (int r = 0; r < n_msgs; ++r) {
-            auto reply = boundary->recv();
-            if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return; }
-            auto it = corr_to_group.find(reply->corr);
-            if (it == corr_to_group.end() || reply->preds.size() != it->second.size()) {
-                out.failed = true; out.err = "unmatched/size-mismatch reply corr=" + std::to_string(reply->corr); return;
-            }
-            for (size_t j = 0; j < it->second.size(); ++j) {
-                chocofarm::NetPrediction pred;
-                pred.value = reply->preds[j].value;
-                pred.logits = std::move(reply->preds[j].logits);
-                trees[static_cast<size_t>(it->second[j])]->resume_with(pred);
-                out.leaves += 1;
-            }
-        }
+        if (active.empty()) break;
+        if (!drive_round(*boundary, trees, active, coalesce_rows, in_dim, corr, out)) return;
     }
 }
 
@@ -297,7 +385,9 @@ int main(int argc, char** argv) {
                      "[--threads N --fibers K --msg-rows M --driver round-sync|greedy --seconds S --n-sims K --m M --in-dim D]\n"
                      "  --fibers 0 (default) = non-fiber baseline; K>=1 = K fibers/thread (the fiber model)\n"
                      "  --msg-rows M (default 1) = coalesce up to M round leaves per message (round-sync; the S_min floor)\n"
-                     "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n";
+                     "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n"
+                     "  --episodic = run real episodes (step the env per executed action); DPS = decisions/s\n"
+                     "  --no-early-exit = substitute Terminate so episodes run full-length (cfg.no_early_exit)\n";
         return 2;
     }
     const int threads = opt(args, "--threads") ? std::atoi(std::string(*opt(args, "--threads")).c_str()) : 3;
@@ -309,6 +399,11 @@ int main(int argc, char** argv) {
     // --msg-rows M: coalesce up to M of a fiber round's parked leaves into ONE B<=M message (the static
     // coalescing floor). M=1 (default) = one leaf per message (the historical B=1 path). Round-sync only.
     const int msg_rows = opt(args, "--msg-rows") ? std::atoi(std::string(*opt(args, "--msg-rows")).c_str()) : 1;
+    // --episodic: each fiber runs a SEQUENCE of decisions (env stepped by the executed action) instead of
+    // repeated root decisions -> the production-shape workload; DPS = decisions/wall. --no-early-exit sets
+    // cfg.no_early_exit so a Terminate is substituted (episodes run full-length, not short-circuited).
+    bool episodic = false, no_early_exit = false;
+    for (const auto& a : args) { if (a == "--episodic") episodic = true; if (a == "--no-early-exit") no_early_exit = true; }
     // --driver: how the FIBER arm pipelines leaves. round-sync (default, preserves the committed
     // semantics) submits a whole round then awaits it; greedy keeps ~K leaves continuously in flight.
     const std::string driver = opt(args, "--driver") ? std::string(*opt(args, "--driver")) : "round-sync";
@@ -325,6 +420,7 @@ int main(int argc, char** argv) {
     chocofarm::GumbelConfig cfg;
     if (auto v = opt(args, "--n-sims")) cfg.n_sims = std::atoi(std::string(*v).c_str());
     if (auto v = opt(args, "--m")) cfg.m = std::atoi(std::string(*v).c_str());
+    cfg.no_early_exit = no_early_exit;   // HPO/benchmark-only: substitute Terminate so episodes run full
 
     auto inst = chocofarm::load_instance(*inst_p, *faces_p);
     if (!inst) { std::cerr << "tlab-real-producer: FATAL: " << inst.error().message << "\n"; return 1; }
@@ -333,6 +429,7 @@ int main(int argc, char** argv) {
     std::cout << "tlab-real-producer: generator=real(" << (fibers > 0 ? "fiber" : "non-fiber")
               << ") driver=" << (fibers > 0 ? driver : std::string("n/a"))
               << " threads=" << threads << " fibers_per_thread=" << fibers << " msg_rows=" << msg_rows
+              << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " seconds=" << seconds << " n_sims=" << cfg.n_sims << " m=" << cfg.m
               << " n_slots=" << chocofarm::n_action_slots(env) << " endpoint=" << *ep << "\n";
 
@@ -343,7 +440,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < threads; ++i)
         pool.emplace_back([&, i] {
             apply_thread_priority(i, low_prio_thread, low_prio_nice);   // renice iff designated
-            if (fibers > 0 && driver == "greedy")
+            if (fibers > 0 && episodic)
+                run_thread_fiber_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, stats[static_cast<size_t>(i)]);
+            else if (fibers > 0 && driver == "greedy")
                 run_thread_fiber_greedy(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
             else if (fibers > 0)
                 run_thread_fiber(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, stats[static_cast<size_t>(i)]);
@@ -361,6 +460,7 @@ int main(int argc, char** argv) {
     const double dps = wall > 0 ? static_cast<double>(dec) / wall : 0.0;
     const double lps = wall > 0 ? static_cast<double>(leaves) / wall : 0.0;
     std::cout << "REAL-AGG threads=" << threads << " fibers=" << fibers << " msg_rows=" << msg_rows
+              << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " driver=" << (fibers > 0 ? driver : std::string("n/a")) << " wall_s=" << wall
               << " decisions=" << dec << " leaves=" << leaves
               << " decisions_per_sec=" << dps << " leaves_per_sec=" << lps
