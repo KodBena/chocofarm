@@ -66,6 +66,8 @@ The arithmetic (conjecture, to validate — §5): at the operating point ~47 lea
 
 **This is an analysis, not a measurement.** It rests on two assumptions the episodic run must confirm: (a) the production bottleneck was the eval/transport (not the search compute or a different coupling fault), and (b) the LPD operating point. That measurement is §5.
 
+> **Correction (2026-06-24, same day — a worked instance of Lesson 1).** The arithmetic above used **~47 leaves/decision — the lab's n_sims=24 config**, while the production 190/457 numbers are at **sims256/m24**, where LPD is ~2×n_sims ≈ **~470 (≈10× higher)**. Redone at the right operating point: the 457 ceiling needs ~457 × 470 ≈ **215k leaf-rows/s**, so our banked 55k would be **eval-limited to ~110 DPS — *below* the 190 practice.** That **reverses the rosy conclusion**: at the real config our static coupling may *not* yet beat production, and the eval path is very plausibly still the limiter. I extrapolated from the wrong config — the exact "infer instead of measure" error this note's Lesson 1 warns against. The sign of the answer is now genuinely open, and **only the sims256 episodic measurement (§5) settles it** — which is why that measurement is the *baseline*, not a confirmation. (Caveat on the caveat: the 55k was itself measured at sims24; at sims256 the in-flight/batch dynamics differ, so the eval throughput there must also be measured, not assumed.)
+
 ---
 
 ## 4. Lessons (the part worth keeping)
