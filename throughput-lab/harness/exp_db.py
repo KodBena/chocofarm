@@ -39,6 +39,32 @@ as the data). So interpretations live in their OWN table, NEVER in tlab_reading.
    effect of a run. And `tlab_reading.notes` is for MEASUREMENT-CONDITION facts (load@end, a hiccuped rep) —
    facts ABOUT a run, NEVER a reading OF it; it must not drift into a half-interpretation field.
 
+THE PRE-REGISTRATION LAYER (tlab_prereg + tlab_prereg_conclusion — criterion-before-data, the accountability
+property made structural). A finding records what a result MEANT; but "this result was DECISIVE" is, in a
+finding, still prose a reader must believe. The defect this layer closes is the retro-fit: a verdict criterion
+invented (or quietly bent) AFTER the data is seen, so any outcome can be narrated as decisive. The fix mirrors
+ADR-0012 (the typed signature is the SSOT): the QUANTIFIED decisiveness criterion is a TYPED structure — a
+partition of one decision metric's value-line into named outcome bins with numeric thresholds (Criterion/Bin)
+— registered and stamped BEFORE any data exists, in an IMMUTABLE row (append-only, like a reading/finding).
+  * tlab_prereg            — one row per registered experiment: the question, the SINGLE decision metric, the
+                             typed `criterion` jsonb (built+validated by the Criterion dataclass — a true
+                             partition, no gaps/overlaps; a 'not-decisive → escalate' band is an EXPLICIT
+                             non-decisive bin, never an accidental hole), the `rationale` (the arithmetic that
+                             justifies why those thresholds discriminate), the plan, and the code stamp it was
+                             DECLARED against. UNIQUE slug — one experiment, one criterion; status pinned to
+                             'registered' by CHECK (the verdict is never written back onto the criterion row).
+  * tlab_prereg_conclusion — the SEPARATE, later verdict (mirrors finding-supersede: the criterion is read +
+                             judged, NEVER rewritten). conclude_prereg loads the frozen criterion and runs
+                             Criterion.evaluate(observed) — the code computes WHICH pre-declared bin the value
+                             fell in + the margin to the nearest threshold + whether that bin is terminal — and
+                             records outcome ∈ {decisive, ambiguous, abandoned} (ADR-0008). UNIQUE prereg_id:
+                             a pre-registration concludes AT MOST ONCE (a second verdict on one immutable
+                             criterion is a contradiction, not an amendment — re-opening is a NEW prereg).
+   So "did the result meet the criterion?" is `criterion.evaluate(measured).decisive` — a mechanical check,
+   not a human reading — and the criterion's immutability + earlier-than-the-result code stamp make
+   "decisive" a falsifiable claim. The conclusion links the resolving tlab_reading and/or tlab_finding,
+   closing the loop prereg → reading → finding.
+
 HP NAME ALIGNMENT (ADR-0012 P1, one home). The first-class HP columns mirror the canonical names declared in
 the SSOT (throughput-lab/hp/spec.py + hp/compile.py): driver, pool_batch, msg_rows (concept of `msg-rows`),
 fibers (the static-lab `--fibers` = the SSOT `fibers_per_thread` concept), inflight_msgs (=
@@ -68,6 +94,12 @@ CLI:
   python exp_db.py --record < reading.json          insert one reading from a JSON object on stdin
                                                      (the shell-harness front door); echoes the new id.
   python exp_db.py --aggregate [--tag T]            print the median/min/max-per-config aggregate query.
+  python exp_db.py --record-prereg < prereg.json    register one pre-registration (criterion BEFORE data);
+                                                     echoes the new prereg_id.
+  python exp_db.py --conclude-prereg ID --observed V   judge a measured value V against prereg ID's frozen
+                                                     criterion (mechanical: prints the bin + margin + verdict).
+  python exp_db.py --abandon-prereg ID --note "…"   close a prereg with no verdict (registered → abandoned).
+  python exp_db.py --preregs [--open]               print the pre-registration layer (criteria + verdicts).
 
 Public Domain (The Unlicense).
 """
@@ -232,12 +264,88 @@ CREATE TABLE IF NOT EXISTS tlab_finding (
 CREATE INDEX IF NOT EXISTS tlab_finding_scope_idx      ON tlab_finding (scope);
 CREATE INDEX IF NOT EXISTS tlab_finding_commit_idx     ON tlab_finding (git_commit);
 CREATE INDEX IF NOT EXISTS tlab_finding_supersedes_idx ON tlab_finding (supersedes);
+
+-- The PRE-REGISTRATION layer (criterion-before-data — the discipline made structural). Where tlab_finding
+-- mechanizes measurement⊥interpretation, this mechanizes hypothesis⊥verdict-criterion⊥result. A finding can
+-- still be retro-fitted to a narrative ("this was decisive" is, in tlab_finding, prose a human must believe).
+-- A PRE-REGISTRATION fixes the QUANTIFIED decisiveness criterion — a partition of the decision metric's
+-- value-line into named outcome bins with numeric thresholds — BEFORE any data exists, so "did the result
+-- meet the criterion?" becomes a MECHANICAL check (which pre-declared bin did the measured value land in,
+-- with what margin?) rather than rhetoric. The accountability property is structural: the criterion row is
+-- immutable (append-only, like a finding/reading), and its conclusion is a SEPARATE, later row — the result
+-- can never edit the criterion it is judged against.
+CREATE TABLE IF NOT EXISTS tlab_prereg (
+    prereg_id     bigserial PRIMARY KEY,
+    -- a human-facing stable key (the experiment's slug), UNIQUE so a re-register of the SAME slug is a loud
+    -- conflict, never a silent second criterion for one experiment (one experiment, one immutable criterion).
+    prereg_key    text NOT NULL UNIQUE,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    -- provenance (ADR-0011): the code state the criterion was DECLARED against — necessarily BEFORE the
+    -- result's commit. commit/tree NOT NULL; DIRTY recorded as-is, never silently 'clean'.
+    git_commit    text NOT NULL,
+    git_tree      text NOT NULL CHECK (git_tree IN ('clean', 'DIRTY')),
+    host          text NOT NULL,
+
+    -- the pre-registered content (all authored BEFORE the run):
+    question      text NOT NULL,            -- the question / hypothesis the experiment tests
+    metric        text NOT NULL,            -- the SINGLE metric the verdict rests on (e.g. 'server_util_pct')
+    -- criterion: the TYPED decisiveness structure (ADR-0012) — an ordered partition of `metric`'s value-line
+    -- into bins {{name, lo, hi, verdict, decisive}}. Stored as jsonb so the SHAPE is queryable, but it is built
+    -- and validated by the Criterion dataclass (partition: no gaps, no overlaps), NOT free prose. The code can
+    -- EVALUATE a measured value against it (which bin? what margin? terminal-decisive?) without a human reading.
+    criterion     jsonb NOT NULL,
+    -- the arithmetic/reasoning that justifies WHY those thresholds discriminate (the load-bearing rationale —
+    -- a criterion without its justifying arithmetic is a number pulled from air; ADR-0002 rejects an empty one).
+    rationale     text NOT NULL,
+    method        text,                     -- the method/plan: how the experiment will be run (nullable)
+    -- status lifecycle, CLOSED vocabulary (ADR-0008). 'registered' is the only status WRITTEN here; the
+    -- transition to concluded/abandoned is recorded by a tlab_prereg_conclusion row (this row is never
+    -- mutated to a verdict — the criterion-before-data immutability), so a CHECK pins it to 'registered'.
+    status        text NOT NULL DEFAULT 'registered' CHECK (status IN ('registered')),
+    refs          jsonb NOT NULL DEFAULT '{{}}'::jsonb,   -- optional config/reading/finding refs (long tail)
+    notes         text
+);
+CREATE INDEX IF NOT EXISTS tlab_prereg_key_idx    ON tlab_prereg (prereg_key);
+CREATE INDEX IF NOT EXISTS tlab_prereg_commit_idx ON tlab_prereg (git_commit);
+
+-- The CONCLUSION row — the SEPARATE, later act that resolves a pre-registration (mirrors the finding-supersede
+-- discipline: the criterion is never rewritten; its verdict is a new, append-only row). A pre-registration may
+-- be concluded AT MOST ONCE (UNIQUE prereg_id) — a second verdict on the same immutable criterion would be a
+-- contradiction, not an amendment; re-opening means a NEW pre-registration (a new criterion). The bin the
+-- value landed in (`bin_name`) and the `margin` to the nearest boundary are computed MECHANICALLY by the code
+-- (Criterion.evaluate) at conclusion time and stored so the verdict is queryable, not re-derived by a reader.
+CREATE TABLE IF NOT EXISTS tlab_prereg_conclusion (
+    conclusion_id bigserial PRIMARY KEY,
+    prereg_id     bigint NOT NULL UNIQUE REFERENCES tlab_prereg(prereg_id),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    git_commit    text NOT NULL,
+    git_tree      text NOT NULL CHECK (git_tree IN ('clean', 'DIRTY')),
+    host          text NOT NULL,
+    -- the outcome, CLOSED vocabulary (ADR-0008): 'decisive' = the value landed in a terminal pre-declared bin;
+    -- 'ambiguous' = it landed in a non-decisive bin (criterion not met -> escalate, e.g. ADR-0014); 'abandoned'
+    -- = the experiment was called off without a measured verdict (the registered->abandoned lifecycle leg).
+    outcome       text NOT NULL CHECK (outcome IN ('decisive', 'ambiguous', 'abandoned')),
+    -- the measured value of the pre-registered metric (NULL only when outcome='abandoned' — no data taken).
+    observed      double precision,
+    -- the bin the value fell in + the margin to the nearest boundary, both computed by Criterion.evaluate at
+    -- conclusion time (NULL for 'abandoned'). bin_name is the pre-declared bin's name; margin>=0 is distance
+    -- to the closest threshold (how decisively it landed). They are RECORDED, not a reader's re-derivation.
+    bin_name      text,
+    bin_verdict   text,                     -- the pre-declared verdict prose of that bin (denormalized for read)
+    margin        double precision,
+    -- the resolving evidence: the reading the verdict rests on and/or the finding that interprets it (the loop
+    -- prereg -> reading -> finding closed). Both nullable; a verdict with NEITHER is allowed only for 'abandoned'.
+    resolved_by_reading bigint REFERENCES tlab_reading(reading_id),
+    resolved_by_finding bigint REFERENCES tlab_finding(finding_id),
+    notes         text
+);
+CREATE INDEX IF NOT EXISTS tlab_prereg_conclusion_prereg_idx ON tlab_prereg_conclusion (prereg_id);
 """
 
 
 def ensure_schema(conn: psycopg.Connection) -> None:
-    """Create the tlab_config/tlab_reading tables + indexes if absent. Idempotent — safe on every harness
-    start. Commits. A SQL error is a loud psycopg error (ADR-0002)."""
+    """Create the tlab_config/tlab_reading/tlab_finding/tlab_prereg(+_conclusion) tables + indexes if absent.
+    Idempotent — safe on every harness start. Commits. A SQL error is a loud psycopg error (ADR-0002)."""
     with conn.cursor() as cur:
         cur.execute(_SCHEMA_SQL)
     conn.commit()
@@ -325,6 +433,150 @@ def _canonical(m: Mapping[str, Any]) -> Any:
     if isinstance(m, (list, tuple)):
         return [_canonical(x) for x in m]
     return m
+
+
+# ============================================================================================
+# The TYPED decisiveness criterion (ADR-0012 — the criterion is a structure the code EVALUATES, not prose a
+# human interprets). A Criterion is an ordered PARTITION of one metric's value-line into named outcome Bins;
+# evaluate(value) returns which bin a measured value fell in + its margin to the nearest boundary + whether
+# that bin is terminal-decisive. "Did the result meet the criterion?" == `criterion.evaluate(v).decisive`.
+# ============================================================================================
+NEG_INF = float("-inf")
+POS_INF = float("inf")
+
+
+@dataclass(frozen=True)
+class Bin:
+    """One outcome band of a Criterion: the half-open interval [lo, hi) on the metric's value-line, a `name`
+    (the slug, e.g. 'producer-bound'), the `verdict` prose it implies, and `decisive` — whether landing here
+    is a TERMINAL verdict (True) or a not-decisive / escalate band (False, e.g. the '78-90% → escalate' zone).
+    Bounds are inclusive-low / exclusive-high so abutting bins tile without overlap; ±inf bound the open ends."""
+    name: str
+    lo: float                                # inclusive lower bound (NEG_INF for the open low end)
+    hi: float                                # exclusive upper bound (POS_INF for the open high end)
+    verdict: str                             # what landing in this bin MEANS (the pre-declared reading)
+    decisive: bool = True                    # False = a not-decisive band (criterion not met → escalate)
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.name.strip():
+            raise ValueError("Bin.name must be non-empty (ADR-0002)")
+        if not self.verdict or not self.verdict.strip():
+            raise ValueError(f"Bin[{self.name}].verdict must be non-empty (ADR-0002 — a bin states its meaning)")
+        lo, hi = float(self.lo), float(self.hi)
+        if not (lo < hi):                    # an empty/inverted band is unrepresentable (ADR-0000)
+            raise ValueError(f"Bin[{self.name}] needs lo < hi, got lo={lo}, hi={hi}")
+        object.__setattr__(self, "lo", lo)
+        object.__setattr__(self, "hi", hi)
+
+    def contains(self, value: float) -> bool:
+        return self.lo <= value < self.hi
+
+
+@dataclass(frozen=True)
+class BinHit:
+    """The mechanical result of evaluating a measured value against a Criterion: the bin it fell in, the
+    verdict that bin implies, whether that verdict is terminal-decisive, and the `margin` — the distance to
+    the nearest threshold of that bin (how decisively the value landed; +inf when the bin is open on the
+    relevant side). A value in no bin is impossible by construction (a Criterion PARTITIONS the whole line)."""
+    value: float
+    bin_name: str
+    verdict: str
+    decisive: bool
+    margin: float
+
+
+@dataclass(frozen=True)
+class Criterion:
+    """The pre-registered decisiveness rule over ONE metric, as a TYPED structure (ADR-0012): an ordered list
+    of Bins that PARTITION the entire value-line (-inf, +inf) — no gaps, no overlaps — validated at
+    construction. The partition invariant is the whole point: a 'not-decisive → escalate' outcome must be an
+    EXPLICIT `decisive=False` bin, never an accidental hole between two thresholds (a hole would let a value
+    fall through to no verdict — the silent ambiguity this layer exists to forbid). evaluate(v) is total."""
+    metric: str
+    bins: tuple[Bin, ...]
+
+    def __post_init__(self) -> None:
+        if not self.metric or not self.metric.strip():
+            raise ValueError("Criterion.metric must name the single decision metric (ADR-0002)")
+        bins = tuple(self.bins)
+        if not bins:
+            raise ValueError("Criterion needs at least one bin (ADR-0002)")
+        names = [b.name for b in bins]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Criterion bin names must be unique, got {names}")
+        ordered = sorted(bins, key=lambda b: b.lo)
+        # PARTITION check: the sorted bins must tile (-inf, +inf) edge-to-edge with no gap and no overlap.
+        if ordered[0].lo != NEG_INF:
+            raise ValueError(f"Criterion bins must cover the low end: first bin lo={ordered[0].lo}, need -inf "
+                             f"(an uncovered low tail is the silent-ambiguity hole this type forbids)")
+        if ordered[-1].hi != POS_INF:
+            raise ValueError(f"Criterion bins must cover the high end: last bin hi={ordered[-1].hi}, need +inf")
+        for a, b in zip(ordered, ordered[1:]):
+            if a.hi != b.lo:                 # a gap (a.hi < b.lo) or an overlap (a.hi > b.lo) is unrepresentable
+                kind = "gap" if a.hi < b.lo else "overlap"
+                raise ValueError(f"Criterion bins must tile without {kind}: bin[{a.name}].hi={a.hi} must equal "
+                                 f"bin[{b.name}].lo={b.lo} (ADR-0000 — the partition is the invariant)")
+        object.__setattr__(self, "bins", ordered)
+
+    def evaluate(self, value: float) -> BinHit:
+        """Return which bin `value` fell in + the margin to the nearest threshold + whether the bin is
+        terminal-decisive. Total by the partition invariant — every real value lands in exactly one bin."""
+        v = float(value)
+        for b in self.bins:
+            if b.contains(v):
+                # margin: distance to the nearest FINITE boundary of this bin (the open ±inf side contributes
+                # +inf, so a value deep in an open-ended bin reports the distance to its one finite threshold).
+                lo_d = POS_INF if b.lo == NEG_INF else v - b.lo
+                hi_d = POS_INF if b.hi == POS_INF else b.hi - v
+                return BinHit(value=v, bin_name=b.name, verdict=b.verdict, decisive=b.decisive,
+                              margin=min(lo_d, hi_d))
+        # Unreachable given the partition invariant; if it ever fires, the invariant was violated (ADR-0002).
+        raise RuntimeError(f"Criterion.evaluate: value {v} fell in no bin — partition invariant broken")
+
+    def to_json(self) -> dict[str, Any]:
+        """Serialize to the jsonb stored in tlab_prereg.criterion. ±inf become the JSON tokens 'NEG_INF' /
+        'POS_INF' (JSON has no infinity literal); from_json inverts this. Round-trips losslessly."""
+        def _b(x: float) -> Any:
+            return "NEG_INF" if x == NEG_INF else "POS_INF" if x == POS_INF else x
+        return {"metric": self.metric,
+                "bins": [{"name": b.name, "lo": _b(b.lo), "hi": _b(b.hi),
+                          "verdict": b.verdict, "decisive": b.decisive} for b in self.bins]}
+
+    @staticmethod
+    def from_json(obj: Mapping[str, Any]) -> "Criterion":
+        """Rebuild a Criterion from its stored jsonb (the Port/ACL decode — re-validates the partition, so a
+        hand-edited or corrupted criterion row fails LOUD on read, not silently; ADR-0002)."""
+        def _b(x: Any) -> float:
+            if x == "NEG_INF":
+                return NEG_INF
+            if x == "POS_INF":
+                return POS_INF
+            return float(x)
+        bins = tuple(Bin(name=d["name"], lo=_b(d["lo"]), hi=_b(d["hi"]),
+                         verdict=d["verdict"], decisive=bool(d.get("decisive", True)))
+                     for d in obj["bins"])
+        return Criterion(metric=str(obj["metric"]), bins=bins)
+
+
+def thresholds_criterion(metric: str, cuts: Sequence[tuple[float, str, str, bool]]) -> Criterion:
+    """Convenience builder for the common shape: a metric partitioned by a sorted list of cut points into
+    contiguous bins. `cuts` is a sequence of (upper_bound, name, verdict, decisive) — the bins are
+    [-inf, cut0), [cut0, cut1), …, [cut_last, +inf); the LAST tuple's upper_bound is ignored (it is the
+    open-ended top bin) but kept for shape uniformity, so pass +inf or any value. Example mirroring the real
+    instance (server-util A/B): thresholds_criterion('server_util_pct', [
+        (78.0, 'server-loop-ceiling', 'serve loop is the wall', True),
+        (90.0, 'escalate',            'not decisive → ADR-0014',  False),
+        (POS_INF, 'producer-bound',   'a faster producer would help', True)])."""
+    cuts = list(cuts)
+    if not cuts:
+        raise ValueError("thresholds_criterion: need at least one cut (ADR-0002)")
+    bins: list[Bin] = []
+    lo = NEG_INF
+    for i, (ub, name, verdict, decisive) in enumerate(cuts):
+        hi = POS_INF if i == len(cuts) - 1 else float(ub)
+        bins.append(Bin(name=name, lo=lo, hi=hi, verdict=verdict, decisive=decisive))
+        lo = hi
+    return Criterion(metric=metric, bins=tuple(bins))
 
 
 # ============================================================================================
@@ -594,6 +846,233 @@ def findings(conn: psycopg.Connection, scope: Optional[str] = None,
 
 
 # ============================================================================================
+# THE PRE-REGISTRATION LAYER — tlab_prereg (+ tlab_prereg_conclusion). Criterion-before-data, mechanized.
+# A pre-registration FIXES the typed decisiveness criterion BEFORE any data exists (the registration row is
+# immutable, append-only like a reading/finding); the verdict is a SEPARATE, later act (conclude_prereg) that
+# JUDGES a measured value against the frozen criterion mechanically (Criterion.evaluate), so "this was
+# decisive" is a checkable claim — did the value land in a pre-declared terminal bin, with margin? — not
+# rhetoric. The result can never edit the criterion it is judged against (that is the accountability property).
+# ============================================================================================
+PREREG_OUTCOMES = ("decisive", "ambiguous", "abandoned")   # closed vocabulary (ADR-0008); a CHECK mirrors it
+
+
+@dataclass(frozen=True)
+class PreReg:
+    """A pre-registration's authored content (everything fixed BEFORE the run). `prereg_key` is the stable
+    human slug (UNIQUE — one experiment, one immutable criterion). The criterion is a TYPED Criterion the code
+    can evaluate, NOT prose. `rationale` is the arithmetic justifying why the thresholds discriminate (a
+    criterion without it is a number from air — rejected). A PreReg with an empty question/rationale is an
+    ADR-0002 programming error caught at record time."""
+    prereg_key: str
+    question: str
+    criterion: Criterion
+    rationale: str
+    method: Optional[str] = None
+    refs: Mapping[str, Any] = field(default_factory=dict)
+    notes: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for f in ("prereg_key", "question", "rationale"):
+            v = getattr(self, f)
+            if not v or not str(v).strip():
+                raise ValueError(f"PreReg.{f} must be non-empty (ADR-0002 — a pre-registration without its "
+                                 f"{f} is not pre-registered)")
+        if not isinstance(self.criterion, Criterion):
+            raise ValueError("PreReg.criterion must be a typed Criterion (ADR-0012 — not free prose)")
+
+
+def record_prereg(conn: psycopg.Connection, prereg: PreReg,
+                  stamp: Optional[Mapping[str, str]] = None, host: Optional[str] = None) -> int:
+    """Register ONE pre-registration: the question, the single decision metric, the TYPED criterion, the
+    justifying arithmetic, and the plan — all stamped with the code state they were DECLARED against (ADR-0011;
+    necessarily before the result). The row is IMMUTABLE (append-only) — a verdict is a separate later act
+    (conclude_prereg). The slug is UNIQUE: re-registering the same key is a LOUD conflict (one experiment, one
+    criterion — never a silent second criterion swapped in after seeing data). RAISES on a duplicate key /
+    empty field / DB fault (ADR-0002). Returns the new prereg_id."""
+    st = dict(stamp) if stamp is not None else code_stamp()
+    commit = st.get("commit", "unknown")
+    tree = st.get("tree", "DIRTY")
+    if tree not in ("clean", "DIRTY"):
+        raise ValueError(f"record_prereg: tree must be 'clean'|'DIRTY', got {tree!r}")
+    hostname = host if host is not None else socket.gethostname()
+    with conn.cursor() as cur:
+        # a duplicate slug is a loud conflict (a second criterion for one experiment is the retro-fit this
+        # layer forbids) — INSERT and let the UNIQUE constraint raise rather than ON CONFLICT silently no-op.
+        cur.execute(
+            """
+            INSERT INTO tlab_prereg
+                (prereg_key, git_commit, git_tree, host, question, metric, criterion, rationale, method,
+                 refs, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING prereg_id
+            """,
+            (prereg.prereg_key, commit, tree, hostname, prereg.question, prereg.criterion.metric,
+             Jsonb(prereg.criterion.to_json()), prereg.rationale, prereg.method,
+             Jsonb(dict(prereg.refs)), prereg.notes),
+        )
+        out = cur.fetchone()
+        if out is None:
+            raise RuntimeError("record_prereg: INSERT ... RETURNING yielded no prereg_id")
+        pid = int(out[0])
+    conn.commit()
+    return pid
+
+
+def record_prereg_safe(conn: psycopg.Connection, prereg: PreReg,
+                       stamp: Optional[Mapping[str, str]] = None,
+                       host: Optional[str] = None) -> Optional[int]:
+    """The loud-but-non-fatal front door (mirrors record_reading_safe): register the pre-registration, but on
+    ANY failure print a LOUD banner + dump the unsaved pre-registration as JSON under ~/w/vdc and return None
+    rather than raise — so a harness that pre-registers at run start does not lose the criterion (the whole
+    accountability artifact) to a DB blip. A one-shot CLI/test uses the raising record_prereg."""
+    try:
+        return record_prereg(conn, prereg, stamp=stamp, host=host)
+    except Exception as exc:                                  # noqa: BLE001 — loud-and-preserve, by design
+        try:
+            conn.rollback()
+        except Exception:                                    # noqa: BLE001
+            pass
+        os.makedirs(FALLBACK_DIR, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+        path = os.path.join(FALLBACK_DIR, f"unsaved-prereg-{ts}.json")
+        blob = {"error": f"{type(exc).__name__}: {exc}",
+                "stamp": dict(stamp) if stamp is not None else None,
+                "prereg": {"prereg_key": prereg.prereg_key, "question": prereg.question,
+                           "criterion": prereg.criterion.to_json(), "rationale": prereg.rationale,
+                           "method": prereg.method, "refs": dict(prereg.refs), "notes": prereg.notes}}
+        Path(path).write_text(json.dumps(blob, indent=2, default=str))
+        print(f"[exp_db] PREREG FAILED ({type(exc).__name__}: {exc}); dumped to {path}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+def _load_prereg_criterion(conn: psycopg.Connection, prereg_id: int) -> Criterion:
+    """Read back the frozen criterion of a pre-registration (the Port/ACL decode — re-validates the partition,
+    so a corrupted criterion row fails loud; ADR-0002). Raises if the prereg_id does not exist."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT criterion FROM tlab_prereg WHERE prereg_id = %s", (prereg_id,))
+        row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"_load_prereg_criterion: prereg_id={prereg_id} does not exist (ADR-0002)")
+    return Criterion.from_json(row[0])
+
+
+def conclude_prereg(conn: psycopg.Connection, prereg_id: int, observed: float, *,
+                    resolved_by_reading: Optional[int] = None,
+                    resolved_by_finding: Optional[int] = None,
+                    notes: Optional[str] = None,
+                    stamp: Optional[Mapping[str, str]] = None, host: Optional[str] = None) -> tuple[int, BinHit]:
+    """Conclude a pre-registration by JUDGING a measured `observed` value against its FROZEN criterion — the
+    separate, later act the immutability guarantee turns on. The bin + margin are computed MECHANICALLY by
+    Criterion.evaluate (never a human's reading); the outcome is 'decisive' iff the value landed in a terminal
+    pre-declared bin, else 'ambiguous' (criterion not met → escalate, e.g. ADR-0014). The criterion is NEVER
+    re-written — only read and judged. A pre-registration concludes AT MOST ONCE (the UNIQUE prereg_id raises a
+    loud conflict on a second verdict — a second verdict on one immutable criterion is a contradiction, not an
+    amendment; re-opening means a NEW pre-registration). RAISES on a missing/duplicate prereg / DB fault
+    (ADR-0002). Returns (conclusion_id, the BinHit verdict)."""
+    criterion = _load_prereg_criterion(conn, prereg_id)
+    hit = criterion.evaluate(observed)
+    outcome = "decisive" if hit.decisive else "ambiguous"
+    st = dict(stamp) if stamp is not None else code_stamp()
+    commit = st.get("commit", "unknown")
+    tree = st.get("tree", "DIRTY")
+    if tree not in ("clean", "DIRTY"):
+        raise ValueError(f"conclude_prereg: tree must be 'clean'|'DIRTY', got {tree!r}")
+    hostname = host if host is not None else socket.gethostname()
+    with conn.cursor() as cur:
+        if resolved_by_reading is not None:
+            cur.execute("SELECT 1 FROM tlab_reading WHERE reading_id = %s", (resolved_by_reading,))
+            if cur.fetchone() is None:
+                raise ValueError(f"conclude_prereg: resolved_by_reading={resolved_by_reading} does not exist")
+        if resolved_by_finding is not None:
+            cur.execute("SELECT 1 FROM tlab_finding WHERE finding_id = %s", (resolved_by_finding,))
+            if cur.fetchone() is None:
+                raise ValueError(f"conclude_prereg: resolved_by_finding={resolved_by_finding} does not exist")
+        cur.execute(
+            """
+            INSERT INTO tlab_prereg_conclusion
+                (prereg_id, git_commit, git_tree, host, outcome, observed, bin_name, bin_verdict, margin,
+                 resolved_by_reading, resolved_by_finding, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING conclusion_id
+            """,
+            (prereg_id, commit, tree, hostname, outcome, observed, hit.bin_name, hit.verdict, hit.margin,
+             resolved_by_reading, resolved_by_finding, notes),
+        )
+        out = cur.fetchone()
+        if out is None:
+            raise RuntimeError("conclude_prereg: INSERT ... RETURNING yielded no conclusion_id")
+        cid = int(out[0])
+    conn.commit()
+    return cid, hit
+
+
+def abandon_prereg(conn: psycopg.Connection, prereg_id: int, *, notes: Optional[str] = None,
+                   stamp: Optional[Mapping[str, str]] = None, host: Optional[str] = None) -> int:
+    """Close a pre-registration WITHOUT a measured verdict (the registered → abandoned lifecycle leg — the
+    experiment was called off before data). Records an 'abandoned' conclusion (observed/bin/margin all NULL),
+    AT MOST ONCE per prereg (the UNIQUE prereg_id). `notes` should say why (ADR-0002 — an unexplained
+    abandonment is suspect). RAISES on a missing/already-concluded prereg (ADR-0002). Returns conclusion_id."""
+    # touch the prereg so a missing id is a loud error before we write the conclusion.
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM tlab_prereg WHERE prereg_id = %s", (prereg_id,))
+        if cur.fetchone() is None:
+            raise ValueError(f"abandon_prereg: prereg_id={prereg_id} does not exist (ADR-0002)")
+    st = dict(stamp) if stamp is not None else code_stamp()
+    commit = st.get("commit", "unknown")
+    tree = st.get("tree", "DIRTY")
+    if tree not in ("clean", "DIRTY"):
+        raise ValueError(f"abandon_prereg: tree must be 'clean'|'DIRTY', got {tree!r}")
+    hostname = host if host is not None else socket.gethostname()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO tlab_prereg_conclusion
+                (prereg_id, git_commit, git_tree, host, outcome, observed, bin_name, bin_verdict, margin, notes)
+            VALUES (%s, %s, %s, %s, 'abandoned', NULL, NULL, NULL, NULL, %s)
+            RETURNING conclusion_id
+            """,
+            (prereg_id, commit, tree, hostname, notes),
+        )
+        out = cur.fetchone()
+        if out is None:
+            raise RuntimeError("abandon_prereg: INSERT ... RETURNING yielded no conclusion_id")
+        cid = int(out[0])
+    conn.commit()
+    return cid
+
+
+def preregs(conn: psycopg.Connection, *, open_only: bool = False,
+            prereg_key: Optional[str] = None) -> list[tuple]:
+    """Read the pre-registration layer (the registered criteria + their conclusion, if any) — a LEFT JOIN so
+    an un-concluded (still-open) pre-registration shows with NULL verdict columns. `open_only` returns only
+    those NOT yet concluded (the live experiments awaiting a verdict); `prereg_key` filters to one. Newest
+    first. Returns (prereg_id, created_at, git_commit, git_tree, prereg_key, metric, question, outcome,
+    observed, bin_name, bin_verdict, margin)."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if prereg_key is not None:
+        clauses.append("p.prereg_key = %s")
+        params.append(prereg_key)
+    if open_only:
+        clauses.append("c.conclusion_id IS NULL")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT p.prereg_id, p.created_at, p.git_commit, p.git_tree, p.prereg_key, p.metric, p.question,
+                   c.outcome, c.observed, c.bin_name, c.bin_verdict, c.margin
+            FROM tlab_prereg p
+            LEFT JOIN tlab_prereg_conclusion c ON c.prereg_id = p.prereg_id
+            {where}
+            ORDER BY p.created_at DESC, p.prereg_id DESC
+            """,
+            params,
+        )
+        return cur.fetchall()
+
+
+# ============================================================================================
 # CLI — ensure-schema / record (from stdin JSON) / aggregate / findings. The shell-harness front door.
 # ============================================================================================
 def _reading_from_json(obj: Mapping[str, Any]) -> tuple[ConfigKey, Reading, Optional[dict], Optional[str]]:
@@ -608,6 +1087,27 @@ def _reading_from_json(obj: Mapping[str, Any]) -> tuple[ConfigKey, Reading, Opti
     stamp = obj.get("stamp")
     host = obj.get("host")
     return key, reading, (dict(stamp) if stamp is not None else None), host
+
+
+def _prereg_from_json(obj: Mapping[str, Any]) -> tuple[PreReg, Optional[dict], Optional[str]]:
+    """Parse a JSON pre-registration object (the CLI stdin contract) into (PreReg, stamp, host). The criterion
+    is given as EITHER an explicit {metric, bins:[{name,lo,hi,verdict,decisive}]} object (lo/hi accept the
+    tokens 'NEG_INF'/'POS_INF' or numbers), OR the convenience `cuts` shape: {metric, cuts:[[upper, name,
+    verdict, decisive], ...]}. A malformed criterion / missing field is a loud error via the Criterion/PreReg
+    constructors (ADR-0002 — the partition is re-validated, not trusted)."""
+    crit_obj = dict(obj["criterion"])
+    if "cuts" in crit_obj:
+        cuts = [(float("inf") if c[0] in ("POS_INF", None) else float(c[0]),
+                 str(c[1]), str(c[2]), bool(c[3])) for c in crit_obj["cuts"]]
+        criterion = thresholds_criterion(str(crit_obj["metric"]), cuts)
+    else:
+        criterion = Criterion.from_json(crit_obj)
+    prereg = PreReg(prereg_key=obj["prereg_key"], question=obj["question"], criterion=criterion,
+                    rationale=obj["rationale"], method=obj.get("method"),
+                    refs=obj.get("refs", {}), notes=obj.get("notes"))
+    stamp = obj.get("stamp")
+    host = obj.get("host")
+    return prereg, (dict(stamp) if stamp is not None else None), host
 
 
 def main() -> int:
@@ -625,14 +1125,33 @@ def main() -> int:
                     help="print the belief layer (interpretations); --scope filters, --current = live only")
     ap.add_argument("--scope", default=None, help="filter --findings to one scope")
     ap.add_argument("--current", action="store_true", help="--findings: only findings nothing supersedes")
+    ap.add_argument("--record-prereg", action="store_true",
+                    help="read ONE JSON pre-registration (prereg_key, question, metric, criterion, rationale, "
+                         "[method,...]) from stdin and register it; print the new prereg_id")
+    ap.add_argument("--conclude-prereg", type=int, metavar="PREREG_ID", default=None,
+                    help="conclude pre-registration PREREG_ID against --observed; prints the mechanical verdict")
+    ap.add_argument("--observed", type=float, default=None,
+                    help="the measured value of the metric, judged against the frozen criterion (--conclude-prereg)")
+    ap.add_argument("--resolved-by-reading", type=int, default=None,
+                    help="--conclude-prereg: the reading_id the verdict rests on")
+    ap.add_argument("--resolved-by-finding", type=int, default=None,
+                    help="--conclude-prereg: the finding_id that interprets the verdict")
+    ap.add_argument("--abandon-prereg", type=int, metavar="PREREG_ID", default=None,
+                    help="close pre-registration PREREG_ID with no verdict (--note should say why)")
+    ap.add_argument("--note", default=None, help="note for --conclude-prereg / --abandon-prereg")
+    ap.add_argument("--preregs", action="store_true",
+                    help="print the pre-registration layer (criteria + verdicts); --open = un-concluded only")
+    ap.add_argument("--open", action="store_true", help="--preregs: only pre-registrations not yet concluded")
     a = ap.parse_args()
-    if not (a.ensure_schema or a.record or a.aggregate or a.record_finding or a.findings):
-        ap.error("nothing to do: pass --ensure-schema / --record / --aggregate / --record-finding / --findings")
+    if not (a.ensure_schema or a.record or a.aggregate or a.record_finding or a.findings
+            or a.record_prereg or a.conclude_prereg is not None or a.abandon_prereg is not None or a.preregs):
+        ap.error("nothing to do: pass --ensure-schema / --record / --aggregate / --record-finding / --findings "
+                 "/ --record-prereg / --conclude-prereg / --abandon-prereg / --preregs")
     conn = connect()
     try:
         if a.ensure_schema:
             ensure_schema(conn)
-            print("[exp_db] schema ensured (tlab_config/tlab_reading)")
+            print("[exp_db] schema ensured (tlab_config/tlab_reading/tlab_finding/tlab_prereg)")
         if a.record:
             ensure_schema(conn)
             obj = json.load(sys.stdin)
@@ -666,6 +1185,41 @@ def main() -> int:
                 print(f"[{fid}] {ts:%Y-%m-%d} {commit}/{tree} <{scope}> {status.upper()}{sup_s}\n"
                       f"      motivation: {motiv or '—'}\n      interpretation: {interp}"
                       + (f"\n      → {change}" if change else ""))
+        if a.record_prereg:
+            ensure_schema(conn)
+            obj = json.load(sys.stdin)        # {prereg_key, question, criterion:{metric, cuts|bins}, rationale, ...}
+            prereg, stamp, host = _prereg_from_json(obj)
+            # loud-but-non-fatal: a harness pre-registers at run start; a DB blip dumps the criterion under
+            # ~/w/vdc + warns, never silently loses the accountability artifact (ADR-0002 weighed against a run).
+            pid = record_prereg_safe(conn, prereg, stamp=stamp, host=host)
+            if pid is not None:
+                print(pid)
+        if a.conclude_prereg is not None:
+            ensure_schema(conn)
+            if a.observed is None:
+                ap.error("--conclude-prereg requires --observed (the measured value to judge)")
+            cid, hit = conclude_prereg(conn, a.conclude_prereg, a.observed,
+                                       resolved_by_reading=a.resolved_by_reading,
+                                       resolved_by_finding=a.resolved_by_finding, notes=a.note)
+            verdict = "DECISIVE" if hit.decisive else "AMBIGUOUS (criterion not met → escalate, ADR-0014)"
+            print(f"[conclusion {cid}] prereg {a.conclude_prereg}: observed {hit.value:g} → "
+                  f"bin '{hit.bin_name}' (margin {hit.margin:g}) → {verdict}\n      verdict: {hit.verdict}")
+        if a.abandon_prereg is not None:
+            ensure_schema(conn)
+            cid = abandon_prereg(conn, a.abandon_prereg, notes=a.note)
+            print(f"[conclusion {cid}] prereg {a.abandon_prereg}: ABANDONED")
+        if a.preregs:
+            for row in preregs(conn, open_only=a.open):
+                pid, ts, commit, tree, key, metric, question, outcome, observed, bin_name, bin_verdict, margin = row
+                if outcome is None:
+                    verdict_s = "OPEN (awaiting verdict)"
+                elif outcome == "abandoned":
+                    verdict_s = "ABANDONED"
+                else:
+                    verdict_s = (f"{outcome.upper()}: observed {observed:g} → '{bin_name}' (margin {margin:g})")
+                print(f"[{pid}] {ts:%Y-%m-%d} {commit}/{tree} <{key}> metric={metric}\n"
+                      f"      Q: {question}\n      {verdict_s}"
+                      + (f"\n      → {bin_verdict}" if bin_verdict else ""))
     finally:
         conn.close()
     return 0
