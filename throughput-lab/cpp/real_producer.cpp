@@ -226,9 +226,19 @@ void run_thread_fiber(int idx, const chocofarm::Environment& env, const std::str
 // This is the production-shape workload; DPS = decisions/wall. Scripted gumbel source for now (incremental
 // fidelity); a per-slot RNG samples each episode's world uniformly from the prior worlds. The per-slot
 // state vectors are RESERVED (never reallocated) so TreeState::start's by-reference captures stay valid.
+//
+// The episode STATE MACHINE (the `advance` lambda) is defined ONCE; `driver` selects only the PIPE SHAPE
+// (ADR-0012 P1 -- one home for the episode logic, one branch for the overlap):
+//   round-sync : submit every parked fiber's leaf (coalesced into coalesce_rows-row messages), then BLOCK
+//                recv'ing the WHOLE round before resuming any -> the search cores idle across the round RTT.
+//   greedy     : keep up to inflight_msgs coalesced messages CONTINUOUSLY in flight; recv ONE group, resume
+//                + re-arm its fibers immediately and re-send -> producer compute overlaps the server forward.
+// Coalescing (coalesce_rows) is held IDENTICAL across both, so an A/B isolates the pipe shape, not the
+// batch width -- the within-stack driver attribution the ours/overcommit bridge needs (ADR-0013).
 void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
                                const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
-                               int fibers_k, int coalesce_rows, ThreadStat& out) {
+                               int fibers_k, int coalesce_rows, const std::string& driver,
+                               int inflight_msgs, ThreadStat& out) {
     if (coalesce_rows < 1) coalesce_rows = 1;
     tlab::BoundaryConfig bcfg;
     bcfg.endpoint = endpoint; bcfg.recv_timeout_ms = 10000; bcfg.n_producer_threads = 1;
@@ -274,26 +284,90 @@ void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const
                                              ep_coll[static_cast<size_t>(i)], kLam);
     }
 
+    // advance(i): slot i's decision completed -> count it, step the episode (env.apply the executed action,
+    // or start a fresh episode at a terminal: Terminate, max_steps, or exhausted belief), then start the
+    // next decision so the fiber is parked on its first leaf again. The SINGLE home for the episode state
+    // machine -- BOTH pipe shapes below call it (ADR-0012 P1); `driver` selects only the overlap shape.
+    auto advance = [&](int i) {
+        const size_t si = static_cast<size_t>(i);
+        out.decisions += 1;
+        const chocofarm::Action act = trees[si]->decision.action;
+        ep_step[si] += 1;
+        const bool terminal = (act.kind == chocofarm::ActionKind::Terminate)
+                              || ep_step[si] >= max_steps || env.empty(ep_bw[si]);
+        if (terminal) new_episode(i);                                          // fresh episode
+        else env.apply(ep_loc[si], ep_bw[si], ep_coll[si], act, ep_world[si]); // step the env
+        trees[si]->start(ep_loc[si], ep_bw[si], ep_coll[si], kLam);            // next decision
+    };
+
     tlab::wire::corr_t corr = static_cast<tlab::wire::corr_t>(idx) * 1'000'000'000ull + 1ull;
     const auto t_start = SteadyClock::now();
-    while (secs_since(t_start) < run_seconds) {
-        std::vector<int> active; active.reserve(static_cast<size_t>(fibers_k));
-        for (int i = 0; i < fibers_k; ++i) {
-            const size_t si = static_cast<size_t>(i);
-            if (!trees[si]->running) {                       // a decision completed -> step the episode
-                out.decisions += 1;
-                const chocofarm::Action act = trees[si]->decision.action;
-                ep_step[si] += 1;
-                const bool terminal = (act.kind == chocofarm::ActionKind::Terminate)
-                                      || ep_step[si] >= max_steps || env.empty(ep_bw[si]);
-                if (terminal) new_episode(i);                                          // fresh episode
-                else env.apply(ep_loc[si], ep_bw[si], ep_coll[si], act, ep_world[si]); // step
-                trees[si]->start(ep_loc[si], ep_bw[si], ep_coll[si], kLam);            // next decision
+
+    if (driver == "greedy") {
+        // GREEDY-ASYNC pipe: keep up to `budget` coalesced messages CONTINUOUSLY in flight. Each loop, fill
+        // the in-flight budget from the `ready` fibers (groups of up to coalesce_rows rows), then recv ONE
+        // group, resume + advance its fibers, and return them to `ready` so they re-arm immediately. The
+        // producer's search compute thus overlaps the server's forward (vs round-sync's whole-round barrier).
+        const int budget = inflight_msgs > 0 ? inflight_msgs : 8;
+        std::unordered_map<tlab::wire::corr_t, std::vector<int>> corr_to_group;
+        std::vector<int> ready; ready.reserve(static_cast<size_t>(fibers_k));
+        for (int i = 0; i < fibers_k; ++i) ready.push_back(i);   // all parked on a leaf after start
+        std::vector<float> buf;
+        int in_flight = 0;
+        auto send_group = [&]() -> bool {
+            const size_t g = std::min(ready.size(), static_cast<size_t>(coalesce_rows));
+            buf.clear();
+            std::vector<int> group; group.reserve(g);
+            for (size_t k = ready.size() - g; k < ready.size(); ++k) {
+                const std::span<const float> feats = trees[static_cast<size_t>(ready[k])]->ch.features;
+                buf.insert(buf.end(), feats.begin(), feats.end());   // concat the group's feature rows
+                group.push_back(ready[k]);
             }
-            if (trees[si]->running) active.push_back(i);
+            ready.resize(ready.size() - g);
+            const tlab::wire::corr_t cc = corr++;
+            const auto G = static_cast<tlab::wire::count_t>(group.size());
+            corr_to_group.emplace(cc, std::move(group));
+            const tlab::LeafBatch lb{cc, G, static_cast<tlab::wire::count_t>(in_dim),
+                                     std::span<const float>(buf.data(), buf.size())};
+            if (auto s = boundary->send(lb); !s) { out.failed = true; out.err = "send: " + s.error().message; return false; }
+            ++in_flight;
+            return true;
+        };
+        while (secs_since(t_start) < run_seconds) {
+            while (!ready.empty() && in_flight < budget) if (!send_group()) return;
+            if (in_flight == 0) break;
+            auto reply = boundary->recv();
+            if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return; }
+            auto it = corr_to_group.find(reply->corr);
+            if (it == corr_to_group.end() || reply->preds.size() != it->second.size()) {
+                out.failed = true; out.err = "unmatched/size-mismatch reply corr=" + std::to_string(reply->corr); return;
+            }
+            for (size_t j = 0; j < it->second.size(); ++j) {
+                const int i = it->second[j];
+                chocofarm::NetPrediction pred;
+                pred.value = reply->preds[j].value;
+                pred.logits = std::move(reply->preds[j].logits);
+                trees[static_cast<size_t>(i)]->resume_with(pred);            // advance to next leaf (or finish)
+                out.leaves += 1;
+                if (!trees[static_cast<size_t>(i)]->running) advance(i);     // decision done -> step + re-park
+                ready.push_back(i);                                          // running again -> ready to send
+            }
+            corr_to_group.erase(it);
+            --in_flight;
         }
-        if (active.empty()) break;
-        if (!drive_round(*boundary, trees, active, coalesce_rows, in_dim, corr, out)) return;
+    } else {
+        // ROUND-SYNC pipe: submit every parked fiber's leaf (coalesced into coalesce_rows-row messages),
+        // then BLOCK recv'ing the whole round before resuming any -> the search cores idle across the
+        // round's RTT. The committed baseline the greedy pipe is measured against.
+        while (secs_since(t_start) < run_seconds) {
+            std::vector<int> active; active.reserve(static_cast<size_t>(fibers_k));
+            for (int i = 0; i < fibers_k; ++i) {
+                if (!trees[static_cast<size_t>(i)]->running) advance(i);   // completed -> step the episode
+                if (trees[static_cast<size_t>(i)]->running) active.push_back(i);
+            }
+            if (active.empty()) break;
+            if (!drive_round(*boundary, trees, active, coalesce_rows, in_dim, corr, out)) return;
+        }
     }
 }
 
@@ -386,6 +460,7 @@ int main(int argc, char** argv) {
                      "  --fibers 0 (default) = non-fiber baseline; K>=1 = K fibers/thread (the fiber model)\n"
                      "  --msg-rows M (default 1) = coalesce up to M round leaves per message (round-sync; the S_min floor)\n"
                      "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n"
+                     "  --inflight-msgs N (default 8) = greedy-episodic pipe depth (coalesced msgs in flight; round-sync ignores)\n"
                      "  --episodic = run real episodes (step the env per executed action); DPS = decisions/s\n"
                      "  --no-early-exit = substitute Terminate so episodes run full-length (cfg.no_early_exit)\n";
         return 2;
@@ -399,6 +474,11 @@ int main(int argc, char** argv) {
     // --msg-rows M: coalesce up to M of a fiber round's parked leaves into ONE B<=M message (the static
     // coalescing floor). M=1 (default) = one leaf per message (the historical B=1 path). Round-sync only.
     const int msg_rows = opt(args, "--msg-rows") ? std::atoi(std::string(*opt(args, "--msg-rows")).c_str()) : 1;
+    // --inflight-msgs N: the greedy-episodic pipe depth -- up to N coalesced messages kept CONTINUOUSLY in
+    // flight (the overlap budget; ignored by round-sync and by the root drivers). Default 8 (the overcommit
+    // reference's --inflight-msgs). The within-stack greedy-vs-round-sync A/B holds coalesce_rows fixed and
+    // moves only this (and the driver) so the pipe shape is attributed in isolation.
+    const int inflight_msgs = opt(args, "--inflight-msgs") ? std::atoi(std::string(*opt(args, "--inflight-msgs")).c_str()) : 8;
     // --episodic: each fiber runs a SEQUENCE of decisions (env stepped by the executed action) instead of
     // repeated root decisions -> the production-shape workload; DPS = decisions/wall. --no-early-exit sets
     // cfg.no_early_exit so a Terminate is substituted (episodes run full-length, not short-circuited).
@@ -430,6 +510,7 @@ int main(int argc, char** argv) {
               << ") driver=" << (fibers > 0 ? driver : std::string("n/a"))
               << " threads=" << threads << " fibers_per_thread=" << fibers << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
+              << " inflight_msgs=" << inflight_msgs
               << " seconds=" << seconds << " n_sims=" << cfg.n_sims << " m=" << cfg.m
               << " n_slots=" << chocofarm::n_action_slots(env) << " endpoint=" << *ep << "\n";
 
@@ -441,7 +522,7 @@ int main(int argc, char** argv) {
         pool.emplace_back([&, i] {
             apply_thread_priority(i, low_prio_thread, low_prio_nice);   // renice iff designated
             if (fibers > 0 && episodic)
-                run_thread_fiber_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, stats[static_cast<size_t>(i)]);
+                run_thread_fiber_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, stats[static_cast<size_t>(i)]);
             else if (fibers > 0 && driver == "greedy")
                 run_thread_fiber_greedy(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
             else if (fibers > 0)
