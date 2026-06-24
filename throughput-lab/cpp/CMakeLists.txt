@@ -117,4 +117,15 @@ if(TLAB_REAL_GENERATOR)
   target_include_directories(tlab-real-gen-smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CHOCO_CORE_INCLUDE})
   target_link_libraries(tlab-real-gen-smoke PRIVATE
     ${CHOCO_CORE_LIB} ${TLAB_BOOST_CONTEXT} ${HIREDIS_LIB} zmq_lib Threads::Threads)
+
+  # The NON-FIBER real-generator load driver (N threads x SerialRuntime, B=1 blocking round-trips ->
+  # server batch ~= N). The baseline the fiber multiplexer is measured against.
+  add_executable(tlab-real-producer
+    real_producer.cpp
+    boundary_per_thread.cpp
+    boundary_coalescing.cpp
+    boundary_factory.cpp)
+  target_include_directories(tlab-real-producer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CHOCO_CORE_INCLUDE})
+  target_link_libraries(tlab-real-producer PRIVATE
+    ${CHOCO_CORE_LIB} ${TLAB_BOOST_CONTEXT} ${HIREDIS_LIB} zmq_lib Threads::Threads)
 endif()

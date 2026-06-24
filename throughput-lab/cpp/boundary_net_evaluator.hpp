@@ -21,6 +21,7 @@
 
 #include <expected>
 #include <span>
+#include <string>
 #include <utility>
 
 #include "chocofarm/error.hpp"
