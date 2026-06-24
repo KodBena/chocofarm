@@ -62,9 +62,11 @@ for b in "$PROD" "$W"; do [ -x "$b" ] || { echo "missing $b (build -DTLAB_REAL_G
 # $SRVENV prefix was added (and was the real cause of the "4-gen wedge" once mis-read as a sandbox kill).
 # `env` fixes it: with env the words are ARGS (VAR=VAL pairs env applies), not a shell assignment prefix, so
 # an empty or non-empty $SRVENV both work. Keep the `env`.
+# NET (env, a path to a real AZ .npz checkpoint, jax only) serves the REAL trained net (Gate B) instead of a
+# random one -> AZ-relevant metrics (the real net's LPD/throughput, ~+13% vs random; finding #15). Empty = random.
 env $SRVENV PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
   --in-dim 241 --n-actions 65 --hidden 256 --max-batch "$MAXBATCH" --warmup "$WARMUP" \
-  --poll-timeout-ms 50 ${SINGLE_THREAD:+--single-thread} --forward "$FORWARD" >"$LOG" 2>&1 & SRV=$!
+  --poll-timeout-ms 50 ${SINGLE_THREAD:+--single-thread} --forward "$FORWARD" ${NET:+--net "$NET"} >"$LOG" 2>&1 & SRV=$!
 cleanup(){ kill -INT "$SRV" 2>/dev/null||true; sleep 1; kill "$SRV" 2>/dev/null||true; rm -f "${EP#ipc://}"; }
 trap cleanup EXIT
 for _ in $(seq 1 240); do grep -q READY "$LOG" && break; sleep 0.5; done
@@ -94,7 +96,7 @@ UTIL=$(grep -oE '\([0-9.]+% of wall\)' "$LOG"|grep -oE '[0-9.]+'|head -1)
 # server_impl carries the threading ARM (single-thread vs two-thread). This is an ARTIFACT/treatment facet,
 # NOT a hyperparameter: it is an A/B between server designs resolved by deleting the loser, not a knob tuned
 # to a shipped optimum -- so it lives in provenance (server_impl), never in the hp/ SSOT (ADR-0008 classify).
-SERVER_IMPL="tlab-server.py:$([ -n "${SINGLE_THREAD:-}" ] && echo single-thread || echo two-thread):$FORWARD"
+SERVER_IMPL="tlab-server.py:$([ -n "${SINGLE_THREAD:-}" ] && echo single-thread || echo two-thread):$FORWARD$([ -n "${NET:-}" ] && echo :realnet)"
 echo "EPISODIC-STATIC [commit=$GIT_COMMIT tree=$GIT_TREE] (sims${NSIMS}/m24, no-early-exit, 3 gens + IDLE surplus, driver=$DRIVER inflight=$INFLIGHT, msg-rows=$MSG_ROWS, ladder=[$WARMUP] max-batch=$MAXBATCH, K=$K, server=$SERVER_IMPL, ${S}s)"
 echo "  decisions=$dec  ->  DPS = $((dec/S))"
 echo "  leaves=$lv  ->  leaf-rows/s = $((lv/S))   LPD ~= $((lv/(dec>0?dec:1)))"
