@@ -16,23 +16,27 @@
 //   the σ-transform / v_mix / PUCT / log-prior reproduce numpy's DELIBERATE float32-prior × float64-Q
 //   promotion EXACTLY. The float32 enters at FOUR places the Python rule's comments flag
 //   (value_target.py:209-249, gumbel_search.py:397-426/436-458), each localized below. ALL FOUR read
-//   the prior through ONE invariant (toggleable by CHOCO_GUMBEL_UNIFORM, the discrimination control):
-//     * MIXED (default, faithful): every prior read is the FLOAT32 stored prior (`node.prior`) — the
-//       precision Python's float32 `root.prior` carries. This is the byte-faithful path.
-//     * UNIFORM (`kUniform`, CHOCO_GUMBEL_UNIFORM=1): every prior read is the FULL-FLOAT64 prior
-//       (`node.prior_d`, the pre-narrowing masked-softmax) — the genuine 1a all-`double` port. The
-//       toggle is ONE rule over ALL FOUR read sites (`prior_read` below), NOT a per-site gate (an
-//       earlier draft gated only v_mix/PUCT but left the dominant log-prior path float32 in BOTH arms,
-//       which made the control VACUOUS — the float32 effect leaked into both arms; see the audit).
+//   the prior through ONE invariant (`prior_value` below): every prior read is the FLOAT32 stored prior
+//   (`node.prior`) — the precision Python's float32 `root.prior` carries. This is the byte-faithful,
+//   production path.
 //
-//     1. `evaluate` stores BOTH `node.prior` (float32, the net's wire dtype the Python search
-//        side-reads as root.prior) AND `node.prior_d` (the same masked-softmax in full float64). The
-//        masked softmax that BUILDS the prior runs in float64 either way; only the STORED `prior` is
-//        narrowed. The downstream LOG-PRIOR root logit (`run_search`: logits[s]=log(prior_read(s))) is
-//        the DOMINANT float32 effect on the discrete output (~1e-7 on log(prior)): it feeds the
-//        Gumbel-top-k `logit+g` AND the SH cut key `g+logit+σ·q̂`, so the float32-vs-double prior FLIPS
-//        the SH survivor and the improved-π argmax on near-tie inputs. This is the seam the
-//        discrimination control actually proves load-bearing on the DISCRETE output.
+//   DISCRIMINATION CONTROL RETIRED (experiment/drop-prior-d): an earlier draft carried a second prior,
+//   `node.prior_d` (the full-float64 pre-narrowing masked-softmax), toggled by CHOCO_GUMBEL_UNIFORM
+//   (`kUniform`) to read the genuine 1a all-`double` port at every site — the discrimination control
+//   that PROVED the float32 prior precision (not the structure) decides the near-ties. Its
+//   non-vacuousness was already established (the uniform arm diverged X/N while the mixed arm matched
+//   N/N). The control and its `node.prior_d` member were removed wholesale on this branch; the mixed
+//   144/144 parity (cpp/parity/gumbel_precision.py, MIXED leg) remains the standing float32-seam
+//   regression guard. With the control gone the GumbelNode struct carries ONE prior, not two, and the
+//   prior read is unconditionally the float32 stored prior.
+//
+//     1. `evaluate` stores `node.prior` (float32, the net's wire dtype the Python search side-reads as
+//        root.prior). The masked softmax that BUILDS the prior runs in float64; only the STORED `prior`
+//        is narrowed. The downstream LOG-PRIOR root logit (`run_search`: logits[s]=log(prior_value(s)))
+//        is the DOMINANT float32 effect on the discrete output (~1e-7 on log(prior)): it feeds the
+//        Gumbel-top-k `logit+g` AND the SH cut key `g+logit+σ·q̂`, so the float32 prior FLIPS the SH
+//        survivor and the improved-π argmax on near-tie inputs (vs the retired double control). This is
+//        the seam the discrimination control proved load-bearing on the DISCRETE output.
 //     2. `v_mix_mixed` computes the prior-weighted blend in FLOAT32: numpy weak-promotes
 //        `prior[s](f32) * q(pyfloat) → f32`, and `pyfloat += f32 → f32`, so `pw_num`/`pw_den`/`v_bar`
 //        AND the whole `(v_net + ΣN·v̄)/(1+ΣN)` return are float32 (the v_mix result is np.float32).
@@ -55,12 +59,13 @@
 //   DISCRETE discrimination below rests on seam 1 (the prior precision). We do NOT over-claim that all
 //   four seams flip the discrete output — claiming so would be the hack the audit names.
 //
-//   DISCRIMINATION CONTROL (CHOCO_GUMBEL_UNIFORM=1): `kUniform` reads the FULL-float64 prior at every
-//   site (seams 1-4), i.e. the genuine 1a uniform-`double` port. On the COARSE 1a inputs (no near-ties)
-//   uniform==mixed (the structure check is precision-insensitive); on the FINE near-tie inputs
-//   (cpp/parity/gumbel_precision.py) the uniform port DIVERGES from Python on a LARGE fraction while
-//   the mixed port matches N/N — the load-bearing proof that the float32 PRIOR precision, not the
-//   structure, is what 1b fixed (the 1b analogue of the 1a mutation control).
+//   DISCRIMINATION CONTROL (RETIRED on experiment/drop-prior-d): the former CHOCO_GUMBEL_UNIFORM=1
+//   `kUniform` arm read the FULL-float64 prior (`node.prior_d`) at every site (the genuine 1a
+//   uniform-`double` port). On the COARSE 1a inputs (no near-ties) uniform==mixed; on the FINE near-tie
+//   inputs (cpp/parity/gumbel_precision.py) the uniform port DIVERGED from Python on a LARGE fraction
+//   while the mixed port matched N/N — the load-bearing proof that the float32 PRIOR precision, not the
+//   structure, is what 1b fixed. That proof stands; the control arm + its `node.prior_d` data were
+//   removed (see the header note above). The mixed 144/144 leg remains the float32-seam regression guard.
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/gumbel.hpp"
@@ -93,27 +98,13 @@ enum class Mutate { None, ShBudget, Puct };
 }
 const Mutate kMutate = read_mutate();  // read once (a process-lifetime test seam)
 
-// The 1b DISCRIMINATION control (test-only): CHOCO_GUMBEL_UNIFORM=1 reverts the three float32 seams
-// (v_mix, the unvisited σ·v_mix completion, the PUCT score) to the 1a uniform-`double` precision, so
-// the precision parity harness can prove the float32 path — not the structure — is what decides the
-// near-ties. Default (unset) is the FAITHFUL mixed precision (float32-prior × float64-Q) that matches
-// Python's value_target.py byte-for-byte. No production path sets it.
-[[nodiscard]] bool read_uniform() {
-    const char* u = std::getenv("CHOCO_GUMBEL_UNIFORM");
-    return u != nullptr && std::strcmp(u, "1") == 0;
-}
-const bool kUniform = read_uniform();  // read once (a process-lifetime test seam)
-
 // The ONE prior-precision rule shared by ALL FOUR float32 prior read sites (the log-prior logit build,
-// v_mix, the σ·v_mix completion, PUCT). MIXED (default) reads the float32 stored prior — the precision
-// Python's float32 root.prior carries. UNIFORM (kUniform) reads the full-float64 pre-narrowing prior —
-// the genuine 1a all-`double` port. Localizing the toggle HERE (one invariant over all readers, not a
-// per-site gate) is what makes the discrimination control non-vacuous: under kUniform NO read site sees
-// the float32 narrowing, so the dominant log-prior effect is double in the uniform arm and float32 in
-// the mixed arm — the discrete divergence the control proves.
-[[nodiscard]] double prior_read(const GumbelNode& node, int s) {
-    return kUniform ? node.prior_d[static_cast<size_t>(s)]
-                    : static_cast<double>(node.prior[static_cast<size_t>(s)]);
+// v_mix, the σ·v_mix completion, PUCT): every read is the FLOAT32 stored prior (`node.prior`) — the
+// precision Python's float32 root.prior carries, the byte-faithful production path. (The retired
+// CHOCO_GUMBEL_UNIFORM=1 control once routed these through a full-float64 `node.prior_d`; that arm and
+// its member were removed on experiment/drop-prior-d — see the header note.)
+[[nodiscard]] double prior_value(const GumbelNode& node, int s) {
+    return static_cast<double>(node.prior[static_cast<size_t>(s)]);
 }
 }  // namespace
 
@@ -147,31 +138,11 @@ namespace {
 // return is np.float32 (value_target.py:226-249, "the v_mix return is np.float32"). We mirror it with
 // `float` arithmetic: narrow `prior[s]·q` to float (numpy-weak), accumulate/divide/blend in float, and
 // widen the float32 result to double ONCE for the (lossless) return — exactly the value Python's f32
-// v_mix carries when it flows into the f64 `logits[s] + σ·vm` add downstream. `kUniform` runs the 1a
-// uniform-`double` path (the discrimination control: diverges from Python on the fine near-tie inputs).
+// v_mix carries when it flows into the f64 `logits[s] + σ·vm` add downstream. (The retired kUniform
+// control once ran a full-`double` path here; that arm was removed on experiment/drop-prior-d.)
 [[nodiscard]] double v_mix_mixed(const GumbelNode& node, double root_value) {
     long sum_n = 0;
-    if (kUniform) {
-        // the genuine 1a all-`double` path: the FULL-float64 prior (prior_read -> prior_d) and double
-        // arithmetic throughout (the discrimination control — diverges from Python on fine near-ties).
-        double pw_num = 0.0, pw_den = 0.0;
-        for (int s : node.legal_slots) {
-            int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
-            if (n > 0) {
-                sum_n += n;
-                double p = prior_read(node, s);  // full-float64 prior (kUniform)
-                pw_num += p * node.q(s);
-                pw_den += p;
-            }
-        }
-        if (sum_n > 0 && pw_den > 0.0) {
-            double v_bar = pw_num / pw_den;
-            return (root_value + static_cast<double>(sum_n) * v_bar)
-                   / (1.0 + static_cast<double>(sum_n));
-        }
-        return root_value;
-    }
-    // mixed precision (default): float32 prior-weighted blend, byte-faithful to numpy's weak promotion.
+    // mixed precision (production): float32 prior-weighted blend, byte-faithful to numpy's weak promotion.
     float pw_num = 0.0f, pw_den = 0.0f;
     for (int s : node.legal_slots) {
         int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
@@ -269,9 +240,8 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
 
     // the prior = masked softmax of the net logits over the legal slots (mirrors predict_both: the net
     // emits raw logits, the search softmaxes them under the mask). 1b SEAM 1: `node.prior` is the float32
-    // prior array the Python search side-reads (root.prior, float32) — the precision the mixed path reads.
-    // We ALSO keep `node.prior_d`, the SAME masked softmax in full float64, so the discrimination control
-    // (kUniform) can read the genuine pre-narrowing double prior at every site (prior_read).
+    // prior array the Python search side-reads (root.prior, float32) — the precision every read site uses.
+    // (The retired kUniform control once also kept a full-float64 `node.prior_d`; removed on this branch.)
     // Reuse the policy's per-leaf scratch for the net-logits-as-double row instead of allocating a fresh
     // vector each leaf (ADR-0012 P9; ws_ is per-policy == per-tree/per-fiber, clobber-safe — one tree's
     // leaves run sequentially, each parked fiber has its OWN ws_). `assign` re-fills the whole slot space
@@ -302,20 +272,15 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
     // the value is byte-identical to the former fresh-vector masked_softmax_1a, but the per-leaf heap
     // allocation is amortized into ws_.prior_scratch (reused across this tree's sequential leaves).
     masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, ws_.prior_scratch);
-    // store BOTH: the full-float64 prior (prior_d, read by the uniform discrimination arm) AND its
-    // float32 narrowing (prior, read by the default mixed arm — the precision Python's root.prior holds).
-    const std::vector<double>& prior_d = ws_.prior_scratch;
-    // prior_d (the full-float64 prior) is read ONLY by the kUniform discrimination control (prior_read,
-    // ~:115). In the PRODUCTION mixed path (kUniform=false) node.prior_d is NEVER read, so populating it
-    // per node was pure dead work (a 65-double pmr alloc + .assign + realloc-copies on every node —
-    // finding #32). Gate it on kUniform: production nodes leave prior_d empty. Bit-identical in BOTH arms
-    // (kUniform still populates AND reads it; !kUniform never touches it). MEASURED: ~2-3% producer-CPU
-    // win (the per-node .assign + alloc skipped); ~0 RSS change (the arena's monotonic-block granularity
-    // dominates resident, not the prior_d bytes — the ~25% RSS estimate was refuted by the witness).
-    if (kUniform) node.prior_d.assign(prior_d.begin(), prior_d.end());  // control arm only (pmr<-std copy)
+    // store the float32 narrowing of the masked-softmax prior (the precision Python's root.prior holds).
+    // The softmax that BUILDS it ran in float64 (ws_.prior_scratch); only the STORED node.prior is
+    // narrowed. (The retired kUniform control once ALSO stored a full-float64 node.prior_d here — a
+    // per-node 65-double pmr alloc + .assign that the production path never read, finding #32; that
+    // member was removed wholesale on experiment/drop-prior-d, so this is now a single store.)
+    const std::vector<double>& prior_f64 = ws_.prior_scratch;
     node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
     for (int s = 0; s < n_slots_; ++s)
-        node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_d[static_cast<size_t>(s)]);
+        node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_f64[static_cast<size_t>(s)]);
 
     node.value = static_cast<double>(np.value);
     node.evaluated = true;
@@ -347,25 +312,25 @@ std::span<const float> GumbelAZPolicy::eval_build_features(GumbelNode& node, con
     return feat;
 }
 
-// The post-predict half of evaluate(): given the leaf NetPrediction, build node.prior_d (float64 masked
-// softmax) + node.prior (its float32 narrowing, the 1b seam-1) + store node.value — BYTE-IDENTICAL to
+// The post-predict half of evaluate(): given the leaf NetPrediction, build node.prior (the float64
+// masked softmax, narrowed to its float32 store — the 1b seam-1) + store node.value — BYTE-IDENTICAL to
 // evaluate()'s tail (same masked_softmax_1a_into, same per-element float32 store). node.legal_slots must
 // already be set (by eval_build_features). The masked softmax that BUILDS the prior runs in float64;
 // only the stored node.prior is narrowed (the precision Python's float32 root.prior carries). Reuses a
 // LOCAL logits_d/prior_scratch (one per call, not ws_) so this method has no hidden cross-leaf scratch
-// dependence — the cursor owns no shared state with run_search.
+// dependence — the cursor owns no shared state with run_search. (The retired kUniform control once also
+// stored node.prior_d here; removed on experiment/drop-prior-d.)
 void GumbelAZPolicy::eval_finish(GumbelNode& node, const NetPrediction& np) const {
     std::vector<double> logits_d(static_cast<size_t>(n_slots_), -1e30);
     for (int s : node.legal_slots) {
         assert(!np.logits.empty() && "gumbel(cursor): net has no policy head (logits empty)");
         logits_d[static_cast<size_t>(s)] = static_cast<double>(np.logits[static_cast<size_t>(s)]);
     }
-    std::vector<double> prior_d;
-    masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, prior_d);
-    node.prior_d.assign(prior_d.begin(), prior_d.end());
+    std::vector<double> prior_f64;
+    masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, prior_f64);
     node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
     for (int s = 0; s < n_slots_; ++s)
-        node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_d[static_cast<size_t>(s)]);
+        node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_f64[static_cast<size_t>(s)]);
     node.value = static_cast<double>(np.value);
     node.evaluated = true;
 }
@@ -375,7 +340,7 @@ double GumbelAZPolicy::sh_cut_sigma(const GumbelNode& root) const {
 }
 
 double GumbelAZPolicy::root_logit(const GumbelNode& root, int s) const {
-    return std::log(std::max(prior_read(root, s), 1e-12));
+    return std::log(std::max(prior_value(root, s), 1e-12));
 }
 
 // ---- AlphaZero PUCT select (mirrors _puct_select) -------------------------------------------------
@@ -398,22 +363,15 @@ int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
         // which numpy weak-promotes through the WHOLE U-term and the `q +` to float32 — so the interior
         // near-tie argmax is decided in FLOAT32 (gumbel_search.py:397-426). Mirror it: cast the Python-
         // float operands to float so each numpy op runs in true float32 (cast-first weak promotion).
-        // `kUniform` runs the 1a uniform-`double` path (the discrimination control).
-        double v;
-        if (kUniform) {
-            double p = prior_read(node, s);  // full-float64 prior (the genuine 1a all-`double` path)
-            double u = cfg_.c_puct * p * sqrt_total / (1.0 + static_cast<double>(n));
-            v = (kMutate == Mutate::Puct) ? (q - u) : (q + u);
-        } else {
-            float p = node.prior[static_cast<size_t>(s)];                       // stored float32 prior
-            float u = static_cast<float>(cfg_.c_puct) * p                        // pyfloat·f32 → f32
-                      * static_cast<float>(sqrt_total)                           // ·pyfloat → f32
-                      / (1.0f + static_cast<float>(n));                          // /(pyint) → f32
-            float vf = (kMutate == Mutate::Puct)
-                           ? (static_cast<float>(q) - u)                         // q(pyfloat) ± f32 → f32
-                           : (static_cast<float>(q) + u);
-            v = static_cast<double>(vf);  // lossless widen; the float32 ordering drives the argmax
-        }
+        // (The retired kUniform control once ran a full-`double` path here; removed on this branch.)
+        float p = node.prior[static_cast<size_t>(s)];                       // stored float32 prior
+        float u = static_cast<float>(cfg_.c_puct) * p                        // pyfloat·f32 → f32
+                  * static_cast<float>(sqrt_total)                           // ·pyfloat → f32
+                  / (1.0f + static_cast<float>(n));                          // /(pyint) → f32
+        float vf = (kMutate == Mutate::Puct)
+                       ? (static_cast<float>(q) - u)                         // q(pyfloat) ± f32 → f32
+                       : (static_cast<float>(q) + u);
+        double v = static_cast<double>(vf);  // lossless widen; the float32 ordering drives the argmax
         // strict `>` first-wins over node.legal_slots (mirrors Python `if v > best_v`). best_v starts at
         // -inf (the first slot always wins); thereafter the comparison is between the float32-rounded
         // scores (widened to double, an order-preserving widen) — the near-tie side Python lands on.
@@ -604,11 +562,10 @@ std::vector<double> GumbelAZPolicy::improved_policy(const GumbelNode& root,
         // is `vm`, an np.float32 (v_mix's float32 return), so numpy `pyfloat(σ)·f32(vm) → f32` and then
         // `f64(logits[s]) + f32 → f64` (the float32-rounded σ·vm added in float64). Mirror EXACTLY:
         // visited → full double; unvisited → round σ·vm to float (cast-first weak promotion), then add
-        // in double. `kUniform` runs the 1a uniform-`double` path (the discrimination control).
+        // in double. (The retired kUniform control once ran a full-`double` path here; removed on this
+        // branch.)
         if (n > 0) {
             completed[static_cast<size_t>(s)] = logits[static_cast<size_t>(s)] + sigma * root.q(s);
-        } else if (kUniform) {
-            completed[static_cast<size_t>(s)] = logits[static_cast<size_t>(s)] + sigma * vm;
         } else {
             float sigma_vm = static_cast<float>(sigma) * static_cast<float>(vm);  // pyfloat·f32 → f32
             completed[static_cast<size_t>(s)] =
@@ -652,12 +609,12 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     // 1b SEAM 1 (the DOMINANT float32 effect on the discrete output): Python reads `prior[s]` off the
     // float32 `root.prior` here, so `math.log(max(prior[s], 1e-12))` is a log of a float32 scalar — the
     // ~1e-7 float32 narrowing perturbs every root logit, and these logits feed BOTH the Gumbel-top-k
-    // (logit+g) AND the SH cut key (g+logit+σ·q̂), so the float32-vs-double prior FLIPS the survivor and
-    // the improved-π argmax on near-tie inputs. `prior_read` routes the precision: float32 in the
-    // default mixed arm (matching Python), full-float64 in the uniform discrimination arm.
+    // (logit+g) AND the SH cut key (g+logit+σ·q̂), so the float32 prior (vs the retired double control)
+    // FLIPS the survivor and the improved-π argmax on near-tie inputs. `prior_value` reads the float32
+    // stored prior (the production path; the uniform discrimination arm was removed on this branch).
     std::vector<double> logits(static_cast<size_t>(n_slots_), -1e30);
     for (int s : nodes[0].legal_slots) {
-        double p = prior_read(nodes[0], s);
+        double p = prior_value(nodes[0], s);
         logits[static_cast<size_t>(s)] = std::log(std::max(p, 1e-12));
     }
 

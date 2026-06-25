@@ -24,13 +24,19 @@ the PUCT interior argmax, and the improved-pi completed logits hit GENUINE near-
 float32-epsilon scale) — and asserts:
 
   (A) the MIXED-precision C++ (the default faithful path) matches Python's GumbelAZSearch EXACTLY on
-      BOTH the executed action AND the improved-pi argmax, across a grid (N/N);
-  (B) the UNIFORM-precision C++ (CHOCO_GUMBEL_UNIFORM=1 — the 1a all-float64 path) DIVERGES from Python
-      on a NON-TRIVIAL number of those same cases.
-(B) is the load-bearing DISCRIMINATION control (the 1b analogue of the 1a mutation control): if uniform
-ALSO matched N/N the fine inputs would NOT be precision-sensitive and the test would be VACUOUS. Both
-numbers are reported. The Python reference is the SAME faithful GumbelAZSearch in both arms — only the
-C++ precision toggles, so the divergence is attributable to the float32 seam, not the structure.
+      BOTH the executed action AND the improved-pi argmax, across a grid (N/N).
+
+(A) is the standing float32-seam REGRESSION GUARD: if a change perturbs the production float32 prior x
+float64-Q precision the near-tie argmaxes flip and this leg fails loudly.
+
+DISCRIMINATION CONTROL RETIRED (experiment/drop-prior-d): this harness ONCE carried a leg (B), the
+UNIFORM-precision C++ (CHOCO_GUMBEL_UNIFORM=1 — the 1a all-float64 path reading a full-float64
+`node.prior_d`), which DIVERGED from Python on a NON-TRIVIAL fraction of these same cases — the
+load-bearing proof that the float32 seam (not the structure) decides the near-ties (the 1b analogue of
+the 1a mutation control). That non-vacuousness was ESTABLISHED (the uniform arm diverged ~34/144 while
+the mixed arm matched N/N). The `CHOCO_GUMBEL_UNIFORM` control and its `node.prior_d` member were then
+removed wholesale from the C++ (gumbel.{hpp,cpp}); with `prior_d` gone there is nothing for leg (B) to
+toggle, so it was retired here too. The MIXED leg (A) remains as the production regression guard.
 
 Both sides use the SAME scripted RNG-free seam as gumbel_logic.py (rng.gumbel -> a fixed FIFO;
 sample_world -> bw[0]; the leaf (value, logits) -> a fixed cycled FIFO). The ONLY difference from 1a is
@@ -39,9 +45,10 @@ prior storage + the float32 sigma-transform round differently than float64), and
 the Q backups near-tie. The leaf logits are passed to the C++ fixture as full-precision per-slot
 vectors (the --leaf-logits protocol), NOT the coarse `lb + s*0.25` ramp the 1a fixture builds.
 
-C++ side: cpp/build/chocofarm-gumbel-dump (mixed precision by default; CHOCO_GUMBEL_UNIFORM=1 = uniform).
+C++ side: cpp/build/chocofarm-gumbel-dump (mixed precision — the ONLY path; the uniform control was
+          retired with prior_d on experiment/drop-prior-d).
 Python side: chocofarm.az.gumbel_search.GumbelAZSearch._decide_root (temperature 0), the REAL
-             mixed-precision path (float32 prior, float32 v_mix, float32 PUCT) on both arms.
+             mixed-precision path (float32 prior, float32 v_mix, float32 PUCT).
 
 Run (from repo root):
     PYTHONPATH=. /home/bork/w/vdc/venvs/generic/bin/python cpp/parity/gumbel_precision.py
@@ -156,12 +163,13 @@ def py_decide(env, m, n_sims, c_puct, max_depth, prefix_slots, gumbel_fifo, valu
 
 
 def cpp_decide(m, n_sims, c_puct, max_depth, prefix_slots, gumbel_fifo, value_fifo,
-               leaf_logits_table, uniform=False):
+               leaf_logits_table):
     """Run the C++ gumbel-dump fixture with the FINE per-slot leaf logits; return (executed_slot,
-    improved_argmax_slot, n_spent). `uniform`=True sets CHOCO_GUMBEL_UNIFORM=1 (the 1a all-float64 path,
-    the discrimination control). The leaf is passed as: line 2 = the value FIFO (one value per leaf);
-    line 4 = the flattened per-slot logits table 'r0c0 r0c1 ... r1c0 ...' (n_slots per row), selected by
-    --leaf-logits-rows on argv (the FINE-input protocol the fixture branches on)."""
+    improved_argmax_slot, n_spent) — the production mixed-precision path (the only path; the
+    CHOCO_GUMBEL_UNIFORM discrimination control was retired with prior_d). The leaf is passed as:
+    line 2 = the value FIFO (one value per leaf); line 4 = the flattened per-slot logits table
+    'r0c0 r0c1 ... r1c0 ...' (n_slots per row), selected by --leaf-logits-rows on argv (the FINE-input
+    protocol the fixture branches on)."""
     cmd = [GUMBEL_BIN, "--instance", INSTANCE, "--faces", FACES,
            "--m", str(m), "--n-sims", str(n_sims), "--c-puct", repr(c_puct),
            "--max-depth", str(max_depth), "--lam", repr(0.0855),
@@ -178,12 +186,7 @@ def cpp_decide(m, n_sims, c_puct, max_depth, prefix_slots, gumbel_fifo, value_fi
     # line 1 = gumbel FIFO; line 2 = value FIFO; line 3 = world-index FIFO (empty -> bw[0]);
     # line 4 = the flattened FINE per-slot logits table.
     stdin = gumbel_str + "\n" + value_str + "\n" + "\n" + logit_str + "\n"
-    sub_env = dict(os.environ)
-    if uniform:
-        sub_env["CHOCO_GUMBEL_UNIFORM"] = "1"
-    else:
-        sub_env.pop("CHOCO_GUMBEL_UNIFORM", None)
-    out = subprocess.run(cmd, input=stdin, capture_output=True, text=True, env=sub_env)
+    out = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"gumbel-dump failed (rc={out.returncode}): {out.stderr}")
     parts = out.stdout.split()
@@ -191,11 +194,11 @@ def cpp_decide(m, n_sims, c_puct, max_depth, prefix_slots, gumbel_fifo, value_fi
 
 
 # The fine-input scales. These are TUNED (not arbitrary): they put the search's DISCRETE decisions
-# (the SH survivor + the improved-pi argmax) on the float32-prior knife-edge, so the all-float64 uniform
-# port (CHOCO_GUMBEL_UNIFORM=1) diverges from the float32 mixed port on a LARGE fraction of the grid.
-# Verified by a sweep over seeds/scales: this (seed, vspread, dscale) gives ~110/144 uniform divergence
-# while the mixed port matches Python N/N. If a reseed drops the divergence to ~0 the test would go
-# VACUOUS — main() ASSERTS the divergence is non-trivial so a regression in the inputs fails loudly.
+# (the SH survivor + the improved-pi argmax) on the float32-prior knife-edge so the MIXED parity (A) is a
+# REAL regression guard — at this scale the production float32 seam DECIDES the argmaxes, so any
+# perturbation of it flips them and (A) fails. (Historically these same scales also made the retired
+# all-float64 uniform control diverge ~34/144 — the recorded non-vacuousness proof; that control is gone
+# with prior_d, but the inputs stay precision-sensitive so the mixed guard keeps its teeth.)
 _FINE_SEED = 13
 _FINE_VSPREAD = 1.0e-7   # leaf-value spread: TIGHT, so visited-slot Q's near-tie (sigma*q nearly cancels
                          #   in the improved-pi argmax) and the ~1e-7 float32 log-prior decides the order
@@ -250,7 +253,10 @@ def main():
     print("FINE seam: rng.gumbel -> a fixed FIFO; sample_world -> bw[0]; leaf (value, FULL-PRECISION "
           "per-slot logits) -> a fixed FIFO drawn at the float32-epsilon scale (GENUINE near-ties)")
     print("assert (A): the MIXED-precision C++ matches Python EXACTLY (exec action + improved-pi argmax) "
-          "N/N; (B) the UNIFORM-precision C++ (CHOCO_GUMBEL_UNIFORM=1) DIVERGES on a non-trivial X/N\n")
+          "N/N — the production float32-seam REGRESSION GUARD")
+    print("note: the (B) UNIFORM discrimination control (CHOCO_GUMBEL_UNIFORM=1) was RETIRED with "
+          "prior_d on experiment/drop-prior-d; its non-vacuousness (~34/144 divergence) was already "
+          "established\n")
 
     rng = np.random.default_rng(_FINE_SEED)
     gumbel_fifo = rng.gumbel(size=4096).tolist()
@@ -270,17 +276,14 @@ def main():
     total = len(cases)
     mixed_ok = 0
     mixed_mismatch = 0
-    uniform_diverge = 0
-    sample_diverge = []
     for n_sims, m, c_puct, max_depth, prefix in cases:
-        # the FAITHFUL Python reference (the REAL mixed-precision path) — the SAME on both arms.
+        # the FAITHFUL Python reference (the REAL mixed-precision path).
         py_exec, py_argmax, py_spent = py_decide(
             env, m, n_sims, c_puct, max_depth, prefix, gumbel_fifo, value_fifo, leaf_logits_table)
 
-        # arm A: the MIXED-precision C++ (default faithful path) — must match Python.
+        # arm A: the MIXED-precision C++ (the production path) — must match Python.
         mx_exec, mx_argmax, mx_spent = cpp_decide(
-            m, n_sims, c_puct, max_depth, prefix, gumbel_fifo, value_fifo, leaf_logits_table,
-            uniform=False)
+            m, n_sims, c_puct, max_depth, prefix, gumbel_fifo, value_fifo, leaf_logits_table)
         if (mx_exec, mx_argmax) == (py_exec, py_argmax) and mx_spent == n_sims:
             mixed_ok += 1
         else:
@@ -290,50 +293,23 @@ def main():
                       f"prefix={prefix}: py(exec={py_exec},argmax={py_argmax},spent={py_spent}) "
                       f"mixed(exec={mx_exec},argmax={mx_argmax},spent={mx_spent})")
 
-        # arm B: the UNIFORM-precision C++ (the 1a all-float64 path) — the discrimination control. It
-        # SHOULD diverge from Python on a non-trivial fraction (else the inputs are not precision-
-        # sensitive and the whole test is vacuous).
-        un_exec, un_argmax, un_spent = cpp_decide(
-            m, n_sims, c_puct, max_depth, prefix, gumbel_fifo, value_fifo, leaf_logits_table,
-            uniform=True)
-        if (un_exec, un_argmax) != (py_exec, py_argmax):
-            uniform_diverge += 1
-            if len(sample_diverge) < 8:
-                sample_diverge.append(
-                    f"    n_sims={n_sims} m={m} c_puct={c_puct} max_depth={max_depth} prefix={prefix}: "
-                    f"py(exec={py_exec},argmax={py_argmax}) uniform(exec={un_exec},argmax={un_argmax})")
+        # arm B (the UNIFORM discrimination control) was retired with prior_d — see the module docstring.
 
     print(f"\n[A mixed-precision parity ] {mixed_ok}/{total} cases the FAITHFUL (mixed-precision) C++ "
           f"matches Python EXACTLY (executed action AND improved-pi argmax)")
-    print(f"[B discrimination control ] {uniform_diverge}/{total} cases the UNIFORM-precision C++ "
-          f"(CHOCO_GUMBEL_UNIFORM=1) DIVERGES from the SAME Python reference")
-    if sample_diverge:
-        print("  sample uniform divergences (the float32 seam decides these near-ties):")
-        for line in sample_diverge:
-            print(line)
+    print("[B discrimination control ] RETIRED with prior_d (experiment/drop-prior-d); "
+          "non-vacuousness already established (~34/144 uniform divergence)")
 
     mixed_pass = (mixed_ok == total)
-    # NON-VACUITY guard (the 1b analogue of "0/240 proves nothing"): require a NON-TRIVIAL divergence,
-    # not merely >0. A single flaky flip could pass `>0` while the inputs are essentially insensitive; a
-    # reseed/scale regression that collapses the divergence must FAIL here. The tuned inputs give ~34/144
-    # uniform divergence — `MIN_DIVERGE` sits well below that with margin, well above flake.
-    MIN_DIVERGE = 10
-    discriminates = (uniform_diverge >= MIN_DIVERGE)
-    if mixed_pass and discriminates:
+    if mixed_pass:
         print(f"\nRESULT: PASS — the MIXED-precision C++ Gumbel-AZ search reproduces Python's "
-              f"float32-prior x float64-Q precision EXACTLY on FINE near-tie inputs ({mixed_ok}/{total}), "
-              f"while the UNIFORM-precision (all-float64) port diverges on {uniform_diverge}/{total} of "
-              f"the SAME cases — proving the float32 seam (not the structure) decides the near-ties, and "
-              f"that the parity is non-vacuous (the 1b analogue of the 1a mutation control).")
+              f"float32-prior x float64-Q precision EXACTLY on FINE near-tie inputs ({mixed_ok}/{total}) "
+              f"— the production float32-seam regression guard holds. (The all-float64 uniform "
+              f"discrimination control that once proved the seam load-bearing was retired with prior_d; "
+              f"its ~34/144 divergence stands as the recorded non-vacuousness proof.)")
         return 0
-    if not mixed_pass:
-        print("\nRESULT: FAIL — the MIXED-precision C++ does NOT match Python on every fine case; the "
-              "float32 promotion is not yet byte-faithful to value_target.py.")
-    if not discriminates:
-        print(f"\nRESULT: FAIL — the UNIFORM-precision control diverged on only {uniform_diverge}/{total} "
-              f"cases (< {MIN_DIVERGE}): the fine inputs are not precision-sensitive enough, so the parity "
-              f"is (near-)VACUOUS (proves little). Tighten the leaf spreads until the uniform mutant "
-              f"diverges on a non-trivial fraction.")
+    print("\nRESULT: FAIL — the MIXED-precision C++ does NOT match Python on every fine case; the "
+          "float32 promotion is not byte-faithful to value_target.py (the production path was perturbed).")
     return 1
 
 

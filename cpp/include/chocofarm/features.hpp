@@ -105,12 +105,12 @@ struct PointEq {
 // (feat64/feat32/mask) reuse is metric-NEUTRAL on the malloc bucket — it is a byte-identical steady-state
 // refactor, not the source of the ~20% bucket. The bucket the profile actually flagged is the per-leaf
 // temporaries DOWNSTREAM of the feature build inside GumbelAZPolicy::evaluate (the net-output-as-double
-// `logits_d` + the masked-softmax `prior_d`, each ~n_slots, freshly heap-allocated every leaf). Those are
+// `logits_d` + the masked-softmax prior scratch, each ~n_slots, freshly heap-allocated every leaf). Those are
 // the `logits_d`/`prior_scratch` buffers below; reusing them is the per-leaf win this workspace now targets.
 //
 // `feat64` is build()'s float64 output; `feat32` is its float32 narrowing (the wire dtype the NetEvaluator
 // port consumes); `mask` is the sliced legal mask. `logits_d` is the net logits widened to double over the
-// slot space; `prior_scratch` is the masked-softmax prior (assigned into node.prior_d). OWNERSHIP is the
+// slot space; `prior_scratch` is the masked-softmax prior in float64 (narrowed into the float32 node.prior). OWNERSHIP is the
 // caller's (the search holds one per GumbelAZPolicy — i.e. per TreeState/per fiber, so the buffers are
 // reused across that one tree's sequential leaves and isolated across concurrently-parked fibers); these
 // are explicitly-typed members passed by name to the _into signatures, NOT a hidden global / thread_local
@@ -120,7 +120,7 @@ struct FeatureWorkspace {
     std::vector<float> feat32;         // the float32 narrowing of feat64 (the wire/port dtype)
     std::vector<float> mask;           // legal_mask_into target — length n_slots
     std::vector<double> logits_d;      // evaluate(): net logits widened to double over the slot space
-    std::vector<double> prior_scratch; // evaluate(): the masked-softmax prior (then assigned into prior_d)
+    std::vector<double> prior_scratch; // evaluate(): the float64 masked-softmax prior (then narrowed into node.prior)
 };
 
 // The §2.2 feature vector for (loc, bw, collected), mirroring features.FeatureBuilder.build. The

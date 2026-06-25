@@ -22,7 +22,7 @@
 //   TreeCursor is a friend of GumbelAZPolicy and REUSES its VALIDATED precision-critical helpers
 //   VERBATIM — eval_build_features/eval_finish (the evaluate() split bracketing the leaf), puct_select,
 //   improved_policy, sh_cut_sigma, root_logit — every one of which calls gumbel.cpp's file-local
-//   prior_read / v_mix_mixed / sigma_scale_1a / masked_softmax_1a. So the FOUR 1b float32 seams, the
+//   prior_value / v_mix_mixed / sigma_scale_1a / masked_softmax_1a. So the FOUR 1b float32 seams, the
 //   Danihelka invariants, and the per-tree RNG draw order are reproduced because the cursor REUSES the
 //   exact same math the recursion runs, only re-sequenced through an explicit stack — it never
 //   re-derives a seam. The RNG draw order is preserved by construction: the cursor draws the root

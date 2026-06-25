@@ -17,7 +17,7 @@
 //   The Python search runs the σ-transform at a DELIBERATE float32-prior × float64-Q mixed precision
 //   (value_target.py:209-249, the byte-identity seam) that a uniform-precision port diverges from on
 //   NEAR-TIE inputs. 1b makes the C++ reproduce that promotion EXACTLY, localized in gumbel.cpp at four
-//   spots (each toggleable by CHOCO_GUMBEL_UNIFORM, the discrimination control):
+//   spots:
 //     1. `evaluate` stores `node.prior` as float32 (the in-search masked-softmax prior; the softmax
 //        that BUILDS it stays float64, only the stored prior is narrowed);
 //     2. `v_mix_mixed` computes the prior-weighted blend ENTIRELY in float32 (numpy's f32×pyfloat weak
@@ -28,7 +28,15 @@
 //        U-term), deciding the interior near-tie argmax at float32.
 //   The SH cut key (g+logit+σ·q̂) and the Gumbel-top-k (logit+g) are float64 on BOTH sides (numpy:
 //   g/logits/sigma float64, q̂ a Python float) — no float32 there. cpp/parity/gumbel_precision.py proves
-//   the FINE near-tie parity (mixed N/N exact, uniform diverges X/N — the load-bearing discrimination).
+//   the FINE near-tie MIXED parity (mixed N/N exact — the float32-seam regression guard).
+//
+//   DISCRIMINATION CONTROL RETIRED (experiment/drop-prior-d): the `CHOCO_GUMBEL_UNIFORM=1` /
+//   `node.prior_d` all-float64 control arm — which once read a full-float64 `node.prior_d` at every site
+//   to PROVE the float32 prior precision (not the structure) decides the near-ties — was removed
+//   wholesale on this branch. Its non-vacuousness was already established (the uniform arm diverged X/N
+//   while the mixed arm matched N/N); the mixed 144/144 parity remains as the standing float32-seam
+//   regression guard. With the control gone, every prior read is the float32 stored `node.prior` (the
+//   production path), so `GumbelNode` carries ONE prior member, not two.
 //
 //   The leaf goes through the injected NetEvaluator port (net_evaluator.hpp / design §1): the search
 //   is its first real consumer. The production decide() wires a NetForward (or a remote ZmqNetClient);
@@ -156,7 +164,7 @@ struct GBeliefChildKeyHash {
 // pmr arena, geometric 2x upstream growth) RESET via release() per decision. To route the node's own
 // inner containers through that arena the node is ALLOCATOR-AWARE (uses-allocator construction): its
 // pmr containers and the allocator-extended ctors below let std::pmr::vector<GumbelNode>::emplace_back
-// PROPAGATE the arena's allocator into each node's W/N/legal_slots/prior(_d)/children. The CONTENTS and
+// PROPAGATE the arena's allocator into each node's W/N/legal_slots/prior/children. The CONTENTS and
 // the find/insert-only children operations are UNCHANGED — only the allocator differs, so the node
 // graph and every lookup are byte-identical to the std::vector/std::unordered_map form (P6: an
 // allocator swap perturbs no value, and children is read by .find() only, never iterated per decision).
@@ -168,11 +176,6 @@ struct GumbelNode {
     std::pmr::vector<float> prior;          // (n_slots,) masked-softmax prior P(s,·) — FLOAT32 (1b seam 1:
                                             //   the in-search prior the Python search side-reads as
                                             //   root.prior, a float32 array; softmaxed in f64, stored f32)
-    std::pmr::vector<double> prior_d;       // (n_slots,) the SAME masked-softmax prior in FULL float64 —
-                                            //   the pre-narrowing double prior. The DISCRIMINATION control
-                                            //   (kUniform) reads THIS at every site so the uniform arm is
-                                            //   the genuine 1a all-float64 port; the mixed (default) arm
-                                            //   reads the float32 `prior`. See gumbel.cpp seam map.
     std::pmr::vector<int> legal_slots;      // legal action slots, in env.legal_actions + TERMINATE order
     std::pmr::vector<double> W;             // (n_slots,) action-slot -> summed λ-penalized return (0 unvisited)
     std::pmr::vector<int> N;                // (n_slots,) action-slot -> selection count (0 unvisited)
@@ -186,9 +189,9 @@ struct GumbelNode {
     // pmr container, so the node's storage is served from the per-policy monotonic_buffer_resource. The
     // n_slots ctor still sizes W/N to the slot space zero-initialized (the unvisited semantics N[slot]==0).
     explicit GumbelNode(const allocator_type& alloc = {})
-        : prior(alloc), prior_d(alloc), legal_slots(alloc), W(alloc), N(alloc), children(alloc) {}
+        : prior(alloc), legal_slots(alloc), W(alloc), N(alloc), children(alloc) {}
     GumbelNode(int n_slots, const allocator_type& alloc)
-        : prior(alloc), prior_d(alloc), legal_slots(alloc),
+        : prior(alloc), legal_slots(alloc),
           W(static_cast<size_t>(n_slots), 0.0, alloc), N(static_cast<size_t>(n_slots), 0, alloc),
           children(alloc) {}
     // The allocator-extended copy/move ctors uses-allocator construction REQUIRES so the NodePool can
@@ -197,11 +200,11 @@ struct GumbelNode {
     // realloc cannot satisfy uses_allocator). Each inner container's (value, alloc) ctor copies/moves the
     // contents byte-identically and binds it to `alloc`. The non-allocator copy/move stay defaulted.
     GumbelNode(const GumbelNode& o, const allocator_type& alloc)
-        : evaluated(o.evaluated), value(o.value), prior(o.prior, alloc), prior_d(o.prior_d, alloc),
+        : evaluated(o.evaluated), value(o.value), prior(o.prior, alloc),
           legal_slots(o.legal_slots, alloc), W(o.W, alloc), N(o.N, alloc), children(o.children, alloc) {}
     GumbelNode(GumbelNode&& o, const allocator_type& alloc)
         : evaluated(o.evaluated), value(o.value), prior(std::move(o.prior), alloc),
-          prior_d(std::move(o.prior_d), alloc), legal_slots(std::move(o.legal_slots), alloc),
+          legal_slots(std::move(o.legal_slots), alloc),
           W(std::move(o.W), alloc), N(std::move(o.N), alloc), children(std::move(o.children), alloc) {}
     GumbelNode(const GumbelNode&) = default;
     GumbelNode(GumbelNode&&) = default;
@@ -324,7 +327,7 @@ class GumbelAZPolicy final : public Policy {
     //   request by value and is RESUMED with the prediction — no fiber, no boost.context, no hidden
     //   control-flow yield (the P9-functional-core shape). It is declared a friend so it can reuse THIS
     //   policy's VALIDATED precision-critical helpers VERBATIM (puct_select / improved_policy and the
-    //   eval split below, all of which call gumbel.cpp's file-local prior_read / v_mix_mixed /
+    //   eval split below, all of which call gumbel.cpp's file-local prior_value / v_mix_mixed /
     //   sigma_scale_1a / masked_softmax_1a) rather than re-implementing the four 1b float32 seams — so B
     //   is bit-identical to run_search BY CONSTRUCTION (it reuses, never re-derives, the seam math). The
     //   friend grant is scoped: TreeCursor reads cfg_/env_/n_slots_/term_slot_ and calls the eval split +
@@ -340,7 +343,7 @@ class GumbelAZPolicy final : public Policy {
     //     node.legal_slots, returning the length-in_dim() float32 feature span the leaf must forward.
     //     BIT-IDENTICAL to evaluate()'s lines up to net_.predict (same fb_/mask/legal_slots build), only
     //     it returns the features instead of calling predict.
-    //   * eval_finish: the post-predict half — given the leaf NetPrediction, build node.prior(_d) (the
+    //   * eval_finish: the post-predict half — given the leaf NetPrediction, build node.prior (the
     //     masked-softmax prior, the 1b seam-1 float32 narrowing) + store node.value, exactly as
     //     evaluate()'s tail. Returns node.value.
     // Composing eval_build_features ; (the cursor parks, the driver predicts) ; eval_finish reproduces
@@ -357,9 +360,9 @@ class GumbelAZPolicy final : public Policy {
     // sequential_halving's. A thin forwarder to the file-local sigma_scale_1a (gumbel.cpp).
     [[nodiscard]] double sh_cut_sigma(const GumbelNode& root) const;
 
-    // The root log-prior logit for slot s: std::log(std::max(prior_read(root, s), 1e-12)) — the 1b seam-1
+    // The root log-prior logit for slot s: std::log(std::max(prior_value(root, s), 1e-12)) — the 1b seam-1
     // dominant float32 effect (run_search's logits build). Re-exposed so the cursor builds the SAME root
-    // logits array (feeding the Gumbel-top-k AND the SH cut key) through the SAME prior_read precision.
+    // logits array (feeding the Gumbel-top-k AND the SH cut key) through the SAME float32 prior precision.
     [[nodiscard]] double root_logit(const GumbelNode& root, int s) const;
 
 
@@ -367,7 +370,7 @@ class GumbelAZPolicy final : public Policy {
     // through the injected NetEvaluator: it returns (value, logits); the prior is the masked softmax of
     // logits over the legal slots (mirrors predict_both). 1b SEAM 1: the masked softmax runs in float64
     // (mlp._masked_softmax), then the STORED prior is narrowed to float32 — the precision the Python
-    // search side-reads (root.prior). `kUniform` widens it back at every read site (discrimination ctl).
+    // search side-reads (root.prior). Every read site reads this float32 prior (the production path).
     double evaluate(GumbelNode& node, const Loc& loc, const Belief& bw,
                     const CollectedSet& collected) const;
 
@@ -401,15 +404,14 @@ class GumbelAZPolicy final : public Policy {
     // AlphaZero PUCT select: argmax q + c_puct·p·√(ΣN)/(1+n) over node.legal_slots, strict-`>`
     // first-wins, unvisited Q completed by the node's own net value (mirrors _puct_select). Returns the
     // selected action slot. 1b SEAM 4: the score is computed in FLOAT32 (the float32 prior weak-promotes
-    // the whole U-term + the `q +`), so the interior near-tie argmax matches Python; `kUniform` runs it
-    // in `double` (discrimination control).
+    // the whole U-term + the `q +`), so the interior near-tie argmax matches Python.
     [[nodiscard]] int puct_select(const GumbelNode& node) const;
 
     // The improved-π target over the legal set: π′ = softmax(logit + σ(completedQ)) (mirrors
     // _improved_policy → value_target.improved_policy). 1b SEAMS 2+3: v_mix (the unvisited completion)
     // runs the float32 prior-weighted blend, and the unvisited slots' σ·v_mix is rounded to float32 (the
     // visited slots use full-float64 σ·q); the masked softmax over the completed logits then runs in
-    // float64. `kUniform` reverts both to `double`. Returns an (n_slots,) row (0 on illegal).
+    // float64. Returns an (n_slots,) row (0 on illegal).
     [[nodiscard]] std::vector<double> improved_policy(const GumbelNode& root,
                                                       const std::vector<double>& logits) const;
 

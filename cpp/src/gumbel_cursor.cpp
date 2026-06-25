@@ -89,7 +89,7 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
         // finish the ROOT eval (the masked-softmax prior + value store), then do run_search's post-root
         // setup: the root logits (seam 1), the Gumbel-top-k draw + sort, and the SH bracket init.
         p_.eval_finish(nodes_[0], prediction);
-        // root logits = log(prior) over legal slots (seam 1: prior_read precision -> log) — illegal -1e30.
+        // root logits = log(prior) over legal slots (seam 1: float32 prior precision -> log) — illegal -1e30.
         root_logits_.assign(static_cast<size_t>(n_slots_), -1e30);
         for (int s : nodes_[0].legal_slots)
             root_logits_[static_cast<size_t>(s)] = p_.root_logit(nodes_[0], s);
