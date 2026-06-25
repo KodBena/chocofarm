@@ -380,7 +380,18 @@ void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const
             // --control-endpoint) leaves the loop byte-unchanged, so the control-off arm is the exact baseline.
             while (!ready.empty() && in_flight < budget && (!ctl || ctl->may_issue(idx)))
                 if (!send_group()) return;
-            if (in_flight == 0) break;
+            // FORCED-FLUSH LIVENESS FLOOR (ADR-0002 / the lab's gate-everything contract). The gate above
+            // is the controller's DISCRETIONARY issue point; like runner_wire_batched.cpp's ungated forced
+            // flush, a thread that is fully drained (in_flight==0) yet still has ready work MUST push one
+            // group regardless of the gate, so a deny-everything controller cannot starve the thread to
+            // exit (the depth-1 floor: a denied thread never deadlocks/terminates). Without this, the
+            // greedy episodic pipe — unlike the batched runner — had no floor and a hard-gating method
+            // drove in_flight to 0 and broke the loop (the thread exited rc=0 mid-trial). One forced group
+            // re-primes the pipe; the gate resumes throttling once in_flight>0 again.
+            if (in_flight == 0 && !ready.empty()) {
+                if (!send_group()) return;
+            }
+            if (in_flight == 0) break;   // genuinely no work left (every fiber finished) -> end the window
             auto reply = boundary->recv();
             if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return; }
             auto it = corr_to_group.find(reply->corr);

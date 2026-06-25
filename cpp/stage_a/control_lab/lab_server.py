@@ -34,7 +34,6 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 REPO = "/home/bork/w/vdc/1/chocofarm"
@@ -50,6 +49,10 @@ from control_lab.lab_wire import (  # noqa: E402
     decode_feature,
     encode_gate,
 )
+# The method-watchdog contract (gate-shape validator + malfunction tally) has ONE home shared by both
+# control wires (ADR-0012 P1) — see control_lab/watchdog.py. lab_server keeps the local names its body
+# uses (MalfunctionRecord, _validate_gates) as thin re-exports of that shared definition.
+from control_lab.watchdog import MalfunctionRecord, validate_gates as _validate_gates  # noqa: E402,F401
 from stage_a_server import StageAServer  # noqa: E402
 
 
@@ -66,26 +69,6 @@ def reward_forward_rows(forward_rows: int, served: "Sequence[LabFeature]") -> fl
     A bigger coalesced forward amortizes the fixed per-forward cost — the throughput lever — so the
     Controller is rewarded for gate policies that fatten forwards."""
     return float(forward_rows)
-
-
-@dataclass
-class MalfunctionRecord:
-    """Loud, structured record of a method's misbehaviour on the decision path (ADR-0002). The harness
-    reads `flags` into the trial record and marks the method; the fixture is never torn down."""
-    slow: int = 0           # act() exceeded the per-decision deadline (fell back to all-allow)
-    raised: int = 0         # act()/observe() threw (fell back to all-allow)
-    malformed: int = 0      # act() returned a non-length-T or non-binary vector (rejected -> all-allow)
-    last_error: str = ""    # the most recent diagnostic string (for the harness log)
-    flags: list[str] = field(default_factory=list)   # ordered, de-duplicated human-readable flags
-
-    def note(self, flag: str, err: str = "") -> None:
-        if err:
-            self.last_error = err
-        if flag not in self.flags:
-            self.flags.append(flag)
-
-    def total(self) -> int:
-        return self.slow + self.raised + self.malformed
 
 
 class LabServer(StageAServer):
@@ -409,26 +392,8 @@ class LabServer(StageAServer):
 
 
 # ---- small pure helpers ----
-def _validate_gates(gates: Any, T: int) -> "list[int] | None":
-    """Validate a Controller's act() return: a length-T sequence of {0,1}. Returns the coerced list, or
-    None on any shape/value violation (the caller then falls back to all-allow + flags)."""
-    try:
-        g = list(gates)
-    except TypeError:
-        return None
-    if len(g) != T:
-        return None
-    out: list[int] = []
-    for v in g:
-        if v == 0:
-            out.append(0)
-        elif v == 1:
-            out.append(1)
-        else:
-            return None
-    return out
-
-
+# _validate_gates + MalfunctionRecord now live in control_lab/watchdog.py (the ONE home both control wires
+# share, ADR-0012 P1) and are imported at the top of this module.
 def _tid_of(envelope: "list[bytes]") -> "int | None":
     """Recover the producer thread id from a request envelope by decoding its FEATURE frame (env[1]).
     Returns None for a non-lab (no feature frame) or garbled envelope — the reply is then echoed verbatim

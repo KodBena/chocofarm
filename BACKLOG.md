@@ -241,4 +241,44 @@ stability fix — ADR-0004 minimal-touch):
   and the nmcs-init milestone (a 2-level NMCS to initialize an AZ run before switching to ISMCTS) is
   far off. Re-enable when that work resumes.
 
+## tlab greedy-episodic Gate-A liveness floor — fixed in the greedy pipe; audit the siblings (2026-06-25)
+
+Integrating the control-lab's 16 methods onto tlab-real-producer's async Gate-A control plane
+(`throughput-lab/harness/run_control_lab.py`) surfaced a producer-side **liveness defect**: the greedy
+episodic driver's discretionary issue gate (`real_producer.cpp` ~L381 `... && (!ctl || ctl->may_issue(idx))`)
+had **no forced-flush floor**. A hard-gating controller (e.g. `ready_threshold2` at 256 fibers) denied
+every issue, the in-flight count drained to 0, and `if (in_flight == 0) break;` **terminated the producer
+thread mid-trial (rc=0)** — violating the lab's own stated contract (`lab_server.py` header: "the
+producer's forced-flush stays the depth-1 liveness floor … a gate-everything method cannot wedge the
+producer"). Fixed minimally + measure-verified: when `in_flight==0 && !ready.empty()`, push ONE group
+regardless of the gate (the depth-1 floor `runner_wire_batched.cpp` already guarantees). Control-OFF is
+byte-unchanged (the branch only fires when `ctl` denies). After the fix all methods run a full trial, the
+watchdog correctly flags + survives `malfunctioning`, and trials egress to `control_research`.
+
+Deferred / to audit (ADR-0011 Rule 4 — quantify over the class, not the instance): the OTHER drivers
+(`run_thread_fiber` round-sync, `run_thread_fiber_greedy`, `run_thread` non-fiber) do NOT carry `ctl` at
+all, so they cannot be gated today — but if the Gate-A hook is ever extended to them, the same forced-flush
+floor must come with it. The C++ liveness invariant now lives in TWO hand-authored copies
+(`real_producer.cpp` greedy-episodic + `runner_wire_batched.cpp` refill) with no shared home; hoisting "a
+gated issue point always carries a depth-1 forced-flush floor" into one helper both call (so a new gated
+driver cannot be born without it — the net, not the patch) is the durable fix. NOT done in this session
+(it touches the shared `runner_wire_batched.cpp` hot path under partial visibility — ADR-0004; a C++ helper
+hoist across two files + a hot-path edit is its own scoped change, not a producer-stability sub-task). The
+per-instance floor IS in place and verified; this records the remaining class-net.
+
+Done in this session (the watchdog twin, the Python analogue of the above): the method-watchdog safety
+contract (gate-shape validator + malfunction tally) was being COPIED into `run_control_lab.py` from
+`lab_server.py` — caught by an out-of-frame hack-rationalization review. It is now ONE shared home,
+`control_lab/watchdog.py` (`MalfunctionRecord` + `validate_gates`), imported by BOTH control wires (ADR-0012
+P1). It is a SEPARATE module from `lab_server` for a concrete reason: `lab_server` imports `StageAServer`
+(JAX) at module load, so the async policy peer would otherwise drag the inference stack in just to validate
+a gate vector.
+
+Open schema smell (not pursued — out of scope; would alter the shared `lab_trial` table the per-forward
+harness also writes): `run_control_lab` stores its leaves/sec score in the `dps_*` columns and the window
+leaf-delta in `n_decisions`, disclosed only in `lab_session.notes` (free prose). A typed `metric_kind`
+discriminator column on `lab_trial` (e.g. `dps` vs `lps`) would make "this throughput is leaves/s not
+decisions/s" a queryable field rather than a sentence a reader must find. Deferred as a lab-store schema
+change, surfaced here so it is not lost.
+
 *Public Domain (The Unlicense).*
