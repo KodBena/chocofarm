@@ -98,7 +98,7 @@ The full test suite (run from the repo root, note the PYTHONPATH):
 ```bash
 cd /home/bork/w/vdc/1/chocofarm-hpdsl
 PYTHONPATH=throughput-lab /home/bork/w/vdc/venvs/generic/bin/python -m pytest throughput-lab/hp/tests/ -q
-#   -> 31 passed
+#   -> 37 passed   (incl. the 8 scalar STATIC_LAB homes now drift-linted)
 ```
 
 `--verify` runs both oracles plus the inertness self-check and **returns non-zero (exit 3),
@@ -146,6 +146,23 @@ Rules the types enforce for you:
 The drift lint (`tests/test_ssot_drift.py`) reads each descriptor's cited home line and asserts
 agreement, failing the build on drift. Caveats on its current coverage are in WHAT DOES NOT below.
 
+### Operating points (the banked selection, distinct from sweep axes)
+
+An `HParam` is a sweep *axis* (a domain the compiler enumerates). The value the lab actually *runs* at —
+the tuned winner of a sweep — is a separate concept: an `OperatingPoint` (a selected point), owned by the
+SSOT as a `NoCodeHome` literal the way `pool_threads`/`pool_batch` are. Two are declared in `spec.py`:
+
+- **`BANKED_TOPOLOGY`** — a `config_id` into the TOPOLOGY surface (server@2 + gens@0,1,3 + idle
+  surplus@2). Resolved to placements by `harness/topology_enum.config_by_id` (validated against the live
+  enumeration; `--banked-env` emits the launch vars). Deliberately NOT an HParam: a 40-way config_id is
+  not an axis, and forcing it onto the surface would add an enumeration var and break the parity gate.
+- **`BANKED_STATIC`** — the tuned producer/server scalars (`fibers=1024`/`msg_rows=256`/`driver=greedy`/
+  `max_batch=256`/`seconds=10`/…). `banked_static()` validates each against its HParam domain (ADR-0000);
+  `banked_static_env()` (`hp.cli --banked-static-env`) emits the `BANKED_*` shell vars.
+
+Harnesses derive their *defaults* from these (override args still win), so the banked point has ONE home
+and per-harness drift (e.g. the `--seconds` 14-vs-5 run-length confound) cannot recur.
+
 ---
 
 ## How selection works
@@ -161,7 +178,10 @@ Target = { surfaces: frozenset[Surface] | None,   # None => all
 ```
 
 CLI: `--select <surface[,surface]>`, `--include name,name`, `--pin k=v` (repeatable),
-`--variant`, `--gens/--cores/--housekeeping-core`.
+`--variant`, `--gens/--cores/--housekeeping-core`. Standalone (ignores `--select`):
+`--banked-static-env` emits the banked STATIC_LAB operating point as shell `eval`-able `BANKED_*`
+vars (the single home `episodic_dps.sh` derives its defaults from); the topology operating point has
+the parallel `harness/topology_enum.py --banked-env`.
 
 The three surfaces:
 
@@ -170,9 +190,11 @@ The three surfaces:
   isolated-core × generator permutation symmetry).
 - `overcommit` — the older `cpp/stage_a/overcommit_sweep.py` parameter region (`wire_mode × N ×
   S_min × D × chunk_floor × θ`, with the 1:3 pin and the `min_coalesce ≤ K` clamp).
-- `static_lab` — the throughput-lab producer + server + scheduling + build HPs. **Scaffolded
-  only** (see below): it selects and verifies but compiles to 1 config because no HParams are
-  declared on it yet.
+- `static_lab` — the throughput-lab producer + server HPs (`fibers`, `msg_rows`, `inflight_msgs`,
+  `driver`, `seconds`, `n_sims`, `m`, `max_batch`, `warmup_ladder`). **Populated 2026-06-25**: each
+  homes on its real code default (producer C++ flags via `CppFlag`, `GumbelConfig` via `CppField`,
+  the server argparse via `PyArg`) and is drift-linted. The banked operating point is `BANKED_STATIC`
+  (see *Operating points* below).
 
 **Fail-loud selection rule (ADR-0002):** a `Target` naming an HP whose `activation` depends on an
 *unselected* HP is **refused** (exit 2), not silently pinned — selecting `min_coalesce` without
@@ -280,12 +302,14 @@ failed (severity major) and is recorded here as a known limitation, not hidden.
    - Parity is preserved bit-for-bit at 4c/3g (40 configs) and as an orbit-partition at 5c/3g; both
      oracles green via `hp.cli --verify` (topology 40/40, overcommit 96/96).
 
-2. **The STATIC_LAB surface is scaffolded but empty.** The `variant` axis, bindings, and
-   `Surface.STATIC_LAB` exist, but no per-HP descriptors are declared, so `--select static_lab`
-   compiles to **1 config** and its `--verify` is trivially vacuous (1 vs 1). The producer + server
-   + scheduling + build HPs from the inventory are a mechanical follow-on using the same types.
-   The two surfaces the brief named as acceptance targets (topology reproduction + overcommit
-   selection) are complete and verified.
+2. **RESOLVED 2026-06-25 — the STATIC_LAB surface is populated.** Previously scaffolded-but-empty;
+   it now declares **9 HParam descriptors** (`fibers`/`msg_rows`/`inflight_msgs`/`driver`/`seconds`/
+   `n_sims`/`m`/`max_batch`/`warmup_ladder`), each homed on its real code default and drift-linted —
+   a new `CppFlag` extractor handles the producer's `opt(...)?conv:DEFAULT` ternaries; `n_sims`/`m`
+   home on `GumbelConfig` (`CppField`); `max_batch` on the server argparse (`PyArg`); `warmup_ladder`
+   is a `NoCodeHome` list literal (the list-valued extractor is the remaining deferral). The banked
+   operating point is the SEPARATE `BANKED_STATIC` (see *Operating points*). Driven by the cross-
+   harness `--seconds` drift that confounded a run-length comparison (`tlab_finding` #21).
 
 3. **`mypy --strict` (DESIGN.md §8 step 1) is not clean across the package.** *(Corrected 2026-06-24:
    the earlier "mypy is not installed" was wrong — mypy 2.1.0 IS in the venv and runs.)* Running
@@ -294,10 +318,13 @@ failed (severity major) and is recorded here as a known limitation, not hidden.
    is strict-friendly (frozen dataclasses, typed unions), but the package as a whole does not yet pass
    the step-1 gate — a follow-on cleanup, not a correctness issue (runtime + the 31-test suite are green).
 
-4. **The C++/argparse default *extractor* (the P7-strongest "generate-from-one-source") is the
-   filed deferral; v1 ships the P7 lint floor** (`test_ssot_drift.py`). This is the disclosed floor
-   the design sanctions (DESIGN.md §1.4 / §9), not a silent stopping point — but combined with
-   limitation 1 it means the topology policy tables are neither extracted nor lint-guarded today.
+4. **The P7-strongest "generate-from-one-source" extractor remains the filed deferral; v1 ships the
+   P7 lint floor** (`test_ssot_drift.py`). The lint now covers `CppField`, `PyArg`, `PyField`, AND
+   `CppFlag` (the producer-flag ternary extractor added 2026-06-25 with the STATIC_LAB population),
+   so the topology policy tables (limitation 1) and the producer/server scalars are all drift-guarded.
+   The only un-guarded home is the warmup-ladder list literal (a `NoCodeHome`, the named list-valued
+   deferral). The lint *checks* drift; it does not yet *generate* the descriptors from source
+   (DESIGN.md §1.4 / §9).
 
 5. **A resolved one-home tension, disclosed:** `pool_threads`/`pool_batch` C++ struct defaults
    (4/32) differ from the OVERCOMMIT operating point (3/64), which lives in `overcommit_sweep.py`'s
@@ -311,7 +338,7 @@ failed (severity major) and is recorded here as a known limitation, not hidden.
 
 | module | responsibility |
 |---|---|
-| `spec.py` | the SSOT registry: `HParam` descriptors + the descriptor algebra (Domain/SourceRef/Effect/SymmetryClass/Guard/Binding). The single home. Declares TOPOLOGY + OVERCOMMIT; STATIC_LAB scaffolded. |
+| `spec.py` | the SSOT registry: `HParam` descriptors + the descriptor algebra (Domain/SourceRef/Effect/SymmetryClass/Guard/Binding). The single home. Declares TOPOLOGY + OVERCOMMIT + STATIC_LAB, plus the `OperatingPoint`s `BANKED_TOPOLOGY` / `BANKED_STATIC` (the selected banked points) and their `banked_*` accessors + `banked_static_env()` shell emitter. |
 | `relations.py` | cross-HP structure: TopologyParams, the R1–R4 placement constraints with rationale, the 1:3 partition, the policy vocabularies. (Currently a second home for the policy tables — see limitation 1.) |
 | `ir.py` | the backend-neutral `ConfigSpace` / `IRVar` / `IRConstr` / `IRSym` (incl. `CanonInert`), construction-validated. |
 | `compile.py` | `Target` + `compile(spec, target) -> ConfigSpace`; selection, binding/variant resolution, projection, the fail-loud selection rule. |
