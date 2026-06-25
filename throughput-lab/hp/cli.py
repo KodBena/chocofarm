@@ -69,9 +69,13 @@ def _parse_pin(items: list[str], reg: spec.Registry) -> dict[str, object]:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--select", required=True,
+    ap.add_argument("--select", required=False, default=None,
                     help="surface to compile: " + " | ".join(_SURFACES) +
                          " (comma-separate to compose)")
+    ap.add_argument("--banked-static-env", action="store_true",
+                    help="emit the banked STATIC_LAB operating point as shell `eval`-able BANKED_* vars "
+                         "(the single home episodic_dps.sh / topology_sweep derive their defaults from); "
+                         "standalone, ignores --select")
     ap.add_argument("--include", default="",
                     help="explicit comma-separated HP names to add to the selection")
     ap.add_argument("--pin", action="append", default=[], metavar="k=v",
@@ -85,6 +89,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--json", default=None, help="write the candidate set + ledger here")
     ap.add_argument("--no-table", action="store_true")
     args = ap.parse_args(argv)
+
+    if args.banked_static_env:                       # standalone emitter: the banked-static SSOT -> shell
+        print(spec.banked_static_env())
+        return 0
+    if not args.select:
+        ap.error("--select is required (or use --banked-static-env)")
 
     reg = spec.registry()
     surfaces = set()

@@ -36,7 +36,7 @@ import re
 import pytest
 
 from hp import spec
-from hp.spec import CppField, NoCodeHome, PyArg, PyField
+from hp.spec import CppField, CppFlag, NoCodeHome, PyArg, PyField
 
 # repo root = three dirs up from this file's hp/tests/.
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -74,6 +74,30 @@ def _cpp_field_value(file: str, symbol: str):
     if not m:
         raise AssertionError(f"could not find C++ field {field!r} in {file}")
     raw = m.group(1).strip()
+    if raw in ("true", "false"):
+        return raw == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+
+
+def _cpp_flag_default(file: str, flag: str):
+    """Parse a C++ CLI flag's default from the producer's ternary pattern:
+        const <type> x = opt(args, "--flag") ? <conv>(...) : DEFAULT;
+    The DEFAULT is the literal after the ternary ' : ' (the ' : ' is space-delimited, so it never
+    collides with a C++ '::' in the true-branch conversion). Recovers int / double / string('...') /
+    bool. This is the producer-side analogue of _py_arg_default (the server uses argparse → PyArg)."""
+    text = _read(file)
+    m = re.search(rf'opt\(args,\s*"{re.escape(flag)}"\)\s*\?[^;]*?\s:\s*([^;:]+?)\s*;', text, re.DOTALL)
+    if not m:
+        raise AssertionError(f"could not find C++ flag {flag!r} ternary default in {file}")
+    raw = m.group(1).strip()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1]
     if raw in ("true", "false"):
         return raw == "true"
     try:
@@ -191,6 +215,8 @@ def _py_field_value(file: str, symbol: str):
 def _home_value(home):
     if isinstance(home, CppField):
         return _cpp_field_value(home.file, home.symbol)
+    if isinstance(home, CppFlag):
+        return _cpp_flag_default(home.file, home.flag)
     if isinstance(home, PyArg):
         return _py_arg_default(home.file, home.dest)
     if isinstance(home, PyField):

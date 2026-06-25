@@ -403,6 +403,7 @@ class Registry:
 # --------------------------------------------------------------------------------------------------
 JOURNEY = "docs/notes/tlab-performance-journey-2026-06-24.md"
 ADAPTER = "docs/design/cpp-eval-transport-adapter.md"
+FINDINGS = "throughput_research.tlab_finding (exp_db)"   # evidence pointer to the deliberate findings layer
 
 
 # ==================================================================================================
@@ -605,7 +606,119 @@ _OVERCOMMIT: list[HParam] = [
     ),
 ]
 
-_REGISTRY = Registry(_TOPOLOGY + _OVERCOMMIT)
+# --- STATIC_LAB surface: the throughput-lab producer + server operating-point knobs ----------------
+# The LIVE tlab stack (tlab-real-producer + the throughput-lab server), distinct from the molted OVERCOMMIT
+# runner. Each descriptor's `default` is the CODE-HOME default (drift-linted: producer flags home on the
+# real_producer.cpp ternary defaults via CppFlag; n_sims/m on the GumbelConfig struct via CppField; the
+# server knobs on server/__main__.py argparse via PyArg). The BANKED operating point (the tuned values
+# episodic_dps.sh actually runs) is the SEPARATE BANKED_STATIC below — the pool_threads/pool_batch pattern
+# (a tuned value diverging from the code default). Names are unique; `concept` is shared with OVERCOMMIT
+# where the knob is the same idea (the sched_policy precedent: many HParams, one concept label).
+PRODUCER_CPP = "throughput-lab/cpp/real_producer.cpp"
+GUMBEL_HPP = "cpp/include/chocofarm/gumbel.hpp"
+SERVER_MAIN = "throughput-lab/server/__main__.py"
+
+_STATIC_LAB: list[HParam] = [
+    HParam(
+        name="fibers", concept="fibers_per_thread",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.PRODUCER_FLAG,
+        home=CppFlag(PRODUCER_CPP, "--fibers"),
+        domain=IntSet((0, 64, 256, 1024, 2048, 4096)), default=0,
+        symmetry=Free(),
+        effect=Measured("+", "K=1024 is the knee: 256->1024 ~+25% (~100k->~125k); 2048/4096 plateau",
+                        EvidenceRef(FINDINGS, "#17 HP-sweep optimum")),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--fibers", home=CppFlag(PRODUCER_CPP, "--fibers")),),
+    ),
+    HParam(
+        name="msg_rows", concept="msg_coalesce",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.PRODUCER_FLAG,
+        home=CppFlag(PRODUCER_CPP, "--msg-rows"),
+        domain=IntSet((1, 64, 128, 256)), default=1,
+        symmetry=Free(),
+        effect=Measured("+", "MSG=256 fills the 256 max-batch; beats 128 but ONLY with K>=1024 to supply it",
+                        EvidenceRef(FINDINGS, "#17")),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--msg-rows", home=CppFlag(PRODUCER_CPP, "--msg-rows")),),
+    ),
+    HParam(
+        name="inflight_msgs", concept="inflight_depth_magnitude",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.PRODUCER_FLAG,
+        home=CppFlag(PRODUCER_CPP, "--inflight-msgs"),
+        domain=IntSet((4, 8, 10, 16, 32)), default=8,
+        symmetry=Free(),
+        effect=Measured("0", "inflight 6-12 is null at the banked point (paired nonparametric, p=0.65)",
+                        EvidenceRef(FINDINGS, "#19 inflight-10-vs-8")),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--inflight-msgs",
+                          home=CppFlag(PRODUCER_CPP, "--inflight-msgs")),),
+    ),
+    HParam(
+        name="driver", concept="producer_pipe_shape",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.PRODUCER_FLAG,
+        home=CppFlag(PRODUCER_CPP, "--driver"),
+        domain=EnumSet(("round-sync", "greedy")), default="round-sync",
+        symmetry=Free(),
+        effect=Measured("+", "greedy wins-or-ties everywhere; clean +15% at the lean ladder (regime-dependent)",
+                        EvidenceRef(JOURNEY, "driver A/B")),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--driver", home=CppFlag(PRODUCER_CPP, "--driver")),),
+    ),
+    HParam(
+        name="seconds", concept="measure_window",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.HARNESS_MEASURE,
+        home=CppFlag(PRODUCER_CPP, "--seconds"),
+        domain=FloatRange(1.0, 120.0), default=5.0,
+        symmetry=Free(),
+        effect=Measured("0", "run length CONFOUNDS the reading ~6% (non-monotone, supply-side, NOT a "
+                             "compute throttle); s>=30 is producer-unstable. Bank 10s.",
+                        EvidenceRef(FINDINGS, "#21 runlen / #22 instability")),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--seconds", home=CppFlag(PRODUCER_CPP, "--seconds")),),
+    ),
+    HParam(
+        name="n_sims", concept="search_sims",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.PRODUCER_FLAG,
+        home=CppField(GUMBEL_HPP, "GumbelConfig::n_sims"),
+        domain=IntSet((48, 128, 256)), default=48,
+        symmetry=Free(),
+        effect=Hypothesized("search budget per decision; 256 is the production-shape config"),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--n-sims",
+                          home=CppField(GUMBEL_HPP, "GumbelConfig::n_sims")),),
+    ),
+    HParam(
+        name="m", concept="search_m",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.PRODUCER_FLAG,
+        home=CppField(GUMBEL_HPP, "GumbelConfig::m"),
+        domain=IntSet((12, 24)), default=12,
+        symmetry=Free(),
+        effect=Hypothesized("root actions sampled by Gumbel-Top-k; 24 is the production config"),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--m", home=CppField(GUMBEL_HPP, "GumbelConfig::m")),),
+    ),
+    HParam(
+        name="max_batch", concept="server_drain_cap",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.SERVER_FLAG,
+        home=PyArg(SERVER_MAIN, "max_batch"),
+        domain=IntSet((256, 512, 1024, 4096)), default=4096,
+        symmetry=Free(),
+        effect=Measured("+", "256 = the single-pull point (cap==MSG_ROWS, clean 256 bucket); 4096 = the "
+                             "legacy overcommit regime (~37% pad util, the topology-screen confound)",
+                        EvidenceRef(FINDINGS, "#17 / #20")),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--max-batch", home=PyArg(SERVER_MAIN, "max_batch")),),
+    ),
+    HParam(
+        name="warmup_ladder", concept="bucket_ladder",
+        surfaces=frozenset({Surface.STATIC_LAB}), kind=Kind.SERVER_FLAG,
+        # The banked bucket ladder (64,256). The server's DEFAULT ladder is a ServerConfig list literal
+        # (1,8,64,512,4096); a list-valued drift-lint is the filed P7 deferral (DESIGN.md §9), so this homes
+        # as a NoCodeHome literal carrying the banked value directly (the sanctioned literal-with-reason).
+        home=NoCodeHome("banked server bucket ladder (64,256); the server's default-ladder list-literal "
+                        "drift-lint is the P7 deferral (DESIGN.md §9) — list-valued homes not yet extracted"),
+        domain=Categorical(((64, 256), (64, 256, 512), (1, 8, 64, 512, 4096))), default=(64, 256),
+        symmetry=OrderInsensitive(),
+        effect=Measured("+", "cap at 256 (no 512 spill) is the well-filled efficient regime at K=1024/MSG=256",
+                        EvidenceRef(FINDINGS, "#17")),
+        bindings=(Binding(Surface.STATIC_LAB, flag="--warmup",
+                          home=NoCodeHome("banked ladder literal; list-default lint is the P7 deferral")),),
+    ),
+]
+
+_REGISTRY = Registry(_TOPOLOGY + _OVERCOMMIT + _STATIC_LAB)
 
 
 def registry() -> Registry:
@@ -624,9 +737,6 @@ def registry() -> Registry:
 # smeared across episodic_dps.sh's taskset args plus a duplicated provenance string — exactly the drift
 # this hoist closes. The config_id is validated against the live enumeration at resolve time (consumers
 # fail loud on an unknown id — ADR-0002); harness/topology_enum.py is the resolver (config_by_id).
-FINDINGS = "throughput_research.tlab_finding (exp_db)"
-
-
 @dataclass(frozen=True)
 class OperatingPoint:
     """A SELECTED config within an enumerated surface (the tuned winner the lab runs), with provenance.
@@ -658,6 +768,61 @@ def banked_topology_config_id() -> str:
     Consumers resolve it to placements via harness.topology_enum.config_by_id (which validates membership
     against the live enumeration — ADR-0002). Replaces the hand-pinned taskset literals in episodic_dps.sh."""
     return BANKED_TOPOLOGY.value
+
+
+# The banked STATIC_LAB operating point: the tuned producer/server values episodic_dps.sh runs at, the ONE
+# home harnesses derive their DEFAULTS from (override args stay, for sweeps). Each value diverges from the
+# code-home default (the HParam.default the drift lint guards) the way pool_threads=3/pool_batch=64 do — a
+# tuned point, not the binary's out-of-box default. seconds=10 is the banked measurement window (finding #21:
+# run length confounds the reading; 10s is stable + on the clean plateau, avoiding the s=14 dip / s>=30 break).
+BANKED_STATIC = OperatingPoint(
+    surface=Surface.STATIC_LAB,
+    value={
+        "fibers": 1024, "msg_rows": 256, "inflight_msgs": 8, "driver": "greedy", "seconds": 10,
+        "n_sims": 256, "m": 24, "max_batch": 256, "warmup_ladder": (64, 256),
+    },
+    home=NoCodeHome("banked tlab producer/server operating point (HP sweep #17 + the inflight/topology/"
+                    "run-length findings); owned by this SSOT, the pool_threads/pool_batch pattern."),
+    effect=Measured("+", "K=1024/MSG=256/greedy/single-pull (max-batch 256) ~+25% over the prior banked "
+                         "point; the fine knobs (inflight, exact run length) are noise-floor-limited",
+                    EvidenceRef(FINDINGS, "#17 / #19 / #20 / #21")),
+    note="harnesses derive their defaults from this; --seconds standardized at 10 to kill the cross-harness "
+         "run-length confound (episodic ran 14, topology_sweep 5/10 — the gap that triggered this).",
+)
+
+
+def banked_static() -> "dict[str, object]":
+    """The banked STATIC_LAB operating point as a plain dict, VALIDATED against the registry domains at call
+    time (ADR-0000: a banked value outside its HParam domain is unrepresentable — a loud error, not a silent
+    bad default). The single home episodic_dps.sh / topology_sweep derive their defaults from."""
+    reg = registry()
+    out = dict(BANKED_STATIC.value)
+    for name, val in out.items():
+        if name not in reg:
+            raise ValueError(f"banked_static: {name!r} is not a registered HParam (ADR-0002)")
+        dom = reg[name].domain
+        if not dom.contains(val):
+            raise ValueError(f"banked_static: {name}={val!r} is outside its domain {dom!r} (ADR-0000)")
+    return out
+
+
+def banked_static_env() -> str:
+    """Emit the banked STATIC_LAB operating point as shell `eval`-able BANKED_* assignments — the single
+    home episodic_dps.sh / topology_sweep derive their DEFAULTS from (override args stay). Validated by
+    banked_static() (each value in its HParam domain). warmup_ladder is comma-joined for the --warmup flag."""
+    b = banked_static()
+    warmup = ",".join(str(x) for x in b["warmup_ladder"])
+    return "\n".join([
+        f"BANKED_FIBERS={b['fibers']}",
+        f"BANKED_MSG_ROWS={b['msg_rows']}",
+        f"BANKED_INFLIGHT={b['inflight_msgs']}",
+        f"BANKED_DRIVER={b['driver']}",
+        f"BANKED_SECONDS={b['seconds']}",
+        f"BANKED_N_SIMS={b['n_sims']}",
+        f"BANKED_M={b['m']}",
+        f"BANKED_MAX_BATCH={b['max_batch']}",
+        f"BANKED_WARMUP={warmup}",
+    ])
 
 
 def ceil_div(num: int, den: int) -> int:

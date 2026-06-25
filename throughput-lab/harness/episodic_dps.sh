@@ -34,6 +34,14 @@ _BANKED_ENV="$(PYTHONPATH=throughput-lab:throughput-lab/harness "$PYBIN" \
   throughput-lab/harness/topology_enum.py --banked-env)" \
   || { echo "FATAL: could not resolve the banked topology from the hp SSOT" >&2; exit 1; }
 eval "$_BANKED_ENV"
+# Banked PRODUCER/SERVER OPERATING POINT — resolved from the hp SSOT (hp/spec.BANKED_STATIC), NOT pinned
+# here. One home for fibers/msg-rows/inflight/driver/seconds/n-sims/m/max-batch/warmup; the arg defaults
+# below DERIVE from these BANKED_* vars (the override args $1..$6 still win, for sweeps). This kills the
+# cross-harness defaults drift — notably --seconds (episodic ran 14, topology_sweep 5/10), the gap that
+# confounded the run-length comparison (finding #21; banked at 10).
+_BANKED_STATIC="$(PYTHONPATH=throughput-lab "$PYBIN" -m hp.cli --banked-static-env)" \
+  || { echo "FATAL: could not resolve the banked static operating point from the hp SSOT" >&2; exit 1; }
+eval "$_BANKED_STATIC"
 # DRIVER defaults to greedy. NOTE: the earlier "+31% clean win" was RETRACTED (an unstamped single-session
 # reading; journey doc Witness 2, commit 2ac1cef). The stamped quiet-box 2x2 shows the driver is
 # REGIME-DEPENDENT: ~+4.5% and NOT clean at the pad-tax 4096 ladder (server compute-bound, no idle to
@@ -47,7 +55,7 @@ eval "$_BANKED_ENV"
 # wall is the ~69% single-core serve-loop ceiling (findings #10/#11) -> ~125k is near the single-core max; more
 # throughput needs a 2nd core, not HP. (Earlier K=256/MSG=128 was Witness 3's banked best; superseded.) Pass
 # K/MSG_ROWS as $1/$4 for other arms; the 512-ladder (WARMUP/MAXBATCH) is +1-2% only.
-K="${1:-1024}"; S="${2:-14}"; NSIMS="${3:-256}"; MSG_ROWS="${4:-256}"; DRIVER="${5:-greedy}"; INFLIGHT="${6:-8}"
+K="${1:-$BANKED_FIBERS}"; S="${2:-$BANKED_SECONDS}"; NSIMS="${3:-$BANKED_N_SIMS}"; MSG_ROWS="${4:-$BANKED_MSG_ROWS}"; DRIVER="${5:-$BANKED_DRIVER}"; INFLIGHT="${6:-$BANKED_INFLIGHT}"
 # SINGLE_THREAD defaults ON (banked, finding #5: single-thread serve path +7.8% vs the two-thread split on one
 # pinned core). Unset => single-thread; pass SINGLE_THREAD= (explicit empty) for the two-thread arm.
 SINGLE_THREAD="${SINGLE_THREAD-1}"
@@ -57,7 +65,7 @@ SINGLE_THREAD="${SINGLE_THREAD-1}"
 # confirmed the 512-ladder is +1-2% only — the maintainer's "last lever", minor). max-256 is the well-filled
 # efficient regime. (Earlier Witness 2 banked the lean {64,256,512}/512 ladder over the old
 # [1,8,64,512,4096] pad-tax ladder -- +25-37%; this refines it.) Override WARMUP/MAXBATCH for other arms.
-WARMUP="${WARMUP:-64,256}"; MAXBATCH="${MAXBATCH:-256}"
+WARMUP="${WARMUP:-$BANKED_WARMUP}"; MAXBATCH="${MAXBATCH:-$BANKED_MAX_BATCH}"
 # FORWARD selects the server compute backend: jax (default; XLA-jit + bucket ladder) | numpy (forward_core
 # in numpy -- NO XLA per-call dispatch overhead, NO pad). The A/B arm for the XLA-overhead hypothesis; numpy
 # wants single-thread BLAS (OMP_NUM_THREADS=1) on the one pinned core.
@@ -95,7 +103,7 @@ grep -q READY "$LOG" || { echo "server never READY"; cat "$LOG"; exit 1; }
 G(){ taskset -c "$1" ${2:-} "$PROD" --instance "$INST" --faces "$FACES" --endpoint "$EP" \
      --threads 1 --fibers "$K" --msg-rows "$MSG_ROWS" --inflight-msgs "$INFLIGHT" \
      --episodic --no-early-exit --driver "$DRIVER" \
-     --seconds "$S" --n-sims "$NSIMS" --m 24; }
+     --seconds "$S" --n-sims "$NSIMS" --m "$BANKED_M"; }
 TMP="$(mktemp -d)"
 # banked topology resolved from the hp SSOT (the --banked-env eval above): server@$SRV_CORE off the
 # housekeeping core, 3 working gens on $GEN_CORES, SCHED_IDLE surplus@$SURPLUS_CORE sharing the server core.
@@ -130,8 +138,8 @@ grep -E 'served|forwards|compute-busy|latency' "$LOG"
 # exp_db --record is loud-but-non-fatal (a DB blip dumps the reading under ~/w/vdc, never fails the run).
 # Set TLAB_NO_DB=1 to skip; TLAB_TAG to label a cohort.
 if [ "${TLAB_NO_DB:-0}" != "1" ]; then
-  RID=$(printf '{"config":{"driver":"%s","server_impl":"%s","producer_bin":"tlab-real-producer","msg_rows":%s,"fibers":%s,"inflight_msgs":%s,"n_sims":%s,"m":24,"max_batch":%s,"warmup_ladder":[%s],"topology":"%s"},"reading":{"command":"episodic_dps.sh %s","tool":"episodic_dps.sh","tag":"%s","leaf_rows_s":%s,"dps":%s,"decisions":%s,"leaves":%s,"wall_s":%s,"real_rows_per_fwd":%s,"server_util_pct":%s},"stamp":{"commit":"%s","tree":"%s"}}' \
-    "$DRIVER" "$SERVER_IMPL" "$MSG_ROWS" "$K" "$INFLIGHT" "$NSIMS" "$MAXBATCH" "$WARMUP" "$TOPOLOGY_STR" "$*" \
+  RID=$(printf '{"config":{"driver":"%s","server_impl":"%s","producer_bin":"tlab-real-producer","msg_rows":%s,"fibers":%s,"inflight_msgs":%s,"n_sims":%s,"m":%s,"max_batch":%s,"warmup_ladder":[%s],"topology":"%s"},"reading":{"command":"episodic_dps.sh %s","tool":"episodic_dps.sh","tag":"%s","leaf_rows_s":%s,"dps":%s,"decisions":%s,"leaves":%s,"wall_s":%s,"real_rows_per_fwd":%s,"server_util_pct":%s},"stamp":{"commit":"%s","tree":"%s"}}' \
+    "$DRIVER" "$SERVER_IMPL" "$MSG_ROWS" "$K" "$INFLIGHT" "$NSIMS" "$BANKED_M" "$MAXBATCH" "$WARMUP" "$TOPOLOGY_STR" "$*" \
     "${TLAB_TAG:-episodic_dps}" "$((lv/S))" "$((dec/S))" "$dec" "$lv" "$S" "${RPF:-null}" "${UTIL:-null}" \
     "$GIT_COMMIT" "$GIT_TREE" \
     | PYTHONPATH=throughput-lab "$PYBIN" throughput-lab/harness/exp_db.py --record 2>>"$LOG")
