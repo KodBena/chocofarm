@@ -103,8 +103,11 @@ EpisodeBlocks EpisodeBuilder::finalize(double exit_c, int nb_final) && {
 
 EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, const Policy& policy,
                           uint32_t world, double lam, std::mt19937_64& rng, int max_steps) {
-    const int n_slots = n_action_slots(env);
-    const int feat_dim = fb.dim();
+    // n_action_slots / fb.dim() now return the typed SlotCount / FeatureDim domains; the EpisodeBuilder +
+    // the runner's local episode bookkeeping stay raw int (runner.cpp is out of this slice's retyping
+    // scope). Unwrap at this accessor seam (ADR-0000 item 5: a named, visible raw<->domain crossing).
+    const int n_slots = static_cast<int>(n_action_slots(env).value());
+    const int feat_dim = static_cast<int>(fb.dim().value());
 
     // Live episode state (mirrors generate_episode's loc/bw/collected init: start at the entry).
     Loc loc{env.entry_point()};
@@ -137,12 +140,14 @@ EpisodeBlocks run_episode(const Environment& env, const FeatureBuilder& fb, cons
         if (action.kind == ActionKind::Terminate) {
             // the TERMINATE decision executes no step (mirrors generate_episode): record it, break.
             eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
-                               /*is_terminate=*/true, /*is_collect=*/false, term_slot(env));
+                               /*is_terminate=*/true, /*is_collect=*/false,
+                               static_cast<int>(term_slot(env).value()));
             break;
         }
         const bool is_collect = (action.kind == ActionKind::Treasure);
         eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
-                           /*is_terminate=*/false, is_collect, action_to_slot(env, action));
+                           /*is_terminate=*/false, is_collect,
+                           static_cast<int>(action_to_slot(env, action).value()));
         StepResult sr = env.apply(loc, bw, collected, action, world);
         eb.record_step(sr.reward, sr.dt);
     }

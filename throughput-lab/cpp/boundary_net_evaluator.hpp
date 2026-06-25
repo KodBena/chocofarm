@@ -38,9 +38,11 @@ class BoundaryNetEvaluator final : public chocofarm::NetEvaluator {
 
     [[nodiscard]] std::expected<chocofarm::NetPrediction, chocofarm::Error> predict(
         std::span<const float> x) const override {
-        const wire::corr_t corr = next_corr_++;
-        const auto in_dim = static_cast<wire::count_t>(x.size());
-        const LeafBatch lb{corr, /*B=*/1, in_dim, x};
+        const wire::ProducerCorr corr = next_corr_;
+        next_corr_ = next_corr_ + wire::corr_t{1};   // affine ++ (the one named monotonic generation crossing)
+        // ACL: std::span size (size_t) -> FeatureDim via the explicit narrowing ctor at the feature boundary.
+        const wire::FeatureDim in_dim{static_cast<wire::count_t>(x.size())};
+        const LeafBatch lb{corr, /*B=*/wire::RowCount{1}, in_dim, x};
         if (auto sent = boundary_.send(lb); !sent)
             return std::unexpected(chocofarm::make_error(
                 "BoundaryNetEvaluator: send failed: " + sent.error().message));
@@ -53,7 +55,7 @@ class BoundaryNetEvaluator final : public chocofarm::NetEvaluator {
         if (reply->corr != corr || reply->preds.empty())
             return std::unexpected(chocofarm::make_error(
                 "BoundaryNetEvaluator: corr mismatch or empty reply (expected corr=" +
-                std::to_string(corr) + ", got corr=" + std::to_string(reply->corr) +
+                std::to_string(corr.value()) + ", got corr=" + std::to_string(reply->corr.value()) +
                 ", preds=" + std::to_string(reply->preds.size()) + ")"));
         chocofarm::NetPrediction pred;
         pred.value = reply->preds[0].value;
@@ -63,7 +65,7 @@ class BoundaryNetEvaluator final : public chocofarm::NetEvaluator {
 
   private:
     Boundary& boundary_;
-    mutable wire::corr_t next_corr_ = 1;
+    mutable wire::ProducerCorr next_corr_{1};   // per-thread monotonic generation (the imperative-shell counter)
 };
 
 }  // namespace tlab

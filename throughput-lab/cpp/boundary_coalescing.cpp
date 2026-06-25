@@ -48,11 +48,35 @@
 #include <vector>
 
 #include "boundary.hpp"
+#include "proc_domains.hpp"   // tlab::ByteCount / HwmMessages / Milliseconds (the coalescing-thread shape)
 #include "zmq_context.hpp"
 #include "zmq_dealer.hpp"
 
 namespace tlab {
 
+namespace {
+
+// ---- OutstandingCount: sent-but-not-yet-replied tally (per mailbox + the wire-frame tally) --------------
+// A non-negative count of in-flight submissions/frames. Minted HERE (its single home — the two outstanding
+// tallies are the only sites) rather than in the process-shape SSOT, because it is a coalescing-thread-local
+// bookkeeping quantity. u64 preserves the original std::uint64_t width (a long-running run's cumulative
+// in-flight peak comfortably fits, and the width must not narrow under behaviour preservation). Additive so
+// the ++/-- read as count arithmetic; the decrement is GUARDED (never wraps below zero — ADR-0002).
+struct OutstandingCountTag {};
+using OutstandingCount = chocofarm::Quantity<OutstandingCountTag, std::uint64_t>;
+
+}  // namespace
+}  // namespace tlab
+
+namespace chocofarm {
+// Opt the (TU-local) OutstandingCount tag into additive (a count + a count is a count — the increment) AND
+// affine (count - raw 1 -> count — the GUARDED decrement; the machinery offers no Q-=Q, so the dec is the
+// affine Q - Rep crossing). Both are the meaningful tally ops; neither is the cross-domain mix it forbids.
+template <> struct quantity_additive<tlab::OutstandingCountTag> : std::true_type {};
+template <> struct quantity_affine<tlab::OutstandingCountTag> : std::true_type {};
+}  // namespace chocofarm
+
+namespace tlab {
 namespace {
 
 // One producer thread's reply MAILBOX: a queue of completed BoundaryReplies the coalescing thread routes
@@ -62,15 +86,15 @@ struct Mailbox {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<BoundaryReply> replies;
-    std::uint64_t outstanding = 0;   // sent-but-not-yet-replied for THIS thread (for any_outstanding)
+    OutstandingCount outstanding{0};   // sent-but-not-yet-replied for THIS thread (for any_outstanding)
 };
 
 // One producer submission waiting to be coalesced: the rows (COPIED — the seam's flat is transient), the
 // producer's own corr-id (echoed back in its BoundaryReply), and the mailbox to route the reply to.
 struct Submission {
-    wire::corr_t producer_corr = 0;
-    wire::count_t B = 0;
-    wire::count_t in_dim = 0;
+    wire::ProducerCorr producer_corr{0};     // the producer's own corr-id (echoed back in its BoundaryReply)
+    wire::RowCount B{0};
+    wire::FeatureDim in_dim{0};
     std::vector<float> rows;                 // B*in_dim floats, row-major (owned copy)
     std::shared_ptr<Mailbox> mailbox;        // where this submission's reply is delivered
 };
@@ -79,16 +103,18 @@ struct Submission {
 // list of (mailbox, producer-corr, B) for the submissions packed into this frame.
 struct PackedPart {
     std::shared_ptr<Mailbox> mailbox;
-    wire::corr_t producer_corr = 0;
-    wire::count_t B = 0;
+    wire::ProducerCorr producer_corr{0};
+    wire::RowCount B{0};
 };
 
 class BoundaryCoalescing final : public Boundary {
   public:
-    BoundaryCoalescing(ZmqDealer dealer, int recv_timeout_ms, int intake_cap)
+    BoundaryCoalescing(ZmqDealer dealer, Milliseconds recv_timeout_ms, HwmMessages intake_cap)
         : dealer_(std::move(dealer)),
           recv_timeout_ms_(recv_timeout_ms),
-          intake_cap_(intake_cap > 0 ? intake_cap : 1),
+          // intake_cap is a byte-budgeted message count (>= 4 by send_hwm_for_budget); the > 0 guard is kept
+          // as a defensive floor (behaviour-preserving) in case a future caller hands a zero.
+          intake_cap_(intake_cap.value() > 0 ? intake_cap : HwmMessages{1}),
           coalescer_([this] { coalesce_loop(); }) {}
 
     ~BoundaryCoalescing() override {
@@ -118,7 +144,7 @@ class BoundaryCoalescing final : public Boundary {
         sub.mailbox = mailbox;
         {
             std::lock_guard<std::mutex> mlk(mailbox->mu);
-            mailbox->outstanding += 1;
+            mailbox->outstanding += OutstandingCount{1};
         }
         {
             std::unique_lock<std::mutex> lk(intake_mu_);
@@ -129,7 +155,8 @@ class BoundaryCoalescing final : public Boundary {
             // queue. The cap is byte-budgeted (send_hwm_for_budget), so intake memory is bounded regardless
             // of rows. A live coalescing thread drains in milliseconds; only stop/fatal ends the wait early.
             intake_space_cv_.wait(lk, [this] {
-                return intake_.size() < static_cast<std::size_t>(intake_cap_) || intake_closed_;
+                // ACL: the deque .size() (size_t) is compared against the message-count cap via .value().
+                return intake_.size() < static_cast<std::size_t>(intake_cap_.value()) || intake_closed_;
             });
             if (intake_closed_) {
                 lk.unlock();
@@ -147,8 +174,10 @@ class BoundaryCoalescing final : public Boundary {
     [[nodiscard]] std::expected<BoundaryReply, BoundaryError> recv() override {
         auto mailbox = mailbox_for_this_thread();
         std::unique_lock<std::mutex> lk(mailbox->mu);
+        // ACL: Milliseconds -> the chrono duration's rep at the deadline computation. recv_timeout_ms_ is
+        // unsigned, so the legacy "<= 0 = block forever" is the .value() == 0 case (handled below).
         const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(recv_timeout_ms_ > 0 ? recv_timeout_ms_ : 0);
+                              std::chrono::milliseconds(recv_timeout_ms_.value());
         for (;;) {
             if (!mailbox->replies.empty()) {
                 BoundaryReply r = std::move(mailbox->replies.front());
@@ -156,7 +185,7 @@ class BoundaryCoalescing final : public Boundary {
                 return r;
             }
             if (auto err = fatal_error()) return std::unexpected(*err);
-            if (recv_timeout_ms_ <= 0) {
+            if (recv_timeout_ms_.value() == 0) {
                 mailbox->cv.wait(lk);   // block forever (config opted out of a bound — not recommended)
             } else {
                 if (mailbox->cv.wait_until(lk, deadline) == std::cv_status::timeout &&
@@ -186,7 +215,7 @@ class BoundaryCoalescing final : public Boundary {
     [[nodiscard]] bool any_outstanding() const override {
         auto mailbox = mailbox_for_this_thread();
         std::lock_guard<std::mutex> lk(mailbox->mu);
-        return mailbox->outstanding > 0;
+        return mailbox->outstanding > OutstandingCount{0};
     }
 
   private:
@@ -248,7 +277,7 @@ class BoundaryCoalescing final : public Boundary {
             // drain and we loop back to PHASE 1. (In decoupled mode RCVTIMEO=0, so this is a non-blocking
             // spin-drain; in coupled mode it blocks up to RCVTIMEO for the first reply, which is fine since
             // the coupled producer is itself waiting on that round-trip.)
-            while (outstanding_wire_ > 0) {
+            while (outstanding_wire_ > OutstandingCount{0}) {
                 auto got = dealer_.recv_one();
                 if (!got) {
                     set_fatal_error(got.error());
@@ -282,7 +311,8 @@ class BoundaryCoalescing final : public Boundary {
         std::unique_lock<std::mutex> lk(intake_mu_);
         if (intake_.empty()) {
             // Short wait so PHASE 2 (reply drain) still runs promptly when nothing is being produced.
-            intake_cv_.wait_for(lk, std::chrono::milliseconds(kIntakeWaitMs),
+            // ACL: Milliseconds -> the chrono duration's rep at the bounded wait.
+            intake_cv_.wait_for(lk, std::chrono::milliseconds(kIntakeWaitMs.value()),
                                 [this] { return stop_ || !intake_.empty(); });
         }
         std::vector<Submission> out;
@@ -299,49 +329,66 @@ class BoundaryCoalescing final : public Boundary {
     // Concatenate the batch's rows into one matrix, stamp one wire corr-id, send it, and record the split.
     [[nodiscard]] std::optional<BoundaryError> send_coalesced(std::vector<Submission>& batch) {
         // All coalesced rows must share in_dim (one frame carries one in_dim header). Validate loudly.
-        const wire::count_t in_dim = batch.front().in_dim;
-        wire::count_t total_B = 0;
+        const wire::FeatureDim in_dim = batch.front().in_dim;
+        wire::RowCount total_B{0};
         for (const auto& s : batch) {
             if (s.in_dim != in_dim)
                 return BoundaryError{"BoundaryCoalescing: coalesced submissions disagree on in_dim (" +
-                                         std::to_string(s.in_dim) + " vs " + std::to_string(in_dim) + ")",
+                                         std::to_string(s.in_dim.value()) + " vs " +
+                                         std::to_string(in_dim.value()) + ")",
                                      false};
-            total_B += s.B;
+            total_B += s.B;   // RowCount additive: a sum of row counts is a row count
         }
         std::vector<float> flat;
-        flat.reserve(static_cast<std::size_t>(total_B) * in_dim);
+        // ACL: the count->element-extent crossing (total_B * in_dim) unwraps both typed counts into the
+        // size_t reserve arithmetic at the allocation site.
+        flat.reserve(static_cast<std::size_t>(total_B.value()) * in_dim.value());
         std::vector<PackedPart> parts;
         parts.reserve(batch.size());
         for (auto& s : batch) {
             flat.insert(flat.end(), s.rows.begin(), s.rows.end());
             parts.push_back(PackedPart{std::move(s.mailbox), s.producer_corr, s.B});
         }
-        const wire::corr_t wire_corr = next_wire_corr_++;
+        const wire::WireCorr wire_corr = next_wire_corr_;
+        next_wire_corr_ = next_wire_corr_ + wire::corr_t{1};   // affine ++ (the named monotonic generation)
         LeafBatch lb;
-        lb.corr = wire_corr;
+        // ACL (the two-corr-namespace fusion): the coalescing thread stamps a WIRE corr, but LeafBatch.corr
+        // is the seam's ProducerCorr slot — so the wire corr crosses into it via .value() + the explicit
+        // ProducerCorr ctor. The bytes are identical (both ride corr_t); the dealer round-trips them opaquely
+        // and recv_one hands the echoed corr back as a ProducerCorr, which scatter_reply re-reads as the wire
+        // corr (the inverse crossing). The packed_ map keeps the authoritative WireCorr key.
+        lb.corr = wire::ProducerCorr{wire_corr.value()};
         lb.B = total_B;
         lb.in_dim = in_dim;
         lb.flat = std::span<const float>(flat.data(), flat.size());
         auto sent = dealer_.send_batch(lb);
         if (!sent) return sent.error();
-        packed_.emplace(wire_corr, std::move(parts));
-        outstanding_wire_ += 1;
+        packed_.emplace(wire_corr.value(), std::move(parts));   // ACL: WireCorr -> raw corr_t map key
+        outstanding_wire_ += OutstandingCount{1};
         return std::nullopt;
     }
 
     // Split one wire reply's predictions back to the producer mailboxes per the recorded parts.
     [[nodiscard]] std::optional<BoundaryError> scatter_reply(BoundaryReply reply) {
-        auto it = packed_.find(reply.corr);
+        // ACL (the inverse of send_coalesced's stamp): recv_one handed the echoed corr back as a ProducerCorr
+        // (the dealer is corr-namespace-agnostic), but on THIS leg it is the WIRE corr the coalescing thread
+        // stamped. Re-read it as a WireCorr, then unwrap to the raw corr_t the packed_ map is keyed by.
+        const wire::WireCorr wire_corr{reply.corr.value()};
+        auto it = packed_.find(wire_corr.value());
         if (it == packed_.end())
             return BoundaryError{"BoundaryCoalescing: reply for unknown wire corr-id " +
-                                     std::to_string(reply.corr) + " (a desynchronized wire)",
+                                     std::to_string(wire_corr.value()) + " (a desynchronized wire)",
                                  false};
         std::vector<PackedPart> parts = std::move(it->second);
         packed_.erase(it);
-        outstanding_wire_ -= 1;
+        // GUARDED decrement (OutstandingCount is non-negative; never wrap below zero — ADR-0002). An entry was
+        // just found in packed_, so this is always > 0 here, but the guard makes the invariant structural.
+        // GUARDED decrement via the affine Q - Rep crossing (the machinery has no Q-=Q for an additive tag).
+        if (outstanding_wire_ > OutstandingCount{0})
+            outstanding_wire_ = outstanding_wire_ - OutstandingCount::rep_type{1};
 
         std::size_t expected = 0;
-        for (const auto& p : parts) expected += p.B;
+        for (const auto& p : parts) expected += p.B.value();   // ACL: RowCount -> size_t prediction-count sum
         if (reply.preds.size() != expected)
             return BoundaryError{"BoundaryCoalescing: wire reply carried " +
                                      std::to_string(reply.preds.size()) + " predictions for " +
@@ -353,14 +400,19 @@ class BoundaryCoalescing final : public Boundary {
         std::size_t off = 0;
         for (auto& part : parts) {
             BoundaryReply out;
-            out.corr = part.producer_corr;
+            out.corr = part.producer_corr;   // the producer's OWN corr (so its recv() sees the corr it stamped)
+            // ACL: RowCount -> size_t slice width at the prediction-vector iterator arithmetic.
+            const std::size_t part_B = part.B.value();
             out.preds.assign(std::make_move_iterator(reply.preds.begin() + off),
-                             std::make_move_iterator(reply.preds.begin() + off + part.B));
-            off += part.B;
+                             std::make_move_iterator(reply.preds.begin() + off + part_B));
+            off += part_B;
             {
                 std::lock_guard<std::mutex> lk(part.mailbox->mu);
                 part.mailbox->replies.push_back(std::move(out));
-                if (part.mailbox->outstanding > 0) part.mailbox->outstanding -= 1;
+                // GUARDED decrement (non-negative; never wrap below zero, ADR-0002) via the affine Q - Rep.
+                if (part.mailbox->outstanding > OutstandingCount{0})
+                    part.mailbox->outstanding =
+                        part.mailbox->outstanding - OutstandingCount::rep_type{1};
             }
             part.mailbox->cv.notify_one();
         }
@@ -370,24 +422,24 @@ class BoundaryCoalescing final : public Boundary {
     // How long the coalescing thread blocks for new intake before falling through to drain replies. A few
     // ms keeps both directions live without a busy spin; it does NOT cap throughput (the moment a batch is
     // queued the wait returns immediately via the predicate).
-    static constexpr int kIntakeWaitMs = 2;
+    static constexpr Milliseconds kIntakeWaitMs{2};
 
     ZmqDealer dealer_;
-    int recv_timeout_ms_ = 5000;   // mirrors the dealer's RCVTIMEO; bounds producer recv() too
+    Milliseconds recv_timeout_ms_{5000};   // mirrors the dealer's RCVTIMEO; bounds producer recv() too
 
     // ---- intake (producer threads -> coalescing thread), BYTE-BUDGET-BOUNDED for back-pressure ----
     std::mutex intake_mu_;
     std::condition_variable intake_cv_;          // coalescing thread waits here for work
     std::condition_variable intake_space_cv_;    // producers wait here for room (the back-pressure signal)
     std::deque<Submission> intake_;
-    int intake_cap_ = 1;                          // max queued submissions (= byte budget / per-message size)
+    HwmMessages intake_cap_{1};                    // max queued submissions (= byte budget / per-message size)
     bool intake_closed_ = false;                  // stop/fatal -> wake blocked producers so they bail, not hang
     bool stop_ = false;
 
     // ---- coalescing-thread-private state (touched only by the coalescing thread) ----
-    wire::corr_t next_wire_corr_ = 1;
-    std::unordered_map<wire::corr_t, std::vector<PackedPart>> packed_;   // wire corr -> its split plan
-    std::uint64_t outstanding_wire_ = 0;                                 // outgoing frames awaiting a reply
+    wire::WireCorr next_wire_corr_{1};            // the coalescing thread's monotonic WIRE corr generation
+    std::unordered_map<wire::corr_t, std::vector<PackedPart>> packed_;   // wire corr (raw key) -> its split plan
+    OutstandingCount outstanding_wire_{0};                               // outgoing frames awaiting a reply
 
     // ---- per-thread mailboxes (the reply fan-out) ----
     mutable std::mutex mailboxes_mu_;
@@ -412,11 +464,12 @@ class BoundaryCoalescing final : public Boundary {
     if (!ctx) return std::unexpected(ctx.error());
     // Send timeout = recv timeout with a 1s floor (see boundary_per_thread.cpp for the rationale): a wedged
     // wire surfaces loudly within ~1s; normal backpressure against a live server never trips it.
-    const int send_timeout_ms = std::max(cfg.recv_timeout_ms, 1000);
+    const Milliseconds send_timeout_ms{std::max(cfg.recv_timeout_ms.value(), 1000u)};
     // ONE shared DEALER for all threads -> the whole outstanding-send byte budget is its queue cap; the
     // byte budget -> a message-count SNDHWM that bounds memory regardless of row size.
-    const int send_hwm = send_hwm_for_budget(cfg.send_queue_bytes, cfg.rows, cfg.in_dim);
-    auto dealer = ZmqDealer::create(*ctx, cfg.endpoint, cfg.recv_timeout_ms, send_timeout_ms, send_hwm);
+    const HwmMessages send_hwm = send_hwm_for_budget(cfg.send_queue_bytes, cfg.rows, cfg.in_dim);
+    auto dealer = ZmqDealer::create(*ctx, cfg.endpoint, OptMilliseconds{cfg.recv_timeout_ms},
+                                    OptMilliseconds{send_timeout_ms}, send_hwm);
     if (!dealer) return std::unexpected(dealer.error());
     // The intake queue (producer threads -> coalescing thread) gets the SAME byte-budget cap as the wire
     // send queue, so BOTH buffers in the coalescing path are bounded (total outstanding ~2x the budget).

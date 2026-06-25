@@ -27,8 +27,10 @@
 //   anywhere (the gumbel/ismcts transposition tables key on (action_slot, belief_key), never collected) —
 //   verified — so the change is observable ONLY through these uses, all preserved.
 //
-//   A leaf header (only <bit>/<cstdint>/<cassert>) so env.hpp / policy.hpp / features.hpp include it with
-//   no cycle, exactly as belief_key.hpp is a leaf type header.
+//   A leaf header (only <bit>/<cstdint>/<cassert> + the cycle-free domains.hpp/world.hpp phantom-type
+//   leaves) so env.hpp / policy.hpp / features.hpp include it with no cycle, exactly as belief_key.hpp is
+//   a leaf type header. The member-arg type is now the typed TreasureId (ADR-0012 P8: the typed signature
+//   is the SSOT) — a FaceId/SlotIndex passed here is a hard compile error, not a runtime category slip.
 //
 // Public Domain (The Unlicense).
 #pragma once
@@ -37,6 +39,7 @@
 #include <cassert>
 #include <cstdint>
 
+#include "chocofarm/domains.hpp"  // TreasureId / CollectedCount — the typed treasure-id + count domains (P1)
 #include "chocofarm/world.hpp"
 
 namespace chocofarm {
@@ -54,46 +57,57 @@ struct CollectedSet {
     using world_mask_t = World;  // IS the shared World SSOT (world.hpp) now, not a local re-declaration:
                                  // the env's per-world bitmask type (env.hpp worlds()), single-sourced (P1)
     std::uint64_t bits = 0;
-    static constexpr int kMaxId = static_cast<int>(sizeof(world_mask_t) * 8);  // = 32, the treasure-id domain
-    static_assert(kMaxId <= static_cast<int>(sizeof(std::uint64_t) * 8),
+    // The treasure-id domain ceiling = bit-width(world_mask_t) = 32; a TreasureCount (the [0,N) upper bound,
+    // here the structural [0,32) one), DERIVED from the world-mask type, never hardcoded (P1/P3). The
+    // TreasureRep static_cast is the ONE width crossing for this constant (sizeof*8 ∈ size_t -> u16).
+    static constexpr TreasureCount kMaxId =
+        TreasureCount{static_cast<TreasureRep>(sizeof(world_mask_t) * 8)};  // = 32, the treasure-id domain
+    static_assert(kMaxId.value() <= static_cast<TreasureRep>(sizeof(std::uint64_t) * 8),
                   "CollectedSet storage must cover the world-mask's treasure-id domain (ADR-0012 P3)");
 
     bool operator==(const CollectedSet&) const = default;
 
-    // Membership test (the former std::set::count(i) == 1 / contains(i)).
-    [[nodiscard]] bool contains(int i) const {
-        assert(i >= 0 && i < kMaxId && "CollectedSet::contains id out of range");
-        return ((bits >> i) & 1u) != 0;
+    // Membership test (the former std::set::count(i) == 1 / contains(i)). `i` is a typed TreasureId — a
+    // FaceId/SlotIndex here does NOT compile (the load-bearing ADR-0000 win). The .value() at the shift is
+    // the ONE id->raw crossing (the bit position), the assert the ADR-0002 fail-loud range net.
+    [[nodiscard]] bool contains(TreasureId i) const {
+        assert(i.value() < kMaxId.value() && "CollectedSet::contains id out of range");
+        return ((bits >> i.value()) & 1u) != 0;
     }
 
     // The immutable add (the descent's `collected ∪ {slot}`): returns a NEW set with bit i set, leaving
     // *this unchanged — a register-move value, the allocation-free replacement for the per-descent copy.
-    [[nodiscard]] CollectedSet with(int i) const {
-        assert(i >= 0 && i < kMaxId && "CollectedSet::with id out of range");
-        return CollectedSet{bits | (std::uint64_t{1} << i)};
+    [[nodiscard]] CollectedSet with(TreasureId i) const {
+        assert(i.value() < kMaxId.value() && "CollectedSet::with id out of range");
+        return CollectedSet{bits | (std::uint64_t{1} << i.value())};
     }
 
     // The in-place add (the former std::set::insert(i)) — env.apply mutates `collected` in place on a
     // treasure collect. ADR-0002: fail-loud on an out-of-range id (an id the world-mask cannot carry).
-    void insert(int i) {
-        assert(i >= 0 && i < kMaxId && "CollectedSet::insert id out of range");
-        bits |= (std::uint64_t{1} << i);
+    void insert(TreasureId i) {
+        assert(i.value() < kMaxId.value() && "CollectedSet::insert id out of range");
+        bits |= (std::uint64_t{1} << i.value());
     }
 
-    // |collected| (the former std::set::size()) — popcount, O(1).
-    [[nodiscard]] int size() const { return std::popcount(bits); }
+    // |collected| (the former std::set::size()) — popcount, O(1). The stdlib ACL: std::popcount returns a
+    // non-negative signed int, crossed to the typed CollectedCount via the explicit ctor (the named .size()
+    // boundary; popcount ∈ [0,64], always fits TreasureRep).
+    [[nodiscard]] CollectedCount size() const {
+        return CollectedCount{static_cast<TreasureRep>(std::popcount(bits))};
+    }
     [[nodiscard]] bool empty() const { return bits == 0; }
 
     // ASCENDING iteration (low bit -> high bit == std::set<int> sorted order). `fn` is called with each
-    // collected id, in ascending order. The one current consumer (features.cpp collected_features, the
-    // indicator axis) writes a position-independent `coll[i]=1`, so order does not affect ITS bytes; the
-    // ascending guarantee is conservative — it preserves the former std::set order so an order-DEPENDENT
-    // consumer (none today) would also stay bit-exact, no per-consumer audit needed.
+    // collected id (a typed TreasureId), in ascending order. The one current consumer (features.cpp
+    // build_into's collected/available/sum_unc axes) writes a position-independent `coll[i]=1`, so order
+    // does not affect ITS bytes; the ascending guarantee is conservative — it preserves the former std::set
+    // order so an order-DEPENDENT consumer (none today) would also stay bit-exact, no per-consumer audit.
     template <typename Fn>
     void for_each_ascending(Fn&& fn) const {
         std::uint64_t b = bits;
         while (b != 0) {
-            const int i = std::countr_zero(b);  // lowest set bit = smallest remaining id
+            // lowest set bit = smallest remaining id; countr_zero ∈ [0,63] crosses to TreasureId (ACL).
+            const TreasureId i{static_cast<TreasureRep>(std::countr_zero(b))};
             fn(i);
             b &= b - 1;                          // clear the lowest set bit
         }

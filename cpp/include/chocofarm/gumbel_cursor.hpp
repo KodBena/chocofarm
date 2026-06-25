@@ -44,11 +44,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory_resource>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
 
 #include "chocofarm/collected_set.hpp"
+#include "chocofarm/domains.hpp"  // SlotIndex/SlotCount/SimBudget/CandidateCount/PlyDepth/OutcomeIndex/ByteCount + World (P1)
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/gumbel.hpp"
@@ -139,11 +141,13 @@ class TreeCursor {
     // belief lives in descent_bw_, reset from bw_ at each c_outcome determinization start (the one copy
     // that remains, see "needs a copy" below). The frame keeps ONLY what the W/N backup needs.
     struct DescendFrame {
-        int node = -1;          // arena index of this frame's node
-        int depth = 0;          // descent depth (root-action child enters at depth 1, as descend does)
-        int action_slot = -1;   // the puct_select'd action this frame stepped on (for the W/N backup)
-        double step = 0.0;      // the immediate λ-penalized step reward of action_slot (added to cont)
-        bool stepped = false;   // has this frame chosen+applied its action (vs still needing its eval)?
+        int node = -1;             // arena index of this frame's node (a NodePool container index, raw)
+        PlyDepth depth{0};         // descent depth (root-action child enters at depth 1, as descend does)
+        SlotIndex action_slot{0};  // the puct_select'd action this frame stepped on (for the W/N backup);
+                                   //   only read when `stepped` (the former -1 "not stepped" carried no
+                                   //   slot value — `stepped` is the real guard, ADR-0002 typed presence)
+        double step = 0.0;         // the immediate λ-penalized step reward of action_slot (added to cont)
+        bool stepped = false;      // has this frame chosen+applied its action (vs still needing its eval)?
     };
 
     // ---- the outer SH bookkeeping (reifies sequential_halving's locals across resume() re-entries) ----
@@ -165,8 +169,8 @@ class TreeCursor {
     double lam_;
     GumbelSource& src_;
 
-    int n_slots_;
-    int term_slot_;
+    SlotCount n_slots_;               // = n_action_slots(env) — the count that bounds SlotIndex
+    SlotIndex term_slot_;             // = term_slot(env) — the always-legal TERMINATE slot
     FeatureWorkspace ws_;              // the cursor's OWN per-leaf scratch (P9 rule 4; never aliases p_.ws_)
     // The cursor's OWN per-decision node-pool arena — DELIBERATELY THE SAME SHAPE run_search uses
     // (gumbel.hpp): a std::pmr::monotonic_buffer_resource over a kArenaInlineBytes inline floor with an
@@ -176,9 +180,13 @@ class TreeCursor {
     // a measured B<direct gap would conflate the cursor mechanism with the cheaper allocator (the confound
     // the first rough measure exposed). So the cursor mirrors the arena exactly; only the await-mechanism
     // differs. (One decision per cursor here, so no release() loop is needed — the arena frees at dtor.)
-    static constexpr std::size_t kArenaInlineBytes = 32 * 1024;  // == GumbelAZPolicy::kArenaInlineBytes
+    // The inline floor as a typed ByteCount (the pmr/array sizing domain — domains.hpp); .value() is the
+    // count->size_t ACL at the std::array non-type template arg + the monotonic_buffer_resource sizing.
+    static constexpr ByteCount kArenaInlineBytes{32 * 1024};  // == GumbelAZPolicy::kArenaInlineBytes
+    static_assert(kArenaInlineBytes == GumbelAZPolicy::kArenaInlineBytes,
+                  "the cursor must mirror the policy's arena inline floor (the B-vs-A allocator parity)");
     MmapUpstream arena_upstream_;
-    std::array<std::byte, kArenaInlineBytes> arena_buf_;
+    std::array<std::byte, kArenaInlineBytes.value()> arena_buf_;
     std::pmr::monotonic_buffer_resource arena_{arena_buf_.data(), arena_buf_.size(), &arena_upstream_};
     NodePool nodes_{&arena_};          // the cursor's OWN node pool, served from the SAME arena shape as A
     std::vector<double> root_logits_;  // root log-prior logits (seam 1) feeding top-k AND the SH cut
@@ -189,27 +197,29 @@ class TreeCursor {
     // SH state: the survivor-elimination bracket. `considered_` is the live candidate set (halved each
     // phase); per_phase_/budget_/n_spent_ track the budget exactly as sequential_halving does. The
     // "which candidate / which of its per_action sims / which c_outcome" cursor is below.
-    std::vector<int> considered_;
-    int sh_per_phase_ = 0;
-    int sh_budget_ = 0;
-    int n_spent_ = 0;
+    std::vector<SlotIndex> considered_;  // the live candidate-slot set (halved each phase)
+    SimBudget sh_per_phase_{0};
+    SimBudget sh_budget_{0};
+    SimBudget n_spent_{0};
     bool sh_single_ = false;           // the |considered|==1 fast path (visit n_sims on the lone candidate)
     bool sh_remainder_ = false;        // in the post-bracket full-budget remainder round-robin
     bool sh_phase_active_ = false;     // a phase has been ENTERED (its per-action loop + cut owe to run);
                                        //   the while-condition is re-checked only when this clears (so the
                                        //   cut ALWAYS fires for an entered phase, even if budget hit 0)
     bool sh_phase_broke_ = false;      // the per-action loop broke early on v<=0 (still cuts afterwards)
-    int sh_phase_idx_ = 0;             // index into considered_ within the current phase's per-action loop
-    int sh_per_action_ = 0;            // this phase's per-action sim count
-    int sh_action_done_ = 0;           // sims already issued for considered_[sh_phase_idx_] this phase
-    size_t sh_rr_ = 0;                 // round-robin index for the remainder loop
+    int sh_phase_idx_ = 0;             // position into considered_ within the phase's per-action loop (a raw
+                                       //   container cursor 0..size, not a slot index)
+    SimBudget sh_per_action_{0};       // this phase's per-action sim count
+    SimBudget sh_action_done_{0};      // sims already issued for considered_[sh_phase_idx_] this phase
+    size_t sh_rr_ = 0;                 // round-robin index for the remainder loop (raw container cursor)
 
     // The current sim's root-action context (simulate_root_action's locals): the root action slot under
     // test, its c_outcome accumulation, and which determinization k we are on. `sim_total_` accumulates
     // the c_outcome sum; the visit-level return is sim_total_/c_outcome.
-    int cur_root_slot_ = -1;
-    int cur_k_ = 0;                    // c_outcome determinization index (0..c_outcome-1)
-    uint32_t cur_world_ = 0;           // the visit-drawn world for this sim (k==0 reuses it, k>0 redraws)
+    std::optional<SlotIndex> cur_root_slot_;  // the root action under test, or empty = "no current sim"
+                                       //   (the former -1 sentinel -> typed absence, ADR-0002)
+    OutcomeIndex cur_k_{0};            // c_outcome determinization index (0..c_outcome-1)
+    World cur_world_ = 0;              // the visit-drawn world for this sim (k==0 reuses it, k>0 redraws)
     double sim_total_ = 0.0;           // running Σ_k (step + descend cont) for the current root-action sim
 
     std::vector<DescendFrame> descend_stack_;  // the reified descend recursion (linear chain)
@@ -225,7 +235,7 @@ class TreeCursor {
     Loc descent_loc_;
     Belief descent_bw_;
     CollectedSet descent_coll_;
-    uint32_t descent_world_ = 0;
+    World descent_world_ = 0;
 
     GumbelAZPolicy::Decision decision_;         // built by finalize()
 

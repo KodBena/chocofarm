@@ -83,7 +83,12 @@ add_executable(tlab-producer
   boundary_coalescing.cpp
   boundary_factory.cpp
 )
-target_include_directories(tlab-producer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The parent chocofarm cpp/include is on the include path for the Band-1 phantom-type MACHINERY
+# (chocofarm/quantity.hpp) only — the lab's wire.hpp reuses the zero-cost Quantity<Tag,Rep> substrate to
+# phantom-split its own (tlab::wire) count/corr domains. This is a HEADER-ONLY reuse (no link to
+# chocofarm_core); the lab's wire spec stays a clean-room mirror of the Python SSOT (ADR-0012 P7).
+get_filename_component(CHOCO_CORE_INCLUDE_FOR_QUANTITY ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp/include ABSOLUTE)
+target_include_directories(tlab-producer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CHOCO_CORE_INCLUDE_FOR_QUANTITY})
 target_link_libraries(tlab-producer PRIVATE zmq_lib Threads::Threads)
 
 # sched_wrap: a tiny libc-only privilege-confinement helper (set a sched policy/attr on self, then exec).

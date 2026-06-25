@@ -137,9 +137,14 @@ namespace {
     if (env.marginals(fb) != env.marginals(bb)) return note("marginals");
     for (int j = 0; j < env.n_detectors(); ++j)
         if (env.informative(j, fb) != env.informative(j, bb)) return note("informative[" + std::to_string(j) + "]");
+    // CollectedSet::with takes a typed TreasureId; these are literal oracle ids — wrap each at the crossing
+    // (ADR-0000 item 5). T is a brevity alias for the named raw->TreasureId ACL, local to this fixture.
+    using chocofarm::TreasureId;
+    using chocofarm::TreasureRep;
+    auto T = [](int id) { return TreasureId{static_cast<TreasureRep>(id)}; };
     for (const chocofarm::CollectedSet& coll :
-         {chocofarm::CollectedSet{}, chocofarm::CollectedSet{}.with(0),
-          chocofarm::CollectedSet{}.with(0).with(3).with(7)}) {
+         {chocofarm::CollectedSet{}, chocofarm::CollectedSet{}.with(T(0)),
+          chocofarm::CollectedSet{}.with(T(0)).with(T(3)).with(T(7))}) {
         if (env.legal_actions(fb, coll) != env.legal_actions(bb, coll)) return note("legal_actions");
     }
     {

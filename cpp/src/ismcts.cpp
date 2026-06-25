@@ -25,22 +25,27 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
+#include <optional>
 
-#include "chocofarm/features.hpp"  // action_to_slot / term_slot: the action<->slot bijection
+#include "chocofarm/features.hpp"  // action_to_slot / term_slot: the action<->slot bijection (typed SlotIndex)
 
 namespace chocofarm {
 
 namespace {
 // The fixed slot for an action (the action<->slot bijection, mirrors action_to_slot). ISMCTS keys
 // its per-action maps by slot — a faithful stand-in for the Python Action-tuple keys (the mapping is
-// a bijection), with insertion order tracked separately so the tie-break stays first-wins.
-[[nodiscard]] int slot_of(const Environment& env, const Action& a) { return action_to_slot(env, a); }
+// a bijection), with insertion order tracked separately so the tie-break stays first-wins. Returns the
+// typed SlotIndex (action_to_slot's return, features.hpp).
+[[nodiscard]] SlotIndex slot_of(const Environment& env, const Action& a) { return action_to_slot(env, a); }
 
 // Reconstruct an Action from its slot (the inverse of action_to_slot), so run_search can return the
-// selected action. Slot 0..N-1 = ("t", i); N..N+nD-1 = ("d", j); N+nD = TERMINATE.
-[[nodiscard]] Action action_of_slot(const Environment& env, int slot) {
-    if (slot < env.N()) return Action{ActionKind::Treasure, slot};
-    if (slot < env.N() + env.n_detectors()) return Action{ActionKind::Detector, slot - env.N()};
+// selected action. Slot 0..N-1 = ("t", i); N..N+nD-1 = ("d", j); N+nD = TERMINATE. env.N()/n_detectors()
+// are the out-of-scope int accessors (env.hpp); the comparison crosses the slot via .value() and Action.i
+// is written raw (the env's Action keeps a bare int `i` — a treasure id OR a face id by kind, the boundary).
+[[nodiscard]] Action action_of_slot(const Environment& env, SlotIndex slot) {
+    const int s = static_cast<int>(slot.value());  // SlotIndex -> raw, the env-N comparison ACL
+    if (s < env.N()) return Action{ActionKind::Treasure, s};                       // slot == treasure id
+    if (s < env.N() + env.n_detectors()) return Action{ActionKind::Detector, s - env.N()};  // face id = s - N
     return terminate_action();
 }
 
@@ -51,10 +56,10 @@ namespace {
 // `visits.find(a)==end()` first-insertion test is exactly `visits[a]==0`; reward is written in lockstep
 // with visits (this is their only writer), so `+= ret` from the zero-init is the former
 // `reward[a]=ret` (new) / `+= ret` (seen) — bit-identical.
-void update_node(ISMCTSNode& nd, int a, double ret) {
-    const size_t s = static_cast<size_t>(a);
-    if (nd.visits[s] == 0) nd.visit_order.push_back(a);  // first visits-insertion -> insertion order
-    nd.visits[s] += 1;
+void update_node(ISMCTSNode& nd, SlotIndex a, double ret) {
+    const size_t s = static_cast<size_t>(a.value());  // SlotIndex -> dense-vector index (the .size() domain)
+    if (nd.visits[s] == VisitCount{0}) nd.visit_order.push_back(a);  // first visits-insertion -> insertion order
+    nd.visits[s] += VisitCount{1};   // additive VisitCount domain
     nd.reward[s] += ret;  // dense, zero-init: += is the former (new ? ret : reward[a]+ret)
 }
 }  // namespace
@@ -63,24 +68,24 @@ ISMCTSPolicy::ISMCTSPolicy(const ISMCTSConfig& cfg, const Policy* base)
     : cfg_(cfg), base_(base ? base : &default_base_) {}
 
 // ---- subset-armed UCB1 selection (eq. 7) (mirrors _ucb_select) ------------------------------------
-int ISMCTSPolicy::ucb_select(const ISMCTSNode& node) const {
-    int best_a = -1;
+SlotIndex ISMCTSPolicy::ucb_select(const ISMCTSNode& node) const {
+    std::optional<SlotIndex> best_a;  // typed absence (ADR-0002): no -1 sentinel for "no best slot yet"
     double best_v = -std::numeric_limits<double>::infinity();
     const double c = cfg_.c;
     // iterate in INSERTION order (visit_order), not the map's sorted-key order — the parity-critical
     // first-wins tie is over insertion order (mirrors Python dict iteration in _ucb_select).
-    for (int a : node.visit_order) {
-        const size_t s = static_cast<size_t>(a);
-        int n_j = node.visits[s];
-        if (n_j == 0) return a;  // an unselected-but-present arm: pick it immediately (mirrors Python)
-        double exploit = node.reward[s] / static_cast<double>(n_j);
+    for (SlotIndex a : node.visit_order) {
+        const size_t s = static_cast<size_t>(a.value());
+        VisitCount n_j = node.visits[s];
+        if (n_j == VisitCount{0}) return a;  // an unselected-but-present arm: pick it immediately (mirrors Python)
+        const double n_jd = static_cast<double>(n_j.value());  // VisitCount -> double, the float-math ACL
+        double exploit = node.reward[s] / n_jd;
         // avail.get(a, n_j): dense avail[a]==0 <=> the key was absent in the map (avail only increments
         // from the zero-init), so `avail[a] ? avail[a] : n_j` reproduces the map's present?value:default
         // exactly (here a slot in visit_order always had its avail bumped in the same iterate, so >0).
-        int navail = (node.avail[s] != 0) ? node.avail[s] : n_j;
-        double explore = (navail > 1)
-                             ? c * std::sqrt(std::log(static_cast<double>(navail)) /
-                                             static_cast<double>(n_j))
+        VisitCount navail = (node.avail[s] != VisitCount{0}) ? node.avail[s] : n_j;
+        double explore = (navail > VisitCount{1})
+                             ? c * std::sqrt(std::log(static_cast<double>(navail.value())) / n_jd)
                              : c;
         double v = exploit + explore;
         if (v > best_v) {  // strict >: first arm (insertion order) wins a tie (mirrors `if v > best_v`)
@@ -90,16 +95,16 @@ int ISMCTSPolicy::ucb_select(const ISMCTSNode& node) const {
     }
     // _ucb_select is only called on a fully-expanded node (visits non-empty), so a best is always
     // found; ADR-0012 P9 — an empty visit_order here is an invariant violation (a bug), assert/abort.
-    assert(best_a != -1 && "ucb_select on an empty (unexpanded) node");
-    return best_a;
+    assert(best_a.has_value() && "ucb_select on an empty (unexpanded) node");
+    return *best_a;
 }
 
 // ---- one determinized iteration (mirrors _iterate) ------------------------------------------------
 double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& nodes, int node,
                              const Loc& loc, const Belief& bw,
-                             const CollectedSet& collected, uint32_t world, double lam,
-                             ISMCTSSource& src, int depth) const {
-    if (depth >= cfg_.max_depth) return -lam * env.exit_cost(loc.pt);
+                             const CollectedSet& collected, World world, double lam,
+                             ISMCTSSource& src, PlyDepth depth) const {
+    if (depth >= cfg_.max_depth) return -lam * env.exit_cost(loc.pt);  // same-domain PlyDepth compare
 
     // Actions compatible with the determinization at this node: every legal action is compatible
     // (its observation is simply resolved by `world`); TERMINATE is always legal. The slot order is
@@ -107,7 +112,7 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
     // order Python builds `actions = list(legal) + [TERMINATE]`.
     std::vector<Action> actions = env.legal_actions(bw, collected);
     actions.push_back(terminate_action());
-    std::vector<int> slots;
+    std::vector<SlotIndex> slots;
     slots.reserve(actions.size());
     for (const Action& a : actions) slots.push_back(slot_of(env, a));
 
@@ -117,16 +122,17 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
     // most-visited final iterate — so visit_order is appended at the _update site below, NOT here.
     // DENSE, zero-init: `avail[a]++` is the former `avail[a] = avail.count(a) ? avail[a]+1 : 1`
     // (avail[a]==0 <=> absent, so 0->1 on first bump, then increments — bit-identical).
-    for (int a : slots) nodes[node].avail[static_cast<size_t>(a)] += 1;
+    for (SlotIndex a : slots) nodes[node].avail[static_cast<size_t>(a.value())] += VisitCount{1};
 
     // (3) Expansion: if any compatible action is untried here, expand one uniformly. DENSE:
     // visits[a]==0 <=> untried (the former `visits.find(a)==end()`).
-    std::vector<int> untried;
-    for (int a : slots)
-        if (nodes[node].visits[static_cast<size_t>(a)] == 0) untried.push_back(a);
+    std::vector<SlotIndex> untried;
+    for (SlotIndex a : slots)
+        if (nodes[node].visits[static_cast<size_t>(a.value())] == VisitCount{0}) untried.push_back(a);
     if (!untried.empty()) {
+        // expand_index returns a CONTAINER POSITION into `untried` (a raw list index, not a slot).
         int pick = src.expand_index(static_cast<int>(untried.size()));
-        int a = untried[static_cast<size_t>(pick)];
+        SlotIndex a = untried[static_cast<size_t>(pick)];
         Action act = action_of_slot(env, a);
         double ret;
         if (act.kind == ActionKind::Terminate) {
@@ -138,9 +144,9 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
             StepResult sr = env.apply(nloc, nbw, nc, act, world);
             double step = sr.reward - lam * sr.dt;
             // register the successor child (still part of this edge's statistics), then the leaf.
-            std::tuple<int, BeliefKey> ckey{a, env.belief_key(nbw)};
+            std::tuple<SlotIndex, BeliefKey> ckey{a, env.belief_key(nbw)};
             if (nodes[node].children.find(ckey) == nodes[node].children.end()) {
-                nodes.emplace_back(n_action_slots(env));  // dense stats sized to the slot space
+                nodes.emplace_back(n_action_slots(env));  // dense stats sized to the slot space (SlotCount)
                 nodes[node].children[ckey] = static_cast<int>(nodes.size()) - 1;
             }
             double cont = src.leaf_value(nloc, nbw, nc, world, lam);
@@ -151,7 +157,7 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
     }
 
     // (2) Selection: UCB1 with the availability count in the exploration term.
-    int a = ucb_select(nodes[node]);
+    SlotIndex a = ucb_select(nodes[node]);
     Action act = action_of_slot(env, a);
     double ret;
     if (act.kind == ActionKind::Terminate) {
@@ -162,19 +168,19 @@ double ISMCTSPolicy::iterate(const Environment& env, std::vector<ISMCTSNode>& no
         CollectedSet nc = collected;
         StepResult sr = env.apply(nloc, nbw, nc, act, world);
         double step = sr.reward - lam * sr.dt;
-        std::tuple<int, BeliefKey> ckey{a, env.belief_key(nbw)};
+        std::tuple<SlotIndex, BeliefKey> ckey{a, env.belief_key(nbw)};
         auto cit = nodes[node].children.find(ckey);
         int child;
         if (cit == nodes[node].children.end()) {
             // the action edge exists, but this determinization routes to a successor belief not yet
             // seen — create that child node (still part of the same edge's statistics).
-            nodes.emplace_back(n_action_slots(env));  // dense stats sized to the slot space
+            nodes.emplace_back(n_action_slots(env));  // dense stats sized to the slot space (SlotCount)
             child = static_cast<int>(nodes.size()) - 1;
             nodes[node].children[ckey] = child;
         } else {
             child = cit->second;
         }
-        double cont = iterate(env, nodes, child, nloc, nbw, nc, world, lam, src, depth + 1);
+        double cont = iterate(env, nodes, child, nloc, nbw, nc, world, lam, src, depth + SearchRep{1});
         ret = step + cont;
     }
     update_node(nodes[node], a, ret);  // _update(node, a, ret)
@@ -187,11 +193,11 @@ Action ISMCTSPolicy::run_search(const Environment& env, const Loc& loc,
                                 double lam, ISMCTSSource& src) const {
     if (env.empty(bw)) return terminate_action();  // mirrors decide's len(bw)==0 -> TERMINATE
     std::vector<ISMCTSNode> nodes;
-    nodes.emplace_back(n_action_slots(env));  // the root (index 0); dense stats sized to the slot space
-    for (int i = 0; i < cfg_.iterations; ++i) {
-        uint32_t w = src.sample_world(bw);  // (1) determinize: one world ~ belief
-        CollectedSet coll = collected;      // _iterate mutates a fresh collected-set per iteration
-        iterate(env, nodes, 0, loc, bw, coll, w, lam, src, 0);
+    nodes.emplace_back(n_action_slots(env));  // the root (arena index 0); dense stats sized to the slot space
+    for (SimBudget i{0}; i < cfg_.iterations; i += SimBudget{1}) {  // the determinized-walk budget loop
+        World w = src.sample_world(bw);  // (1) determinize: one world ~ belief
+        CollectedSet coll = collected;   // _iterate mutates a fresh collected-set per iteration
+        iterate(env, nodes, 0, loc, bw, coll, w, lam, src, PlyDepth{0});
     }
     // (final) most-visited root action; TERMINATE if nothing was tried. First-wins tie over INSERTION
     // order (mirrors max(root.visits, key=...) which keeps the first max). DENSE: "nothing was tried" is
@@ -199,17 +205,20 @@ Action ISMCTSPolicy::run_search(const Environment& env, const Loc& loc,
     // meant the MAP had no key, i.e. no slot was ever inserted — exactly visit_order being empty).
     const ISMCTSNode& root = nodes[0];
     if (root.visit_order.empty()) return terminate_action();
-    int best_slot = -1;
-    int best_visits = -1;
-    for (int a : root.visit_order) {
-        if (root.visits[static_cast<size_t>(a)] == 0) continue;  // an avail-only arm never selected: skip
-        if (root.visits[static_cast<size_t>(a)] > best_visits) {  // strict >: first arm wins a tie
-            best_visits = root.visits[static_cast<size_t>(a)];
+    std::optional<SlotIndex> best_slot;  // typed absence: no -1 sentinel for "no most-visited arm yet"
+    VisitCount best_visits{0};           // a real visit count strictly exceeds the 0 floor (was the -1 sentinel)
+    bool seen = false;                   // distinguishes "no arm yet" from "best is 0" (the former -1 < 0)
+    for (SlotIndex a : root.visit_order) {
+        VisitCount v = root.visits[static_cast<size_t>(a.value())];
+        if (v == VisitCount{0}) continue;  // an avail-only arm never selected: skip
+        if (!seen || v > best_visits) {    // strict >: first arm wins a tie (the former best_visits=-1 init)
+            best_visits = v;
             best_slot = a;
+            seen = true;
         }
     }
-    assert(best_slot != -1 && "non-empty visits but no most-visited arm");
-    return action_of_slot(env, best_slot);
+    assert(best_slot.has_value() && "non-empty visits but no most-visited arm");
+    return action_of_slot(env, *best_slot);
 }
 
 namespace {
@@ -225,12 +234,12 @@ class RngISMCTSSource final : public ISMCTSSource {
     uint32_t sample_world(const Belief& bw) override { return draw_.sample_world(bw); }
 
     int expand_index(int n) override {
-        std::uniform_int_distribution<int> pick(0, n - 1);  // mirrors int(rng.integers(n))
+        std::uniform_int_distribution<int> pick(0, n - 1);  // mirrors int(rng.integers(n)); n is a list len
         return pick(rng_);
     }
 
     double leaf_value(const Loc& loc, const Belief& bw,
-                      const CollectedSet& collected, uint32_t world, double lam) override {
+                      const CollectedSet& collected, World world, double lam) override {
         return base_value(env_, base_, loc, bw, collected, world, lam);  // shared leaf utility (P1)
     }
 

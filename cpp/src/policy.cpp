@@ -24,11 +24,13 @@ ActionAndPi Policy::decide_target(const Environment& env, const Loc& loc, const 
                                   const CollectedSet& collected, double lam,
                                   std::mt19937_64& rng) const {
     Action action = decide(env, loc, bw, collected, lam, rng);
-    std::vector<float> pi(static_cast<size_t>(n_action_slots(env)), 0.0f);
+    // n_action_slots -> SlotCount, action_to_slot/term_slot -> SlotIndex (features.hpp, typed). The dense
+    // PI vector is sized/indexed via .value() — the typed slot -> container-index ACL.
+    std::vector<float> pi(static_cast<size_t>(n_action_slots(env).value()), 0.0f);
     std::vector<Action> legal = env.legal_actions(bw, collected);
     const float u = 1.0f / static_cast<float>(legal.size() + 1);  // legal + TERMINATE
-    for (const Action& a : legal) pi[static_cast<size_t>(action_to_slot(env, a))] = u;
-    pi[static_cast<size_t>(term_slot(env))] = u;
+    for (const Action& a : legal) pi[static_cast<size_t>(action_to_slot(env, a).value())] = u;
+    pi[static_cast<size_t>(term_slot(env).value())] = u;
     return ActionAndPi{action, std::move(pi)};
 }
 
@@ -39,12 +41,15 @@ Action GreedyBase::decide(const Environment& env, const Loc& loc, const Belief& 
     std::vector<double> marg = env.marginals(bw);
     double best = 0.0;
     Action act = terminate_action();
-    for (int i = 0; i < env.N(); ++i) {
-        if (collected.contains(i) || marg[i] <= 0.0) continue;
-        double s = marg[i] * env.value(i) - lam * env.dist(loc.pt, env.treasure_pt(i));
+    // `i` walks the TreasureId domain [0, N). env.N()/value/treasure_pt + Action.i are the out-of-scope
+    // raw-int env/Action boundary, so the id crosses via .value() at each env call (the named ACL); the
+    // typed CollectedSet::contains(TreasureId) takes the id directly (collected_set.hpp).
+    for (TreasureId i{0}; i.value() < static_cast<TreasureRep>(env.N()); i = i + TreasureRep{1}) {
+        if (collected.contains(i) || marg[i.value()] <= 0.0) continue;
+        double s = marg[i.value()] * env.value(i.value()) - lam * env.dist(loc.pt, env.treasure_pt(i.value()));
         if (s > best) {  // strict >: first treasure wins a tie (matches Python's `if s > best`)
             best = s;
-            act = Action{ActionKind::Treasure, i};
+            act = Action{ActionKind::Treasure, static_cast<int>(i.value())};
         }
     }
     return act;
@@ -62,14 +67,16 @@ Action GreedyStopBase::decide(const Environment& env, const Loc& loc,
     double cur_exit = env.exit_cost(loc.pt);  // exit(here)
     double best = 0.0;
     Action act = terminate_action();
-    for (int i = 0; i < env.N(); ++i) {
-        if (collected.contains(i) || marg[i] <= 0.0) continue;
-        double go = env.dist(loc.pt, env.treasure_pt(i));            // go_there = d(loc, ("t", i))
+    // `i` walks the TreasureId domain [0, N); the env/Action raw-int boundary takes .value() (the named ACL).
+    for (TreasureId i{0}; i.value() < static_cast<TreasureRep>(env.N()); i = i + TreasureRep{1}) {
+        if (collected.contains(i) || marg[i.value()] <= 0.0) continue;
+        double go = env.dist(loc.pt, env.treasure_pt(i.value()));    // go_there = d(loc, ("t", i))
         // exit(there) = exit_cost(("t", i)) = exit_cost from the treasure's coordinate.
-        double net = marg[i] * env.value(i) - lam * (go + env.exit_cost(env.treasure_pt(i)) - cur_exit);
+        double net = marg[i.value()] * env.value(i.value()) -
+                     lam * (go + env.exit_cost(env.treasure_pt(i.value())) - cur_exit);
         if (net > best) {  // strict >: first treasure wins a tie (matches Python's `if net > best`)
             best = net;
-            act = Action{ActionKind::Treasure, i};
+            act = Action{ActionKind::Treasure, static_cast<int>(i.value())};
         }
     }
     return act;
@@ -83,36 +90,40 @@ std::vector<Action> candidate_actions(const Environment& env, const Loc& loc,
     std::vector<double> marg = env.marginals(bw);
 
     // nearest `n_det` still-informative detectors by env.dist(loc, ("d", i)); stable on face id
-    // (Python's `sorted` is stable, so a distance tie keeps ascending-id order).
-    std::vector<int> dets;
-    for (int i = 0; i < env.n_detectors(); ++i)
-        if (env.informative(i, bw)) dets.push_back(i);
-    std::stable_sort(dets.begin(), dets.end(), [&](int a, int b) {
-        return env.dist(loc.pt, env.face_pt(a)) < env.dist(loc.pt, env.face_pt(b));
+    // (Python's `sorted` is stable, so a distance tie keeps ascending-id order). `i` walks the FaceId
+    // domain [0, nD); env.n_detectors/informative/face_pt are the raw-int boundary (.value() ACL). The
+    // caps n_det/n_tre stay raw int — they are the caller's (nmcs) branching budget, not a domain quantity.
+    std::vector<FaceId> dets;
+    for (FaceId i{0}; i.value() < static_cast<GeometryIdRep>(env.n_detectors()); i = i + GeometryIdRep{1})
+        if (env.informative(static_cast<int>(i.value()), bw)) dets.push_back(i);
+    std::stable_sort(dets.begin(), dets.end(), [&](FaceId a, FaceId b) {
+        return env.dist(loc.pt, env.face_pt(a.value())) < env.dist(loc.pt, env.face_pt(b.value()));
     });
-    if (static_cast<int>(dets.size()) > n_det) dets.resize(n_det);
+    if (static_cast<int>(dets.size()) > n_det) dets.resize(static_cast<size_t>(n_det));
 
     // nearest `n_tre` uncollected, marg>0 treasures by env.dist(loc, ("t", i)); stable on treasure id.
-    std::vector<int> tres;
-    for (int i = 0; i < env.N(); ++i)
-        if (!collected.contains(i) && marg[i] > 0.0) tres.push_back(i);
-    std::stable_sort(tres.begin(), tres.end(), [&](int a, int b) {
-        return env.dist(loc.pt, env.treasure_pt(a)) < env.dist(loc.pt, env.treasure_pt(b));
+    // `i` walks the TreasureId domain [0, N); CollectedSet::contains takes the typed id directly.
+    std::vector<TreasureId> tres;
+    for (TreasureId i{0}; i.value() < static_cast<TreasureRep>(env.N()); i = i + TreasureRep{1})
+        if (!collected.contains(i) && marg[i.value()] > 0.0) tres.push_back(i);
+    std::stable_sort(tres.begin(), tres.end(), [&](TreasureId a, TreasureId b) {
+        return env.dist(loc.pt, env.treasure_pt(a.value())) < env.dist(loc.pt, env.treasure_pt(b.value()));
     });
-    if (static_cast<int>(tres.size()) > n_tre) tres.resize(n_tre);
+    if (static_cast<int>(tres.size()) > n_tre) tres.resize(static_cast<size_t>(n_tre));
 
-    // order: detectors, then treasures, then (optionally) TERMINATE (matches candidate_actions).
+    // order: detectors, then treasures, then (optionally) TERMINATE (matches candidate_actions). Action.i
+    // is the env's bare-int field (a face id for Detector, a treasure id for Treasure) — the .value() ACL.
     std::vector<Action> cands;
     cands.reserve(dets.size() + tres.size() + (include_terminate ? 1u : 0u));
-    for (int i : dets) cands.push_back(Action{ActionKind::Detector, i});
-    for (int i : tres) cands.push_back(Action{ActionKind::Treasure, i});
+    for (FaceId i : dets) cands.push_back(Action{ActionKind::Detector, static_cast<int>(i.value())});
+    for (TreasureId i : tres) cands.push_back(Action{ActionKind::Treasure, static_cast<int>(i.value())});
     if (include_terminate) cands.push_back(terminate_action());
     return cands;
 }
 
 // ---- base_value: play the base to the end in a fixed world (mirrors solvers.base._base_value) -----
 double base_value(const Environment& env, const Policy& base, Loc loc, Belief bw,
-                  CollectedSet collected, uint32_t world, double lam) {
+                  CollectedSet collected, World world, double lam) {
     double R = 0.0, T = 0.0;
     // env.max_steps() is the single episode-horizon home (mirrors _base_value's range(env.max_steps)),
     // read from the env so a playout's horizon cannot silently desync from the Python env's.

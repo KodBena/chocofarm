@@ -119,7 +119,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     chocofarm::Environment env(*inst);
-    DetNet net(chocofarm::n_action_slots(env));
+    // n_action_slots returns the typed SlotCount; DetNet (a proto-local test net) sizes its logit vector
+    // from a raw int — unwrap at this crossing (ADR-0000 item 5: a named, visible raw<->domain crossing).
+    DetNet net(static_cast<int>(chocofarm::n_action_slots(env).value()));
 
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();

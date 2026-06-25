@@ -98,7 +98,9 @@ struct ParseError {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto n = parse_long(*v);
             if (!n || *n < 1) return std::unexpected(ParseError{"--threads must be an integer >= 1"});
-            cfg.n_threads = static_cast<int>(*n);
+            // CLI ACL: validated-positive long -> ThreadCount via the explicit ctor (the >= 1 invariant the
+            // typed count assumes is established HERE, at the boundary, before the narrow to u32).
+            cfg.n_threads = tlab::ThreadCount{static_cast<std::uint32_t>(*n)};
         } else if (flag == "--rate") {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto r = parse_double(*v);
@@ -108,12 +110,14 @@ struct ParseError {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto b = parse_long(*v);
             if (!b || *b < 1) return std::unexpected(ParseError{"--rows must be an integer >= 1"});
-            cfg.rows_per_batch = static_cast<tlab::wire::count_t>(*b);
+            // CLI ACL: validated-positive long -> wire::RowCount (explicit ctor at the count_t narrow).
+            cfg.rows_per_batch = tlab::wire::RowCount{static_cast<tlab::wire::count_t>(*b)};
         } else if (flag == "--in-dim") {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto d = parse_long(*v);
             if (!d || *d < 1) return std::unexpected(ParseError{"--in-dim must be an integer >= 1"});
-            cfg.in_dim = static_cast<tlab::wire::count_t>(*d);
+            // CLI ACL: validated-positive long -> wire::FeatureDim (explicit ctor at the count_t narrow).
+            cfg.in_dim = tlab::wire::FeatureDim{static_cast<tlab::wire::count_t>(*d)};
         } else if (flag == "--seconds") {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto s = parse_double(*v);
@@ -131,18 +135,25 @@ struct ParseError {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto ms = parse_long(*v);
             if (!ms) return std::unexpected(ParseError{"--recv-timeout-ms must be an integer"});
-            cfg.recv_timeout_ms = static_cast<int>(*ms);
+            // CLI ACL: a value <= 0 is the "block forever" case -> empty OptMilliseconds (typed absence,
+            // ADR-0002), never a sign sentinel threaded onward; a positive ms -> Milliseconds via the ctor.
+            cfg.recv_timeout_ms = (*ms <= 0)
+                ? tlab::OptMilliseconds{}
+                : tlab::OptMilliseconds{tlab::Milliseconds{static_cast<std::uint32_t>(*ms)}};
         } else if (flag == "--send-queue-mb") {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto mb = parse_long(*v);
             if (!mb || *mb < 16 || *mb > 1024)
                 return std::unexpected(ParseError{"--send-queue-mb must be an integer in [16, 1024] (<=1G)"});
-            cfg.send_queue_bytes = static_cast<std::size_t>(*mb) << 20;
+            // CLI ACL: validated MB -> ByteCount via the explicit *<<20 (MB->bytes) crossing.
+            cfg.send_queue_bytes = tlab::ByteCount{static_cast<std::size_t>(*mb) << 20};
         } else if (flag == "--low-prio-thread") {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto k = parse_long(*v);
             if (!k || *k < 0) return std::unexpected(ParseError{"--low-prio-thread must be an integer >= 0"});
-            cfg.low_prio_thread = static_cast<int>(*k);
+            // CLI ACL: a present, validated-nonnegative index -> OptThreadIndex (the legacy -1 "none" is the
+            // DEFAULT empty optional, never reached here — passing the flag means a designated thread, ADR-0002).
+            cfg.low_prio_thread = tlab::ThreadIndex{static_cast<std::uint32_t>(*k)};
         } else if (flag == "--low-prio-nice") {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto n = parse_long(*v);
@@ -198,10 +209,11 @@ int main(int argc, char** argv) {
     const tlab::ProducerConfig cfg = *parsed;
 
     // Echo the run configuration so the report is self-describing (what was REQUESTED, next to ACHIEVED).
+    // ostream ACL: unwrap the typed quantities to their reps for the human-/harness-readable line.
     std::cout << "tlab-producer: topology=" << topology_name(cfg.topology)
-              << " mode=" << mode_name(cfg.mode) << " threads=" << cfg.n_threads
-              << " rate=" << cfg.target_rate_hz << "hz/thread rows=" << cfg.rows_per_batch
-              << " in_dim=" << cfg.in_dim << " seconds=" << cfg.run_seconds
+              << " mode=" << mode_name(cfg.mode) << " threads=" << cfg.n_threads.value()
+              << " rate=" << cfg.target_rate_hz << "hz/thread rows=" << cfg.rows_per_batch.value()
+              << " in_dim=" << cfg.in_dim.value() << " seconds=" << cfg.run_seconds
               << " endpoint=" << cfg.endpoint << "\n";
 
     auto result = tlab::run_producer(cfg);

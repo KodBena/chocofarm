@@ -76,6 +76,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 
 namespace chocofarm {
@@ -103,29 +104,32 @@ const Mutate kMutate = read_mutate();  // read once (a process-lifetime test sea
 // precision Python's float32 root.prior carries, the byte-faithful production path. (The retired
 // CHOCO_GUMBEL_UNIFORM=1 control once routed these through a full-float64 `node.prior_d`; that arm and
 // its member were removed on experiment/drop-prior-d — see the header note.)
-[[nodiscard]] double prior_value(const GumbelNode& node, int s) {
-    return static_cast<double>(node.prior[static_cast<size_t>(s)]);
+[[nodiscard]] double prior_value(const GumbelNode& node, SlotIndex s) {
+    return static_cast<double>(node.prior[static_cast<size_t>(s.value())]);  // .value() = index->size_t ACL
 }
 }  // namespace
 
 namespace {
 // Reconstruct an Action from its slot (the inverse of action_to_slot). Slot 0..N-1 = ("t", i);
 // N..N+nD-1 = ("d", j); N+nD = TERMINATE.
-[[nodiscard]] Action action_of_slot(const Environment& env, int slot) {
-    if (slot < env.N()) return Action{ActionKind::Treasure, slot};
-    if (slot < env.N() + env.n_detectors()) return Action{ActionKind::Detector, slot - env.N()};
+// ACL: Action.i is a raw int (env.hpp, out of scope) carrying a treasure/face id; env.N()/n_detectors()
+// return raw int. slot.value() crosses SlotIndex->raw at the kind decision + the detector-offset subtract.
+[[nodiscard]] Action action_of_slot(const Environment& env, SlotIndex slot) {
+    const int s = static_cast<int>(slot.value());
+    if (s < env.N()) return Action{ActionKind::Treasure, s};
+    if (s < env.N() + env.n_detectors()) return Action{ActionKind::Detector, s - env.N()};
     return terminate_action();
 }
 
 // The σ-transform scale prefactor (mirrors value_target.sigma_scale): (c_visit + max_a N(a))·c_scale.
 // max over visited legal slots. INTEGER max-reduction — robust, precision-independent.
 [[nodiscard]] double sigma_scale_1a(const GumbelNode& node, double c_visit, double c_scale) {
-    int max_n = 0;
-    for (int s : node.legal_slots) {
-        const int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (the former N.find==end branch)
+    VisitCount max_n{0};
+    for (SlotIndex s : node.legal_slots) {
+        const VisitCount n = node.N[static_cast<size_t>(s.value())];  // 0 if unvisited (former N.find==end)
         if (n > max_n) max_n = n;
     }
-    return (c_visit + static_cast<double>(max_n)) * c_scale;
+    return (c_visit + static_cast<double>(max_n.value())) * c_scale;
 }
 
 // The Danihelka §3 value-completion v_mix for unvisited actions (mirrors value_target.v_mix):
@@ -141,14 +145,14 @@ namespace {
 // v_mix carries when it flows into the f64 `logits[s] + σ·vm` add downstream. (The retired kUniform
 // control once ran a full-`double` path here; that arm was removed on experiment/drop-prior-d.)
 [[nodiscard]] double v_mix_mixed(const GumbelNode& node, double root_value) {
-    long sum_n = 0;
+    VisitCount sum_n{0};  // ΣN over visited legal slots (the one-home for the former `long sum_n`)
     // mixed precision (production): float32 prior-weighted blend, byte-faithful to numpy's weak promotion.
     float pw_num = 0.0f, pw_den = 0.0f;
-    for (int s : node.legal_slots) {
-        int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
-        if (n > 0) {
+    for (SlotIndex s : node.legal_slots) {
+        VisitCount n = node.N[static_cast<size_t>(s.value())];  // 0 if unvisited (dense; former N.find==end -> 0)
+        if (n > VisitCount{0}) {
             sum_n += n;
-            float p = node.prior[static_cast<size_t>(s)];               // the stored float32 prior
+            float p = node.prior[static_cast<size_t>(s.value())];      // the stored float32 prior
             // numpy `f32 * pyfloat → f32` casts the WEAK Python operand to float32 FIRST, then
             // multiplies in float32 (verified: cast-first, NOT a f64 multiply narrowed). Mirror it by
             // casting `q` to float before the multiply, so the product is computed in true float32.
@@ -156,13 +160,14 @@ namespace {
             pw_den += p;                                                // pyfloat(0) += f32 → f32
         }
     }
-    if (sum_n > 0 && pw_den > 0.0f) {
+    if (sum_n > VisitCount{0} && pw_den > 0.0f) {
         float v_bar = pw_num / pw_den;                                  // f32 / f32 → f32
         // numpy weak-promotes the Python-float `root_value` to float32 BEFORE the add (verified:
         // `pyfloat + f32` casts the weak operand to f32 first, then adds in f32 — NOT f64-then-narrow).
         float rv = static_cast<float>(root_value);
-        float vmix = (rv + static_cast<float>(sum_n) * v_bar)          // f32 + (pyint*f32→f32) → f32
-                     / (1.0f + static_cast<float>(sum_n));             // / (pyint) → f32
+        float sn = static_cast<float>(sum_n.value());                  // VisitCount->float (the count value)
+        float vmix = (rv + sn * v_bar)                                 // f32 + (pyint*f32→f32) → f32
+                     / (1.0f + sn);                                    // / (pyint) → f32
         return static_cast<double>(vmix);                             // lossless widen for the f64 add
     }
     return root_value;
@@ -179,25 +184,25 @@ namespace {
 // per-leaf evaluate() prior build through here; the per-decision improved_policy keeps the value-returning
 // form (one alloc per decision, not per leaf).
 void masked_softmax_1a_into(const std::vector<double>& completed,
-                            std::span<const int> legal_slots, int n_slots,
+                            std::span<const SlotIndex> legal_slots, SlotCount n_slots,
                             std::vector<double>& out) {
-    out.assign(static_cast<size_t>(n_slots), 0.0);
+    out.assign(static_cast<size_t>(n_slots.value()), 0.0);  // .value() = slot-count->size_t ACL
     if (legal_slots.empty()) return;
     double row_max = -std::numeric_limits<double>::infinity();
-    for (int s : legal_slots) row_max = std::max(row_max, completed[static_cast<size_t>(s)]);
+    for (SlotIndex s : legal_slots) row_max = std::max(row_max, completed[static_cast<size_t>(s.value())]);
     double denom = 0.0;
-    for (int s : legal_slots) {
-        double e = std::exp(completed[static_cast<size_t>(s)] - row_max);
-        out[static_cast<size_t>(s)] = e;
+    for (SlotIndex s : legal_slots) {
+        double e = std::exp(completed[static_cast<size_t>(s.value())] - row_max);
+        out[static_cast<size_t>(s.value())] = e;
         denom += e;
     }
     if (denom <= 0.0) denom = 1.0;
-    for (int s : legal_slots) out[static_cast<size_t>(s)] /= denom;
+    for (SlotIndex s : legal_slots) out[static_cast<size_t>(s.value())] /= denom;
 }
 
 [[nodiscard]] std::vector<double> masked_softmax_1a(const std::vector<double>& completed,
-                                                    std::span<const int> legal_slots,
-                                                    int n_slots) {
+                                                    std::span<const SlotIndex> legal_slots,
+                                                    SlotCount n_slots) {
     std::vector<double> out;
     masked_softmax_1a_into(completed, legal_slots, n_slots, out);
     return out;
@@ -247,26 +252,28 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
     // leaves run sequentially, each parked fiber has its OWN ws_). `assign` re-fills the whole slot space
     // with the -1e30 illegal sentinel, byte-identical to the former fresh `vector(n_slots_, -1e30)`.
     std::vector<double>& logits_d = ws_.logits_d;
-    logits_d.assign(static_cast<size_t>(n_slots_), -1e30);
+    logits_d.assign(static_cast<size_t>(n_slots_.value()), -1e30);  // .value() = slot-count->size_t ACL
     // collect the legal slots from the MASK (the available/informative blocks build() already produced
     // — no second env.legal_actions → marginals sweep). Treasure slots 0..N-1 then detector slots
     // N..N+nD-1 (id order), then TERMINATE — the SAME order env.legal_actions yields (available = the
     // collect test, informative = env.informative), so node.legal_slots is bit-identical.
+    // ACL: env.N()/n_detectors() are raw int (env.hpp); the mask is a raw-slot-position float vector. The
+    // treasure slot i and detector slot N+j cross raw->SlotIndex at the push (the slot bijection's legs).
     node.legal_slots.clear();
     const int N = env_.N(), nD = env_.n_detectors();
     for (int i = 0; i < N; ++i)
-        if (mask[static_cast<size_t>(i)] != 0.0f) node.legal_slots.push_back(i);
+        if (mask[static_cast<size_t>(i)] != 0.0f) node.legal_slots.push_back(SlotIndex{static_cast<LayoutRep>(i)});
     for (int j = 0; j < nD; ++j)
-        if (mask[static_cast<size_t>(N + j)] != 0.0f) node.legal_slots.push_back(N + j);
+        if (mask[static_cast<size_t>(N + j)] != 0.0f) node.legal_slots.push_back(SlotIndex{static_cast<LayoutRep>(N + j)});
     node.legal_slots.push_back(term_slot_);  // TERMINATE is always legal
     // build the masked-softmax prior from the net logits. The net carries n_slots logits (the policy
     // head emits over the full slot space); illegal slots are masked.
-    for (int s : node.legal_slots) {
+    for (SlotIndex s : node.legal_slots) {
         // np.logits may be empty (value-only net) — in 1a the scripted leaf always carries logits; a
         // production value-only net would need a uniform prior, but the AZ search requires a policy head
         // (mirrors predict_both's n_actions assert), so we read the logit directly.
         assert(!np.logits.empty() && "gumbel: net has no policy head (logits empty)");
-        logits_d[static_cast<size_t>(s)] = static_cast<double>(np.logits[static_cast<size_t>(s)]);
+        logits_d[static_cast<size_t>(s.value())] = static_cast<double>(np.logits[static_cast<size_t>(s.value())]);
     }
     // build the masked-softmax prior into the policy's per-leaf scratch (P9), then move it onto the node:
     // the value is byte-identical to the former fresh-vector masked_softmax_1a, but the per-leaf heap
@@ -278,9 +285,9 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
     // per-node 65-double pmr alloc + .assign that the production path never read, finding #32; that
     // member was removed wholesale on experiment/drop-prior-d, so this is now a single store.)
     const std::vector<double>& prior_f64 = ws_.prior_scratch;
-    node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
-    for (int s = 0; s < n_slots_; ++s)
-        node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_f64[static_cast<size_t>(s)]);
+    node.prior.assign(static_cast<size_t>(n_slots_.value()), 0.0f);
+    for (size_t s = 0; s < static_cast<size_t>(n_slots_.value()); ++s)
+        node.prior[s] = static_cast<float>(prior_f64[s]);  // dense per-slot float32 narrowing (raw row index)
 
     node.value = static_cast<double>(np.value);
     node.evaluated = true;
@@ -303,11 +310,11 @@ std::span<const float> GumbelAZPolicy::eval_build_features(GumbelNode& node, con
     fb_.legal_mask_into(feat, ws.mask);
     const std::vector<float>& mask = ws.mask;
     node.legal_slots.clear();
-    const int N = env_.N(), nD = env_.n_detectors();
+    const int N = env_.N(), nD = env_.n_detectors();  // ACL: env cardinalities raw int (env.hpp)
     for (int i = 0; i < N; ++i)
-        if (mask[static_cast<size_t>(i)] != 0.0f) node.legal_slots.push_back(i);
+        if (mask[static_cast<size_t>(i)] != 0.0f) node.legal_slots.push_back(SlotIndex{static_cast<LayoutRep>(i)});
     for (int j = 0; j < nD; ++j)
-        if (mask[static_cast<size_t>(N + j)] != 0.0f) node.legal_slots.push_back(N + j);
+        if (mask[static_cast<size_t>(N + j)] != 0.0f) node.legal_slots.push_back(SlotIndex{static_cast<LayoutRep>(N + j)});
     node.legal_slots.push_back(term_slot_);  // TERMINATE is always legal
     return feat;
 }
@@ -325,15 +332,15 @@ std::span<const float> GumbelAZPolicy::eval_build_features(GumbelNode& node, con
 // IDENTICAL: same masked_softmax_1a_into, same per-element float32 store; only the buffers are reused.
 void GumbelAZPolicy::eval_finish(GumbelNode& node, const NetPrediction& np, FeatureWorkspace& ws) const {
     std::vector<double>& logits_d = ws.logits_d;
-    logits_d.assign(static_cast<size_t>(n_slots_), -1e30);
-    for (int s : node.legal_slots) {
+    logits_d.assign(static_cast<size_t>(n_slots_.value()), -1e30);
+    for (SlotIndex s : node.legal_slots) {
         assert(!np.logits.empty() && "gumbel(cursor): net has no policy head (logits empty)");
-        logits_d[static_cast<size_t>(s)] = static_cast<double>(np.logits[static_cast<size_t>(s)]);
+        logits_d[static_cast<size_t>(s.value())] = static_cast<double>(np.logits[static_cast<size_t>(s.value())]);
     }
     masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, ws.prior_scratch);
-    node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
-    for (int s = 0; s < n_slots_; ++s)
-        node.prior[static_cast<size_t>(s)] = static_cast<float>(ws.prior_scratch[static_cast<size_t>(s)]);
+    node.prior.assign(static_cast<size_t>(n_slots_.value()), 0.0f);
+    for (size_t s = 0; s < static_cast<size_t>(n_slots_.value()); ++s)
+        node.prior[s] = static_cast<float>(ws.prior_scratch[s]);  // dense per-slot float32 narrowing (raw row index)
     node.value = static_cast<double>(np.value);
     node.evaluated = true;
 }
@@ -342,35 +349,37 @@ double GumbelAZPolicy::sh_cut_sigma(const GumbelNode& root) const {
     return sigma_scale_1a(root, cfg_.c_visit, cfg_.c_scale);
 }
 
-double GumbelAZPolicy::root_logit(const GumbelNode& root, int s) const {
+double GumbelAZPolicy::root_logit(const GumbelNode& root, SlotIndex s) const {
     return std::log(std::max(prior_value(root, s), 1e-12));
 }
 
 // ---- AlphaZero PUCT select (mirrors _puct_select) -------------------------------------------------
-int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
+SlotIndex GumbelAZPolicy::puct_select(const GumbelNode& node) const {
     // total_n = ΣN over the slot space. The former std::map held ONLY visited slots; the dense vector holds
     // ALL slots with unvisited == 0, so summing the whole vector gives the IDENTICAL total (the 0 entries
-    // add nothing). Order-independent either way (a sum).
-    int total_n = 0;
-    for (int n : node.N) total_n += n;
-    double sqrt_total = (total_n > 0) ? std::sqrt(static_cast<double>(total_n)) : 1.0;
+    // add nothing). Order-independent either way (a sum). VisitCount is additive (a count + a count).
+    VisitCount total_n{0};
+    for (VisitCount n : node.N) total_n += n;
+    double sqrt_total = (total_n > VisitCount{0}) ? std::sqrt(static_cast<double>(total_n.value())) : 1.0;
     double base_v = node.value;  // unvisited Q completed by the node's own net value
-    int best_a = -1;
+    std::optional<SlotIndex> best_a;  // typed absence over the -1 "no best slot" sentinel (ADR-0002)
     double best_v = -std::numeric_limits<double>::infinity();
     // iterate node.legal_slots (the env-order list), strict `>` first-wins — mirrors Python's loop over
     // node.legal with `if v > best_v`, never the std::map's sorted-key order.
-    for (int s : node.legal_slots) {
-        int n = node.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
-        double q = (n > 0) ? (node.W[static_cast<size_t>(s)] / static_cast<double>(n)) : base_v;
+    for (SlotIndex s : node.legal_slots) {
+        VisitCount n = node.N[static_cast<size_t>(s.value())];  // 0 if unvisited (dense; former N.find==end -> 0)
+        double q = (n > VisitCount{0})
+                       ? (node.W[static_cast<size_t>(s.value())] / static_cast<double>(n.value()))
+                       : base_v;
         // 1b SEAM (seam 4): Python computes `q + c_puct·p·√ΣN/(1+n)` with `p` the float32 prior scalar,
         // which numpy weak-promotes through the WHOLE U-term and the `q +` to float32 — so the interior
         // near-tie argmax is decided in FLOAT32 (gumbel_search.py:397-426). Mirror it: cast the Python-
         // float operands to float so each numpy op runs in true float32 (cast-first weak promotion).
         // (The retired kUniform control once ran a full-`double` path here; removed on this branch.)
-        float p = node.prior[static_cast<size_t>(s)];                       // stored float32 prior
+        float p = node.prior[static_cast<size_t>(s.value())];               // stored float32 prior
         float u = static_cast<float>(cfg_.c_puct) * p                        // pyfloat·f32 → f32
                   * static_cast<float>(sqrt_total)                           // ·pyfloat → f32
-                  / (1.0f + static_cast<float>(n));                          // /(pyint) → f32
+                  / (1.0f + static_cast<float>(n.value()));                  // /(pyint) → f32
         float vf = (kMutate == Mutate::Puct)
                        ? (static_cast<float>(q) - u)                         // q(pyfloat) ± f32 → f32
                        : (static_cast<float>(q) + u);
@@ -383,15 +392,17 @@ int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
             best_a = s;
         }
     }
-    assert(best_a != -1 && "puct_select on a node with no legal slots");
-    return best_a;
+    assert(best_a.has_value() && "puct_select on a node with no legal slots");
+    return *best_a;
 }
 
 // ---- interior PUCT descent; net value at the leaf (mirrors _descend) ------------------------------
 double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
                                const Belief& bw, const CollectedSet& collected,
-                               uint32_t world, double lam, GumbelSource& src, int depth) const {
-    if (depth >= cfg_.max_depth || env_.empty(bw)) {
+                               World world, double lam, GumbelSource& src, PlyDepth depth) const {
+    // ACL: cfg_.max_depth is a raw int (GumbelConfig, the CLI-set config) -> PlyDepth at the depth cap.
+    const PlyDepth max_depth{static_cast<SearchRep>(cfg_.max_depth)};
+    if (depth >= max_depth || env_.empty(bw)) {
         if (!nodes[static_cast<size_t>(node)].evaluated) {
             if (env_.empty(bw)) return -lam * env_.exit_cost(loc.pt);
             return evaluate(nodes[static_cast<size_t>(node)], loc, bw, collected);
@@ -403,7 +414,7 @@ double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
         return evaluate(nodes[static_cast<size_t>(node)], loc, bw, collected);
     }
 
-    int a = puct_select(nodes[static_cast<size_t>(node)]);
+    SlotIndex a = puct_select(nodes[static_cast<size_t>(node)]);
     Action act = action_of_slot(env_, a);
     double ret;
     if (act.kind == ActionKind::Terminate) {
@@ -412,9 +423,9 @@ double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
         Loc nloc = loc;  // COPY: apply computes dt = dist(OLD loc, target) then moves nloc to target
         Belief nbw = bw;
         CollectedSet nc = collected;
-        StepResult sr = env_.apply(nloc, nbw, nc, act, world);
+        StepResult sr = env_.apply(nloc, nbw, nc, act, world);  // World == uint32_t (env.apply ACL)
         double step = sr.reward - lam * sr.dt;
-        std::tuple<int, GBeliefKey> ckey{a, gumbel_belief_key(env_, nbw)};
+        std::tuple<SlotIndex, GBeliefKey> ckey{a, gumbel_belief_key(env_, nbw)};
         auto& cur = nodes[static_cast<size_t>(node)];
         int child;
         auto cit = cur.children.find(ckey);
@@ -425,33 +436,36 @@ double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
         } else {
             child = cit->second;
         }
-        double cont = descend(nodes, child, nloc, nbw, nc, world, lam, src, depth + 1);
+        double cont = descend(nodes, child, nloc, nbw, nc, world, lam, src,
+                              depth + SearchRep{1});  // PlyDepth affine: depth + 1 ply
         ret = step + cont;
     }
     auto& cur = nodes[static_cast<size_t>(node)];
-    cur.W[static_cast<size_t>(a)] += ret;  // dense, zero-init: += is the former (count?W[a]:0)+ret
-    cur.N[static_cast<size_t>(a)] += 1;    // dense, zero-init: += is the former (count?N[a]:0)+1
+    cur.W[static_cast<size_t>(a.value())] += ret;       // dense, zero-init: += is the former (count?W[a]:0)+ret
+    cur.N[static_cast<size_t>(a.value())] += VisitCount{1};  // dense, zero-init: += is the former (count?N[a]:0)+1
     return ret;
 }
 
 // ---- one sim of a root action (mirrors _simulate_root_action) -------------------------------------
 double GumbelAZPolicy::simulate_root_action(NodePool& nodes, const Loc& loc,
                                             const Belief& bw,
-                                            const CollectedSet& collected, int slot, uint32_t world,
+                                            const CollectedSet& collected, SlotIndex slot, World world,
                                             double lam, GumbelSource& src) const {
     Action a = action_of_slot(env_, slot);
     if (a.kind == ActionKind::Terminate) return -lam * env_.exit_cost(loc.pt);
     // outcome-averaging over c_outcome determinizations of the IMMEDIATE outcome (k=0 reuses the
-    // threaded world; k>0 draws a fresh world from the belief — mirrors _simulate_root_action).
+    // threaded world; k>0 draws a fresh world from the belief — mirrors _simulate_root_action). k is an
+    // OutcomeIndex (the k==0 reuse vs k>0 redraw distinction); cfg_.c_outcome is a raw int (config ACL).
     double total = 0.0;
-    for (int k = 0; k < cfg_.c_outcome; ++k) {
-        uint32_t w = (k == 0) ? world : src.sample_world(bw);
+    const OutcomeIndex c_outcome{static_cast<SearchRep>(cfg_.c_outcome)};
+    for (OutcomeIndex k{0}; k < c_outcome; k = k + SearchRep{1}) {
+        World w = (k == OutcomeIndex{0}) ? world : src.sample_world(bw);
         Loc nloc = loc;  // COPY: apply computes dt = dist(OLD loc, target) then moves nloc to target
         Belief nbw = bw;
         CollectedSet nc = collected;
         StepResult sr = env_.apply(nloc, nbw, nc, a, w);
         double step = sr.reward - lam * sr.dt;
-        std::tuple<int, GBeliefKey> ckey{slot, gumbel_belief_key(env_, nbw)};
+        std::tuple<SlotIndex, GBeliefKey> ckey{slot, gumbel_belief_key(env_, nbw)};
         int child;
         auto cit = nodes[0].children.find(ckey);
         if (cit == nodes[0].children.end()) {
@@ -461,7 +475,7 @@ double GumbelAZPolicy::simulate_root_action(NodePool& nodes, const Loc& loc,
         } else {
             child = cit->second;
         }
-        double cont = descend(nodes, child, nloc, nbw, nc, w, lam, src, 1);
+        double cont = descend(nodes, child, nloc, nbw, nc, w, lam, src, PlyDepth{1});
         total += step + cont;
     }
     return total / static_cast<double>(cfg_.c_outcome);
@@ -469,43 +483,51 @@ double GumbelAZPolicy::simulate_root_action(NodePool& nodes, const Loc& loc,
 
 // ---- run `count` sims of root action `slot` (mirrors _visit) --------------------------------------
 void GumbelAZPolicy::visit(NodePool& nodes, const Loc& loc,
-                           const Belief& bw, const CollectedSet& collected, int slot,
-                           double lam, GumbelSource& src, int count) const {
-    for (int i = 0; i < count; ++i) {
-        uint32_t w = src.sample_world(bw);
+                           const Belief& bw, const CollectedSet& collected, SlotIndex slot,
+                           double lam, GumbelSource& src, SimBudget count) const {
+    for (SimBudget i{0}; i < count; i = i + SimBudget{1}) {  // SimBudget is additive (count accumulates)
+        World w = src.sample_world(bw);
         double ret = simulate_root_action(nodes, loc, bw, collected, slot, w, lam, src);
-        nodes[0].W[static_cast<size_t>(slot)] += ret;  // dense, zero-init: += is the former (count?W:0)+ret
-        nodes[0].N[static_cast<size_t>(slot)] += 1;    // dense, zero-init: += is the former (count?N:0)+1
+        nodes[0].W[static_cast<size_t>(slot.value())] += ret;       // dense, zero-init: former (count?W:0)+ret
+        nodes[0].N[static_cast<size_t>(slot.value())] += VisitCount{1};  // dense, zero-init: former (count?N:0)+1
     }
 }
 
 // ---- Sequential Halving (Danihelka §2) (mirrors _sequential_halving) ------------------------------
-int GumbelAZPolicy::sequential_halving(NodePool& nodes, const Loc& loc,
+SlotIndex GumbelAZPolicy::sequential_halving(NodePool& nodes, const Loc& loc,
                                        const Belief& bw,
                                        const CollectedSet& collected, double lam, GumbelSource& src,
-                                       std::vector<int> considered, const std::vector<double>& g,
-                                       const std::vector<double>& logits, int& n_spent) const {
-    n_spent = 0;
-    if (considered.empty()) return -1;
+                                       std::vector<SlotIndex> considered, const std::vector<double>& g,
+                                       const std::vector<double>& logits, SimBudget& n_spent) const {
+    n_spent = SimBudget{0};
+    // considered is non-empty by the caller's contract (run_search returns early on an empty belief, and a
+    // non-empty belief always has >=1 legal slot => >=1 candidate). The former defensive `return -1` is a
+    // typed-absence non-state now (SlotIndex carries no -1); assert the invariant (ADR-0002/P9 own-state).
+    assert(!considered.empty() && "sequential_halving on an empty candidate set (caller contract)");
+    // ACL: cfg_.n_sims is a raw int (GumbelConfig, CLI-set) -> SimBudget at the budget seed.
+    const SimBudget n_sims{static_cast<SearchRep>(cfg_.n_sims)};
     if (considered.size() == 1) {
-        visit(nodes, loc, bw, collected, considered[0], lam, src, cfg_.n_sims);
-        n_spent = cfg_.n_sims;
+        visit(nodes, loc, bw, collected, considered[0], lam, src, n_sims);
+        n_spent = n_sims;
         return considered[0];
     }
 
-    int m = static_cast<int>(considered.size());
-    int n_phases = std::max(1, static_cast<int>(std::ceil(std::log2(static_cast<double>(m)))));
-    int per_phase = std::max(1, cfg_.n_sims / n_phases);  // paper's N/⌈log2 m⌉ phase budget
-    int budget = cfg_.n_sims;
+    // m / n_phases / keep are CandidateCount (set-cardinality); the budget family is SimBudget. The
+    // std::max/std::min/division mix the raw ints the formulas demand, crossed at .value()/wrap.
+    const CandidateCount m{static_cast<SearchRep>(considered.size())};
+    int n_phases = std::max(1, static_cast<int>(std::ceil(std::log2(static_cast<double>(m.value())))));
+    SimBudget per_phase{static_cast<SearchRep>(std::max(1, cfg_.n_sims / n_phases))};  // paper's N/⌈log2 m⌉
+    SimBudget budget = n_sims;
 
-    while (considered.size() > 1 && budget > 0) {
-        int phase_budget = std::min(per_phase, budget);
-        int per_action = std::max(1, phase_budget / static_cast<int>(considered.size()));
-        for (int s : considered) {
-            int v = std::min(per_action, budget);
-            if (v <= 0) break;
+    while (considered.size() > 1 && budget > SimBudget{0}) {
+        SimBudget phase_budget{std::min(per_phase.value(), budget.value())};
+        SimBudget per_action{static_cast<SearchRep>(
+            std::max(1, static_cast<int>(phase_budget.value()) / static_cast<int>(considered.size())))};
+        for (SlotIndex s : considered) {
+            SimBudget v{std::min(per_action.value(), budget.value())};
+            if (v == SimBudget{0}) break;  // unsigned: v<=0 is v==0 (the never-negative invariant, ADR-0000)
             visit(nodes, loc, bw, collected, s, lam, src, v);
-            budget -= v;
+            budget = SimBudget{budget.value() - v.value()};  // budget draws down (no quantity_sub trait)
             n_spent += v;
         }
         // drop the worst half by g + logit + σ·q̂ (σ recomputed each phase as max_a N(a) grows).
@@ -515,19 +537,19 @@ int GumbelAZPolicy::sequential_halving(NodePool& nodes, const Loc& loc,
         // with a strict-`>` comparator gives the SAME order (a `>`-comparator stable sort = a reversed
         // stable ascending sort on a total order; on the coarse precision-insensitive inputs the keys
         // are well-separated so no ties arise regardless).
-        std::vector<std::pair<double, int>> keyed;
+        std::vector<std::pair<double, SlotIndex>> keyed;
         keyed.reserve(considered.size());
-        for (int s : considered) {
-            double key = g[static_cast<size_t>(s)] + logits[static_cast<size_t>(s)] +
+        for (SlotIndex s : considered) {
+            double key = g[static_cast<size_t>(s.value())] + logits[static_cast<size_t>(s.value())] +
                          sigma * nodes[0].q(s);
             keyed.emplace_back(key, s);
         }
         std::stable_sort(keyed.begin(), keyed.end(),
-                         [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                         [](const std::pair<double, SlotIndex>& a, const std::pair<double, SlotIndex>& b) {
                              return a.first > b.first;  // descending; stable keeps ties in input order
                          });
         int keep = std::max(1, static_cast<int>(keyed.size()) / 2);
-        std::vector<int> next;
+        std::vector<SlotIndex> next;
         next.reserve(static_cast<size_t>(keep));
         for (int i = 0; i < keep; ++i) next.push_back(keyed[static_cast<size_t>(i)].second);
         considered = std::move(next);
@@ -539,12 +561,12 @@ int GumbelAZPolicy::sequential_halving(NodePool& nodes, const Loc& loc,
     // which on the cases where the remainder is non-zero shifts the cross-language survivor/argmax. The
     // faithful path always spends the FULL budget here.
     if (kMutate != Mutate::ShBudget) {
-        size_t i = 0;
-        while (budget > 0 && !considered.empty()) {
-            int s = considered[i % considered.size()];
-            visit(nodes, loc, bw, collected, s, lam, src, 1);
-            budget -= 1;
-            n_spent += 1;
+        size_t i = 0;  // round-robin index over the survivors (a raw container cursor, read modulo size)
+        while (budget > SimBudget{0} && !considered.empty()) {
+            SlotIndex s = considered[i % considered.size()];
+            visit(nodes, loc, bw, collected, s, lam, src, SimBudget{1});
+            budget = SimBudget{budget.value() - 1};
+            n_spent += SimBudget{1};
             ++i;
         }
     }
@@ -556,9 +578,9 @@ std::vector<double> GumbelAZPolicy::improved_policy(const GumbelNode& root,
                                                     const std::vector<double>& logits) const {
     double sigma = sigma_scale_1a(root, cfg_.c_visit, cfg_.c_scale);
     double vm = v_mix_mixed(root, root.value);   // float32-faithful v_mix (returned widened to double)
-    std::vector<double> completed(static_cast<size_t>(n_slots_), -1e30);
-    for (int s : root.legal_slots) {
-        int n = root.N[static_cast<size_t>(s)];  // 0 if unvisited (dense; former N.find==end -> 0)
+    std::vector<double> completed(static_cast<size_t>(n_slots_.value()), -1e30);
+    for (SlotIndex s : root.legal_slots) {
+        VisitCount n = root.N[static_cast<size_t>(s.value())];  // 0 if unvisited (dense; former N.find==end -> 0)
         // 1b SEAM (seam 3): `completed[s] = logits[s] + σ·q`, where `logits[s]` is a float64 root logit
         // (an element of the float64 `logits` array) and σ is a Python float. For VISITED slots q is a
         // Python float (root.q), so `σ·q` is float64 → the whole term is float64. For UNVISITED slots q
@@ -567,12 +589,13 @@ std::vector<double> GumbelAZPolicy::improved_policy(const GumbelNode& root,
         // visited → full double; unvisited → round σ·vm to float (cast-first weak promotion), then add
         // in double. (The retired kUniform control once ran a full-`double` path here; removed on this
         // branch.)
-        if (n > 0) {
-            completed[static_cast<size_t>(s)] = logits[static_cast<size_t>(s)] + sigma * root.q(s);
+        if (n > VisitCount{0}) {
+            completed[static_cast<size_t>(s.value())] =
+                logits[static_cast<size_t>(s.value())] + sigma * root.q(s);
         } else {
             float sigma_vm = static_cast<float>(sigma) * static_cast<float>(vm);  // pyfloat·f32 → f32
-            completed[static_cast<size_t>(s)] =
-                logits[static_cast<size_t>(s)] + static_cast<double>(sigma_vm);   // f64 + f32 → f64
+            completed[static_cast<size_t>(s.value())] =
+                logits[static_cast<size_t>(s.value())] + static_cast<double>(sigma_vm);  // f64 + f32 → f64
         }
     }
     return masked_softmax_1a(completed, root.legal_slots, n_slots_);
@@ -596,9 +619,9 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     // empty-belief guard (mirrors decide_with_target's len(bw)==0): the only continuation is to exit.
     if (env_.empty(bw)) {
         out.action = terminate_action();
-        out.improved.assign(static_cast<size_t>(n_slots_), 0.0);
-        out.improved[static_cast<size_t>(term_slot_)] = 1.0;
-        out.survivor_slot = term_slot_;
+        out.improved.assign(static_cast<size_t>(n_slots_.value()), 0.0);
+        out.improved[static_cast<size_t>(term_slot_.value())] = 1.0;
+        out.survivor_slot = static_cast<int>(term_slot_.value());  // ACL: Decision field is raw int
         out.n_spent = 0;
         return out;
     }
@@ -615,44 +638,48 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     // (logit+g) AND the SH cut key (g+logit+σ·q̂), so the float32 prior (vs the retired double control)
     // FLIPS the survivor and the improved-π argmax on near-tie inputs. `prior_value` reads the float32
     // stored prior (the production path; the uniform discrimination arm was removed on this branch).
-    std::vector<double> logits(static_cast<size_t>(n_slots_), -1e30);
-    for (int s : nodes[0].legal_slots) {
+    std::vector<double> logits(static_cast<size_t>(n_slots_.value()), -1e30);
+    for (SlotIndex s : nodes[0].legal_slots) {
         double p = prior_value(nodes[0], s);
-        logits[static_cast<size_t>(s)] = std::log(std::max(p, 1e-12));
+        logits[static_cast<size_t>(s.value())] = std::log(std::max(p, 1e-12));
     }
 
     // Gumbel-Top-k: one gumbel draw over the FULL slot space, sort logits+g, take top-m legal slots.
-    std::vector<double> g = src.gumbel(n_slots_);
+    // ACL: gumbel(int n) takes the slot-space draw length raw (the override-gated virtual) — n_slots_.value().
+    std::vector<double> g = src.gumbel(static_cast<int>(n_slots_.value()));
     // score0 = where(logits > -1e29, logits+g, -inf) (mirrors _decide_root). Build over legal slots
     // only (illegal stay -inf), then take the top m = min(self.m, #legal).
-    std::vector<std::pair<double, int>> scored;  // (score, slot) over legal slots
+    std::vector<std::pair<double, SlotIndex>> scored;  // (score, slot) over legal slots
     scored.reserve(nodes[0].legal_slots.size());
-    for (int s : nodes[0].legal_slots) {
-        scored.emplace_back(logits[static_cast<size_t>(s)] + g[static_cast<size_t>(s)], s);
+    for (SlotIndex s : nodes[0].legal_slots) {
+        scored.emplace_back(logits[static_cast<size_t>(s.value())] + g[static_cast<size_t>(s.value())], s);
     }
     // top-m by descending score (mirrors np.argsort(score0)[::-1][:m]). On the coarse precision-
     // insensitive inputs the gumbel-perturbed scores are well-separated (no ties); a stable descending
     // sort fixes the order deterministically (Python's argsort is value-ordered for distinct scores).
     std::stable_sort(scored.begin(), scored.end(),
-                     [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                     [](const std::pair<double, SlotIndex>& a, const std::pair<double, SlotIndex>& b) {
                          return a.first > b.first;
                      });
+    // m = min(self.m, #legal): a CandidateCount. cfg_.m is a raw int (GumbelConfig, CLI-set) -> the ACL.
     int m = std::min(cfg_.m, static_cast<int>(nodes[0].legal_slots.size()));
-    std::vector<int> considered;
+    std::vector<SlotIndex> considered;
     considered.reserve(static_cast<size_t>(m));
     for (int i = 0; i < m; ++i) considered.push_back(scored[static_cast<size_t>(i)].second);
 
     // Sequential Halving over n_sims; returns the surviving slot (the executed action at temperature 0).
-    int survivor = sequential_halving(nodes, loc, bw, collected, lam, src, considered, g, logits,
-                                      out.n_spent);
+    // n_spent is a SimBudget internally; assign to the raw-int Decision field at the boundary below.
+    SimBudget n_spent{0};
+    SlotIndex survivor = sequential_halving(nodes, loc, bw, collected, lam, src, considered, g, logits,
+                                            n_spent);
+    out.n_spent = static_cast<int>(n_spent.value());  // ACL: Decision.n_spent is raw int
 
     // the improved-π target over the FULL legal set.
     out.improved = improved_policy(nodes[0], logits);
 
     // executed action = the SH survivor (Danihelka §2; temperature 0). The temperature>0 sampling path
     // is a 1b/production concern; 1a's logic check is temperature 0 (the eval policy's rule).
-    assert(survivor != -1 && "gumbel: SH returned no survivor on a non-empty belief");
-    out.survivor_slot = survivor;
+    out.survivor_slot = static_cast<int>(survivor.value());  // ACL: Decision field is raw int
     out.action = action_of_slot(env_, survivor);
 
     // HPO/BENCHMARK-ONLY no-early-exit substitution (cfg_.no_early_exit, default false → this whole block
@@ -669,19 +696,19 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     // corrupted; we intentionally leave out.improved and the backprop unchanged and substitute ONLY the
     // executed action (+ survivor_slot, kept consistent with it).
     if (cfg_.no_early_exit && out.action.kind == ActionKind::Terminate) {
-        int best_slot = -1;
+        std::optional<SlotIndex> best_slot;  // typed absence over the -1 "no non-terminate option" sentinel
         double best_pi = -1.0;
-        for (int s : nodes[0].legal_slots) {
+        for (SlotIndex s : nodes[0].legal_slots) {
             if (s == term_slot_) continue;  // skip the Terminate slot; want a non-terminate legal action
-            const double pi = out.improved[static_cast<size_t>(s)];
+            const double pi = out.improved[static_cast<size_t>(s.value())];
             if (pi > best_pi) {  // strict `>` first-wins, mirroring the search's argmax tie-break
                 best_pi = pi;
                 best_slot = s;
             }
         }
-        if (best_slot != -1) {  // a non-terminate legal action exists → continue the episode on it
-            out.survivor_slot = best_slot;
-            out.action = action_of_slot(env_, best_slot);
+        if (best_slot.has_value()) {  // a non-terminate legal action exists → continue the episode on it
+            out.survivor_slot = static_cast<int>(best_slot->value());  // ACL: Decision field is raw int
+            out.action = action_of_slot(env_, *best_slot);
         }
         // else: no non-terminate legal action (only term_slot_ legal) → leave Terminate; the episode
         // correctly ends, exactly as the empty-belief guard above does (there is nothing to substitute).

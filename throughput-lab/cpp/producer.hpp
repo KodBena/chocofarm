@@ -47,9 +47,11 @@
 #include <cstdint>
 #include <expected>
 #include <string>
+#include <vector>
 
 #include "boundary.hpp"   // tlab::Boundary, BoundaryError, BoundaryTopology, BoundaryConfig
-#include "wire.hpp"        // tlab::wire — STAGE_A_IN_DIM, count_t
+#include "proc_domains.hpp" // tlab — ThreadCount/OptThreadIndex/OpCount/ByteCount/OptMilliseconds
+#include "wire.hpp"        // tlab::wire — STAGE_A_IN_DIM, RowCount/FeatureDim, count_t
 
 namespace tlab {
 
@@ -70,8 +72,8 @@ enum class ProducerMode {
 // ---- the result of STEP 1 calibration (a thread's measured compute rate) ------------------------
 struct Calibration {
     double ops_per_sec = 0.0;       // measured x+=1 iterations per second (STEP 1)
-    std::uint64_t warmup_ops = 0;   // iterations burned in the discarded warmup (for the record)
-    std::uint64_t timed_ops = 0;    // iterations in the timed window (the basis of ops_per_sec)
+    OpCount warmup_ops{0};          // iterations burned in the discarded warmup (for the record)
+    OpCount timed_ops{0};           // iterations in the timed window (the basis of ops_per_sec)
     double timed_seconds = 0.0;     // the timed window's measured wall-clock duration
 };
 
@@ -93,17 +95,17 @@ struct ProducerStats {
 
 // ---- the producer run configuration (the dialable knobs) ----------------------------------------
 struct ProducerConfig {
-    int n_threads = 1;                          // producer threads (each self-calibrates, STEP 1)
+    ThreadCount n_threads{1};                   // producer threads (each self-calibrates, STEP 1)
     ProducerMode mode = ProducerMode::Decoupled;
     BoundaryTopology topology = BoundaryTopology::PerThread;
     double target_rate_hz = 1000.0;             // requested per-thread emission rate R (batches/sec)
-    wire::count_t rows_per_batch = 1;           // B per submitted batch (1 = degenerate single-leaf)
-    wire::count_t in_dim = wire::STAGE_A_IN_DIM;// feature width per row (241 on the live env)
+    wire::RowCount rows_per_batch{1};           // B per submitted batch (1 = degenerate single-leaf)
+    wire::FeatureDim in_dim{wire::STAGE_A_IN_DIM};// feature width per row (241 on the live env)
     double run_seconds = 5.0;                   // measured run duration (STEP 3 emission window)
     double calib_window_seconds = 0.2;          // STEP 1 timed-spin window
     std::string endpoint = "ipc:///tmp/tlab-infer.sock";   // the server's ZMQ ipc endpoint
-    int recv_timeout_ms = 5000;                 // bounds Boundary recv()/poll() (loud timeout, P5)
-    std::size_t send_queue_bytes = 256ull << 20;// TOTAL outstanding-send byte budget (back-pressure cap; <=1G)
+    OptMilliseconds recv_timeout_ms = Milliseconds{5000};  // bounds Boundary recv()/poll() (loud timeout, P5; empty = block forever)
+    ByteCount send_queue_bytes{256ull << 20};   // TOTAL outstanding-send byte budget (back-pressure cap; <=1G)
 
     // ---- per-thread scheduling priority (the "renice ONE generator thread" lever) ----------------
     // A single designated generator thread can be run at a LOWER scheduling priority than its peers (and
@@ -113,8 +115,10 @@ struct ProducerConfig {
     // thread's nice via setpriority(gettid()), not the whole process (that would be a uniform process
     // nice — a different, coarser lever). nice is graceful/weighted: the reniced thread still runs in the
     // slack, it just cedes under contention (vs SCHED_IDLE's binary starve, which could collapse the feed).
-    int low_prio_thread = -1;                   // index of the ONE generator thread to renice (-1 = none)
-    int low_prio_nice = 0;                       // its nice value (>0 = lower priority; 0 = no-op)
+    OptThreadIndex low_prio_thread{};           // index of the ONE generator thread to renice (empty = none; the legacy -1, typed)
+    int low_prio_nice = 0;                       // its nice value (>0 = lower priority; 0 = no-op). STAYS signed int [-20,19]:
+                                                 //   the sign is API-load-bearing (negative = higher priority) and goes
+                                                 //   straight to setpriority — the named NiceValue ACL, validated at the CLI.
 };
 
 // Run the producer: stand up the Boundary (per `cfg.topology`/`cfg.endpoint`), spawn `cfg.n_threads`

@@ -4,6 +4,15 @@
 //   (integer bit ops) — bit-identical to the numpy env; the distances are float-equivalent
 //   (std::hypot mirroring math.hypot). ADR-0012 P6/P7.
 //
+//   PHANTOM-TYPE NOTE (ADR-0000 / ADR-0012 P8): the bitset kernels + this TU's internal word loops speak
+//   the typed word/world domains (WordCount/WordIndex/WorldCount/WorldRank — domains.hpp/world.hpp), with
+//   the raw<->domain crossings named at the ACL (popcount_all().value(), last_rank(), the .size()/kw64_
+//   wrap). The BELIEF MEMBER types (BitsetBelief::count_ / kw64_, ZddBelief::cached_count_) and the env's
+//   CROSS-FILE public API (nb()/world_at_rank()/sample_world()/belief_key()/Action.i) stay RAW int here:
+//   they are read/written by out-of-frame TUs (features.cpp, feature_compute.hpp, gumbel/ismcts/nmcs/
+//   policy, the parity/bench harnesses) whose signatures this slice does not touch — the member/API-type
+//   migration is gated on retyping those readers together (ADR-0004 minimal-touch under partial scope).
+//
 // Public Domain (The Unlicense).
 #include "chocofarm/env.hpp"
 
@@ -39,22 +48,30 @@ inline void assert_tail_zero([[maybe_unused]] const BitsetBelief& b) {
 // it never touches the always-zero tail, preserving the tail-zero invariant operator== relies on.
 void filter_bits(BitsetBelief& b, std::span<const uint64_t> mask, bool want) {
     std::span<uint64_t> bits = b.live();
-    if (want) for (int w = 0; w < b.kw64_; ++w) bits[static_cast<size_t>(w)] &=  mask[static_cast<size_t>(w)];
-    else      for (int w = 0; w < b.kw64_; ++w) bits[static_cast<size_t>(w)] &= ~mask[static_cast<size_t>(w)];
-    b.count_ = popcount_all(b.live());
+    // The live word stride as a typed WordCount; the AND scan walks the WordIndex domain (domains.hpp).
+    // `kw64_` is the still-raw BitsetBelief member (its count/word-domain migration is gated by the
+    // cross-file readers of the member, see this file's header note) — wrapped here at the loop boundary.
+    const WordCount nwords{static_cast<WordRep>(b.kw64_)};
+    if (want) for (WordIndex w{0}; w.value() < nwords.value(); w = w + WordRep{1}) bits[w.value()] &=  mask[w.value()];
+    else      for (WordIndex w{0}; w.value() < nwords.value(); w = w + WordRep{1}) bits[w.value()] &= ~mask[w.value()];
+    // popcount_all returns a typed WorldCount; count_ is still the raw cached int (the count-domain
+    // migration of the Belief members is a follow-on sweep) — unwrap at this seam (ADR-0000 item 5).
+    b.count_ = static_cast<int>(popcount_all(b.live()).value());
     assert_tail_zero(b);  // debug-only: an AND never sets a tail word, but net the invariant explicitly
 }
 
-// The r-th set bit -> world rank, with the loud-abort invariant arm the seam owns (the kernel returns -1 on
-// a count_/bits desync; here that becomes a FATAL abort — ADR-0002 / scoping §6 risk 7).
+// The r-th set bit -> world rank, with the loud-abort invariant arm the seam owns (the kernel returns a
+// TYPED ABSENCE — std::nullopt — on a count_/bits desync; here that becomes a FATAL abort, ADR-0002 /
+// scoping §6 risk 7). `r` is wrapped into the WorldRank domain at this seam; the returned global index is
+// unwrapped back to the raw int the caller still uses (the rank-domain migration is a follow-on sweep).
 [[nodiscard]] int rank_or_abort(std::span<const uint64_t> bits, int r) {
-    const int idx = rth_set_bit_index(bits, r);
-    if (idx < 0) {
+    const std::optional<WorldRank> idx = rth_set_bit_index(bits, WorldRank{static_cast<WorldCountRep>(r)});
+    if (!idx) {
         assert(false && "rth_set_bit_index: r out of range (count_ desynced from bits?)");
         std::cerr << "chocofarm: FATAL invariant: rth_set_bit_index: r out of range\n";
         std::abort();
     }
-    return idx;
+    return static_cast<int>(idx->value());
 }
 
 }  // namespace
@@ -82,7 +99,9 @@ static std::vector<uint32_t> build_worlds(int N, int K) {
 }
 
 Environment::Environment(const Instance& inst) : inst_(inst) {
-    worlds_ = build_worlds(inst_.N, inst_.K);
+    // build_worlds speaks raw int (the combination walk's loop arithmetic); N()/K() are the env's named
+    // raw-int ACL accessors over the typed inst_.N/inst_.K count domains (env.hpp; ADR-0000 item 5).
+    worlds_ = build_worlds(N(), K());
     // contiguous per-detector cover bitmasks (face_masks()): hoist faces[j].bitmask out of the
     // array-of-structs into a packed uint32_t[nD] so the belief sweep reads them without the AoS
     // stride (ADR-0012 P1 — one contiguous home, env still owns them). Order = face id (== faces order).
@@ -102,7 +121,7 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
     const bool worlds_enumerable = nworlds > 0;  // build_worlds returns the full C(N,K) set; empty only if K out of range
     kW64_ = static_cast<int>((nworlds + 63) / 64);
     const std::size_t mask_bytes =
-        static_cast<std::size_t>(inst_.N + n_detectors()) * static_cast<std::size_t>(kW64_) * sizeof(uint64_t);
+        static_cast<std::size_t>(N() + n_detectors()) * static_cast<std::size_t>(kW64_) * sizeof(uint64_t);
     // The gate's THIRD conjunct (the inline-buffer fit): the BitsetBelief now holds its words in a
     // FIXED-CAPACITY inline std::array<.., kBitsetMaxWords> (env.hpp — the per-copy heap alloc this kills),
     // so a belief with kW64 > kBitsetMaxWords CANNOT be represented in the bitset arm and MUST fall to the
@@ -126,13 +145,13 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
         // (w & face_masks()[j]) != 0 — the SAME enumeration + face masks the env owns, so the masks
         // derive from worlds_/face_masks_ (the identity env.observe rests on; the oracle pins it).
         const size_t kw = static_cast<size_t>(kW64_);
-        treasure_mask_.assign(static_cast<size_t>(inst_.N) * kw, 0ull);
+        treasure_mask_.assign(static_cast<size_t>(N()) * kw, 0ull);
         detector_mask_.assign(static_cast<size_t>(n_detectors()) * kw, 0ull);
         for (size_t r = 0; r < nworlds; ++r) {
             const uint32_t w = worlds_[r];
             const size_t word = r >> 6;           // r / 64
             const uint64_t bit = uint64_t{1} << (r & 63u);  // 1 << (r % 64)
-            for (int t = 0; t < inst_.N; ++t)
+            for (int t = 0; t < N(); ++t)
                 if ((w >> t) & 1u) treasure_mask_[static_cast<size_t>(t) * kw + word] |= bit;
             for (int j = 0; j < n_detectors(); ++j)
                 if ((w & face_masks_[static_cast<size_t>(j)]) != 0) detector_mask_[static_cast<size_t>(j) * kw + word] |= bit;
@@ -181,7 +200,11 @@ uint32_t Environment::sample_world(const Belief& b, std::mt19937_64& rng) const 
     // The IDENTICAL uniform draw on both arms (so the RNG stream is byte-identical): r in [0, nb-1], then
     // unrank via world_at_rank. The flat arm's nb is .worlds.size(); the bitset arm's is count_.
     const int n = nb(b);
-    std::uniform_int_distribution<size_t> pick(0, static_cast<size_t>(n) - 1);
+    // The uniform upper bound is the LAST valid world rank — the named count->rank crossing last_rank()
+    // (world.hpp), not an ad-hoc `n - 1` int subtraction (ADR-0000 item 5). `n` is the public int nb (the
+    // env's cross-file API stays raw); it is wrapped into WorldCount here and unwrapped through WorldRank.
+    const WorldRank hi = last_rank(WorldCount{static_cast<WorldCountRep>(n)});
+    std::uniform_int_distribution<size_t> pick(0, static_cast<size_t>(hi.value()));
     const int r = static_cast<int>(pick(rng));
     return world_at_rank(b, r);
 }
@@ -224,11 +247,11 @@ std::vector<double> Environment::marginals(const Belief& bw) const {
     // exact for count <= |worlds| (P6).
     return std::visit([&](const auto& a) -> std::vector<double> {
         using T = std::decay_t<decltype(a)>;
-        std::vector<double> m(inst_.N, 0.0);
+        std::vector<double> m(static_cast<size_t>(N()), 0.0);
         if constexpr (std::is_same_v<T, FlatBelief>) {
             if (a.worlds.empty()) return m;
             for (uint32_t w : a.worlds)
-                for (int t = 0; t < inst_.N; ++t)
+                for (int t = 0; t < N(); ++t)
                     if ((w >> t) & 1u) m[static_cast<size_t>(t)] += 1.0;
             const double inv = 1.0 / static_cast<double>(a.worlds.size());
             for (double& v : m) v *= inv;  // mean over the world-set (mirrors env.marginals)
@@ -236,8 +259,8 @@ std::vector<double> Environment::marginals(const Belief& bw) const {
         } else if constexpr (std::is_same_v<T, BitsetBelief>) {
             if (a.count_ == 0) return m;
             const double inv = 1.0 / static_cast<double>(a.count_);
-            for (int t = 0; t < inst_.N; ++t)
-                m[static_cast<size_t>(t)] = static_cast<double>(popcount_and(a.live(), treasure_mask(t))) * inv;
+            for (int t = 0; t < N(); ++t)
+                m[static_cast<size_t>(t)] = static_cast<double>(popcount_and(a.live(), treasure_mask(t)).value()) * inv;
             return m;
         }
         CHOCO_ZDD_ELSE(return zdd::marginals(*this, a);)  // ZDD arm: all_marginals * inv — byte-identical
@@ -259,7 +282,7 @@ bool Environment::informative(int face_id, const Belief& bw) const {
             }
             return false;  // mirrors SenseAction.informative: hit.any() and (~hit).any()
         } else if constexpr (std::is_same_v<T, BitsetBelief>) {
-            const int cnt = popcount_and(a.live(), detector_mask(face_id));
+            const int cnt = static_cast<int>(popcount_and(a.live(), detector_mask(face_id)).value());
             return cnt > 0 && cnt < a.count_;
         }
         CHOCO_ZDD_ELSE(return zdd::informative(*this, face_id, a);)  // ZDD arm: 0 < det_cnt < nb — byte-identical
@@ -271,8 +294,11 @@ std::vector<Action> Environment::legal_actions(const Belief& bw,
     std::vector<Action> acts;
     std::vector<double> marg = marginals(bw);
     // collects: marg>0 and not collected, in treasure-id order (env iterates _treasure_ids = range(N))
-    for (int i = 0; i < inst_.N; ++i) {
-        if (!collected.contains(i) && marg[i] > 0.0) acts.push_back(Action{ActionKind::Treasure, i});
+    for (int i = 0; i < N(); ++i) {
+        // collected.contains takes a typed TreasureId; Action.i / the loop counter stay raw int (the env's
+        // documented cross-file ACL boundary). Wrap at this crossing (ADR-0000 item 5).
+        if (!collected.contains(TreasureId{static_cast<TreasureRep>(i)}) && marg[i] > 0.0)
+            acts.push_back(Action{ActionKind::Treasure, i});
     }
     // senses: each informative face, in face-id order (env iterates self.detectors = range(nD))
     for (int j = 0; j < n_detectors(); ++j) {
@@ -345,9 +371,12 @@ StepResult Environment::apply(Loc& loc, Belief& bw, CollectedSet& collected,
     if (action.kind == ActionKind::Treasure) {
         bool pres = ((world >> action.i) & 1u) != 0;
         // reward = value[i] (all unit values on this instance) iff present and not yet collected
-        bool fresh = pres && !collected.contains(action.i);
+        // action.i is the raw-int treasure id (Action stays raw int — the env's cross-file ACL boundary);
+        // CollectedSet contains/insert take a typed TreasureId. Wrap once at this crossing (ADR-0000 item 5).
+        const TreasureId tid{static_cast<TreasureRep>(action.i)};
+        bool fresh = pres && !collected.contains(tid);
         res.reward = fresh ? 1.0 : 0.0;  // env.value[i] = 1.0 on the live instance (unit values)
-        if (pres) collected.insert(action.i);
+        if (pres) collected.insert(tid);
         filter_treasure(bw, action.i, pres);
     } else {
         bool pos = observe(action.i, world);  // the face's reading at this world

@@ -47,6 +47,8 @@
 #include "boundary.hpp"
 #include "boundary_net_evaluator.hpp"
 #include "cursor_slot.hpp"   // OPTION B: the explicit-state CursorSlot engine (selectable, default fiber)
+#include "proc_domains.hpp"  // tlab — ThreadCount/ThreadIndex/OptThreadIndex (process-shape domains)
+#include "wire.hpp"          // tlab::wire — FeatureDim/RowCount(count_t)/ProducerCorr(corr_t) at the coalescing ACL
 
 namespace {
 // A small fixed Gumbel script (the scripted CyclicGumbelSource path, as wire_parallel_bench uses): the
@@ -102,6 +104,11 @@ using SteadyClock = std::chrono::steady_clock;
 //   (est_tree_resident_bytes); the cursor-specific NUMERIC re-calibration (a down-fit that would admit more)
 //   is still filed (BACKLOG.md) — deferred because it loosens admission. Non-fiber (--fibers 0) runs ONE
 //   tree per thread, so the live count is `threads`, not threads*fibers.
+// The byte MAGNITUDES here (and MemAvailable above) stay RAW u64, NOT the tlab ByteCount (which is size_t):
+// the OOM-admission comparison must hold a guaranteed 64-bit width that beats MemAvailable even on a 32-bit
+// size_t build, and these are /proc-sourced absolute magnitudes, not buffer sizes the std allocators size. The
+// brief names this the licensed raw-u64 ACL (a dedicated 64-bit wrap is deferred — BACKLOG). n_sims is the
+// core's raw search-shape int (its typedef is the core's home).
 [[nodiscard]] std::uint64_t est_tree_resident_bytes(int n_sims) {
     constexpr std::uint64_t kTreeBaseBytes = 256ull * 1024;    // per-tree floor (TreeState/cursor + policy +
                                                                //   bounded belief memo). CONSERVATIVE for the
@@ -124,25 +131,33 @@ struct ThreadStat {
 // the thread's gettid). In the generator-bound regime, the inference server's core has idle slack; a 4th
 // generator sharing that core, reniced low, soaks the slack but yields the instant the server has a batch.
 // A no-op unless low_prio_thread names this index. Failure is non-fatal + loud-ish (ADR-0002).
-void apply_thread_priority(int thread_index, int low_prio_thread, int low_prio_nice) {
-    if (low_prio_thread < 0 || thread_index != low_prio_thread || low_prio_nice == 0) return;
+void apply_thread_priority(tlab::ThreadIndex thread_index, tlab::OptThreadIndex low_prio_thread,
+                           int low_prio_nice) {
+    // The "-1 = none" sentinel is now typed absence (OptThreadIndex): a no-op unless a thread is designated,
+    // it IS this one (same-domain ==), and a non-zero nice is asked.
+    if (!low_prio_thread || thread_index != *low_prio_thread || low_prio_nice == 0) return;
+    // setpriority ACL: tid is the POSIX id_t from gettid; the nice value STAYS signed int [-20,19] (sign is
+    // load-bearing) and goes straight to the syscall — not wrapped (the named NiceValue ACL).
     const auto tid = static_cast<id_t>(::syscall(SYS_gettid));
     errno = 0;
     if (::setpriority(PRIO_PROCESS, tid, low_prio_nice) != 0)
-        std::fprintf(stderr, "[tlab-real-producer] WARN: could not renice thread %d to nice %d (errno=%d)\n",
-                     thread_index, low_prio_nice, errno);
+        std::fprintf(stderr, "[tlab-real-producer] WARN: could not renice thread %u to nice %d (errno=%d)\n",
+                     thread_index.value(), low_prio_nice, errno);
 }
 
 // One producer thread: build its own boundary + bridge + SerialRuntime, then run real decisions from the
 // root state (varying the seed so trees differ) until the wall deadline. Each decision's leaf_requests is
 // the count of B=1 round-trips it drove through the boundary.
-void run_thread(int idx, const chocofarm::Environment& env, const std::string& endpoint,
-                const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim, ThreadStat& out) {
+void run_thread(tlab::ThreadIndex idx, const chocofarm::Environment& env, const std::string& endpoint,
+                const chocofarm::GumbelConfig& cfg, double run_seconds, tlab::wire::FeatureDim in_dim,
+                ThreadStat& out) {
     tlab::BoundaryConfig bcfg;
     bcfg.endpoint = endpoint;
-    bcfg.recv_timeout_ms = 10000;     // generous: the server may be busy gathering other threads' leaves
-    bcfg.n_producer_threads = 1;
-    bcfg.rows = 1;
+    // BoundaryConfig speaks the typed tlab domains (Milliseconds/ThreadCount/RowCount/FeatureDim) — assign
+    // the literal knobs in-domain (ADR-0000 rule 1); in_dim is already a FeatureDim (same-domain copy).
+    bcfg.recv_timeout_ms = tlab::Milliseconds{10000};  // generous: the server may be busy gathering leaves
+    bcfg.n_producer_threads = tlab::ThreadCount{1};
+    bcfg.rows = tlab::wire::RowCount{1};
     bcfg.in_dim = in_dim;
     auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
     if (!b) { out.failed = true; out.err = "boundary: " + b.error().message; return; }
@@ -154,15 +169,19 @@ void run_thread(int idx, const chocofarm::Environment& env, const std::string& e
     const chocofarm::Belief bw = env.full_belief();
     const chocofarm::CollectedSet coll;
     const auto start = SteadyClock::now();
-    std::uint64_t seed = static_cast<std::uint64_t>(idx) * 1'000'003ull + 1ull;
+    // ThreadIndex ACL: the per-thread seed offset reads the raw index rep (a seed-mixing arithmetic site).
+    std::uint64_t seed = static_cast<std::uint64_t>(idx.value()) * 1'000'003ull + 1ull;
     while (secs_since(start) < run_seconds) {
         chocofarm::SearchTask t;
-        t.loc = loc; t.bw = bw; t.collected = coll; t.lam = 0.1; t.seed = seed++; t.cfg = cfg;
+        // t.seed is the opaque RngSeed domain; wrap the mixed raw seed at the engine-seed crossing (item 5).
+        t.loc = loc; t.bw = bw; t.collected = coll; t.lam = 0.1; t.seed = chocofarm::RngSeed{seed++}; t.cfg = cfg;
         std::vector<chocofarm::SearchTask> tasks{t};
         auto dec = serial.run(env, std::span<const chocofarm::SearchTask>(tasks));
         if (!dec) { out.failed = true; out.err = "runtime: " + dec.error().message; return; }
         out.decisions += 1;
-        out.leaves += static_cast<std::uint64_t>((*dec)[0].leaf_requests);
+        // SimBudget ACL: Decision::leaf_requests is the core's typed search-budget count; .value() crosses it
+        // into the producer's raw leaf tally (a different, untyped aggregate — leaves/wall throughput).
+        out.leaves += static_cast<std::uint64_t>((*dec)[0].leaf_requests.value());
     }
 }
 
@@ -182,8 +201,12 @@ void run_thread(int idx, const chocofarm::Environment& env, const std::string& e
 template <class Slot>
 [[nodiscard]] bool drive_round(tlab::Boundary& boundary,
                                std::vector<std::unique_ptr<Slot>>& trees,
-                               const std::vector<int>& active, int coalesce_rows, int in_dim,
-                               tlab::wire::corr_t& corr, ThreadStat& out) {
+                               const std::vector<int>& active, int coalesce_rows,
+                               tlab::wire::FeatureDim in_dim,
+                               tlab::wire::ProducerCorr& corr, ThreadStat& out) {
+    // corr_to_group is keyed by the OPAQUE wire corr_t (the token the reply echoes); the running `corr` is the
+    // typed ProducerCorr seq, crossed to corr_t at the LeafBatch stamp + the map key. `coalesce_rows`/`active`
+    // /`group`/`n_msgs` are pipeline counters with NO SSOT typedef (see the cross-file note) — kept raw.
     std::unordered_map<tlab::wire::corr_t, std::vector<int>> corr_to_group;
     std::vector<float> buf;
     int n_msgs = 0;
@@ -197,20 +220,24 @@ template <class Slot>
             buf.insert(buf.end(), feats.begin(), feats.end());   // concat the group's feature rows
             group.push_back(active[k]);
         }
-        const tlab::wire::corr_t cc = corr++;
-        const auto G = static_cast<tlab::wire::count_t>(group.size());
-        corr_to_group.emplace(cc, std::move(group));
-        const tlab::LeafBatch lb{cc, G, static_cast<tlab::wire::count_t>(in_dim),
-                                 std::span<const float>(buf.data(), buf.size())};
+        // ProducerCorr ACL: stamp the current corr (opaque token) then advance the affine seq (next = corr + 1).
+        const tlab::wire::ProducerCorr cc = corr;
+        corr = corr + tlab::wire::corr_t{1};
+        // RowCount ACL: the message's B is the group size (container .size() -> count_t at the explicit ctor).
+        const auto G = tlab::wire::RowCount{static_cast<tlab::wire::count_t>(group.size())};
+        corr_to_group.emplace(cc.value(), std::move(group));
+        const tlab::LeafBatch lb{cc, G, in_dim, std::span<const float>(buf.data(), buf.size())};
         if (auto s = boundary.send(lb); !s) { out.failed = true; out.err = "send: " + s.error().message; return false; }
         ++n_msgs;   // buf is reused next group: send copies the bytes into the wire frame before returning
     }
     for (int r = 0; r < n_msgs; ++r) {
         auto reply = boundary.recv();
         if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return false; }
-        auto it = corr_to_group.find(reply->corr);
+        // wire ACL: the reply's typed ProducerCorr crosses back to the raw corr_t key (the map is keyed by
+        // cc.value() at emplace) — the named lookup/format unwrap (ADR-0000 item 5).
+        auto it = corr_to_group.find(reply->corr.value());
         if (it == corr_to_group.end() || reply->preds.size() != it->second.size()) {
-            out.failed = true; out.err = "unmatched/size-mismatch reply corr=" + std::to_string(reply->corr); return false;
+            out.failed = true; out.err = "unmatched/size-mismatch reply corr=" + std::to_string(reply->corr.value()); return false;
         }
         for (size_t j = 0; j < it->second.size(); ++j) {
             chocofarm::NetPrediction pred;
@@ -250,8 +277,8 @@ template <class Slot>
 // engine is the ONLY thing that differs; the episode logic is one home. run_thread_fiber_episodic /
 // run_thread_cursor_episodic are one-line wrappers that bind `Slot` + the factory (below).
 template <class Slot, class MakeSlot>
-void run_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
-                  double run_seconds, int in_dim,
+void run_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env, const std::string& endpoint,
+                  double run_seconds, tlab::wire::FeatureDim in_dim,
                   int fibers_k, int coalesce_rows, const std::string& driver,
                   int inflight_msgs, chocofarm::IssueController* ctl, MakeSlot make_slot,
                   ThreadStat& out) {
@@ -259,9 +286,14 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
     // engine factory), exactly where it is needed (the per-slot policy ctor). The episode body reads only
     // env (max_steps/empty/apply) + the slot surface, so threading cfg through here would be a dead param.
     if (coalesce_rows < 1) coalesce_rows = 1;
+    // BoundaryConfig speaks the typed tlab domains; assign literals in-domain. coalesce_rows is a raw int
+    // arg (the driver's CLI knob) wrapped into RowCount at this crossing; in_dim is already a FeatureDim.
     tlab::BoundaryConfig bcfg;
-    bcfg.endpoint = endpoint; bcfg.recv_timeout_ms = 10000; bcfg.n_producer_threads = 1;
-    bcfg.rows = coalesce_rows; bcfg.in_dim = in_dim;
+    bcfg.endpoint = endpoint;
+    bcfg.recv_timeout_ms = tlab::Milliseconds{10000};
+    bcfg.n_producer_threads = tlab::ThreadCount{1};
+    bcfg.rows = tlab::wire::RowCount{static_cast<tlab::wire::count_t>(coalesce_rows)};
+    bcfg.in_dim = in_dim;
     auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
     if (!b) { out.failed = true; out.err = "boundary: " + b.error().message; return; }
     std::unique_ptr<tlab::Boundary> boundary = std::move(*b);
@@ -291,7 +323,8 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
         ep_loc.emplace_back(env.entry_point());
         ep_bw.emplace_back(env.full_belief());
         ep_coll.emplace_back();
-        ep_rng.emplace_back(static_cast<std::uint64_t>(idx) * 1'000'003ull + static_cast<std::uint64_t>(i) + 1ull);
+        // ThreadIndex ACL: the per-slot rng seed reads the raw index rep (a seed-mixing arithmetic site).
+        ep_rng.emplace_back(static_cast<std::uint64_t>(idx.value()) * 1'000'003ull + static_cast<std::uint64_t>(i) + 1ull);
         trees.push_back(make_slot(i));   // the engine-specific slot factory (fiber TreeState or CursorSlot)
     }
     for (int i = 0; i < fibers_k; ++i) {
@@ -316,7 +349,9 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
         trees[si]->start(ep_loc[si], ep_bw[si], ep_coll[si], kLam);            // next decision
     };
 
-    tlab::wire::corr_t corr = static_cast<tlab::wire::corr_t>(idx) * 1'000'000'000ull + 1ull;
+    // ProducerCorr ACL: the per-thread corr seq is seeded into a disjoint id band (idx*1e9) so threads' corrs
+    // never collide; the raw seed crosses to the typed producer corr via the explicit ctor.
+    tlab::wire::ProducerCorr corr{static_cast<tlab::wire::corr_t>(idx.value()) * 1'000'000'000ull + 1ull};
     const auto t_start = SteadyClock::now();
 
     if (driver == "greedy") {
@@ -340,11 +375,13 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
                 group.push_back(ready[k]);
             }
             ready.resize(ready.size() - g);
-            const tlab::wire::corr_t cc = corr++;
-            const auto G = static_cast<tlab::wire::count_t>(group.size());
-            corr_to_group.emplace(cc, std::move(group));
-            const tlab::LeafBatch lb{cc, G, static_cast<tlab::wire::count_t>(in_dim),
-                                     std::span<const float>(buf.data(), buf.size())};
+            // ProducerCorr ACL: stamp the current corr, then advance the affine seq (next = corr + 1).
+            const tlab::wire::ProducerCorr cc = corr;
+            corr = corr + tlab::wire::corr_t{1};
+            // RowCount ACL: B = the group size (container .size() -> count_t at the explicit ctor).
+            const auto G = tlab::wire::RowCount{static_cast<tlab::wire::count_t>(group.size())};
+            corr_to_group.emplace(cc.value(), std::move(group));
+            const tlab::LeafBatch lb{cc, G, in_dim, std::span<const float>(buf.data(), buf.size())};
             if (auto s = boundary->send(lb); !s) { out.failed = true; out.err = "send: " + s.error().message; return false; }
             ++in_flight;
             return true;
@@ -353,7 +390,9 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
             // Gate A (consolidation): the overcommit controller gates issuance — mirror
             // runner_wire_batched.cpp's `may_issue(tid)` refill gate (one actuation path). ctl==nullptr (no
             // --control-endpoint) leaves the loop byte-unchanged, so the control-off arm is the exact baseline.
-            while (!ready.empty() && in_flight < budget && (!ctl || ctl->may_issue(idx)))
+            // IssueController ACL: may_issue/publish speak the controller's raw int tid (its own home); the
+            // ThreadIndex unwraps to that tid here, at the control-plane boundary.
+            while (!ready.empty() && in_flight < budget && (!ctl || ctl->may_issue(static_cast<int>(idx.value()))))
                 if (!send_group()) return;
             // FORCED-FLUSH LIVENESS FLOOR (ADR-0002 / the lab's gate-everything contract). The gate above
             // is the controller's DISCRETIONARY issue point; like runner_wire_batched.cpp's ungated forced
@@ -369,9 +408,10 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
             if (in_flight == 0) break;   // genuinely no work left (every fiber finished) -> end the window
             auto reply = boundary->recv();
             if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return; }
-            auto it = corr_to_group.find(reply->corr);
+            // wire ACL: typed ProducerCorr -> raw corr_t map key / format (ADR-0000 item 5).
+            auto it = corr_to_group.find(reply->corr.value());
             if (it == corr_to_group.end() || reply->preds.size() != it->second.size()) {
-                out.failed = true; out.err = "unmatched/size-mismatch reply corr=" + std::to_string(reply->corr); return;
+                out.failed = true; out.err = "unmatched/size-mismatch reply corr=" + std::to_string(reply->corr.value()); return;
             }
             for (size_t j = 0; j < it->second.size(); ++j) {
                 const int i = it->second[j];
@@ -388,7 +428,7 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
             // Gate A: publish this thread's telemetry — the bridge thread reads it each cadence and REQs the
             // policy engine (issue_engine.py). The identity policy ignores the values (allow-all); a real
             // control policy consumes them. Cheap relaxed atomics, off the forward's critical path.
-            if (ctl) ctl->publish(idx, in_flight, static_cast<int>(ready.size()), 0,
+            if (ctl) ctl->publish(static_cast<int>(idx.value()), in_flight, static_cast<int>(ready.size()), 0,
                                   static_cast<long>(out.leaves), 0.0);
         }
     } else {
@@ -424,8 +464,10 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
 // pipe shapes + the control gate) is reused (ADR-0012 P1). The search is bit-identical to the former
 // fiber's run_search (cpp/parity + gumbel_cursor_proto). The cpp/ fiber machinery (fiber_tree.hpp etc.)
 // is UNTOUCHED — it still backs the C++ runner / serve / wire-benches; only the PRODUCER retired it.
-void run_thread_cursor_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
-                                const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
+void run_thread_cursor_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env,
+                                const std::string& endpoint,
+                                const chocofarm::GumbelConfig& cfg, double run_seconds,
+                                tlab::wire::FeatureDim in_dim,
                                 int fibers_k, int coalesce_rows, const std::string& driver,
                                 int inflight_msgs, chocofarm::IssueController* ctl, ThreadStat& out) {
     auto make = [&](int i) {
@@ -454,9 +496,15 @@ int main(int argc, char** argv) {
                      "      --controller-cadence-ms M (default 5) = control-loop tick. Absent = control off (baseline).\n";
         return 2;
     }
-    const int threads = opt(args, "--threads") ? std::atoi(std::string(*opt(args, "--threads")).c_str()) : 3;
+    // CLI ACL (ADR-0002 fail-loud): --threads -> ThreadCount, --in-dim -> wire::FeatureDim, both via the
+    // explicit ctor at the atoi narrow, validated >= 1 here so the typed invariant holds at the boundary.
+    const int threads_raw = opt(args, "--threads") ? std::atoi(std::string(*opt(args, "--threads")).c_str()) : 3;
+    if (threads_raw < 1) { std::cerr << "tlab-real-producer: --threads must be >= 1\n"; return 2; }
+    const tlab::ThreadCount threads{static_cast<std::uint32_t>(threads_raw)};
     const double seconds = opt(args, "--seconds") ? std::atof(std::string(*opt(args, "--seconds")).c_str()) : 5.0;
-    const int in_dim = opt(args, "--in-dim") ? std::atoi(std::string(*opt(args, "--in-dim")).c_str()) : 241;
+    const int in_dim_raw = opt(args, "--in-dim") ? std::atoi(std::string(*opt(args, "--in-dim")).c_str()) : 241;
+    if (in_dim_raw < 1) { std::cerr << "tlab-real-producer: --in-dim must be >= 1\n"; return 2; }
+    const tlab::wire::FeatureDim in_dim{static_cast<tlab::wire::count_t>(in_dim_raw)};
     // --fibers K: 0 (default) = NON-FIBER baseline (one SerialRuntime/thread, B=1 blocking); K>=1 = the
     // FIBER model (K TreeState fibers/thread multiplexed, K leaves in flight -> server batch grows with K).
     const int fibers = opt(args, "--fibers") ? std::atoi(std::string(*opt(args, "--fibers")).c_str()) : 0;
@@ -510,13 +558,35 @@ int main(int argc, char** argv) {
     }
     // Renice ONE generator thread DOWN (the generator-bound core-sharing lever): a 4th generator on the
     // server's core, reniced, soaks its idle slack but yields to the server's forward.
-    const int low_prio_thread = opt(args, "--low-prio-thread")
-        ? std::atoi(std::string(*opt(args, "--low-prio-thread")).c_str()) : -1;
-    const int low_prio_nice = opt(args, "--low-prio-nice")
+    // CLI ACL: --low-prio-thread -> OptThreadIndex (absent flag = empty = "no designated thread", the legacy
+    // -1 dissolved into typed absence, ADR-0002); a present negative is also treated as "none". --low-prio-nice
+    // STAYS a signed int [-20,19] (sign load-bearing: negative = higher priority), validated then handed to
+    // setpriority unwrapped (the named NiceValue ACL).
+    tlab::OptThreadIndex low_prio_thread{};
+    if (auto v = opt(args, "--low-prio-thread")) {
+        const int k = std::atoi(std::string(*v).c_str());
+        if (k >= 0) low_prio_thread = tlab::ThreadIndex{static_cast<std::uint32_t>(k)};
+    }
+    int low_prio_nice = opt(args, "--low-prio-nice")
         ? std::atoi(std::string(*opt(args, "--low-prio-nice")).c_str()) : 0;
+    if (low_prio_nice < -20 || low_prio_nice > 19) {
+        std::cerr << "tlab-real-producer: --low-prio-nice must be an integer in [-20, 19]\n";
+        return 2;
+    }
+    // CLI ACL (ADR-0002 fail-loud): --n-sims / --m are core search-shape ints consumed straight into the
+    // core's typed GumbelConfig (n_sims/m are the core's raw-int fields — that typedef is the core's home, not
+    // tlab's; here the boundary VALIDATES rather than feeding a meaningless budget onward).
     chocofarm::GumbelConfig cfg;
-    if (auto v = opt(args, "--n-sims")) cfg.n_sims = std::atoi(std::string(*v).c_str());
-    if (auto v = opt(args, "--m")) cfg.m = std::atoi(std::string(*v).c_str());
+    if (auto v = opt(args, "--n-sims")) {
+        const int n = std::atoi(std::string(*v).c_str());
+        if (n < 1) { std::cerr << "tlab-real-producer: --n-sims must be >= 1\n"; return 2; }
+        cfg.n_sims = n;
+    }
+    if (auto v = opt(args, "--m")) {
+        const int m = std::atoi(std::string(*v).c_str());
+        if (m < 1) { std::cerr << "tlab-real-producer: --m must be >= 1\n"; return 2; }
+        cfg.m = m;
+    }
     cfg.no_early_exit = no_early_exit;   // HPO/benchmark-only: substitute Terminate so episodes run full
 
     auto inst = chocofarm::load_instance(*inst_p, *faces_p);
@@ -526,11 +596,11 @@ int main(int argc, char** argv) {
     std::cout << "tlab-real-producer: generator=real(" << (fibers > 0 ? "multiplexed" : "non-fiber")
               << ") engine=" << engine
               << " driver=" << (fibers > 0 ? driver : std::string("n/a"))
-              << " threads=" << threads << " fibers_per_thread=" << fibers << " msg_rows=" << msg_rows
+              << " threads=" << threads.value() << " fibers_per_thread=" << fibers << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " inflight_msgs=" << inflight_msgs
               << " seconds=" << seconds << " n_sims=" << cfg.n_sims << " m=" << cfg.m
-              << " n_slots=" << chocofarm::n_action_slots(env) << " endpoint=" << *ep << "\n";
+              << " n_slots=" << chocofarm::n_action_slots(env).value() << " endpoint=" << *ep << "\n";  // SlotCount -> raw for print
 
     // Gate A (consolidation): optionally inject the control plane — a process-shared IssueController + an
     // IssueControlBridge that REQs the Python policy engine (issue_engine.py) every cadence and applies the
@@ -543,7 +613,8 @@ int main(int argc, char** argv) {
     std::unique_ptr<chocofarm::IssueController> ctl;
     std::unique_ptr<chocofarm::IssueControlBridge> bridge;
     if (control_ep) {
-        ctl = std::make_unique<chocofarm::IssueController>(threads, inflight_msgs);
+        // IssueController ACL: the controller speaks raw int n_threads/d_ceiling (its own home) — unwrap here.
+        ctl = std::make_unique<chocofarm::IssueController>(static_cast<int>(threads.value()), inflight_msgs);
         bridge = std::make_unique<chocofarm::IssueControlBridge>(ctl.get(), std::string(*control_ep), cadence_ms);
         bridge->start();
         std::cout << "tlab-real-producer: control plane ON (endpoint=" << *control_ep
@@ -561,8 +632,11 @@ int main(int argc, char** argv) {
     // here (a process can't see its siblings); the >50% bar leaves headroom for the server + a second
     // producer, and the operator running N producers divides accordingly. Skipped only if MemAvailable is
     // unreadable (a typed absence, never a guess).
+    // ThreadCount ACL: the admission-guard resident model is raw u64 arithmetic (it must hold magnitudes the
+    // size_t-backed tlab ByteCount can't guarantee on a 32-bit build — see est_tree_resident_bytes). The
+    // thread count crosses to u64 here, at the /proc-sizing boundary.
     const std::uint64_t live_trees =
-        static_cast<std::uint64_t>(threads) * (fibers > 0 ? static_cast<std::uint64_t>(fibers) : 1ull);
+        static_cast<std::uint64_t>(threads.value()) * (fibers > 0 ? static_cast<std::uint64_t>(fibers) : 1ull);
     const std::uint64_t per_tree = est_tree_resident_bytes(cfg.n_sims);
     const std::uint64_t est_resident = live_trees * per_tree;
     std::cout << "tlab-real-producer: est_resident=" << (est_resident >> 20) << " MiB ("
@@ -579,17 +653,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::vector<ThreadStat> stats(static_cast<size_t>(threads));
+    std::vector<ThreadStat> stats(static_cast<size_t>(threads.value()));
     std::vector<std::thread> pool;
     const std::string endpoint(*ep);
     const auto t0 = SteadyClock::now();
-    for (int i = 0; i < threads; ++i)
+    const std::uint32_t n_threads = threads.value();   // ThreadCount ACL: the spawn-loop bound is the raw rep
+    for (std::uint32_t i = 0; i < n_threads; ++i)
         pool.emplace_back([&, i] {
-            apply_thread_priority(i, low_prio_thread, low_prio_nice);   // renice iff designated
+            const tlab::ThreadIndex tix{i};   // the 0-based producer-thread index (typed, distinct from the count)
+            apply_thread_priority(tix, low_prio_thread, low_prio_nice);   // renice iff designated
             if (fibers > 0)   // validated above: cursor engine + --episodic (the multiplexed path)
-                run_thread_cursor_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
+                run_thread_cursor_episodic(tix, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
             else
-                run_thread(i, env, endpoint, cfg, seconds, in_dim, stats[static_cast<size_t>(i)]);   // non-fiber baseline
+                run_thread(tix, env, endpoint, cfg, seconds, in_dim, stats[static_cast<size_t>(i)]);   // non-fiber baseline
         });
     for (auto& th : pool) th.join();
     if (bridge) {
@@ -606,7 +682,7 @@ int main(int argc, char** argv) {
     }
     const double dps = wall > 0 ? static_cast<double>(dec) / wall : 0.0;
     const double lps = wall > 0 ? static_cast<double>(leaves) / wall : 0.0;
-    std::cout << "REAL-AGG threads=" << threads << " fibers=" << fibers << " engine=" << engine
+    std::cout << "REAL-AGG threads=" << threads.value() << " fibers=" << fibers << " engine=" << engine
               << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " driver=" << (fibers > 0 ? driver : std::string("n/a")) << " wall_s=" << wall

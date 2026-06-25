@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include "chocofarm/domains.hpp"  // TreasureCount(N)/PresentCount(K)/TreasureId + World — the typed instance domains (P1)
 #include "chocofarm/error.hpp"
 
 namespace chocofarm {
@@ -35,15 +36,23 @@ struct Point {
 // from instance.json's fossil arrays. The face id is the index in `faces`; the ("d", id) action
 // shape is the env's legacy shape (env.py / actions.py).
 struct Face {
-    uint32_t bitmask = 0;   // sum over j in cover of (1 << j) — the disjunction read at rep_point
+    World bitmask = 0;      // sum over j in cover of (1 << j) — the disjunction read at rep_point. `World`
+                            // (= the uint32 per-treasure mask, world.hpp) names what this bitfield IS:
+                            // a treasure-id bitset, the SAME domain env.observe ANDs against (ADR-0000;
+                            // the former bare uint32 was a silent re-author of the world-mask type).
     Point rep_point;        // where you stand to read this face (det_pt[id])
 };
 
 // The Tier-1 instance geometry (one home; ADR-0012 P1). N is derived from the treasure count,
 // never stored (mirrors Instance.N).
 struct Instance {
-    int N = 0;                       // number of treasures (= treasures.size())
-    int K = 0;                       // exactly-K-of-N present count
+    // N is the treasure-universe cardinality (= treasures.size()); K the exactly-K-of-N present count.
+    // Typed as the count domains (domains.hpp): N a TreasureCount, K a PresentCount — DISTINCT tags, so a
+    // K used where an N is owed no longer compiles (ADR-0000; the former bare int pair conflated them).
+    // Both default to 0 (the zero-init Quantity ctor) — an unloaded instance has no treasures (mirrors
+    // Instance.N's derive-from-count).
+    TreasureCount N{};               // number of treasures (= treasures.size())
+    PresentCount K{};                // exactly-K-of-N present count
     std::vector<Point> treasures;    // treasures[i] = coord of treasure id i (ids are 0..N-1)
     std::vector<std::string> teleport_names;  // teleport order as in instance.json (insertion order)
     std::vector<Point> teleports;    // teleports[k] = coord of teleport teleport_names[k]

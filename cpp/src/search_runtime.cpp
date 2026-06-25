@@ -19,13 +19,14 @@ namespace chocofarm {
 namespace {
 // Map the search's full Decision (action + improved-π in double + n_spent) onto the runtime Decision
 // (improved-π narrowed to float32, the wire/trainer dtype), stamping the per-decision leaf-request count.
-// Shared by both runtimes so the mapping has one home (P1).
-[[nodiscard]] Decision to_decision(const GumbelAZPolicy::Decision& dec, int leaf_requests) {
+// Shared by both runtimes so the mapping has one home (P1). `dec.n_spent` is the gumbel Decision's raw int
+// (kept raw at that boundary for std::cout); it crosses into the SimBudget domain via the explicit ctor.
+[[nodiscard]] Decision to_decision(const GumbelAZPolicy::Decision& dec, SimBudget leaf_requests) {
     Decision d;
     d.executed = dec.action;
     d.improved_pi.assign(dec.improved.begin(), dec.improved.end());  // double -> float32
-    d.n_spent = dec.n_spent;
-    d.leaf_requests = leaf_requests;
+    d.n_spent = SimBudget{static_cast<SearchRep>(dec.n_spent)};      // gumbel raw int -> SimBudget (ACL)
+    d.leaf_requests = leaf_requests;                                 // already the counter's SimBudget
     return d;
 }
 }  // namespace
@@ -40,7 +41,7 @@ SerialRuntime::run(const Environment& env, std::span<const SearchTask> tasks) co
         // leaves it would without the runtime; the count is the structural observable.
         CountingNetEvaluator counter(net_);
         GumbelAZPolicy policy(task.cfg, counter, env);
-        std::mt19937_64 rng(task.seed);
+        std::mt19937_64 rng(task.seed.value());  // RngSeed -> uint64_t at the engine-seeding boundary (ACL)
         // decide_with_target() builds the production RngGumbelSource off `rng` internally and returns the
         // FULL Decision (executed action + improved-π + n_spent) — the UNCHANGED search entry point.
         // SerialRuntime over a LOCAL total net cannot fail here (the leaf is total); the seam's error arm
@@ -66,18 +67,19 @@ PoolRuntime::run(const Environment& env, std::span<const SearchTask> tasks) cons
     auto worker = [&]() {
         std::size_t i;
         while ((i = cursor.fetch_add(1, std::memory_order_relaxed)) < tasks.size()) {
-            const SearchTask& task = tasks[i];
+            const SearchTask& task = tasks[i];  // `i` is the atomic task cursor — a CONTAINER index, size_t
             CountingNetEvaluator counter(net_);
             GumbelAZPolicy policy(task.cfg, counter, env);
-            std::mt19937_64 rng(task.seed);
+            std::mt19937_64 rng(task.seed.value());  // RngSeed -> uint64_t at the engine-seeding boundary
             GumbelAZPolicy::Decision dec =
                 policy.decide_with_target(env, task.loc, task.bw, task.collected, task.lam, rng);
             out[i] = to_decision(dec, counter.count());
         }
     };
 
-    // Never spawn more threads than tasks (an idle thread does nothing useful); at least one.
-    int nw = std::max(1, std::min(n_workers_, static_cast<int>(tasks.size())));
+    // Never spawn more threads than tasks (an idle thread does nothing useful); at least one. n_workers_ is
+    // a WorkerCount (>=1 by construction); .value() crosses it into the int min/max against the task count.
+    int nw = std::max(1, std::min(static_cast<int>(n_workers_.value()), static_cast<int>(tasks.size())));
     if (nw == 1) {  // degenerate: run inline (the serial path), no thread spawn
         worker();
         return out;

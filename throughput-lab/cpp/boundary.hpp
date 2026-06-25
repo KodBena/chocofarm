@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -33,7 +34,8 @@
 #include <string>
 #include <vector>
 
-#include "wire.hpp"   // tlab::wire — the Layer-1 codec + the corr_t / count_t / float_t types
+#include "proc_domains.hpp"  // tlab — ThreadCount/ByteCount/HwmMessages/Milliseconds (process-shape domains)
+#include "wire.hpp"   // tlab::wire — the Layer-1 codec + RowCount/FeatureDim/ProducerCorr (+ corr_t/count_t)
 
 namespace tlab {
 
@@ -56,9 +58,9 @@ struct BoundaryError {
 // (the Boundary frames it as the LEADING ZMQ frame per wire.hpp Layer 2, and round-trips it opaquely
 // — it NEVER parses it). A bounds-carrying view, not a raw pointer (P9).
 struct LeafBatch {
-    wire::corr_t corr = 0;
-    wire::count_t B = 0;
-    wire::count_t in_dim = 0;
+    wire::ProducerCorr corr{0};       // the producer-stamped correlation id (opaque round-trip)
+    wire::RowCount B{0};              // # leaf ROWS in this batch (>= 1)
+    wire::FeatureDim in_dim{0};       // feature WIDTH per row (Stage-A 241)
     std::span<const float> flat;   // B*in_dim floats, valid for the duration of the send call
 };
 
@@ -66,7 +68,7 @@ struct LeafBatch {
 // `corr` is the echoed correlation id (the producer matches it to its outstanding LeafBatch);
 // `preds` is the decoded B predictions (each a de-standardized value + raw logits) in submit order.
 struct BoundaryReply {
-    wire::corr_t corr = 0;
+    wire::ProducerCorr corr{0};   // the echoed PRODUCER corr (Topology B rewrites the wire corr back to it)
     std::vector<wire::ResponseFields> preds;
 };
 
@@ -135,11 +137,12 @@ enum class BoundaryTopology {
 // Topology B, `n_producer_threads` sizes the coalescing thread's intake.
 struct BoundaryConfig {
     std::string endpoint;            // e.g. "ipc:///tmp/tlab-infer.sock"
-    int recv_timeout_ms = 5000;      // bounds recv()/poll(); <= 0 means block forever (not recommended)
-    int n_producer_threads = 1;      // Topology A: # DEALERs (one per thread); Topology B: intake sizing
-    int rows = 1;                    // B per message — sizes per-message memory for the byte-budgeted send HWM
-    int in_dim = 241;                // feature width per row — sizes per-message memory for the send HWM
-    std::size_t send_queue_bytes = 256ull << 20;  // TOTAL outstanding-send byte budget across all dealers (cap)
+    Milliseconds recv_timeout_ms{5000};   // bounds recv()/poll(); the empty-optional case (block forever) is
+                                          // handled at the ZMQ ACL (zmq_dealer.hpp), not modeled in the config
+    ThreadCount n_producer_threads{1};    // Topology A: # DEALERs (one per thread); Topology B: intake sizing
+    wire::RowCount rows{1};               // B per message — sizes per-message memory for the byte-budgeted HWM
+    wire::FeatureDim in_dim{241};         // feature width per row — sizes per-message memory for the send HWM
+    ByteCount send_queue_bytes{256ull << 20};  // TOTAL outstanding-send byte budget across all dealers (cap)
 };
 
 // The send-queue high-water mark (in MESSAGES) that holds outstanding-send memory under `budget_bytes`
@@ -147,14 +150,18 @@ struct BoundaryConfig {
 // back-pressures; bounding by BYTES (not a fixed message count) keeps the memory cap honest as `rows`
 // grows — a fixed count lets large-row messages OOM the producer (exactly what the old 1'000'000-deep
 // HWM did, ~60 GB). Overestimates per-message overhead so the budget is a CEILING, not a floor.
-[[nodiscard]] inline int send_hwm_for_budget(std::size_t budget_bytes, int rows, int in_dim) {
-    const std::size_t per_msg = static_cast<std::size_t>(17)                       // corr(8) + req header(9)
-        + static_cast<std::size_t>(rows) * static_cast<std::size_t>(in_dim) * 4u   // B*in_dim float32 payload
-        + static_cast<std::size_t>(512);                                          // generous ZMQ bookkeeping slack
-    std::size_t hwm = budget_bytes / (per_msg > 0 ? per_msg : 1);
+[[nodiscard]] inline HwmMessages send_hwm_for_budget(ByteCount budget_bytes, wire::RowCount rows,
+                                                     wire::FeatureDim in_dim) {
+    // ACL: the count->bytes crossing (B*in_dim*FLOAT_BYTES) is the explicit multiply at the sizing site —
+    // the typed counts .value()-unwrap into the size_t byte arithmetic here (the named count->bytes ACL).
+    const std::size_t per_msg = static_cast<std::size_t>(17)              // corr(8) + req header(9)
+        + static_cast<std::size_t>(rows.value()) * static_cast<std::size_t>(in_dim.value())
+              * wire::FLOAT_BYTES                                          // B*in_dim float32 payload
+        + static_cast<std::size_t>(512);                                  // generous ZMQ bookkeeping slack
+    std::size_t hwm = budget_bytes.value() / (per_msg > 0 ? per_msg : 1);
     if (hwm < 4) hwm = 4;                  // always allow a little pipelining
-    if (hwm > 1'000'000) hwm = 1'000'000;  // sane ceiling (also guards the int cast)
-    return static_cast<int>(hwm);
+    if (hwm > 1'000'000) hwm = 1'000'000;  // sane ceiling (also guards the message-count narrowing)
+    return HwmMessages{static_cast<std::uint32_t>(hwm)};  // ACL: size_t->u32 message count (clamped above)
 }
 
 // The boundary factory: build the impl named by `topology`, connected per `cfg`. Returns the owned

@@ -53,7 +53,17 @@ int main(int argc, char** argv) {
                      "  endpoint (ipc://...) -> route each leaf through tlab::Boundary to a live server.\n";
         return 2;
     }
-    const int n_sims = args.size() > 3 ? std::atoi(std::string(args[3]).c_str()) : 16;
+    // CLI ACL (ADR-0002 fail-loud at the boundary): the optional n_sims is a core search-shape int consumed
+    // straight into GumbelConfig.n_sims (the core's raw-int field — its typedef is the core's home, not
+    // tlab's). A non-positive value is rejected here rather than fed onward as a meaningless budget.
+    int n_sims = 16;
+    if (args.size() > 3) {
+        n_sims = std::atoi(std::string(args[3]).c_str());
+        if (n_sims < 1) {
+            std::cerr << "tlab-real-gen-smoke: n_sims must be an integer >= 1\n";
+            return 2;
+        }
+    }
     const bool route = args.size() > 4;   // a 4th arg = the server endpoint -> route through the boundary
 
     auto inst = chocofarm::load_instance(args[1], args[2]);
@@ -62,7 +72,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     chocofarm::Environment env(*inst);
-    const int n_slots = chocofarm::n_action_slots(env);
+    // n_action_slots returns a typed SlotCount; this smoke driver sizes DetNet's logits from a raw int —
+    // unwrap at the crossing (ADR-0000 item 5: a named, visible raw<->domain crossing).
+    const int n_slots = static_cast<int>(chocofarm::n_action_slots(env).value());
 
     // The leaf evaluator: a local DetNet (no transport — the build-coupling proof), OR a
     // BoundaryNetEvaluator that round-trips each leaf through OUR tlab::Boundary to a live server (the
@@ -72,12 +84,14 @@ int main(int argc, char** argv) {
     std::unique_ptr<tlab::BoundaryNetEvaluator> bridge;
     const chocofarm::NetEvaluator* net = &det;
     if (route) {
+        // BoundaryConfig speaks the typed tlab domains (Milliseconds/ThreadCount/RowCount/FeatureDim,
+        // boundary.hpp/proc_domains.hpp); construct the literal knobs in-domain (ADR-0000 rule 1).
         tlab::BoundaryConfig bcfg;
         bcfg.endpoint = std::string(args[4]);
-        bcfg.recv_timeout_ms = 5000;
-        bcfg.n_producer_threads = 1;
-        bcfg.rows = 1;
-        bcfg.in_dim = 241;
+        bcfg.recv_timeout_ms = tlab::Milliseconds{5000};
+        bcfg.n_producer_threads = tlab::ThreadCount{1};
+        bcfg.rows = tlab::wire::RowCount{1};
+        bcfg.in_dim = tlab::wire::FeatureDim{241};
         auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
         if (!b) {
             std::cerr << "tlab-real-gen-smoke: FATAL: boundary: " << b.error().message << "\n";
@@ -95,7 +109,7 @@ int main(int argc, char** argv) {
     t.bw = env.full_belief();
     t.collected = chocofarm::CollectedSet{};
     t.lam = 0.1;
-    t.seed = 1;
+    t.seed = chocofarm::RngSeed{1};  // opaque 64-bit seed bit-pattern (RngSeed domain), not a count/index
     t.cfg = cfg;
 
     chocofarm::SerialRuntime serial(*net);
@@ -107,6 +121,6 @@ int main(int argc, char** argv) {
     }
     std::cout << "tlab-real-gen-smoke: OK  n_slots=" << n_slots
               << "  n_sims=" << cfg.n_sims
-              << "  leaf_requests=" << (*out)[0].leaf_requests << "\n";
+              << "  leaf_requests=" << (*out)[0].leaf_requests.value() << "\n";  // SimBudget -> raw for print
     return 0;
 }

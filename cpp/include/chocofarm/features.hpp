@@ -29,18 +29,21 @@
 
 #include "chocofarm/belief_key.hpp"
 #include "chocofarm/collected_set.hpp"
+#include "chocofarm/domains.hpp"  // SlotIndex/SlotCount/FeatureDim/Treasure|Face|TeleportCount — typed domains (P1)
 #include "chocofarm/env.hpp"
 #include "chocofarm/feature_layout.hpp"
 
 namespace chocofarm {
 
 // Fixed action-space size for this env (mirrors actions.n_action_slots): N collects + nD senses +
-// 1 TERMINATE. Slot 0..N-1 = ("t", i); N..N+nD-1 = ("d", j); N+nD = TERMINATE (always legal).
-int n_action_slots(const Environment& env);
-int term_slot(const Environment& env);          // index of the always-legal TERMINATE slot
+// 1 TERMINATE. Slot 0..N-1 = ("t", i); N..N+nD-1 = ("d", j); N+nD = TERMINATE (always legal). Returns a
+// SlotCount (the count that BOUNDS SlotIndex — count-vs-index, ADR-0008), via the n_action_slots bridge.
+[[nodiscard]] SlotCount n_action_slots(const Environment& env);
+[[nodiscard]] SlotIndex term_slot(const Environment& env);  // index of the always-legal TERMINATE slot
 
-// The fixed slot for an action (mirrors actions.action_to_slot).
-int action_to_slot(const Environment& env, const Action& a);
+// The fixed slot for an action (mirrors actions.action_to_slot). Returns a typed SlotIndex — a FeatureDim
+// or a bare id used where a slot is owed no longer compiles (ADR-0000; dissolves the overloaded Action.i).
+[[nodiscard]] SlotIndex action_to_slot(const Environment& env, const Action& a);
 
 // The legal-action mask over the fixed slots (mirrors actions.legal_mask): 1.0 on each legal action
 // slot + the always-legal TERMINATE slot, 0.0 elsewhere. This is the LOGIC INVARIANT M the runner
@@ -130,7 +133,7 @@ struct FeatureWorkspace {
 class FeatureBuilder {
   public:
     explicit FeatureBuilder(const Environment& env);
-    int dim() const { return dim_; }
+    [[nodiscard]] FeatureDim dim() const { return dim_; }  // the build() output length (typed, P8)
     // `loc` is the current standing point (resolved Point, as in env.coord). `bw`/`collected` are
     // the live belief + collected set. Returns a length-`dim()` float64 vector.
     std::vector<double> build(const Point& loc, const Belief& bw,
@@ -174,10 +177,10 @@ class FeatureBuilder {
 
   private:
     const Environment& env_;
-    int N_;
-    int nD_;
-    int n_tel_;
-    int dim_;
+    TreasureCount N_;      // |treasures| (the TreasureId/marg upper bound) — env.N() at the ctor ACL
+    FaceCount nD_;         // |faces|/detectors (the FaceId/p_pos upper bound) — env.n_detectors() ACL
+    TeleportCount n_tel_;  // |teleports| (the TeleportId/dist_w upper bound) — env.n_teleports() ACL
+    FeatureDim dim_;       // 5N+3nD+6+n_tel — the build() output length (derived, never hardcoded)
     double diag_;          // bounding-box diagonal over all coords (map_diag)
     double log_nworlds_;   // log(|worlds|)
     FeatureLayoutSpec layout_;  // the §2.2 block table, runtime-read from the Python-emitted SSOT
@@ -188,8 +191,11 @@ class FeatureBuilder {
     // FeatureLayoutSpec::start was 2.3% self-time in the K=32 profile. The layout SSOT still OWNS the
     // offsets (ADR-0012 P1); this caches the resolved values, bit-identical to the lookups. Fields are
     // the written-key set, in declaration order.
+    // Each is a block START offset into the feature vector — a FeatureDim (the same vector-space offset
+    // domain dim()/layout_.start() speak). Resolved once from layout_ in the ctor (P1: the layout SSOT
+    // owns them; this caches the resolved values, bit-identical to the start() lookups).
     struct BlockOffsets {
-        int marg, collected, available, dist_t, unc, informative, p_pos, dist_d,
+        FeatureDim marg, collected, available, dist_t, unc, informative, p_pos, dist_d,
             sharpness, n_collected, marg_sum, exit_norm, nonempty, sum_unc, dist_w;
     };
     BlockOffsets off_{};
@@ -218,6 +224,10 @@ class FeatureBuilder {
     // recomputes — P6 correctness-invariant), and gumbel's node transposition table already captures the
     // repeated-belief reuse, so the small cap holds throughput (MEASURED). Overridable for the sweep by env
     // CHOCO_BELIEF_CACHE_CAP (ADR-0009 tuning knob); the default is the measured throughput-neutral knee.
+    // NOTE: the belief-cache capacity family (cap / kDefault / n_ below) is a memo-entry COUNT — a
+    // tuning-knob capacity, NOT one of the modeled integer DOMAINS (no minted phantom tag exists for it
+    // in domains.hpp), so it stays a raw int rather than reaching for an unmotivated type (ADR-0000:
+    // type where it carries meaning; a cache backstop is a generic capacity, not a domain magnitude).
     static int belief_cache_cap();  // kDefault, or CHOCO_BELIEF_CACHE_CAP if the env var is set (>0)
     // MEASURED knee (ADR-0009, the structural-fix cap sweep at K=1024/n_sims=256): leaves/s is FLAT from
     // cap 50000 down to 16 (47752 -> 46693, < 2%, server-bound), while per-producer peak RSS falls 2442 ->

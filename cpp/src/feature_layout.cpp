@@ -21,7 +21,7 @@
 namespace chocofarm {
 
 std::expected<FeatureLayoutSpec, Error>
-FeatureLayoutSpec::load(std::string_view path, int expected_dim) {
+FeatureLayoutSpec::load(std::string_view path, FeatureDim expected_dim) {
     std::ifstream f{std::string(path)};
     if (!f)
         return std::unexpected(make_error("cannot open feature-layout spec: " + std::string(path)));
@@ -30,16 +30,24 @@ FeatureLayoutSpec::load(std::string_view path, int expected_dim) {
         return std::unexpected(make_error("malformed JSON in feature-layout spec: " + std::string(path)));
     try {
         FeatureLayoutSpec spec;
-        spec.dim_ = j.at("dim").get<int>();
-        int o = 0;
+        // JSON loader ACL (ADR-0002): nlohmann get<int> parses signed; FAIL-LOUD on a negative dim at the
+        // boundary BEFORE the explicit FeatureDim (unsigned u16) crossing — a negative dim is a malformed
+        // spec, never a wrapped huge unsigned. (Mirrors instance.cpp's signed->unsigned-id boundary.)
+        const int dim_raw = j.at("dim").get<int>();
+        if (dim_raw < 0)
+            return std::unexpected(make_error("feature-layout: negative dim (" + std::to_string(dim_raw) + ")"));
+        spec.dim_ = FeatureDim{static_cast<LayoutRep>(dim_raw)};
+        FeatureDim o{0};  // running Σwidth (cumulative offset); FeatureDim is additive (offset + width)
         for (const auto& b : j.at("blocks")) {
             FeatureBlock blk;
             blk.key = b.at("key").get<std::string>();
-            blk.width = b.at("width").get<int>();
-            if (blk.width < 0)
+            // JSON loader ACL: fail-loud on a negative width at the boundary before the unsigned crossing.
+            const int width_raw = b.at("width").get<int>();
+            if (width_raw < 0)
                 return std::unexpected(make_error("feature-layout: negative width for block '" + blk.key + "'"));
+            blk.width = FeatureDim{static_cast<LayoutRep>(width_raw)};
             blk.start = o;
-            o += blk.width;
+            o = o + blk.width;  // additive FeatureDim: the contiguous-partition cumulative start
             auto [it, inserted] = spec.index_.emplace(blk.key, static_cast<int>(spec.blocks_.size()));
             if (!inserted)
                 return std::unexpected(make_error("feature-layout: duplicate block key '" + blk.key + "'"));
@@ -48,13 +56,14 @@ FeatureLayoutSpec::load(std::string_view path, int expected_dim) {
         // Cross-language consistency (ADR-0002): the shipped spec's `dim`, its Σwidth, and THIS env's
         // derived dim must ALL agree. Σwidth==dim with cumulative starts makes the blocks a contiguous
         // partition of [0, dim) by construction; ==expected_dim ties the shipped spec to this env. Any
-        // disagreement is a silent-mislabel hazard, so it is a loud boundary Error here.
+        // disagreement is a silent-mislabel hazard, so it is a loud boundary Error here. Same-domain
+        // FeatureDim == (the defaulted three-way over the rep); .value() at the diagnostic-string crossing.
         if (o != spec.dim_)
-            return std::unexpected(make_error("feature-layout: Σwidth (" + std::to_string(o) +
-                                              ") != spec dim (" + std::to_string(spec.dim_) + ")"));
+            return std::unexpected(make_error("feature-layout: Σwidth (" + std::to_string(o.value()) +
+                                              ") != spec dim (" + std::to_string(spec.dim_.value()) + ")"));
         if (spec.dim_ != expected_dim)
-            return std::unexpected(make_error("feature-layout: spec dim (" + std::to_string(spec.dim_) +
-                                              ") != env-derived dim (" + std::to_string(expected_dim) +
+            return std::unexpected(make_error("feature-layout: spec dim (" + std::to_string(spec.dim_.value()) +
+                                              ") != env-derived dim (" + std::to_string(expected_dim.value()) +
                                               ") — the spec does not match this env"));
         return spec;
     } catch (const std::exception& e) {
@@ -62,7 +71,7 @@ FeatureLayoutSpec::load(std::string_view path, int expected_dim) {
     }
 }
 
-int FeatureLayoutSpec::start(std::string_view key) const {
+FeatureDim FeatureLayoutSpec::start(std::string_view key) const {
     auto it = index_.find(std::string(key));
     if (it == index_.end()) {
         // ADR-0012 P9: the writer names only keys the FeatureBuilder ctor verified the spec carries,

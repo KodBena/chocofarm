@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "chocofarm/collected_set.hpp"
+#include "chocofarm/domains.hpp"  // TreasureId/FaceId + World — the typed id domains the base primitives thread (P1)
 #include "chocofarm/env.hpp"
 
 namespace chocofarm {
@@ -128,7 +129,7 @@ class GreedyStopBase final : public Policy {
 // taken BY VALUE — _base_value mutates a playout COPY of the belief in place (the seam's apply filters
 // it through the run), so the copy is deliberate (a Belief value, not a borrowed ref).
 [[nodiscard]] double base_value(const Environment& env, const Policy& base, Loc loc,
-                                Belief bw, CollectedSet collected, uint32_t world,
+                                Belief bw, CollectedSet collected, World world,
                                 double lam);
 
 // The GENERIC world-sampling seam: the part of a search's RNG use that is NOT search-specific.
@@ -141,8 +142,9 @@ class GreedyStopBase final : public Policy {
 // generic draw is shared (ADR-0012 P1), only the leaf is search-specific.
 struct WorldSource {
     virtual ~WorldSource() = default;
-    // Sample one concrete world from the belief `b` (mirrors env.sample_world(b, rng)).
-    virtual uint32_t sample_world(const Belief& b) = 0;
+    // Sample one concrete world from the belief `b` (mirrors env.sample_world(b, rng)). Returns a World
+    // mask (the per-treasure bitset, world.hpp) — the determinization the search recurses in.
+    virtual World sample_world(const Belief& b) = 0;
 };
 
 // The production world sampler: a uniform draw from the belief off a single std::mt19937_64
@@ -154,7 +156,7 @@ struct WorldSource {
 class RngWorldSource : public WorldSource {
   public:
     RngWorldSource(const Environment& env, std::mt19937_64& rng) : env_(env), rng_(rng) {}
-    uint32_t sample_world(const Belief& b) override { return env_.sample_world(b, rng_); }
+    World sample_world(const Belief& b) override { return env_.sample_world(b, rng_); }
 
   protected:
     const Environment& env_;  // borrowed: the home of the uniform draw (the seam, L1)

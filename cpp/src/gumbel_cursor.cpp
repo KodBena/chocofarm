@@ -35,9 +35,12 @@ namespace {
 // Reconstruct an Action from its slot (the inverse of action_to_slot; a copy of gumbel.cpp's file-local
 // action_of_slot — pure slot->Action, precision-irrelevant, NOT a seam). Slot 0..N-1 = Treasure i;
 // N..N+nD-1 = Detector j; term_slot = TERMINATE.
-[[nodiscard]] Action action_of_slot(const Environment& env, int slot) {
-    if (slot < env.N()) return Action{ActionKind::Treasure, slot};
-    if (slot < env.N() + env.n_detectors()) return Action{ActionKind::Detector, slot - env.N()};
+// ACL: Action.i is a raw int (env.hpp), env.N()/n_detectors() return raw int; slot.value() crosses
+// SlotIndex->raw at the kind decision + the detector-offset subtract.
+[[nodiscard]] Action action_of_slot(const Environment& env, SlotIndex slot) {
+    const int s = static_cast<int>(slot.value());
+    if (s < env.N()) return Action{ActionKind::Treasure, s};
+    if (s < env.N() + env.n_detectors()) return Action{ActionKind::Detector, s - env.N()};
     return terminate_action();
 }
 }  // namespace
@@ -61,9 +64,9 @@ Step TreeCursor::advance() {
         // to exit; NO leaf is issued.
         if (p_.env_.empty(bw_)) {
             decision_.action = terminate_action();
-            decision_.improved.assign(static_cast<size_t>(n_slots_), 0.0);
-            decision_.improved[static_cast<size_t>(term_slot_)] = 1.0;
-            decision_.survivor_slot = term_slot_;
+            decision_.improved.assign(static_cast<size_t>(n_slots_.value()), 0.0);
+            decision_.improved[static_cast<size_t>(term_slot_.value())] = 1.0;
+            decision_.survivor_slot = static_cast<int>(term_slot_.value());  // ACL: Decision field raw int
             decision_.n_spent = 0;
             phase_ = Phase::Done;
             return CursorDecided{decision_};
@@ -90,29 +93,31 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
         // setup: the root logits (seam 1), the Gumbel-top-k draw + sort, and the SH bracket init.
         p_.eval_finish(nodes_[0], prediction, ws_);
         // root logits = log(prior) over legal slots (seam 1: float32 prior precision -> log) — illegal -1e30.
-        root_logits_.assign(static_cast<size_t>(n_slots_), -1e30);
-        for (int s : nodes_[0].legal_slots)
-            root_logits_[static_cast<size_t>(s)] = p_.root_logit(nodes_[0], s);
+        root_logits_.assign(static_cast<size_t>(n_slots_.value()), -1e30);
+        for (SlotIndex s : nodes_[0].legal_slots)
+            root_logits_[static_cast<size_t>(s.value())] = p_.root_logit(nodes_[0], s);
         // Gumbel-Top-k: ONE gumbel draw over the FULL slot space (drawn AFTER the root eval — exactly
         // where run_search draws it), sort logits+g, take the top-m legal slots.
-        g_ = src_.gumbel(n_slots_);
-        std::vector<std::pair<double, int>> scored;
+        // ACL: gumbel(int n) takes the slot-space draw length raw (the override-gated virtual).
+        g_ = src_.gumbel(static_cast<int>(n_slots_.value()));
+        std::vector<std::pair<double, SlotIndex>> scored;
         scored.reserve(nodes_[0].legal_slots.size());
-        for (int s : nodes_[0].legal_slots)
-            scored.emplace_back(root_logits_[static_cast<size_t>(s)] + g_[static_cast<size_t>(s)], s);
+        for (SlotIndex s : nodes_[0].legal_slots)
+            scored.emplace_back(root_logits_[static_cast<size_t>(s.value())] + g_[static_cast<size_t>(s.value())], s);
         std::stable_sort(scored.begin(), scored.end(),
-                         [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                         [](const std::pair<double, SlotIndex>& a, const std::pair<double, SlotIndex>& b) {
                              return a.first > b.first;
                          });
+        // m = min(self.m, #legal): a CandidateCount; cfg_.m is a raw int (GumbelConfig, CLI-set).
         int m = std::min(p_.cfg_.m, static_cast<int>(nodes_[0].legal_slots.size()));
         considered_.clear();
         considered_.reserve(static_cast<size_t>(m));
         for (int i = 0; i < m; ++i) considered_.push_back(scored[static_cast<size_t>(i)].second);
 
         // SH bracket init (mirrors sequential_halving's head).
-        n_spent_ = 0;
+        n_spent_ = SimBudget{0};
         if (considered_.empty()) {  // unreachable on a non-empty belief, kept for the contract
-            decision_.survivor_slot = -1;
+            decision_.survivor_slot = -1;  // raw-int Decision field (the unreachable "no survivor")
             finalize();
             phase_ = Phase::Done;
             return CursorDecided{decision_};
@@ -123,15 +128,18 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
             sh_single_ = true;
             cur_root_slot_ = considered_[0];
         } else {
+            // ACL: cfg_.n_sims is a raw int (GumbelConfig). m_sz/n_phases are CandidateCount; the budget
+            // family is SimBudget.
             int m_sz = static_cast<int>(considered_.size());
             int n_phases = std::max(1, static_cast<int>(std::ceil(std::log2(static_cast<double>(m_sz)))));
-            sh_per_phase_ = std::max(1, p_.cfg_.n_sims / n_phases);
-            sh_budget_ = p_.cfg_.n_sims;
+            sh_per_phase_ = SimBudget{static_cast<SearchRep>(std::max(1, p_.cfg_.n_sims / n_phases))};
+            sh_budget_ = SimBudget{static_cast<SearchRep>(p_.cfg_.n_sims)};
             // start the first phase's per-action loop
-            int phase_budget = std::min(sh_per_phase_, sh_budget_);
-            sh_per_action_ = std::max(1, phase_budget / static_cast<int>(considered_.size()));
+            SimBudget phase_budget{std::min(sh_per_phase_.value(), sh_budget_.value())};
+            sh_per_action_ = SimBudget{static_cast<SearchRep>(std::max(
+                1, static_cast<int>(phase_budget.value()) / static_cast<int>(considered_.size())))};
             sh_phase_idx_ = 0;
-            sh_action_done_ = 0;
+            sh_action_done_ = SimBudget{0};
         }
         // begin the first sim of the first candidate
         return drive();
@@ -171,8 +179,8 @@ Step TreeCursor::drive() {
         }
 
         // Are we mid-sim (a root action under c_outcome determinization)?
-        if (cur_root_slot_ != -1) {
-            Action a = action_of_slot(p_.env_, cur_root_slot_);
+        if (cur_root_slot_.has_value()) {
+            Action a = action_of_slot(p_.env_, *cur_root_slot_);
             if (a.kind == ActionKind::Terminate) {
                 // simulate_root_action terminate short-circuit: return -lam*exit_cost (NO c_outcome loop,
                 // NO leaf, NO world draws). The whole sim's value is this.
@@ -183,11 +191,12 @@ Step TreeCursor::drive() {
             // simulate_root_action's c_outcome loop. cur_k_ is the NEXT determinization to start; each
             // started determinization either parks (returns up via resume) or completes its descent
             // synchronously (a no-leaf path), folding its (step + descend cont) into sim_total_.
-            if (cur_k_ < p_.cfg_.c_outcome) {
+            // ACL: cfg_.c_outcome is a raw int (GumbelConfig) -> OutcomeIndex at the loop bound.
+            if (cur_k_ < OutcomeIndex{static_cast<SearchRep>(p_.cfg_.c_outcome)}) {
                 // k==0 reuses the visit-drawn world (cur_world_), k>0 draws fresh — the IDENTICAL draw
                 // order simulate_root_action uses (no draw for k==0, one sample_world per k>0).
-                uint32_t w = (cur_k_ == 0) ? cur_world_ : src_.sample_world(bw_);
-                ++cur_k_;  // this determinization is now consumed (advance before pushing the descent)
+                World w = (cur_k_ == OutcomeIndex{0}) ? cur_world_ : src_.sample_world(bw_);
+                cur_k_ = cur_k_ + SearchRep{1};  // OutcomeIndex affine: this determinization is consumed
                 // BY-REFERENCE: seed the SINGLE live descent state from the decision-level (loc_, bw_,
                 // collected_) — the ONE belief copy that remains, per determinization (the decision belief
                 // is reused across c_outcome, so it must be preserved; descent_bw_ is the mutable narrowing
@@ -199,7 +208,7 @@ Step TreeCursor::drive() {
                 StepResult sr = p_.env_.apply(descent_loc_, descent_bw_, descent_coll_, a, descent_world_);
                 double step = sr.reward - lam_ * sr.dt;
                 // find/create the root child node for (slot, belief_key) (simulate_root_action's body).
-                std::tuple<int, GBeliefKey> ckey{cur_root_slot_, gumbel_belief_key(p_.env_, descent_bw_)};
+                std::tuple<SlotIndex, GBeliefKey> ckey{*cur_root_slot_, gumbel_belief_key(p_.env_, descent_bw_)};
                 int child;
                 auto cit = nodes_[0].children.find(ckey);
                 if (cit == nodes_[0].children.end()) {
@@ -214,7 +223,7 @@ Step TreeCursor::drive() {
                 sim_total_ += step;
                 DescendFrame fr;
                 fr.node = child;
-                fr.depth = 1;
+                fr.depth = PlyDepth{1};
                 descend_stack_.push_back(fr);  // the depth-1 child state lives in descent_* (not the frame)
                 continue;  // loop: pump_descent drives the new frame (park or complete)
             }
@@ -228,15 +237,15 @@ Step TreeCursor::drive() {
         // the budget is exhausted.
         // --- the lone-candidate fast path: visit n_sims on considered_[0] ---
         if (sh_single_) {
-            if (n_spent_ < p_.cfg_.n_sims) {
+            if (n_spent_ < SimBudget{static_cast<SearchRep>(p_.cfg_.n_sims)}) {  // ACL: cfg_.n_sims raw int
                 cur_root_slot_ = considered_[0];
                 cur_world_ = src_.sample_world(bw_);  // visit(): w = src.sample_world(bw)
-                cur_k_ = 0;
+                cur_k_ = OutcomeIndex{0};
                 sim_total_ = 0.0;
                 continue;
             }
             // done: survivor is considered_[0].
-            decision_.survivor_slot = considered_[0];
+            decision_.survivor_slot = static_cast<int>(considered_[0].value());  // ACL: Decision field raw int
             finalize();
             phase_ = Phase::Done;
             return CursorDecided{decision_};
@@ -255,12 +264,13 @@ Step TreeCursor::drive() {
         if (!sh_remainder_) {
             if (!sh_phase_active_) {
                 // top-of-while check: enter a phase iff size>1 && budget>0.
-                if (considered_.size() > 1 && sh_budget_ > 0) {
+                if (considered_.size() > 1 && sh_budget_ > SimBudget{0}) {
                     sh_phase_active_ = true;
-                    int phase_budget = std::min(sh_per_phase_, sh_budget_);
-                    sh_per_action_ = std::max(1, phase_budget / static_cast<int>(considered_.size()));
+                    SimBudget phase_budget{std::min(sh_per_phase_.value(), sh_budget_.value())};
+                    sh_per_action_ = SimBudget{static_cast<SearchRep>(std::max(
+                        1, static_cast<int>(phase_budget.value()) / static_cast<int>(considered_.size())))};
                     sh_phase_idx_ = 0;
-                    sh_action_done_ = 0;
+                    sh_action_done_ = SimBudget{0};
                     sh_phase_broke_ = false;
                     continue;
                 }
@@ -271,9 +281,9 @@ Step TreeCursor::drive() {
             }
             // a phase is active: run its per-action loop, then ALWAYS cut.
             if (!sh_phase_broke_ && sh_phase_idx_ < static_cast<int>(considered_.size())) {
-                int s = considered_[static_cast<size_t>(sh_phase_idx_)];
-                int v = std::min(sh_per_action_, sh_budget_);
-                if (v <= 0) {
+                SlotIndex s = considered_[static_cast<size_t>(sh_phase_idx_)];
+                SimBudget v{std::min(sh_per_action_.value(), sh_budget_.value())};
+                if (v == SimBudget{0}) {  // unsigned: v<=0 is v==0 (the never-negative invariant, ADR-0000)
                     // sequential_halving: `if (v <= 0) break;` -> end this phase's per-action loop early
                     // (but STILL cut afterwards — the break only exits the per-action for-loop).
                     sh_phase_broke_ = true;
@@ -285,36 +295,36 @@ Step TreeCursor::drive() {
                     // `visit(s, v); budget -= v;` (n_spent is incremented per sim in on_sim_complete).
                     cur_root_slot_ = s;
                     cur_world_ = src_.sample_world(bw_);  // visit(): w = src.sample_world(bw)
-                    cur_k_ = 0;
+                    cur_k_ = OutcomeIndex{0};
                     sim_total_ = 0.0;
-                    ++sh_action_done_;
+                    sh_action_done_ += SimBudget{1};
                     if (sh_action_done_ == v) {
-                        sh_budget_ -= v;
+                        sh_budget_ = SimBudget{sh_budget_.value() - v.value()};  // budget draws down
                         ++sh_phase_idx_;
-                        sh_action_done_ = 0;
+                        sh_action_done_ = SimBudget{0};
                     }
                     continue;
                 }
                 ++sh_phase_idx_;  // defensive; action_done resets at v
-                sh_action_done_ = 0;
+                sh_action_done_ = SimBudget{0};
                 continue;
             }
             // the per-action loop is done (ran out of candidates or broke on v<=0): ALWAYS cut the worst
             // half by g+logit+σ·q̂ (sequential_halving's per-phase cut, runs regardless of budget).
             double sigma = p_.sh_cut_sigma(nodes_[0]);
-            std::vector<std::pair<double, int>> keyed;
+            std::vector<std::pair<double, SlotIndex>> keyed;
             keyed.reserve(considered_.size());
-            for (int s : considered_) {
-                double key = g_[static_cast<size_t>(s)] + root_logits_[static_cast<size_t>(s)] +
+            for (SlotIndex s : considered_) {
+                double key = g_[static_cast<size_t>(s.value())] + root_logits_[static_cast<size_t>(s.value())] +
                              sigma * nodes_[0].q(s);
                 keyed.emplace_back(key, s);
             }
             std::stable_sort(keyed.begin(), keyed.end(),
-                             [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                             [](const std::pair<double, SlotIndex>& a, const std::pair<double, SlotIndex>& b) {
                                  return a.first > b.first;
                              });
-            int keep = std::max(1, static_cast<int>(keyed.size()) / 2);
-            std::vector<int> next;
+            int keep = std::max(1, static_cast<int>(keyed.size()) / 2);  // keep is a CandidateCount (survivors)
+            std::vector<SlotIndex> next;
             next.reserve(static_cast<size_t>(keep));
             for (int i = 0; i < keep; ++i) next.push_back(keyed[static_cast<size_t>(i)].second);
             considered_ = std::move(next);
@@ -323,18 +333,18 @@ Step TreeCursor::drive() {
         }
 
         // --- the full-budget remainder loop (round-robin on the survivors) ---
-        if (sh_budget_ > 0 && !considered_.empty()) {
-            int s = considered_[sh_rr_ % considered_.size()];
+        if (sh_budget_ > SimBudget{0} && !considered_.empty()) {
+            SlotIndex s = considered_[sh_rr_ % considered_.size()];
             cur_root_slot_ = s;
             cur_world_ = src_.sample_world(bw_);
-            cur_k_ = 0;
+            cur_k_ = OutcomeIndex{0};
             sim_total_ = 0.0;
-            sh_budget_ -= 1;
+            sh_budget_ = SimBudget{sh_budget_.value() - 1};  // budget draws down
             ++sh_rr_;
             continue;
         }
         // SH complete: survivor is considered_.front().
-        decision_.survivor_slot = considered_.front();
+        decision_.survivor_slot = static_cast<int>(considered_.front().value());  // ACL: Decision field raw int
         finalize();
         phase_ = Phase::Done;
         return CursorDecided{decision_};
@@ -351,8 +361,8 @@ Step TreeCursor::pump_descent() {
         // members (NOT the frame). f is the back() frame, so descent_* IS its state (the descent narrowed
         // them in place to this depth). No per-frame belief copy is read here.
 
-        // descend()'s top: depth>=max_depth || empty(bw).
-        if (f.depth >= p_.cfg_.max_depth || p_.env_.empty(descent_bw_)) {
+        // descend()'s top: depth>=max_depth || empty(bw). ACL: cfg_.max_depth is a raw int (GumbelConfig).
+        if (f.depth >= PlyDepth{static_cast<SearchRep>(p_.cfg_.max_depth)} || p_.env_.empty(descent_bw_)) {
             if (!node.evaluated) {
                 if (p_.env_.empty(descent_bw_)) {
                     // empty belief: return -lam*exit_cost (NO leaf, NO eval).
@@ -383,14 +393,14 @@ Step TreeCursor::pump_descent() {
 
         // evaluated interior node: puct_select an action, apply it, descend into the child (push a frame),
         // OR (terminate) compute the return and unwind. This is descend()'s interior body.
-        int a = p_.puct_select(node);
+        SlotIndex a = p_.puct_select(node);
         Action act = action_of_slot(p_.env_, a);
         if (act.kind == ActionKind::Terminate) {
             double ret = -lam_ * p_.env_.exit_cost(descent_loc_.pt);  // stop now: only the exit toll
             // descend()'s tail on THIS node: cur.W[a]+=ret; cur.N[a]+=1; return ret. (The terminate edge's
             // own W/N is on this node, then the value backs up to the parents as their step+cont.)
-            node.W[static_cast<size_t>(a)] += ret;
-            node.N[static_cast<size_t>(a)] += 1;
+            node.W[static_cast<size_t>(a.value())] += ret;
+            node.N[static_cast<size_t>(a.value())] += VisitCount{1};
             descend_stack_.pop_back();
             unwind_with(ret);
             return CursorDecided{};
@@ -401,7 +411,7 @@ Step TreeCursor::pump_descent() {
         // belief COPY the by-reference design removes: apply writes the narrowed belief back in place.
         StepResult sr = p_.env_.apply(descent_loc_, descent_bw_, descent_coll_, act, descent_world_);
         double step = sr.reward - lam_ * sr.dt;
-        std::tuple<int, GBeliefKey> ckey{a, gumbel_belief_key(p_.env_, descent_bw_)};
+        std::tuple<SlotIndex, GBeliefKey> ckey{a, gumbel_belief_key(p_.env_, descent_bw_)};
         int child;
         auto cit = node.children.find(ckey);
         if (cit == node.children.end()) {
@@ -420,7 +430,7 @@ Step TreeCursor::pump_descent() {
         // push the child frame at depth+1; its (loc, bw, collected, world) ARE the just-narrowed descent_*.
         DescendFrame cf;
         cf.node = child;
-        cf.depth = descend_stack_.back().depth + 1;
+        cf.depth = descend_stack_.back().depth + SearchRep{1};  // PlyDepth affine: depth + 1 ply
         descend_stack_.push_back(cf);
         // loop: pump the new top frame.
     }
@@ -437,8 +447,8 @@ void TreeCursor::unwind_with(double cont) {
     while (!descend_stack_.empty()) {
         DescendFrame& parent = descend_stack_.back();
         double ret = parent.step + cont;  // descend(): ret = step + cont
-        nodes_[static_cast<size_t>(parent.node)].W[static_cast<size_t>(parent.action_slot)] += ret;
-        nodes_[static_cast<size_t>(parent.node)].N[static_cast<size_t>(parent.action_slot)] += 1;
+        nodes_[static_cast<size_t>(parent.node)].W[static_cast<size_t>(parent.action_slot.value())] += ret;
+        nodes_[static_cast<size_t>(parent.node)].N[static_cast<size_t>(parent.action_slot.value())] += VisitCount{1};
         descend_stack_.pop_back();
         cont = ret;  // this frame's ret becomes its parent's cont
     }
@@ -447,40 +457,44 @@ void TreeCursor::unwind_with(double cont) {
 
 // ---- visit's W/N tail: a finished sim's return backs up to the root --------------------------------
 void TreeCursor::on_sim_complete(double ret) {
-    // visit(): nodes[0].W[slot] += ret; nodes[0].N[slot] += 1.
-    nodes_[0].W[static_cast<size_t>(cur_root_slot_)] += ret;
-    nodes_[0].N[static_cast<size_t>(cur_root_slot_)] += 1;
-    ++n_spent_;
-    // clear the per-sim cursor; the SH schedule pulls the next sim.
-    cur_root_slot_ = -1;
-    cur_k_ = 0;
+    // visit(): nodes[0].W[slot] += ret; nodes[0].N[slot] += 1. cur_root_slot_ is set while mid-sim.
+    assert(cur_root_slot_.has_value() && "on_sim_complete with no current root slot (driver invariant)");
+    const SlotIndex slot = *cur_root_slot_;
+    nodes_[0].W[static_cast<size_t>(slot.value())] += ret;
+    nodes_[0].N[static_cast<size_t>(slot.value())] += VisitCount{1};
+    n_spent_ += SimBudget{1};
+    // clear the per-sim cursor; the SH schedule pulls the next sim (typed absence over the -1 sentinel).
+    cur_root_slot_.reset();
+    cur_k_ = OutcomeIndex{0};
     sim_total_ = 0.0;
 }
 
 // ---- finalize: improved-π + executed action + the no-early-exit substitution ----------------------
 void TreeCursor::finalize() {
-    decision_.n_spent = n_spent_;
+    decision_.n_spent = static_cast<int>(n_spent_.value());  // ACL: Decision.n_spent is raw int
     decision_.improved = p_.improved_policy(nodes_[0], root_logits_);
-    int survivor = decision_.survivor_slot;
+    // survivor_slot is the raw-int Decision field set by drive()/resume(); cross back to SlotIndex for the
+    // bijection lookup. It is never -1 here on a non-empty belief (drive() always sets a real survivor).
+    const int survivor = decision_.survivor_slot;
     assert(survivor != -1 && "gumbel(cursor): SH returned no survivor on a non-empty belief");
-    decision_.action = action_of_slot(p_.env_, survivor);
+    decision_.action = action_of_slot(p_.env_, SlotIndex{static_cast<LayoutRep>(survivor)});
 
     // HPO/BENCHMARK-ONLY no-early-exit substitution (cfg_.no_early_exit; default false -> skipped, the
     // decision byte-unchanged). Identical to run_search's tail.
     if (p_.cfg_.no_early_exit && decision_.action.kind == ActionKind::Terminate) {
-        int best_slot = -1;
+        std::optional<SlotIndex> best_slot;  // typed absence over the -1 "no non-terminate option" sentinel
         double best_pi = -1.0;
-        for (int s : nodes_[0].legal_slots) {
+        for (SlotIndex s : nodes_[0].legal_slots) {
             if (s == term_slot_) continue;
-            const double pi = decision_.improved[static_cast<size_t>(s)];
+            const double pi = decision_.improved[static_cast<size_t>(s.value())];
             if (pi > best_pi) {
                 best_pi = pi;
                 best_slot = s;
             }
         }
-        if (best_slot != -1) {
-            decision_.survivor_slot = best_slot;
-            decision_.action = action_of_slot(p_.env_, best_slot);
+        if (best_slot.has_value()) {
+            decision_.survivor_slot = static_cast<int>(best_slot->value());  // ACL: Decision field raw int
+            decision_.action = action_of_slot(p_.env_, *best_slot);
         }
     }
 }

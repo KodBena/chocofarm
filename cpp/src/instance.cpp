@@ -47,19 +47,35 @@ std::expected<json, Error> load_json(std::string_view path) {
 // the public contract is throw-free; the JSON library's exceptions are caught HERE at the edge).
 std::expected<Instance, Error> parse_instance(const json& inst, const json& faces) {
     Instance out;
-    out.K = inst.at("K").get<int>();
+    // JSON boundary ACL (ADR-0002 / domains.hpp): nlohmann get<int> parses K SIGNED; a negative K is a
+    // malformed instance — fail loud HERE, before the explicit PresentCount(K) crossing into the unsigned
+    // domain (a silent signed->unsigned wrap would smuggle a garbage K past the count domain).
+    const int k_raw = inst.at("K").get<int>();
+    if (k_raw < 0)
+        return std::unexpected(make_error("chocofarm: negative K in instance.json"));
+    out.K = PresentCount{static_cast<TreasureRep>(k_raw)};
 
     // treasures: {id-string -> [x, y]}. Ids are 0..N-1; place each at its integer id index so bit
     // position == treasure id (mirrors the Python loader's {int(i): tuple(xy)} + the bit layout).
     const json& tj = inst.at("treasures");
-    out.N = static_cast<int>(tj.size());
-    out.treasures.resize(out.N);
+    // .size() ACL (domains.hpp): std::map .size() is size_t, non-negative by construction -> the named
+    // size_t->TreasureRep narrowing into the TreasureCount domain via the explicit ctor.
+    out.N = TreasureCount{static_cast<TreasureRep>(tj.size())};
+    // K <= N is the structural exactly-K-of-N invariant (|worlds| = C(N,K)); a K>N instance is malformed.
+    // Fail loud at the boundary (ADR-0002) — same-domain compare is the typed Quantity <=> (K and N share
+    // the TreasureRep family, but are DISTINCT tags, so unwrap to the shared rep for the cardinality check).
+    if (out.K.value() > out.N.value())
+        return std::unexpected(make_error("chocofarm: K > N in instance.json (exactly-K-of-N violated)"));
+    out.treasures.resize(out.N.value());  // count -> container size: the count's raw extent
     for (auto it = tj.begin(); it != tj.end(); ++it) {
-        int id = std::stoi(it.key());
-        if (id < 0 || id >= out.N)
+        // std::stoi parses the treasure-id key SIGNED (JSON boundary ACL); range-check against [0,N) before
+        // the explicit TreasureId crossing (a negative or out-of-range id is a malformed instance).
+        const int id_raw = std::stoi(it.key());
+        if (id_raw < 0 || id_raw >= static_cast<int>(out.N.value()))
             return std::unexpected(make_error("chocofarm: treasure id out of range in instance.json"));
+        const TreasureId id{static_cast<TreasureRep>(id_raw)};
         const json& xy = it.value();
-        out.treasures[id] = Point{xy.at(0).get<double>(), xy.at(1).get<double>()};
+        out.treasures[id.value()] = Point{xy.at(0).get<double>(), xy.at(1).get<double>()};
     }
 
     // teleports: {name -> [x, y]} (insertion order, as Python dict preserves it).
@@ -76,10 +92,14 @@ std::expected<Instance, Error> parse_instance(const json& inst, const json& face
     for (const auto& f : fj) {
         Face face;
         for (const auto& j : f.at("cover")) {
-            int t = j.get<int>();
-            if (t < 0 || t >= out.N)
+            // JSON boundary ACL: a cover entry is a SIGNED get<int> treasure id; range-check [0,N) before
+            // the TreasureId crossing, then set bit t in the World mask (the world.hpp domain Face::bitmask
+            // now names). The 1<<t shift stays on the raw World rep (a bit position, not a count).
+            const int t_raw = j.get<int>();
+            if (t_raw < 0 || t_raw >= static_cast<int>(out.N.value()))
                 return std::unexpected(make_error("chocofarm: face cover bit out of range [0,N) in faces.json"));
-            face.bitmask |= (uint32_t{1} << t);
+            const TreasureId t{static_cast<TreasureRep>(t_raw)};
+            face.bitmask |= (World{1} << t.value());  // bit t of the per-treasure World mask
         }
         const json& rp = f.at("rep_point");
         face.rep_point = Point{rp.at(0).get<double>(), rp.at(1).get<double>()};

@@ -224,8 +224,12 @@ class Environment {
     // The full C(N,K) world-set as bitmasks over treasure ids (mirrors world_array): all K-subsets
     // of range(N), in itertools.combinations order, as (1<<t) sums. 20 bits fit a uint32.
     const std::vector<World>& worlds() const { return worlds_; }
-    int N() const { return inst_.N; }
-    int K() const { return inst_.K; }
+    // The env's cross-file public API stays RAW int (the ACL boundary documented in env.cpp's header note:
+    // features.cpp / gumbel / ismcts / the parity harnesses read these as int and are out of this slice's
+    // scope). inst_.N / inst_.K are the TYPED count domains (instance.hpp); unwrap at this accessor seam
+    // (ADR-0000 item 5: a named, visible raw<->domain crossing).
+    int N() const { return static_cast<int>(inst_.N.value()); }
+    int K() const { return static_cast<int>(inst_.K.value()); }
     int n_detectors() const { return static_cast<int>(inst_.faces.size()); }
 
     // ---- geometry ----

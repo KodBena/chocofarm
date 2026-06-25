@@ -388,3 +388,30 @@ target_compile_options(chocofarm-wire-batched-runtime-check PRIVATE -Wall -Wextr
 add_executable(chocofarm-wire-ab-bench src/wire_ab_bench.cpp src/runner_wire_batched.cpp)
 target_link_libraries(chocofarm-wire-ab-bench PRIVATE chocofarm_core ${BOOST_CONTEXT_LINK})
 target_compile_options(chocofarm-wire-ab-bench PRIVATE -Wall -Wextra)
+
+# ---- the Quantity<Tag,Rep> ZERO-COST elision A/B oracle (the maintainer's hard gate, mechanized) ----
+# Compiles the SAME hot kernel (cpp/parity/quantity_elision_ab.cpp) twice, -O3 -march=native: once over the
+# strong type Quantity<ProbeTag,uint32_t> (CHOCO_AB_TYPED=1) and once over the bare uint32_t the phantom
+# wraps (=0), then objdump-disassembles the `hot` symbol in each and DIFFS them. A non-empty diff FAILS the
+# build — the phantom is not zero-cost. This is the runnable substantiation behind the elision claim
+# (ADR-0009; ADR-0000: net the property, don't assert it in prose). The static side lives in quantity.hpp's
+# static_asserts (sizeof / trivially-copyable / standard-layout); this is the empirical instruction-identity
+# side. Forced -O3 -march=native regardless of CMAKE_BUILD_TYPE (the gate is about THESE flags).
+add_library(chocofarm-quantity-elision-typed OBJECT parity/quantity_elision_ab.cpp)
+target_compile_definitions(chocofarm-quantity-elision-typed PRIVATE CHOCO_AB_TYPED=1)
+target_compile_options(chocofarm-quantity-elision-typed PRIVATE -O3 -march=native -DNDEBUG)
+target_include_directories(chocofarm-quantity-elision-typed PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_library(chocofarm-quantity-elision-raw OBJECT parity/quantity_elision_ab.cpp)
+target_compile_definitions(chocofarm-quantity-elision-raw PRIVATE CHOCO_AB_TYPED=0)
+target_compile_options(chocofarm-quantity-elision-raw PRIVATE -O3 -march=native -DNDEBUG)
+target_include_directories(chocofarm-quantity-elision-raw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_custom_target(chocofarm-quantity-elision-check ALL
+  COMMAND ${CMAKE_COMMAND}
+          -DTYPED_OBJ=$<TARGET_OBJECTS:chocofarm-quantity-elision-typed>
+          -DRAW_OBJ=$<TARGET_OBJECTS:chocofarm-quantity-elision-raw>
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/parity/quantity_elision_check.cmake
+  DEPENDS chocofarm-quantity-elision-typed chocofarm-quantity-elision-raw
+  VERBATIM
+  COMMENT "Quantity<Tag,Rep> zero-cost gate: objdump A/B of `hot` (typed vs raw) must be byte-identical")

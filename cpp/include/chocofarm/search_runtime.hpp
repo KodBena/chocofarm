@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "chocofarm/collected_set.hpp"
+#include "chocofarm/domains.hpp"  // RngSeed/SimBudget/WorkerCount — the typed runtime domains (P1)
 #include "chocofarm/env.hpp"
 #include "chocofarm/error.hpp"
 #include "chocofarm/gumbel.hpp"
@@ -53,7 +54,8 @@ struct SearchTask {
     Belief bw;                     // observed belief (the seam value type; flat world-set today)
     CollectedSet collected;        // treasures already collected (fixed-width bitmask, alloc-free)
     double lam = 0.0;              // the live Dinkelbach penalty (per-decision, not frozen)
-    std::uint64_t seed = 0;        // the per-tree RNG seed (seeds the std::mt19937_64 the source draws off)
+    RngSeed seed{};                // the per-tree RNG seed (an opaque 64-bit bit-pattern; .value() seeds the
+                                   // std::mt19937_64 at the engine boundary — NOT a count/index, RngSeed)
     GumbelConfig cfg{};            // the frozen budget for this decision (m, n_sims, c_puct, ...)
 };
 
@@ -65,8 +67,9 @@ struct SearchTask {
 struct Decision {
     Action executed{};                 // the executed action (the SH survivor, temperature 0)
     std::vector<float> improved_pi;    // π′ over the full slot space — the trainer's policy target (PI)
-    int n_spent = 0;                   // root-action sims spent (= n_sims on a non-empty belief)
-    int leaf_requests = 0;             // net forwards this decision issued (the structural sequence length)
+    SimBudget n_spent{};               // root-action sims spent (= n_sims on a non-empty belief) — SimBudget
+    SimBudget leaf_requests{};         // net forwards this decision issued (the structural sequence length;
+                                       // a sim-budget-bounded count — SimBudget, the search-budget domain)
 };
 
 // A NetEvaluator decorator that counts predict() calls and delegates to an inner evaluator unchanged.
@@ -80,15 +83,15 @@ class CountingNetEvaluator final : public NetEvaluator {
     explicit CountingNetEvaluator(const NetEvaluator& inner) : inner_(inner) {}
 
     [[nodiscard]] std::expected<NetPrediction, Error> predict(std::span<const float> x) const override {
-        ++count_;
+        count_ += SimBudget{1};  // additive SimBudget: one leaf request per predict() (the structural count)
         return inner_.predict(x);
     }
 
-    [[nodiscard]] int count() const { return count_; }
+    [[nodiscard]] SimBudget count() const { return count_; }
 
   private:
     const NetEvaluator& inner_;
-    mutable int count_ = 0;
+    mutable SimBudget count_{};  // per-decision leaf-request tally (the structural observable) — SimBudget
 };
 
 // The runtime seam: turn a batch of independent SearchTasks into their Decisions, IN INPUT ORDER, or a
@@ -143,17 +146,19 @@ class SerialRuntime final : public SearchRuntime {
 // is the one precondition.
 class PoolRuntime final : public SearchRuntime {
   public:
-    // `n_workers` OS threads (clamped to ≥1, and at run() to ≤ the task count). On the 4-vCPU host pin
-    // with --cores 0,1,2,3 and size n_workers ≤ 4 (the ~1.9× contention ceiling, CLAUDE.md).
+    // `n_workers` OS threads (clamped to >=1, and at run() to <= the task count). On the 4-vCPU host pin
+    // with --cores 0,1,2,3 and size n_workers <= 4 (the ~1.9x contention ceiling, CLAUDE.md). The ctor
+    // param stays a raw int (the CLI/caller boundary); the clamp `>0 ? : 1` enforces the WorkerCount's
+    // >=1 invariant AT the crossing into the typed member (the std::max(...,1) guard becomes structural).
     PoolRuntime(const NetEvaluator& net, int n_workers)
-        : net_(net), n_workers_(n_workers > 0 ? n_workers : 1) {}
+        : net_(net), n_workers_(WorkerCount{static_cast<SearchRep>(n_workers > 0 ? n_workers : 1)}) {}
 
     [[nodiscard]] std::expected<std::vector<Decision>, Error>
     run(const Environment& env, std::span<const SearchTask> tasks) const override;
 
   private:
     const NetEvaluator& net_;
-    int n_workers_;
+    WorkerCount n_workers_;  // OS worker-thread count, >=1 by construction (the typed pool size)
 };
 
 }  // namespace chocofarm

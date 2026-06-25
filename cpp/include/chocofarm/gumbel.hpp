@@ -73,6 +73,7 @@
 
 #include "chocofarm/belief_key.hpp"
 #include "chocofarm/collected_set.hpp"
+#include "chocofarm/domains.hpp"  // SlotIndex/SlotCount/VisitCount/SimBudget/CandidateCount/PlyDepth/OutcomeIndex/ByteCount + World (P1)
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/net_evaluator.hpp"
@@ -117,7 +118,7 @@ using GBeliefKey = BeliefKey;  // the ONE fingerprint (belief_key.hpp), now shar
     return env.belief_key(bw);
 }
 
-// Hash for the children transposition key (action-slot, belief_key) = tuple<int, tuple<int,u32,u32>>.
+// Hash for the children transposition key (action-slot, belief_key) = tuple<SlotIndex, tuple<int,u32,u32>>.
 // `children` is a find/insert-only TRANSPOSITION TABLE (never iterated in key order — descend /
 // simulate_root_action only `find` then insert), so swapping std::map -> std::unordered_map is bit-exact:
 // the node graph is unchanged, only the lookup container differs (no ordered traversal anywhere). The mix
@@ -127,13 +128,15 @@ using GBeliefKey = BeliefKey;  // the ONE fingerprint (belief_key.hpp), now shar
 // the usual avalanche. Correctness rests on operator== of the tuple (the table compares keys exactly on a
 // bucket collision), not on the hash being injective.
 struct GBeliefChildKeyHash {
-    [[nodiscard]] std::size_t operator()(const std::tuple<int, GBeliefKey>& k) const noexcept {
+    [[nodiscard]] std::size_t operator()(const std::tuple<SlotIndex, GBeliefKey>& k) const noexcept {
         auto mix = [](std::size_t& h, std::size_t v) {
             h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
         };
         std::size_t h = 0;
         const GBeliefKey& bk = std::get<1>(k);
-        mix(h, static_cast<std::size_t>(static_cast<uint32_t>(std::get<0>(k))));   // action slot
+        // ACL (std::hash register): SlotIndex.value() / the GBeliefKey fields -> the size_t mixing
+        // accumulator (the hash contract's width; a hash register, not a domain magnitude — kept raw).
+        mix(h, static_cast<std::size_t>(static_cast<uint32_t>(std::get<0>(k).value())));  // action slot
         mix(h, static_cast<std::size_t>(static_cast<uint32_t>(std::get<0>(bk))));  // belief count
         mix(h, static_cast<std::size_t>(std::get<1>(bk)));                         // first world id
         mix(h, static_cast<std::size_t>(std::get<2>(bk)));                         // last world id
@@ -176,13 +179,14 @@ struct GumbelNode {
     std::pmr::vector<float> prior;          // (n_slots,) masked-softmax prior P(s,·) — FLOAT32 (1b seam 1:
                                             //   the in-search prior the Python search side-reads as
                                             //   root.prior, a float32 array; softmaxed in f64, stored f32)
-    std::pmr::vector<int> legal_slots;      // legal action slots, in env.legal_actions + TERMINATE order
+                                            //   indexed by SlotIndex (.value() at the std::vector subscript)
+    std::pmr::vector<SlotIndex> legal_slots;  // legal action slots, in env.legal_actions + TERMINATE order
     std::pmr::vector<double> W;             // (n_slots,) action-slot -> summed λ-penalized return (0 unvisited)
-    std::pmr::vector<int> N;                // (n_slots,) action-slot -> selection count (0 unvisited)
+    std::pmr::vector<VisitCount> N;         // (n_slots,) action-slot -> selection count (0 unvisited)
     // (action-slot, belief_key) -> child arena idx. A find/insert-only transposition table (never iterated
     // in key order), so a pmr::unordered_map is bit-exact with the former std::unordered_map / the older
     // std::map — same GBeliefChildKeyHash + tuple operator==, only the allocator differs (GBeliefChildKeyHash).
-    std::pmr::unordered_map<std::tuple<int, GBeliefKey>, int, GBeliefChildKeyHash> children;
+    std::pmr::unordered_map<std::tuple<SlotIndex, GBeliefKey>, int, GBeliefChildKeyHash> children;
 
     // The allocator-aware ctors (uses-allocator construction): the no-arg + n_slots forms forward an
     // allocator (the pmr arena, supplied by std::pmr::vector<GumbelNode>::emplace_back) to EVERY inner
@@ -190,9 +194,12 @@ struct GumbelNode {
     // n_slots ctor still sizes W/N to the slot space zero-initialized (the unvisited semantics N[slot]==0).
     explicit GumbelNode(const allocator_type& alloc = {})
         : prior(alloc), legal_slots(alloc), W(alloc), N(alloc), children(alloc) {}
-    GumbelNode(int n_slots, const allocator_type& alloc)
+    // n_slots is the SlotCount that bounds SlotIndex; .value() is the count->size_t ACL at the dense-vector
+    // sizing (the named std::vector .size() boundary). N is zero-initialized to VisitCount{0} (unvisited).
+    GumbelNode(SlotCount n_slots, const allocator_type& alloc)
         : prior(alloc), legal_slots(alloc),
-          W(static_cast<size_t>(n_slots), 0.0, alloc), N(static_cast<size_t>(n_slots), 0, alloc),
+          W(static_cast<size_t>(n_slots.value()), 0.0, alloc),
+          N(static_cast<size_t>(n_slots.value()), VisitCount{0}, alloc),
           children(alloc) {}
     // The allocator-extended copy/move ctors uses-allocator construction REQUIRES so the NodePool can
     // grow (it move-constructs the existing nodes into the new arena block, propagating THIS arena's
@@ -213,10 +220,10 @@ struct GumbelNode {
 
     // Q(slot) = W/N, or 0.0 unvisited (mirrors _Node.q). Dense: N[slot]==0 <=> unvisited (the former
     // `N.find==end` branch), so the unvisited->0.0 semantics is preserved exactly.
-    [[nodiscard]] double q(int slot) const {
-        const int n = N[static_cast<size_t>(slot)];
-        if (n == 0) return 0.0;
-        return W[static_cast<size_t>(slot)] / static_cast<double>(n);
+    [[nodiscard]] double q(SlotIndex slot) const {
+        const VisitCount n = N[static_cast<size_t>(slot.value())];  // .value() is the index->size_t ACL
+        if (n == VisitCount{0}) return 0.0;
+        return W[static_cast<size_t>(slot.value())] / static_cast<double>(n.value());
     }
 };
 
@@ -233,7 +240,10 @@ using NodePool = std::pmr::vector<GumbelNode>;
 // check wires a scripted, RNG-free source.
 struct GumbelSource : public WorldSource {
     // One i.i.d. Gumbel(0,1) draw per slot, length `n` (mirrors rng.gumbel(size=n_slots)). Returned by
-    // value (a length-n vector). The logic check returns a fixed scripted vector here.
+    // value (a length-n vector). The logic check returns a fixed scripted vector here. `n` is a SlotCount
+    // at the call site (the slot-space draw length); the virtual keeps the raw `int` because the
+    // GumbelSource family's out-of-scope overrides (gumbel_dump.cpp's ScriptedGumbelSource) bind this exact
+    // signature — the int->SlotCount crossing happens at the call/use sites, not the virtual boundary.
     [[nodiscard]] virtual std::vector<double> gumbel(int n) = 0;
 };
 
@@ -252,11 +262,14 @@ class RngGumbelSource final : public GumbelSource {
   public:
     RngGumbelSource(const Environment& env, std::mt19937_64& rng) : draw_(env, rng), rng_(rng) {}
 
-    uint32_t sample_world(const Belief& bw) override { return draw_.sample_world(bw); }
+    // World return (= uint32_t, the WorldSource override signature) — the typed world domain made visible.
+    World sample_world(const Belief& bw) override { return draw_.sample_world(bw); }
 
     std::vector<double> gumbel(int n) override {
         // Gumbel(0,1) via the inverse-CDF transform -log(-log(U)), U in (0,1) (mirrors numpy's gumbel
         // family, NOT its exact stream — the behavioral bar). U is drawn off (0,1) open to avoid log(0).
+        // `n` is the slot-space draw length (a SlotCount at the call site); the loop index is a raw
+        // iteration count over [0,n), not a slot index, so it stays bare.
         std::vector<double> out(static_cast<size_t>(n));
         std::uniform_real_distribution<double> unif(
             std::numeric_limits<double>::min(), 1.0);  // (0,1], min() avoids log(0)
@@ -290,11 +303,18 @@ class GumbelAZPolicy final : public Policy {
     // exploits). Runs the full Gumbel search from a FIXED (loc, belief, collected) and returns
     // (executed_action, improved_pi). Mirrors GumbelAZSearch._decide_root (temperature 0). Exposed for
     // the logic-check fixture so the structure + selection logic is validated independent of RNG.
+    // Decision is a CROSS-FILE wire/contract value: its fields are read as raw int by out-of-scope
+    // consumers (search_runtime.cpp's to_decision, the *_proto.cpp / *_runtime_check.cpp parity asserts +
+    // std::cout, runner_wire_batched.cpp). n_spent is a SimBudget and survivor_slot a SlotIndex by DOMAIN
+    // (-1 = "no survivor", the empty-belief / unreachable contract path), but the public field types stay
+    // raw int so those out-of-scope readers are unbroken (ADR-0004 minimal-touch; ADR-0012 P8 — the SSOT
+    // signature here is bounded by the consumers this header cannot edit). The crossing to the typed
+    // SlotIndex/SimBudget is at the internal use sites in gumbel.cpp/gumbel_cursor.cpp.
     struct Decision {
         Action action;                 // the executed action (the SH survivor at temperature 0)
         std::vector<double> improved;  // (n_slots,) improved-π target (softmax of completed logits)
-        int n_spent = 0;               // total root-action sims spent (= n_sims when bw non-empty)
-        int survivor_slot = -1;        // the SH survivor slot (the executed action's slot)
+        int n_spent = 0;               // total root-action sims spent (= n_sims when bw non-empty) — SimBudget
+        int survivor_slot = -1;        // the SH survivor slot (the executed action's slot) — SlotIndex, -1 = none
     };
     [[nodiscard]] Decision run_search(const Loc& loc, const Belief& bw,
                                       const CollectedSet& collected, double lam,
@@ -363,7 +383,7 @@ class GumbelAZPolicy final : public Policy {
     // The root log-prior logit for slot s: std::log(std::max(prior_value(root, s), 1e-12)) — the 1b seam-1
     // dominant float32 effect (run_search's logits build). Re-exposed so the cursor builds the SAME root
     // logits array (feeding the Gumbel-top-k AND the SH cut key) through the SAME float32 prior precision.
-    [[nodiscard]] double root_logit(const GumbelNode& root, int s) const;
+    [[nodiscard]] double root_logit(const GumbelNode& root, SlotIndex s) const;
 
 
     // Populate node.value/prior/legal_slots from one net forward (mirrors _evaluate). The leaf goes
@@ -377,35 +397,38 @@ class GumbelAZPolicy final : public Policy {
     // Sequential Halving over n_sims (Danihelka §2): n_phases = ceil(log2 m), per-phase equal-share
     // budget, drop the worst half each phase by g+logit+σ·q̂, then a remainder loop spends the FULL
     // budget. Returns the surviving slot (the executed action). Mirrors _sequential_halving.
-    [[nodiscard]] int sequential_halving(NodePool& nodes, const Loc& loc,
+    // `considered` is the live candidate-slot set; `n_spent` (out) is a SimBudget total. logits/g are
+    // slot-indexed score arrays (raw double rows, SlotIndex.value() at the subscript).
+    [[nodiscard]] SlotIndex sequential_halving(NodePool& nodes, const Loc& loc,
                                          const Belief& bw, const CollectedSet& collected,
-                                         double lam, GumbelSource& src, std::vector<int> considered,
+                                         double lam, GumbelSource& src, std::vector<SlotIndex> considered,
                                          const std::vector<double>& g, const std::vector<double>& logits,
-                                         int& n_spent) const;
+                                         SimBudget& n_spent) const;
 
-    // Run `count` sims of root action `slot`, accumulating W/N (mirrors _visit).
+    // Run `count` sims of root action `slot`, accumulating W/N (mirrors _visit). `count` is a SimBudget.
     void visit(NodePool& nodes, const Loc& loc, const Belief& bw,
-               const CollectedSet& collected, int slot, double lam, GumbelSource& src,
-               int count) const;
+               const CollectedSet& collected, SlotIndex slot, double lam, GumbelSource& src,
+               SimBudget count) const;
 
     // One sim of a root action: realize it, average the leaf over c_outcome immediate determinizations,
     // descend the interior with PUCT for the remaining depth (mirrors _simulate_root_action). Returns
     // the λ-penalized return.
     [[nodiscard]] double simulate_root_action(NodePool& nodes, const Loc& loc,
                                               const Belief& bw,
-                                              const CollectedSet& collected, int slot, uint32_t world,
+                                              const CollectedSet& collected, SlotIndex slot, World world,
                                               double lam, GumbelSource& src) const;
 
-    // Interior PUCT descent; net value at the leaf (mirrors _descend). `node` is an arena index.
+    // Interior PUCT descent; net value at the leaf (mirrors _descend). `node` is an arena index; `depth`
+    // is a PlyDepth.
     [[nodiscard]] double descend(NodePool& nodes, int node, const Loc& loc,
                                  const Belief& bw, const CollectedSet& collected,
-                                 uint32_t world, double lam, GumbelSource& src, int depth) const;
+                                 World world, double lam, GumbelSource& src, PlyDepth depth) const;
 
     // AlphaZero PUCT select: argmax q + c_puct·p·√(ΣN)/(1+n) over node.legal_slots, strict-`>`
     // first-wins, unvisited Q completed by the node's own net value (mirrors _puct_select). Returns the
     // selected action slot. 1b SEAM 4: the score is computed in FLOAT32 (the float32 prior weak-promotes
     // the whole U-term + the `q +`), so the interior near-tie argmax matches Python.
-    [[nodiscard]] int puct_select(const GumbelNode& node) const;
+    [[nodiscard]] SlotIndex puct_select(const GumbelNode& node) const;
 
     // The improved-π target over the legal set: π′ = softmax(logit + σ(completedQ)) (mirrors
     // _improved_policy → value_target.improved_policy). 1b SEAMS 2+3: v_mix (the unvisited completion)
@@ -419,8 +442,8 @@ class GumbelAZPolicy final : public Policy {
     const NetEvaluator& net_;
     const Environment& env_;
     FeatureBuilder fb_;
-    int n_slots_;
-    int term_slot_;
+    SlotCount n_slots_;   // = n_action_slots(env) — the count that bounds SlotIndex (sizes the dense vectors)
+    SlotIndex term_slot_; // = term_slot(env) — the always-legal TERMINATE slot
 
     // The per-leaf evaluate() scratch (ADR-0012 P9 hot-path exception): evaluate() reuses these buffers
     // across THIS policy's leaves — the feature triple via fb_.build_into / fb_.legal_mask_into, plus the
@@ -474,9 +497,11 @@ class GumbelAZPolicy final : public Policy {
     //       unchanged); only deep decisions reach the mmap upstream, and that block is returned at the next
     //       release(). MEASURED sizing (ADR-0009): see the structural-fix run; the shallow-decision tree fits
     //       within kArenaInlineBytes, so the per-decision upstream-touch rate stays low (deep-tree tail only).
-    static constexpr std::size_t kArenaInlineBytes = 32 * 1024;  // shallow-decision inline floor (was 256 KiB)
+    // The inline floor as a typed ByteCount (the pmr/array sizing domain — domains.hpp). .value() is the
+    // count->size_t ACL at the std::array non-type template arg + the monotonic_buffer_resource sizing.
+    static constexpr ByteCount kArenaInlineBytes{32 * 1024};     // shallow-decision inline floor (was 256 KiB)
     mutable MmapUpstream arena_upstream_;                        // overflow -> OS-releasing mmap blocks
-    mutable std::array<std::byte, kArenaInlineBytes> arena_buf_;
+    mutable std::array<std::byte, kArenaInlineBytes.value()> arena_buf_;
     mutable std::pmr::monotonic_buffer_resource arena_{arena_buf_.data(), arena_buf_.size(),
                                                        &arena_upstream_};
 };

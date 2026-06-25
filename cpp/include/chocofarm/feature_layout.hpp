@@ -17,15 +17,18 @@
 #include <unordered_map>
 #include <vector>
 
+#include "chocofarm/domains.hpp"  // FeatureDim — the feature-vector dimension/offset/width domain (P1)
 #include "chocofarm/error.hpp"
 
 namespace chocofarm {
 
-// One layout block: a named contiguous span [start, start+width) of the feature vector.
+// One layout block: a named contiguous span [start, start+width) of the feature vector. `start` and
+// `width` are both FeatureDim (the same vector-space offset domain; FeatureDim is additive so
+// start + width -> the next start, the contiguous-partition arithmetic load() does — ADR-0012 P1).
 struct FeatureBlock {
     std::string key;
-    int start = 0;
-    int width = 0;
+    FeatureDim start{0};
+    FeatureDim width{0};
 };
 
 // The feature-vector layout, loaded from the Python-emitted SSOT (feature_layout.json). Built by the
@@ -45,21 +48,23 @@ class FeatureLayoutSpec {
     // (5N+3nD+6+n_tel); BOTH the spec's `dim` field AND Σwidth must equal it — a desync between the
     // shipped spec and this env is a loud boundary Error (never a silent mislabel).
     [[nodiscard]] static std::expected<FeatureLayoutSpec, Error>
-    load(std::string_view path, int expected_dim);
+    load(std::string_view path, FeatureDim expected_dim);
 
-    [[nodiscard]] int dim() const { return dim_; }
+    [[nodiscard]] FeatureDim dim() const { return dim_; }
+    // block_count is the cardinality of the block table — a generic container count netted against
+    // kWritten.size() (NOT a feature-vector dimension), so it stays a raw int (no domain crossing).
     [[nodiscard]] int block_count() const { return static_cast<int>(blocks_.size()); }
     [[nodiscard]] bool contains(std::string_view key) const {
         return index_.find(std::string(key)) != index_.end();
     }
     // The start offset of the named block. Aborts loudly (ADR-0002) if `key` is absent — an invariant
     // (the writer names only keys the FeatureBuilder ctor verified the spec carries).
-    [[nodiscard]] int start(std::string_view key) const;
+    [[nodiscard]] FeatureDim start(std::string_view key) const;
 
   private:
-    int dim_ = 0;
+    FeatureDim dim_{0};
     std::vector<FeatureBlock> blocks_;
-    std::unordered_map<std::string, int> index_;  // key -> blocks_ index
+    std::unordered_map<std::string, int> index_;  // key -> blocks_ index (a vector position, not a dim)
 };
 
 }  // namespace chocofarm

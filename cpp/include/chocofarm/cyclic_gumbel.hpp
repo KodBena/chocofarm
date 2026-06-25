@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "chocofarm/domains.hpp"  // World — the typed world domain (alias of uint32_t) made visible (P1)
 #include "chocofarm/gumbel.hpp"
 
 namespace chocofarm {
@@ -29,9 +30,13 @@ class CyclicGumbelSource final : public GumbelSource {
     // sentinel (0u) is preserved.
     CyclicGumbelSource(const Environment& env, std::vector<double> table)
         : env_(env), table_(std::move(table)) {}
-    uint32_t sample_world(const Belief& bw) override {
-        return env_.empty(bw) ? 0u : env_.world_at_rank(bw, 0);
+    // World return (= uint32_t, the WorldSource override signature) — the typed world domain made visible.
+    // The empty-belief sentinel (World 0) is preserved; world_at_rank's rank arg 0 is the raw env API (ACL).
+    World sample_world(const Belief& bw) override {
+        return env_.empty(bw) ? World{0u} : env_.world_at_rank(bw, 0);
     }
+    // `n` is the slot-space draw length (a SlotCount at the call site); the virtual keeps the raw `int` to
+    // match the GumbelSource family override signature. The loop index is a raw iteration count over [0,n).
     std::vector<double> gumbel(int n) override {
         std::vector<double> out(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = table_[(idx_++) % table_.size()];

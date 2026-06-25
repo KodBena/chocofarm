@@ -18,12 +18,15 @@
 //   only the id, not an ordered slot list.)
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
 #include <unordered_set>
 
 #include "boundary.hpp"
+#include "proc_domains.hpp"   // tlab::ByteCount / HwmMessages / Milliseconds / OptMilliseconds (factory ACL)
 #include "zmq_context.hpp"
 #include "zmq_dealer.hpp"
 
@@ -39,7 +42,7 @@ class BoundaryPerThread final : public Boundary {
     [[nodiscard]] std::expected<void, BoundaryError> send(const LeafBatch& batch) override {
         auto sent = dealer_.send_batch(batch);
         if (!sent) return std::unexpected(sent.error());
-        outstanding_.insert(batch.corr);
+        outstanding_.insert(batch.corr.value());   // ACL: ProducerCorr -> raw corr_t hash key (named crossing)
         return {};
     }
 
@@ -74,10 +77,10 @@ class BoundaryPerThread final : public Boundary {
     // Erase the reply's corr from the outstanding set (loud if it was never sent — a desynchronized wire,
     // ADR-0002), then hand the reply on.
     [[nodiscard]] std::expected<BoundaryReply, BoundaryError> match_and_take(BoundaryReply reply) {
-        auto it = outstanding_.find(reply.corr);
+        auto it = outstanding_.find(reply.corr.value());   // ACL: ProducerCorr -> raw corr_t hash key
         if (it == outstanding_.end())
             return std::unexpected(BoundaryError{
-                "BoundaryPerThread::recv: reply for unknown corr-id " + std::to_string(reply.corr) +
+                "BoundaryPerThread::recv: reply for unknown corr-id " + std::to_string(reply.corr.value()) +
                     " (a desynchronized wire)",
                 false});
         outstanding_.erase(it);
@@ -85,6 +88,9 @@ class BoundaryPerThread final : public Boundary {
     }
 
     ZmqDealer dealer_;
+    // Topology A has ONE corr namespace (no coalescing rewrite): the set holds the PRODUCER corr-ids this
+    // thread stamped and awaits a reply for. Hashed by the underlying corr_t (the opaque id; a hash register,
+    // not a domain magnitude — the .value() crossing is the named hash-key ACL).
     std::unordered_set<wire::corr_t> outstanding_;
 };
 
@@ -102,13 +108,17 @@ class BoundaryPerThread final : public Boundary {
     // peer) surfaces as a loud bounded send error within at most ~1s, while normal backpressure (a live
     // server drains the queue in microseconds) never trips it. Independent of the recv timeout because the
     // decoupled mode drives the recv timeout to 0, which must NOT also make sends non-blocking-fragile.
-    const int send_timeout_ms = std::max(cfg.recv_timeout_ms, 1000);
+    const Milliseconds send_timeout_ms{std::max(cfg.recv_timeout_ms.value(), 1000u)};
     // One DEALER per producer thread, so split the TOTAL outstanding-send byte budget across the threads;
-    // the byte budget -> a per-dealer message-count SNDHWM that bounds memory regardless of row size.
-    const std::size_t per_dealer_bytes =
-        cfg.send_queue_bytes / static_cast<std::size_t>(std::max(cfg.n_producer_threads, 1));
-    const int send_hwm = send_hwm_for_budget(per_dealer_bytes, cfg.rows, cfg.in_dim);
-    auto dealer = ZmqDealer::create(*ctx, cfg.endpoint, cfg.recv_timeout_ms, send_timeout_ms, send_hwm);
+    // the byte budget -> a per-dealer message-count SNDHWM that bounds memory regardless of row size. ACL:
+    // the byte/thread division crosses to size_t (the byte-extent rep) by unwrapping the typed count
+    // divisor; the std::max(.,1) is RETAINED as the divide-by-zero guard (behaviour-preserving — the >= 1
+    // validation lives at the CLI/config boundary, out of scope of this file).
+    const ByteCount per_dealer_bytes{cfg.send_queue_bytes.value() /
+        static_cast<std::size_t>(std::max(cfg.n_producer_threads.value(), std::uint32_t{1}))};
+    const HwmMessages send_hwm = send_hwm_for_budget(per_dealer_bytes, cfg.rows, cfg.in_dim);
+    auto dealer = ZmqDealer::create(*ctx, cfg.endpoint, OptMilliseconds{cfg.recv_timeout_ms},
+                                    OptMilliseconds{send_timeout_ms}, send_hwm);
     if (!dealer) return std::unexpected(dealer.error());
     return std::make_unique<BoundaryPerThread>(std::move(*dealer));
 }

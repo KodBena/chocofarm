@@ -61,15 +61,20 @@ namespace {
 // unless this thread is the designated one and a non-zero nice is asked. Renicing DOWN (positive nice)
 // needs no privilege; a failure is surfaced loud-ish (a warning) and is non-fatal — the run continues at
 // the default priority rather than aborting the measurement (ADR-0002: surface, do not silently swallow).
-void apply_thread_priority(const ProducerConfig& cfg, int thread_index) {
-    if (cfg.low_prio_thread < 0 || thread_index != cfg.low_prio_thread || cfg.low_prio_nice == 0)
+void apply_thread_priority(const ProducerConfig& cfg, ThreadIndex thread_index) {
+    // The "-1 = none" sentinel is now typed absence (OptThreadIndex): a no-op unless a thread is designated,
+    // it IS this one, and a non-zero nice is asked. Same-domain == over the typed index (cross-domain mixing
+    // would not compile).
+    if (!cfg.low_prio_thread || thread_index != *cfg.low_prio_thread || cfg.low_prio_nice == 0)
         return;
+    // setpriority ACL: tid is the POSIX id_t from gettid; the nice value STAYS signed int [-20,19] (sign is
+    // load-bearing) and goes straight to the syscall — not wrapped (the named NiceValue ACL).
     const auto tid = static_cast<id_t>(::syscall(SYS_gettid));
     errno = 0;
     if (::setpriority(PRIO_PROCESS, tid, cfg.low_prio_nice) != 0) {
-        std::fprintf(stderr, "[tlab-producer] WARN: could not renice generator thread %d to nice %d "
+        std::fprintf(stderr, "[tlab-producer] WARN: could not renice generator thread %u to nice %d "
                              "(errno=%d) — running at default priority\n",
-                     thread_index, cfg.low_prio_nice, errno);
+                     thread_index.value(), cfg.low_prio_nice, errno);
     }
 }
 
@@ -92,11 +97,16 @@ using SteadyClock = std::chrono::steady_clock;
 //
 // The barrier is the standard, transparent way to defeat the fold (it is what google/benchmark's
 // DoNotOptimize does); it keeps the "task" the literal `x += 1` rather than substituting a heavier op.
+// The volatile sink stays a RAW u64 the optimizer cannot fold (a spin register, not a domain magnitude) —
+// it is the materialized accumulator, deliberately un-typed (the brief's named raw site).
 volatile std::uint64_t g_spin_sink = 0;
 
-[[gnu::noinline]] std::uint64_t spin_ops(std::uint64_t iters) {
+[[gnu::noinline]] std::uint64_t spin_ops(OpCount iters) {
+    // OpCount ACL: unwrap the typed iteration count to the raw loop bound at the spin boundary; the spin
+    // accumulator itself is the raw u64 sink (un-typed by design).
+    const std::uint64_t n = iters.value();
     std::uint64_t x = g_spin_sink;
-    for (std::uint64_t i = 0; i < iters; ++i) {
+    for (std::uint64_t i = 0; i < n; ++i) {
         x += 1;                              // the literal task
         asm volatile("" : "+r"(x));          // per-iteration barrier: x is live each step, no fold to +iters
     }
@@ -110,26 +120,28 @@ volatile std::uint64_t g_spin_sink = 0;
 [[nodiscard]] Calibration calibrate(double window_seconds) {
     Calibration c;
     // Warmup: a fixed chunk, timed only to record warmup_ops (discarded from the rate).
-    constexpr std::uint64_t kWarmupIters = 5'000'000;
+    constexpr OpCount kWarmupIters{5'000'000};
     spin_ops(kWarmupIters);
     c.warmup_ops = kWarmupIters;
 
     // Timed window: start with a guess and double until we've spanned >= window_seconds, so the measured
-    // window is long enough to be stable (a sub-millisecond window would be clock-noise dominated).
-    std::uint64_t iters = 10'000'000;
+    // window is long enough to be stable (a sub-millisecond window would be clock-noise dominated). The
+    // adaptive cap (1<<40 iters) and the *scale grow happen on the raw rep (an OpCount magnitude op), so the
+    // count crosses to/from raw at the .value()/explicit-ctor here.
+    OpCount iters{10'000'000};
     for (;;) {
         const auto t0 = SteadyClock::now();
         spin_ops(iters);
         const double elapsed = seconds_since(t0);
-        if (elapsed >= window_seconds || iters >= (std::uint64_t(1) << 40)) {
+        if (elapsed >= window_seconds || iters.value() >= (std::uint64_t(1) << 40)) {
             c.timed_ops = iters;
             c.timed_seconds = elapsed;
-            c.ops_per_sec = elapsed > 0.0 ? static_cast<double>(iters) / elapsed : 0.0;
+            c.ops_per_sec = elapsed > 0.0 ? static_cast<double>(iters.value()) / elapsed : 0.0;
             return c;
         }
         // Scale the next guess to roughly hit the window (with a 2x floor so we always make progress).
         const double scale = elapsed > 0.0 ? (window_seconds / elapsed) * 1.2 : 2.0;
-        iters = static_cast<std::uint64_t>(static_cast<double>(iters) * std::max(2.0, scale));
+        iters = OpCount{static_cast<std::uint64_t>(static_cast<double>(iters.value()) * std::max(2.0, scale))};
     }
 }
 
@@ -164,14 +176,16 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     // A guard: if the requested rate is so high that even ZERO spin cannot keep up, the loop will simply
     // run flat-out (spin 0) and the achieved rate reports the true ceiling. We mark overhead_bound after the
     // run by comparing achieved vs requested (the honest, measured test), not from this a-priori number.
-    std::uint64_t ops_between = ops_between_f > 0.0 ? static_cast<std::uint64_t>(ops_between_f) : 0;
+    // STEP 2 result: the inter-emission op budget as a typed OpCount (0 when the rate is overhead-bound).
+    OpCount ops_between{ops_between_f > 0.0 ? static_cast<std::uint64_t>(ops_between_f) : 0ull};
 
     // Pre-build one batch of synthetic feature rows (rows_per_batch x in_dim). The VALUES are arbitrary
     // (throughput depends on the matmul SHAPES, not the contents); we fill a simple deterministic ramp so
     // the bytes are not all-zero (which a compiler/allocator might special-case) and are reproducible.
-    const wire::count_t B = cfg.rows_per_batch;
-    const wire::count_t in_dim = cfg.in_dim;
-    std::vector<float> rows(static_cast<std::size_t>(B) * in_dim);
+    const wire::RowCount B = cfg.rows_per_batch;
+    const wire::FeatureDim in_dim = cfg.in_dim;
+    // count->element ACL: the row buffer length is B*in_dim elements; both reps cross to size_t at the alloc.
+    std::vector<float> rows(static_cast<std::size_t>(B.value()) * in_dim.value());
     for (std::size_t i = 0; i < rows.size(); ++i)
         rows[i] = static_cast<float>((i % 97)) * 0.01f - 0.5f;
 
@@ -179,15 +193,19 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     std::vector<double> latencies_us;
     latencies_us.reserve(1u << 16);
 
-    // corr -> send timestamp, so a reply's latency is now - send_time. A small map suffices in COUPLED
-    // (at most one outstanding); DECOUPLED may have many in flight, so we use an unordered_map.
+    // corr -> send timestamp, so a reply's latency is now - send_time. Keyed by the typed PRODUCER corr (the
+    // generator's id space); the reply carries the OPAQUE round-tripped corr_t, crossed back to ProducerCorr
+    // at the lookup ACL (the wire never reorders within one DEALER, so the producer corr round-trips intact).
+    // A small map suffices in COUPLED (at most one outstanding); DECOUPLED may have many in flight.
     std::unordered_map<wire::corr_t, SteadyClock::time_point> send_times;
 
     std::uint64_t batches_sent = 0;
     std::uint64_t replies_recv = 0;
 
     auto note_reply = [&](const BoundaryReply& reply) {
-        auto it = send_times.find(reply.corr);
+        // wire ACL: the reply's typed ProducerCorr is crossed back to the raw corr_t that keys the send-time
+        // map (the same raw token the LeafBatch stamped) — the named lookup unwrap (ADR-0000 item 5).
+        auto it = send_times.find(reply.corr.value());
         if (it != send_times.end()) {
             const double us = std::chrono::duration<double, std::micro>(SteadyClock::now() - it->second).count();
             latencies_us.push_back(us);
@@ -203,25 +221,28 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
         // COUPLED — emit one, block for its reply, spin the think-time budget, repeat. The achieved rate is
         // bounded by the round-trip; the calibrated spin is the think-time BETWEEN reply and next emit.
         while (seconds_since(run_start) < run_seconds) {
-            const wire::corr_t corr = corr_seq.fetch_add(1, std::memory_order_relaxed);
+            // ProducerCorr ACL: the process-global atomic hands back a raw corr_t; wrap it as the typed
+            // producer corr the LeafBatch stamps, and use the same raw token as the send-time key.
+            const wire::ProducerCorr corr{corr_seq.fetch_add(1, std::memory_order_relaxed)};
             LeafBatch lb{corr, B, in_dim, std::span<const float>(rows.data(), rows.size())};
-            send_times[corr] = SteadyClock::now();
+            send_times[corr.value()] = SteadyClock::now();
             auto sent = boundary.send(lb);
             if (!sent) break;   // a dead wire: stop this thread (the error is reported via achieved < requested)
             batches_sent += 1;
             auto reply = boundary.recv();   // BLOCK for this batch's reply (the critical-path emulation)
             if (!reply) break;              // timeout/transport error -> stop
             note_reply(*reply);
-            if (ops_between > 0) spin_ops(ops_between);   // think-time budget
+            if (ops_between != OpCount{0}) spin_ops(ops_between);   // think-time budget
         }
     } else {
         // DECOUPLED — free-run at the calibrated rate; poll() replies without gating. We emit, drain any
         // ready replies (non-blocking), then burn the inter-emission spin. The boundary was created with a
         // SHORT recv-timeout (see run_producer) so poll() returns promptly and does not stall the free-run.
         while (seconds_since(run_start) < run_seconds) {
-            const wire::corr_t corr = corr_seq.fetch_add(1, std::memory_order_relaxed);
+            // ProducerCorr ACL: see the COUPLED arm — raw atomic token -> typed producer corr + raw map key.
+            const wire::ProducerCorr corr{corr_seq.fetch_add(1, std::memory_order_relaxed)};
             LeafBatch lb{corr, B, in_dim, std::span<const float>(rows.data(), rows.size())};
-            send_times[corr] = SteadyClock::now();
+            send_times[corr.value()] = SteadyClock::now();
             auto sent = boundary.send(lb);
             if (!sent) break;
             batches_sent += 1;
@@ -233,7 +254,7 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
                 note_reply(**polled);
             }
             if (!sent) break;
-            if (ops_between > 0) spin_ops(ops_between);   // pace to the calibrated rate
+            if (ops_between != OpCount{0}) spin_ops(ops_between);   // pace to the calibrated rate
         }
     }
 
@@ -245,8 +266,13 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     // deadline (a few RTTs past the last send) and stop when nothing remains outstanding OR the deadline
     // passes. A genuinely lost reply (server never answered) thus bounds the drain by time, never hangs.
     if (cfg.mode == ProducerMode::Decoupled) {
+        // OptMilliseconds ACL: the drain deadline is a few RTTs past the last send. The legacy code used
+        // max(recv_timeout_ms, 100) on the raw int — for the "block forever" case (empty optional, formerly
+        // <= 0) that max floored to 100 ms, preserved here. A present timeout floors at 100 ms identically.
+        const std::uint32_t drain_ms =
+            cfg.recv_timeout_ms ? std::max<std::uint32_t>(cfg.recv_timeout_ms->value(), 100u) : 100u;
         const auto drain_deadline =
-            SteadyClock::now() + std::chrono::milliseconds(std::max(cfg.recv_timeout_ms, 100));
+            SteadyClock::now() + std::chrono::milliseconds(drain_ms);
         while (boundary.any_outstanding() && SteadyClock::now() < drain_deadline) {
             auto polled = boundary.poll();
             if (!polled) break;                  // transport/decode error -> stop; report what we have
@@ -283,9 +309,9 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
 
 [[nodiscard]] std::expected<std::vector<ProducerStats>, BoundaryError> run_producer(
         const ProducerConfig& cfg) {
-    if (cfg.n_threads < 1)
+    if (cfg.n_threads < ThreadCount{1})
         return std::unexpected(BoundaryError{"run_producer: n_threads must be >= 1", false});
-    if (cfg.in_dim == 0 || cfg.rows_per_batch == 0)
+    if (cfg.in_dim == wire::FeatureDim{0} || cfg.rows_per_batch == wire::RowCount{0})
         return std::unexpected(BoundaryError{"run_producer: in_dim and rows_per_batch must be >= 1", false});
 
     // The boundary's recv-timeout governs how long a single socket recv blocks:
@@ -297,19 +323,27 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     //     immediate. The decoupled tail-drain is deadline-bounded, not recv-blocked; see run_one_thread.)
     //   COUPLED — recv() legitimately waits for the round-trip, so we honor cfg.recv_timeout_ms (a slow
     //     or absent server then surfaces as a loud bounded timeout, ADR-0002).
-    const int boundary_recv_timeout_ms =
-        (cfg.mode == ProducerMode::Decoupled) ? 0 : cfg.recv_timeout_ms;
+    // BoundaryConfig.recv_timeout_ms is a typed Milliseconds (the ZMQ RCVTIMEO port crosses it to int at the
+    // ZMQ ACL; 0 = block forever there). DECOUPLED forces 0ms (truly non-blocking poll); COUPLED honors the
+    // configured timeout, an EMPTY optional ("block forever") collapsing to 0ms the port reads as "no timeout"
+    // — bit-faithful to the legacy <= 0 path. Stays in the Milliseconds DOMAIN end to end (no int round-trip).
+    const Milliseconds boundary_recv_timeout =
+        (cfg.mode == ProducerMode::Decoupled)
+            ? Milliseconds{0}
+            : (cfg.recv_timeout_ms ? *cfg.recv_timeout_ms : Milliseconds{0});
 
+    // BoundaryConfig speaks the SAME typed domains as ProducerConfig (Milliseconds/ThreadCount/RowCount/
+    // FeatureDim/ByteCount — boundary.hpp), so these are same-domain assignments, no raw crossing (P8).
     BoundaryConfig bcfg;
     bcfg.endpoint = cfg.endpoint;
-    bcfg.recv_timeout_ms = boundary_recv_timeout_ms;
+    bcfg.recv_timeout_ms = boundary_recv_timeout;
     bcfg.n_producer_threads = cfg.n_threads;
-    bcfg.rows = static_cast<int>(cfg.rows_per_batch);     // sizes the per-message memory for the send HWM
-    bcfg.in_dim = static_cast<int>(cfg.in_dim);
-    bcfg.send_queue_bytes = cfg.send_queue_bytes;          // TOTAL outstanding-send byte budget (back-pressure)
+    bcfg.rows = cfg.rows_per_batch;             // sizes the per-message memory for the send HWM
+    bcfg.in_dim = cfg.in_dim;
+    bcfg.send_queue_bytes = cfg.send_queue_bytes;  // TOTAL outstanding-send byte budget (back-pressure)
 
     std::atomic<std::uint64_t> corr_seq{1};   // process-global unique corr-id source (shared by all threads)
-    std::vector<ProducerStats> stats(static_cast<std::size_t>(cfg.n_threads));
+    std::vector<ProducerStats> stats(static_cast<std::size_t>(cfg.n_threads.value()));
 
     if (cfg.topology == BoundaryTopology::Coalescing) {
         // Topology B — ONE shared boundary; all threads send/recv/poll on it (it routes per thread).
@@ -317,10 +351,11 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
         if (!boundary) return std::unexpected(boundary.error());
         Boundary& shared = **boundary;
         std::vector<std::thread> threads;
-        threads.reserve(static_cast<std::size_t>(cfg.n_threads));
-        for (int t = 0; t < cfg.n_threads; ++t)
+        const std::uint32_t n = cfg.n_threads.value();   // ThreadCount ACL: the loop bound is the raw rep
+        threads.reserve(static_cast<std::size_t>(n));
+        for (std::uint32_t t = 0; t < n; ++t)
             threads.emplace_back([&, t] {
-                apply_thread_priority(cfg, t);   // renice this thread DOWN iff it is the designated one
+                apply_thread_priority(cfg, ThreadIndex{t});   // renice this thread DOWN iff it is the designated one
                 run_one_thread(cfg, shared, corr_seq, stats[t]);
             });
         for (auto& th : threads) th.join();
@@ -331,12 +366,13 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     // created INSIDE the thread so the socket is opened/used/closed all on the owning thread. A per-thread
     // creation failure is latched and surfaced as the run's error after the join.
     std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(cfg.n_threads));
+    const std::uint32_t n = cfg.n_threads.value();   // ThreadCount ACL: the loop bound is the raw rep
+    threads.reserve(static_cast<std::size_t>(n));
     std::mutex err_mu;
     std::optional<BoundaryError> first_err;
-    for (int t = 0; t < cfg.n_threads; ++t) {
+    for (std::uint32_t t = 0; t < n; ++t) {
         threads.emplace_back([&, t] {
-            apply_thread_priority(cfg, t);   // renice this thread DOWN iff it is the designated one
+            apply_thread_priority(cfg, ThreadIndex{t});   // renice this thread DOWN iff it is the designated one
             auto boundary = make_boundary(BoundaryTopology::PerThread, bcfg);
             if (!boundary) {
                 std::lock_guard<std::mutex> lk(err_mu);

@@ -266,7 +266,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    int n_slots = chocofarm::n_action_slots(env);
+    // n_action_slots / term_slot now return typed SlotCount / SlotIndex; this dump tool's scripting stays
+    // raw int (out of the retyping slice's scope) — unwrap at the crossing (ADR-0000 item 5).
+    int n_slots = static_cast<int>(chocofarm::n_action_slots(env).value());
     // build the scripted net: FINE mode (--leaf-logits-rows N>0) uses line 2 as the value FIFO + line 4
     // as the per-slot logits table; COARSE mode splits line 2 into (value, logit_base) pairs.
     std::unique_ptr<ScriptedNet> net;
@@ -331,7 +333,7 @@ int main(int argc, char** argv) {
 
     // executed action slot.
     int exec_slot;
-    if (dec.action.kind == chocofarm::ActionKind::Terminate) exec_slot = chocofarm::term_slot(env);
+    if (dec.action.kind == chocofarm::ActionKind::Terminate) exec_slot = static_cast<int>(chocofarm::term_slot(env).value());
     else if (dec.action.kind == chocofarm::ActionKind::Treasure) exec_slot = dec.action.i;
     else exec_slot = env.N() + dec.action.i;
 

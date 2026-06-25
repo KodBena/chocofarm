@@ -35,9 +35,18 @@
 #include <vector>
 
 #include "boundary.hpp"   // tlab::BoundaryError, boundary_err, BoundaryReply, LeafBatch
-#include "wire.hpp"        // tlab::wire — encode_request / decode_response, corr_t, CORR_BYTES
+#include "proc_domains.hpp"  // tlab::OptMilliseconds / HwmMessages (the ZMQ setsockopt ACL domains)
+#include "wire.hpp"        // tlab::wire — encode_request / decode_response, ProducerCorr, corr_t, CORR_BYTES
 
 namespace tlab {
+
+// ---- FrameCount: the # of ZMQ frames in one received multipart reply (the envelope-shape domain) --------
+// A small non-negative count (the lab's reply is exactly [corr-id][payload] = 2 frames; >=2 is the
+// invariant). Minted HERE (its single home — the recv envelope check is the only site) rather than in the
+// process-shape SSOT, because it is a transport-recv-local quantity, not a pipeline-shape one. u32 is ample
+// (a multipart reply is a handful of frames). The defaulted three-way (<=>) gives the < used at the check.
+struct FrameCountTag {};
+using FrameCount = chocofarm::Quantity<FrameCountTag, std::uint32_t>;
 
 // The owned DEALER socket + the matched corr-id framing. Move-only. Build via create().
 //
@@ -62,8 +71,8 @@ class ZmqDealer final {
     // a permanent hang (the very wedge this lab must not introduce). A bounded SNDTIMEO turns it into a
     // typed is_timeout error the producer reports honestly.
     [[nodiscard]] static std::expected<ZmqDealer, BoundaryError> create(
-            void* zctx, const std::string& endpoint, int recv_timeout_ms, int send_timeout_ms,
-            int send_hwm) {
+            void* zctx, const std::string& endpoint, OptMilliseconds recv_timeout_ms,
+            OptMilliseconds send_timeout_ms, HwmMessages send_hwm) {
         if (zctx == nullptr)
             return std::unexpected(BoundaryError{"ZmqDealer::create: null zmq context", false});
         void* sock = zmq_socket(zctx, ZMQ_DEALER);
@@ -72,12 +81,14 @@ class ZmqDealer final {
                 std::string("ZmqDealer::create: zmq_socket failed: ") + zmq_strerror(zmq_errno()), false});
         int linger = 0;
         zmq_setsockopt(sock, ZMQ_LINGER, &linger, sizeof(linger));
-        // recv_timeout_ms <= 0 means "block forever" to ZMQ (a -1 RCVTIMEO). We pass the value through:
-        // the boundary config documents that <= 0 blocks forever (not recommended — an absent server then
-        // hangs instead of producing a loud timeout). For the standard bounded case it is a real timeout.
-        zmq_setsockopt(sock, ZMQ_RCVTIMEO, &recv_timeout_ms, sizeof(recv_timeout_ms));
+        // ACL (the named ZMQ timeout boundary): an OptMilliseconds narrows to the signed int the C API
+        // demands ONLY here. An EMPTY optional is "block forever" -> -1 (the typed-absence model, ADR-0002),
+        // never a sign sentinel threaded through the code. A present duration .value()-unwraps to int.
+        const int rcvtimeo = recv_timeout_ms ? static_cast<int>(recv_timeout_ms->value()) : -1;
+        zmq_setsockopt(sock, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
         // SNDTIMEO bounds a full-queue send so a wedged wire fails loudly rather than hanging (ADR-0002).
-        zmq_setsockopt(sock, ZMQ_SNDTIMEO, &send_timeout_ms, sizeof(send_timeout_ms));
+        const int sndtimeo = send_timeout_ms ? static_cast<int>(send_timeout_ms->value()) : -1;
+        zmq_setsockopt(sock, ZMQ_SNDTIMEO, &sndtimeo, sizeof(sndtimeo));
         // BOUND the DEALER send queue (ZMQ_SNDHWM) so a DECOUPLED free-run BACK-PRESSURES instead of
         // buffering without limit. `send_hwm` is computed by the caller from a BYTE budget and the message
         // size (boundary.hpp send_hwm_for_budget), so outstanding-send memory is capped REGARDLESS of row
@@ -87,7 +98,10 @@ class ZmqDealer final {
         // throttles to the server's serve rate — achieved-rate then measures the true serving CEILING. Only
         // a genuinely DEAD peer (no drain for the full SNDTIMEO = max(recv_timeout_ms, 1000), 5 s default)
         // trips the loud is_timeout send error (ADR-0002).
-        int sndhwm = send_hwm;
+        // ACL (the named SNDHWM boundary): HwmMessages narrows to the signed int zmq_setsockopt demands
+        // ONLY here. The value is clamped to [4, 1'000'000] upstream (send_hwm_for_budget), so the
+        // u32->int cast cannot overflow the positive int range.
+        int sndhwm = static_cast<int>(send_hwm.value());
         zmq_setsockopt(sock, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
         if (zmq_connect(sock, endpoint.c_str()) != 0) {
             std::string msg = std::string("ZmqDealer::create: zmq_connect(") + endpoint +
@@ -130,13 +144,17 @@ class ZmqDealer final {
     [[nodiscard]] std::expected<void, BoundaryError> send_batch(const LeafBatch& batch) {
         std::vector<unsigned char> payload;
         try {
-            payload = wire::encode_request(batch.flat, batch.B, batch.in_dim);
+            // wire ACL: encode_request is the raw-bytes codec boundary (count_t in, bytes out); the typed
+            // RowCount/FeatureDim .value()-unwrap to count_t at this crossing (ADR-0000 item 5).
+            payload = wire::encode_request(batch.flat, batch.B.value(), batch.in_dim.value());
         } catch (const std::exception& e) {
             return std::unexpected(BoundaryError{
                 std::string("ZmqDealer::send_batch: encode_request failed: ") + e.what(), false});
         }
         // frame 1: the corr-id (opaque u64, echoed back verbatim) — native bytes, ZMQ_SNDMORE.
-        const wire::corr_t corr = batch.corr;
+        // ACL (the opaque corr round-trip): the typed corr .value()-unwraps to the raw corr_t at the exact
+        // byte write; the server never parses these bytes, so endianness is irrelevant (native-endian memcpy).
+        const wire::corr_t corr = batch.corr.value();
         if (zmq_send(sock_, &corr, wire::CORR_BYTES, ZMQ_SNDMORE) < 0) {
             const int err = zmq_errno();
             return std::unexpected(BoundaryError{
@@ -188,14 +206,23 @@ class ZmqDealer final {
             more = zmq_msg_more(&m);
             zmq_msg_close(&m);
         }
-        if (frames.size() < 2 || frames.front().size() != wire::CORR_BYTES)
+        // ACL: std::vector::size() (size_t) -> a typed FrameCount at the envelope-shape check. The >=2
+        // envelope invariant (corr frame + payload frame) is a domain fact, not a raw int comparison.
+        const FrameCount n_frames{static_cast<std::uint32_t>(frames.size())};
+        if (n_frames < FrameCount{2} || frames.front().size() != wire::CORR_BYTES)
             return std::unexpected(BoundaryError{
-                "ZmqDealer::recv_one: malformed reply envelope (" + std::to_string(frames.size()) +
+                "ZmqDealer::recv_one: malformed reply envelope (" + std::to_string(n_frames.value()) +
                     " frames, leading " + std::to_string(frames.empty() ? 0 : frames.front().size()) +
                     " bytes; want >=2 frames + 8-byte corr-id)",
                 false});
         BoundaryReply reply;
-        std::memcpy(&reply.corr, frames.front().data(), wire::CORR_BYTES);  // opaque round-trip: native bytes
+        // ACL (the opaque corr round-trip): read the leading frame's raw corr_t bytes into a corr_t, then
+        // wrap into the seam's ProducerCorr via the explicit ctor. (Topology A: this IS the producer corr the
+        // dealer's owner stamped. Topology B reinterprets it as a WireCorr at the coalescing ACL — see
+        // boundary_coalescing.cpp; the bytes are identical, the two corr namespaces share corr_t.)
+        wire::corr_t corr_raw = 0;
+        std::memcpy(&corr_raw, frames.front().data(), wire::CORR_BYTES);   // opaque round-trip: native bytes
+        reply.corr = wire::ProducerCorr{corr_raw};
         try {
             reply.preds = wire::decode_response(frames.back());
         } catch (const std::exception& e) {

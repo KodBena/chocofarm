@@ -78,6 +78,8 @@
 #include <string>
 #include <vector>
 
+#include "chocofarm/quantity.hpp"  // the zero-cost phantom machinery (Band-1, reused across the boundary)
+
 namespace tlab::wire {
 
 // ---- the protocol-version header byte (the codec-mismatch tripwire) ----------------------------
@@ -113,6 +115,65 @@ static_assert(sizeof(version_t) == VERSION_BYTES, "version_t width must match VE
 static_assert(sizeof(count_t)   == COUNT_BYTES,   "count_t width must match COUNT_BYTES");
 static_assert(sizeof(float_t)   == FLOAT_BYTES,   "float_t width must match FLOAT_BYTES");
 static_assert(sizeof(corr_t)    == CORR_BYTES,    "corr_t width must match CORR_BYTES");
+
+// ============================================================================================
+//  IN-MEMORY PHANTOM SPLIT (ADR-0000 / ADR-0012 P6) — reuses chocofarm's Quantity<Tag,Rep> machinery
+// ============================================================================================
+// The same three-roles-one-u32 fusion as chocofarm/wire_spec.hpp (B / in_dim / n_actions all ride
+// count_t) plus the two-corr-namespaces fusion (producer-corr vs wire-corr both ride corr_t). The phantom
+// split makes the in-memory mix a COMPILE error while keeping the on-wire bytes BIT-IDENTICAL: each
+// phantom wraps the same count_t/corr_t and the codec .value()-unwraps at the exact byte read/write
+// (the named wire ACL). The traits live in namespace chocofarm (the machinery's home), so they are
+// specialized with explicit qualification on the tlab-local tags below.
+
+// B — leaf ROWS per message (>= 1). A row count, NOT a width.
+struct RowCountTag {};
+using RowCount = chocofarm::Quantity<RowCountTag, count_t>;
+
+// in_dim — feature WIDTH per row (241 on Stage-A). The B<->in_dim swap is the bug a distinct tag forbids.
+struct FeatureDimTag {};
+using FeatureDim = chocofarm::Quantity<FeatureDimTag, count_t>;
+
+// n_actions — policy action count for the whole batch (0 ⇒ value-only; a meaningful typed zero, ADR-0002).
+struct ActionCountTag {};
+using ActionCount = chocofarm::Quantity<ActionCountTag, count_t>;
+
+// CorrId — the OPAQUE 8-byte transport correlation token (memcpy'd raw native-endian; never parsed). Two
+// namespaces share corr_t: the PRODUCER corr (per-thread, stamped by the generator) and the WIRE corr
+// (stamped by the coalescing thread), split/joined in Topology B. Distinct tags make the coalescing
+// scatter map's two id-spaces unmixable. NOT additive (an id), NOT a quantity — but the monotonic ++
+// generation is the one affine op (next = corr + 1), so the increment crossing is named, not implicit.
+struct ProducerCorrTag {};
+using ProducerCorr = chocofarm::Quantity<ProducerCorrTag, corr_t>;
+struct WireCorrTag {};
+using WireCorr = chocofarm::Quantity<WireCorrTag, corr_t>;
+
+// The protocol-version header byte as a CLOSED tag (an unknown version unrepresentable; the on-wire byte
+// width stays version_t = u8, P6). The decode crosses the wire ACL with static_cast and fails loud
+// (ADR-0002) on a byte outside this set.
+enum class ProtocolVersionTag : version_t {
+    SingleLeaf = 1,
+    Batched = 2,
+};
+static_assert(static_cast<version_t>(ProtocolVersionTag::Batched) == PROTOCOL_VERSION,
+              "ProtocolVersionTag::Batched must equal the SSOT PROTOCOL_VERSION byte (one home, P1).");
+
+}  // namespace tlab::wire
+
+namespace chocofarm {
+// Opt the tlab wire count tags into additive + affine (a row count + a row count is a row count; a loop
+// index over [0,B)). The corr tags are affine ONLY (monotonic ++ generation), never additive.
+template <> struct quantity_additive<tlab::wire::RowCountTag> : std::true_type {};
+template <> struct quantity_affine<tlab::wire::RowCountTag> : std::true_type {};
+template <> struct quantity_additive<tlab::wire::FeatureDimTag> : std::true_type {};
+template <> struct quantity_affine<tlab::wire::FeatureDimTag> : std::true_type {};
+template <> struct quantity_additive<tlab::wire::ActionCountTag> : std::true_type {};
+template <> struct quantity_affine<tlab::wire::ActionCountTag> : std::true_type {};
+template <> struct quantity_affine<tlab::wire::ProducerCorrTag> : std::true_type {};
+template <> struct quantity_affine<tlab::wire::WireCorrTag> : std::true_type {};
+}  // namespace chocofarm
+
+namespace tlab::wire {
 
 // =============================================================================================
 //  THE LAYER-1 CODEC (header-only, transport-free — no zmq include here). The build agent for the
