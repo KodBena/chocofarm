@@ -1,14 +1,19 @@
 // throughput-lab/cpp/real_producer.cpp
-// Purpose: the REAL-generator load driver (NON-FIBER baseline) — N producer threads, each running real
-//   Gumbel-AZ decisions back-to-back through its OWN tlab::Boundary (a per-thread DEALER), each leaf a
-//   B=1 blocking round-trip to the live server. With N threads each holding one leaf in flight, the
-//   server gathers up to N concurrent leaves per forward (batch ~= N). This is the NON-FIBER data point
-//   the fiber multiplexer (K leaves/thread -> batch ~= N*K) is measured against: the open question is
-//   whether the fiber model helps or hurts throughput vs this baseline (the maintainer's investigation,
-//   neither prior trusted). All rates MEASURED (leaves/wall, decisions/wall), never assumed (ADR-0009).
+// Purpose: the REAL-generator load driver — N producer threads running real Gumbel-AZ decisions through
+//   each thread's OWN tlab::Boundary (a per-thread DEALER) to the live server. Two modes:
+//     --fibers 0  : NON-FIBER baseline — one SerialRuntime/thread, B=1 blocking round-trips (server
+//                   batch ~= N concurrent threads). The reference data point.
+//     --fibers K  : the MULTIPLEXED engine — K resumable trees/thread parked across the RTT (server
+//                   batch grows with K). The engine is the EXPLICIT-STATE TreeCursor (Option B); the
+//                   former stackful-fiber engine (Option A) was RETIRED from the producer (finding #34:
+//                   the cursor is bit-identical, ~1.6% faster producer-bound, and carries no
+//                   boost.context / per-decision mmap). The cpp/ fiber machinery (fiber_tree.hpp, the
+//                   C++ runner / serve / wire-benches) is UNTOUCHED — only the producer retired it.
+//                   Full fiber+boost retirement across the other consumers is filed (BACKLOG.md).
+//   All rates MEASURED (leaves/wall, decisions/wall), never assumed (ADR-0009).
 //
-//   Built only under -DTLAB_REAL_GENERATOR=ON (links chocofarm_core). The synthetic tlab-producer stays
-//   a standalone clean-room binary; this is the additive real-generator sibling (ADR-0012 compose).
+//   Built only under -DTLAB_REAL_GENERATOR=ON (links chocofarm_core; NO boost). The synthetic
+//   tlab-producer stays a standalone clean-room binary; this is the additive real-generator sibling.
 // Public Domain (The Unlicense).
 #include <sys/resource.h>   // setpriority / PRIO_PROCESS — per-thread nice (Linux: nice is per-task)
 #include <sys/syscall.h>    // SYS_gettid
@@ -33,7 +38,6 @@
 #include <vector>
 
 #include "chocofarm/env.hpp"
-#include "chocofarm/fiber_tree.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/instance.hpp"
 #include "chocofarm/issue_control_bridge.hpp"   // consolidation Gate A: REUSE the control plane (one home,
@@ -81,24 +85,25 @@ using SteadyClock = std::chrono::steady_clock;
     return std::nullopt;
 }
 
-// Estimated RESIDENT bytes one fiber holds while parked mid-decision. The driver keeps EVERY fiber's tree
-// live simultaneously (each parked on a leaf across the multiplexed RTT), so the producer's resident floor
-// is threads*fibers*this. This model is RE-CALIBRATED to the post-structural-fix footprint (RCA
-// tlab_finding #26; the O(fibers)-resident dissolution: the per-fiber belief memo is now BOUNDED to a small
-// ring (FeatureBuilder::kDefaultBeliefCacheCap, features.hpp), the node arena's overflow now RETURNS to the
-// OS per decision (releasing_arena.hpp), and the fiber stack is a demand-paged guard-page mmap (fiber_tree.
-// hpp) — so the former dominant unbounded term, the belief memo, no longer scales with tree size). MEASURED
-// (ADR-0009, the structural-fix per-fiber sweep at default cap, /usr/bin/time peak RSS / K, both n_sims):
-//   K 256/512/1024 @ n_sims=256 -> ~1489/1475/1314 KiB per fiber;  @ n_sims=48 -> ~411/395/389 KiB per
-//   fiber. A two-point fit gives base ~256 KiB + ~5 KiB/sim (the residual is the live TreeState + policy +
-//   node arena; the bounded belief memo is cap*~2.6 KiB ~= 42 KiB, no longer the dominant term). The
-//   constants below are rounded slightly CONSERVATIVE (over- not under-estimate) so the admission guard
-//   stays a true fail-loud backstop — it ADMITS the full config (1024/256: ~1536 KiB*1024 ~= 1.5 GiB/
-//   producer, well under 50% of an 8 GiB box) yet still rejects a genuinely-too-big ask.
-// Non-fiber (--fibers 0) runs ONE tree per thread, so the live count is `threads`, not threads*fibers.
+// Estimated RESIDENT bytes one tree holds while parked mid-decision. The engine keeps EVERY tree live
+// simultaneously (each parked on a leaf across the multiplexed RTT), so the producer's resident floor is
+// threads*fibers*this. This model was calibrated against the post-structural-fix FIBER footprint (RCA
+// tlab_finding #26): the per-tree belief memo is BOUNDED to a small ring (FeatureBuilder::
+// kDefaultBeliefCacheCap, features.hpp) and the node arena's overflow RETURNS to the OS per decision
+// (releasing_arena.hpp). MEASURED then (ADR-0009, peak RSS / K, both n_sims):
+//   K 256/512/1024 @ n_sims=256 -> ~1489/1475/1314 KiB per tree;  @ n_sims=48 -> ~411/395/389 KiB. A
+//   two-point fit gives base ~256 KiB + ~5 KiB/sim (live TreeState/policy + node arena; bounded memo ~42 KiB).
+//   Rounded slightly CONSERVATIVE (over-estimate) so the guard is a true fail-loud backstop — it ADMITS the
+//   full config (1024/256: ~1536 KiB*1024 ~= 1.5 GiB/producer, well under 50% of an 8 GiB box) yet rejects
+//   a genuinely-too-big ask.
+// NOTE (finding #34, cursor retirement): the producer's engine is now the explicit-state cursor, which has
+//   NO 512 KiB fiber stack (it runs on the thread stack), so this fiber-calibrated estimate is now
+//   *conservative with extra margin* — still a sound over-estimating backstop. A cursor-specific
+//   re-calibration (and a rename off `fiber`) is filed (BACKLOG.md). Non-fiber (--fibers 0) runs ONE tree
+//   per thread, so the live count is `threads`, not threads*fibers.
 [[nodiscard]] std::uint64_t est_fiber_resident_bytes(int n_sims) {
-    constexpr std::uint64_t kFiberBaseBytes = 256ull * 1024;   // measured per-fiber floor (TreeState+policy+
-                                                               //   stack-resident+bounded belief memo)
+    constexpr std::uint64_t kFiberBaseBytes = 256ull * 1024;   // measured per-tree floor (TreeState/cursor +
+                                                               //   policy + bounded belief memo)
     constexpr std::uint64_t kBytesPerSim = 5ull * 1024;        // measured live node storage per sim (post-fix)
     return kFiberBaseBytes
            + static_cast<std::uint64_t>(std::max(n_sims, 0)) * kBytesPerSim;
@@ -214,64 +219,7 @@ template <class Slot>
     return true;
 }
 
-// One FIBER producer thread: multiplex K TreeState fibers over its own Boundary, ROUND-SYNCHRONOUS
-// (wire_parallel_bench's discipline): each round, submit every parked fiber's leaf (B=1) into the DEALER,
-// let the SERVER gather the K concurrent requests into one forward, then recv the K replies and resume
-// each fiber. K leaves in flight per thread -> the server's per-forward batch grows with K (and with N
-// threads, ~N*K). A finished fiber is restarted on a fresh decision to keep K in flight for the window.
-// This is the fiber arm of the investigation; run_thread (above) is the non-fiber baseline it is measured
-// against. (Greedy-async -- keep the pipe full across rounds -- is the next refinement.)
-void run_thread_fiber(int idx, const chocofarm::Environment& env, const std::string& endpoint,
-                      const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim, int fibers_k,
-                      int coalesce_rows, ThreadStat& out) {
-    if (coalesce_rows < 1) coalesce_rows = 1;
-    tlab::BoundaryConfig bcfg;
-    bcfg.endpoint = endpoint;
-    bcfg.recv_timeout_ms = 10000;
-    bcfg.n_producer_threads = 1;
-    bcfg.rows = coalesce_rows;   // up to coalesce_rows leaves per message -> sizes the send HWM budget
-    bcfg.in_dim = in_dim;
-    auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
-    if (!b) { out.failed = true; out.err = "boundary: " + b.error().message; return; }
-    std::unique_ptr<tlab::Boundary> boundary = std::move(*b);
-
-    // Root state — kept alive for every fiber's whole life (TreeState::start captures loc/bw/coll BY
-    // REFERENCE and re-reads them on every leaf across all resume_with calls).
-    const chocofarm::Loc loc{env.entry_point()};
-    const chocofarm::Belief bw = env.full_belief();
-    const chocofarm::CollectedSet coll;
-
-    // K independent tree-fibers (scripted source, per-tree rotated table so the trees differ).
-    std::vector<std::unique_ptr<chocofarm::TreeState>> trees;
-    trees.reserve(static_cast<size_t>(fibers_k));
-    for (int i = 0; i < fibers_k; ++i) {
-        std::vector<double> table(kGumbelTable.size());
-        for (size_t j = 0; j < kGumbelTable.size(); ++j)
-            table[j] = kGumbelTable[(j + static_cast<size_t>(i)) % kGumbelTable.size()];
-        trees.push_back(std::make_unique<chocofarm::TreeState>(cfg, env, std::move(table)));
-    }
-    for (auto& t : trees) t->start(loc, bw, coll, kLam);   // advance each to its first parked leaf
-
-    tlab::wire::corr_t corr = static_cast<tlab::wire::corr_t>(idx) * 1'000'000'000ull + 1ull;
-    const auto t_start = SteadyClock::now();
-    while (secs_since(t_start) < run_seconds) {
-        // Collect parked fibers; restart any that finished (count the completed decision) to keep K busy.
-        std::vector<int> active;
-        active.reserve(static_cast<size_t>(fibers_k));
-        for (int i = 0; i < fibers_k; ++i) {
-            if (!trees[static_cast<size_t>(i)]->running) {
-                out.decisions += 1;
-                trees[static_cast<size_t>(i)]->start(loc, bw, coll, kLam);
-            }
-            if (trees[static_cast<size_t>(i)]->running) active.push_back(i);
-        }
-        if (active.empty()) break;
-
-        if (!drive_round(*boundary, trees, active, coalesce_rows, in_dim, corr, out)) return;
-    }
-}
-
-// EPISODIC fiber driver: like run_thread_fiber, but each slot runs a SEQUENCE of decisions forming an
+// EPISODIC driver: like run_thread_fiber, but each slot runs a SEQUENCE of decisions forming an
 // EPISODE. On a completed decision the executed action steps the slot's OWN (loc, bw, collected) via
 // env.apply against a per-episode sampled true world (mirrors runner.cpp's run_episode), and the next
 // decision starts from the EVOLVED state, not the root. With cfg.no_early_exit on, a Terminate is
@@ -464,24 +412,14 @@ void run_episodic(int idx, const chocofarm::Environment& env, const std::string&
     return table;
 }
 
-// OPTION A wrapper: bind run_episodic to the fiber TreeState (the DEFAULT engine — byte-untouched). The
-// factory reproduces the original per-slot TreeState construction (cfg, env, rotated table).
-void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
-                               const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
-                               int fibers_k, int coalesce_rows, const std::string& driver,
-                               int inflight_msgs, chocofarm::IssueController* ctl, ThreadStat& out) {
-    auto make = [&](int i) {
-        return std::make_unique<chocofarm::TreeState>(cfg, env, slot_table(i));
-    };
-    run_episodic<chocofarm::TreeState>(idx, env, endpoint, run_seconds, in_dim, fibers_k,
-                                       coalesce_rows, driver, inflight_msgs, ctl, make, out);
-}
-
-// OPTION B wrapper: bind run_episodic to the explicit-state CursorSlot (CHOCO_PRODUCER_ENGINE=cursor /
-// --engine cursor). The factory builds a CursorSlot per slot (the SAME cfg/env/rotated table) — the
-// cursor adapter exposes the SAME .start/.running/.ch.features/.resume_with surface, so the entire
-// episodic body (state machine + both pipe shapes + the control gate) is reused (ADR-0012 P1). The
-// search the cursor runs is bit-identical to the fiber's run_search (cpp/parity + gumbel_cursor_proto).
+// EPISODIC producer wrapper: bind run_episodic to the explicit-state CursorSlot (the producer's ONE
+// multiplexed engine since the fiber path was retired here — finding #34: the cursor is bit-identical,
+// ~1.6% faster producer-bound, and runs on the thread stack with no boost.context / per-decision mmap).
+// The factory builds a CursorSlot per slot (cfg/env/rotated table); the cursor adapter exposes the SAME
+// .start/.running/.ch.features/.resume_with surface, so the entire episodic body (state machine + both
+// pipe shapes + the control gate) is reused (ADR-0012 P1). The search is bit-identical to the former
+// fiber's run_search (cpp/parity + gumbel_cursor_proto). The cpp/ fiber machinery (fiber_tree.hpp etc.)
+// is UNTOUCHED — it still backs the C++ runner / serve / wire-benches; only the PRODUCER retired it.
 void run_thread_cursor_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
                                 const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
                                 int fibers_k, int coalesce_rows, const std::string& driver,
@@ -493,84 +431,6 @@ void run_thread_cursor_episodic(int idx, const chocofarm::Environment& env, cons
                                    coalesce_rows, driver, inflight_msgs, ctl, make, out);
 }
 
-// One GREEDY-ASYNC fiber producer thread (wire_pool_bench's discipline): keep ~K leaves CONTINUOUSLY in
-// flight and process replies as they land — recv ONE, resume that fiber (it computes its next leaf), and
-// re-submit it immediately, rather than the round-synchronous barrier (submit all, wait for all). The
-// difference is overlap: in round-sync the search cores idle while the whole round's replies are awaited;
-// here a thread is always either receiving or computing a fiber's next leaf, so the search cores stay
-// busy across the RTT. Same corr->fiber routing and finished-fiber restart as the round-sync arm; the
-// ONLY change is the pipeline shape. Optional (selected by --driver greedy) so the round-sync semantics
-// are preserved for comparison.
-void run_thread_fiber_greedy(int idx, const chocofarm::Environment& env, const std::string& endpoint,
-                             const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
-                             int fibers_k, ThreadStat& out) {
-    tlab::BoundaryConfig bcfg;
-    bcfg.endpoint = endpoint;
-    bcfg.recv_timeout_ms = 10000;
-    bcfg.n_producer_threads = 1;
-    bcfg.rows = 1;
-    bcfg.in_dim = in_dim;
-    auto b = tlab::make_boundary(tlab::BoundaryTopology::PerThread, bcfg);
-    if (!b) { out.failed = true; out.err = "boundary: " + b.error().message; return; }
-    std::unique_ptr<tlab::Boundary> boundary = std::move(*b);
-
-    const chocofarm::Loc loc{env.entry_point()};
-    const chocofarm::Belief bw = env.full_belief();
-    const chocofarm::CollectedSet coll;
-
-    std::vector<std::unique_ptr<chocofarm::TreeState>> trees;
-    trees.reserve(static_cast<size_t>(fibers_k));
-    for (int i = 0; i < fibers_k; ++i) {
-        std::vector<double> table(kGumbelTable.size());
-        for (size_t j = 0; j < kGumbelTable.size(); ++j)
-            table[j] = kGumbelTable[(j + static_cast<size_t>(i)) % kGumbelTable.size()];
-        trees.push_back(std::make_unique<chocofarm::TreeState>(cfg, env, std::move(table)));
-    }
-    for (auto& t : trees) t->start(loc, bw, coll, kLam);
-
-    std::unordered_map<tlab::wire::corr_t, int> corr_to_fiber;
-    tlab::wire::corr_t corr = static_cast<tlab::wire::corr_t>(idx) * 1'000'000'000ull + 1ull;
-    int in_flight = 0;
-    // Submit fiber i's current parked leaf, restarting it on a fresh decision if it had finished. Returns
-    // false only on a send error (out.failed set) or if a restarted fiber yielded no leaf (exhausted).
-    auto submit = [&](int i) -> bool {
-        if (!trees[static_cast<size_t>(i)]->running) {
-            out.decisions += 1;
-            trees[static_cast<size_t>(i)]->start(loc, bw, coll, kLam);
-        }
-        if (!trees[static_cast<size_t>(i)]->running) return false;  // produced no leaf (won't happen for n_sims>=1)
-        const std::span<const float> feats = trees[static_cast<size_t>(i)]->ch.features;
-        const tlab::wire::corr_t cc = corr++;
-        const tlab::LeafBatch lb{cc, 1, static_cast<tlab::wire::count_t>(feats.size()), feats};
-        if (auto s = boundary->send(lb); !s) { out.failed = true; out.err = "send: " + s.error().message; return false; }
-        corr_to_fiber.emplace(cc, i);
-        ++in_flight;
-        return true;
-    };
-
-    for (int i = 0; i < fibers_k; ++i) submit(i);   // prime: K leaves in flight
-    if (out.failed) return;
-
-    const auto t_start = SteadyClock::now();
-    while (secs_since(t_start) < run_seconds && in_flight > 0) {
-        auto reply = boundary->recv();
-        if (!reply) { out.failed = true; out.err = "recv: " + reply.error().message; return; }
-        auto it = corr_to_fiber.find(reply->corr);
-        if (it == corr_to_fiber.end() || reply->preds.empty()) {
-            out.failed = true; out.err = "unmatched/empty reply corr=" + std::to_string(reply->corr); return;
-        }
-        const int i = it->second;
-        corr_to_fiber.erase(it);
-        --in_flight;
-        chocofarm::NetPrediction pred;
-        pred.value = reply->preds[0].value;
-        pred.logits = std::move(reply->preds[0].logits);
-        trees[static_cast<size_t>(i)]->resume_with(pred);   // advances to its next leaf (or finishes)
-        out.leaves += 1;
-        submit(i);                                          // re-arm this fiber -> back to ~K in flight
-        if (out.failed) return;
-    }
-}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -578,9 +438,9 @@ int main(int argc, char** argv) {
     auto inst_p = opt(args, "--instance"), faces_p = opt(args, "--faces"), ep = opt(args, "--endpoint");
     if (!inst_p || !faces_p || !ep) {
         std::cerr << "usage: tlab-real-producer --instance <p> --faces <p> --endpoint <ipc://...> "
-                     "[--threads N --fibers K --msg-rows M --driver round-sync|greedy --engine fiber|cursor --seconds S --n-sims K --m M --in-dim D]\n"
-                     "  --fibers 0 (default) = non-fiber baseline; K>=1 = K fibers/thread (the fiber model)\n"
-                     "  --engine fiber (default) | cursor = Option A (stackful fiber) vs Option B (explicit-state TreeCursor); cursor requires --fibers K>=1 + --episodic (also via CHOCO_PRODUCER_ENGINE)\n"
+                     "[--threads N --fibers K --msg-rows M --driver round-sync|greedy --seconds S --n-sims K --m M --in-dim D --episodic]\n"
+                     "  --fibers 0 (default) = non-fiber SerialRuntime baseline; K>=1 = K cursor trees/thread (the multiplexed engine; requires --episodic)\n"
+                     "  --engine cursor (default, only value) = the explicit-state TreeCursor (Option B); the stackful-fiber engine was retired from the producer (finding #34). Also via CHOCO_PRODUCER_ENGINE\n"
                      "  --msg-rows M (default 1) = coalesce up to M round leaves per message (round-sync; the S_min floor)\n"
                      "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n"
                      "  --inflight-msgs N (default 8) = greedy-episodic pipe depth (coalesced msgs in flight; round-sync ignores)\n"
@@ -625,18 +485,23 @@ int main(int argc, char** argv) {
     //   B is wired ONLY into the EPISODIC path (the production-shape workload the e2e measures); the root /
     //   non-episodic drivers stay fiber-only (a loud reject if cursor is asked for there — never a silent
     //   fallback, ADR-0002).
-    std::string engine = "fiber";
+    std::string engine = "cursor";
     if (const char* e = std::getenv("CHOCO_PRODUCER_ENGINE")) engine = e;
     if (auto v = opt(args, "--engine")) engine = std::string(*v);
-    if (engine != "fiber" && engine != "cursor") {
-        std::cerr << "tlab-real-producer: --engine must be fiber|cursor, got " << engine << "\n";
+    if (engine != "cursor") {
+        std::cerr << "tlab-real-producer: --engine must be cursor — the stackful-fiber engine (Option A) "
+                     "was RETIRED from the producer in favor of the explicit-state TreeCursor (finding #34: "
+                     "bit-identical, ~1.6% faster producer-bound, no boost.context / per-decision mmap). The "
+                     "fiber path lives on in the C++ runner / serve / wire-benches. Got " << engine << ".\n";
         return 2;
     }
-    if (engine == "cursor" && !(opt(args, "--fibers") && episodic)) {
-        std::cerr << "tlab-real-producer: --engine cursor requires --fibers K>=1 AND --episodic (the "
-                     "cursor engine is wired into the EPISODIC multiplexed path only — the production-shape "
-                     "workload). Got fibers/episodic absent. Refusing rather than silently falling back to "
-                     "the fiber engine (ADR-0002).\n";
+    // The cursor engine drives the EPISODIC production-shape multiplexed path; --fibers K>=1 therefore
+    // requires --episodic (the former non-episodic root fiber drivers were retired with Option A). --fibers
+    // 0 is the non-fiber SerialRuntime baseline (one tree/thread, engine irrelevant).
+    if (fibers > 0 && !episodic) {
+        std::cerr << "tlab-real-producer: --fibers K>=1 requires --episodic (the cursor engine drives the "
+                     "episodic multiplexed path; the non-episodic root fiber drivers were retired). Pass "
+                     "--episodic, or --fibers 0 for the non-fiber baseline.\n";
         return 2;
     }
     // Renice ONE generator thread DOWN (the generator-bound core-sharing lever): a 4th generator on the
@@ -654,7 +519,7 @@ int main(int argc, char** argv) {
     if (!inst) { std::cerr << "tlab-real-producer: FATAL: " << inst.error().message << "\n"; return 1; }
     chocofarm::Environment env(*inst);
 
-    std::cout << "tlab-real-producer: generator=real(" << (fibers > 0 ? "fiber" : "non-fiber")
+    std::cout << "tlab-real-producer: generator=real(" << (fibers > 0 ? "multiplexed" : "non-fiber")
               << ") engine=" << engine
               << " driver=" << (fibers > 0 ? driver : std::string("n/a"))
               << " threads=" << threads << " fibers_per_thread=" << fibers << " msg_rows=" << msg_rows
@@ -682,8 +547,8 @@ int main(int argc, char** argv) {
     }
 
     // ADMISSION GUARD (RCA tlab_finding #23; ADR-0000 make-the-illegal-state-unrepresentable + ADR-0002
-    // a config the receiver can't honor must not be silently accepted). The fiber driver keeps EVERY fiber's
-    // Gumbel tree live simultaneously, so the producer's resident floor is threads*fibers*est_tree_bytes
+    // a config the receiver can't honor must not be silently accepted). The multiplexed engine keeps EVERY
+    // tree's Gumbel tree live simultaneously, so the producer's resident floor is threads*fibers*est_tree_bytes
     // (non-fiber: threads*est_tree_bytes — one tree per thread). At --fibers 1024 --n-sims 256 that is
     // ~3.4 GiB for ONE producer; four concurrent producers exceed an 8 GiB box and the OOM killer fires an
     // opaque rc=-9 mid-run (and a single producer's throughput halves under the memory-pressure regime as
@@ -716,16 +581,10 @@ int main(int argc, char** argv) {
     for (int i = 0; i < threads; ++i)
         pool.emplace_back([&, i] {
             apply_thread_priority(i, low_prio_thread, low_prio_nice);   // renice iff designated
-            if (fibers > 0 && episodic && engine == "cursor")
+            if (fibers > 0)   // validated above: cursor engine + --episodic (the multiplexed path)
                 run_thread_cursor_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
-            else if (fibers > 0 && episodic)
-                run_thread_fiber_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
-            else if (fibers > 0 && driver == "greedy")
-                run_thread_fiber_greedy(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
-            else if (fibers > 0)
-                run_thread_fiber(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, stats[static_cast<size_t>(i)]);
             else
-                run_thread(i, env, endpoint, cfg, seconds, in_dim, stats[static_cast<size_t>(i)]);
+                run_thread(i, env, endpoint, cfg, seconds, in_dim, stats[static_cast<size_t>(i)]);   // non-fiber baseline
         });
     for (auto& th : pool) th.join();
     if (bridge) {

@@ -126,4 +126,32 @@ above) is itself the proof that A is sound, and it is cheap — so if the mainta
 favour of B's P9-purity, nothing is lost but that one prototype. The decision is recorded here so
 the veto is informed, not a silent override.
 
+## Amendment 2026-06-25 — REVERSED for the producer: Option B (explicit-state cursor) adopted, on a measured basis
+
+*(Dated append per ADR-0005 Rule 8 — this point-in-time decision stands as the record of what was decided
+on 2026-06-16 and why; it is NOT rewritten. This amendment records that the decision was later reversed for
+the tlab producer, on evidence that did not exist when A was chosen.)*
+
+The A-over-B choice above rested on two pillars that a later investigation (DB findings #28→#34) found
+invalid: (1) "don't re-prove the 1b precision" is an ADR-0013 verification-dodge, not a soundness reason —
+the re-proof is the *cost of the sound fix*, to be paid; (2) "server-bound, off the critical path" is
+irrelevant to component soundness and is temporary (the GPU-producer-bound future makes producer CPU/memory
+concrete). Re-decided on **measured** grounds:
+
+- An explicit-state `TreeCursor` (Option B) was built (`cpp/include/chocofarm/gumbel_cursor.hpp`,
+  `cpp/src/gumbel_cursor.cpp`) and **re-proven bit-identical** — `gumbel_logic` 144/144, `gumbel_precision`
+  144/144 + 34/144 discrimination, `gumbel_cursor_proto` bit-exact across the m/n_sims/c_outcome/max_depth
+  sweep. The 1b precision re-proof the 2016-06-16 note declined was **paid**, and passes.
+- After a belief-by-reference refinement (park one in-place narrowing belief, not ~24 per-frame copies), B
+  measures **~1.6% faster than the fiber on the producer-bound CPU path** (and ≈ the bare recursion), with
+  **lower L1i/iTLB and L1d/L2 miss counts** (perf cache analysis), and no boost.context / per-decision mmap.
+  At the current server-bound e2e operating point A and B are tied (the server is the bottleneck).
+- **Disposition:** the **producer** adopted B as the default engine and retired its fiber path (merged on
+  `feat/tlab-real-generators`). The §"honest costs of A" fiber mechanism is gone for the producer. The
+  cursor is exactly the P9 functional-core shape `cpp-search-runtime.md` §3.2 originally recommended — so
+  this amendment also vindicates that design doc's lean, which the 2026-06-16 note had reversed.
+- **Scope:** the cpp/ fiber machinery (`fiber_tree.hpp`, the C++ runner / serve / wire-benches) still uses
+  the fiber and is unchanged; the full cross-consumer retirement is filed (`BACKLOG.md`). So Option A is
+  *retired in the producer*, not yet *deleted from the tree*.
+
 *Public Domain (The Unlicense).*

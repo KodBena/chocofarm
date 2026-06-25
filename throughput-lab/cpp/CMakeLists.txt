@@ -141,6 +141,9 @@ if(TLAB_REAL_GENERATOR)
     boundary_coalescing.cpp
     boundary_factory.cpp)
   target_include_directories(tlab-real-producer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CHOCO_CORE_INCLUDE})
+  # NO boost.context: the producer retired the stackful-fiber engine for the explicit-state TreeCursor
+  # (finding #34), which runs on the thread stack. boost is still discovered above for the other
+  # consumers (tlab-real-gen-smoke; the C++ runner / wire-benches in cpp/) — only the PRODUCER dropped it.
   target_link_libraries(tlab-real-producer PRIVATE
-    ${CHOCO_CORE_LIB} ${TLAB_BOOST_CONTEXT} ${HIREDIS_LIB} zmq_lib Threads::Threads)
+    ${CHOCO_CORE_LIB} ${HIREDIS_LIB} zmq_lib Threads::Threads)
 endif()

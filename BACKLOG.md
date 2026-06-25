@@ -281,4 +281,31 @@ discriminator column on `lab_trial` (e.g. `dps` vs `lps`) would make "this throu
 decisions/s" a queryable field rather than a sentence a reader must find. Deferred as a lab-store schema
 change, surfaced here so it is not lost.
 
+## Full fiber + boost.context retirement — the producer retired it; other consumers have not (2026-06-25)
+
+The tlab **producer** retired the stackful-fiber engine (Option A) for the explicit-state `TreeCursor`
+(Option B) and made cursor the default — merged on `feat/tlab-real-generators`. Basis: DB finding #34
+(bit-identical search re-proven; ~1.6% faster producer-bound CPU; lower L1i/iTLB/L1d/L2 misses; one live
+belief/cursor vs ~24; no boost.context, no per-decision 512 KiB mmap). The producer no longer includes
+`fiber_tree.hpp` and no longer links boost. The cpp/ fiber machinery is INTENTIONALLY kept because it
+still backs other consumers; the full retirement is deferred (each piece independent, ADR-0004 — touches
+the shared validated fiber core used beyond the producer):
+
+- **Port the remaining fiber consumers to the cursor, then delete the fiber path**: `chocofarm-cpp-runner`
+  (`runner_wire_batched.{hpp,cpp}`), `serve.cpp`, the wire benches/checks (`wire_parallel_bench`,
+  `wire_pool_bench`, `wire_batched_runtime_check`), and `fiber_proto.cpp`. Each needs the bit-identity
+  re-proof the producer got (`gumbel_cursor_proto` + `cpp/parity`, the P6 bar).
+- **Then drop boost.context globally**: remove `TreeState`/`fiber_tree.hpp`/`fiber_leaf.hpp` and the
+  `BOOST_CONTEXT_LINK`/`TLAB_BOOST_CONTEXT` discovery from both CMakeLists — the dependency gone entirely
+  (the full P9 win).
+- **Recalibrate + rename the producer admission guard**: `est_fiber_resident_bytes` (real_producer.cpp) is
+  fiber-calibrated (a 512 KiB stack term the cursor does not pay). Now conservative-with-margin (sound,
+  over-estimating); re-measure for the cursor and rename off `fiber`.
+
+This SUBSUMES the producer half of "Fiber producer per-fiber resident footprint" (2026-06-25): fix (a)
+right-size-the-fiber-stack is MOOT for the producer (the cursor has no fiber stack); fix (b) bound-live-
+arenas-to-in-flight still applies (the cursor keeps K arenas live too). It also MOOTS part of the Gate-A
+audit item: `run_thread_fiber` (round-sync) and `run_thread_fiber_greedy` were DELETED with this retirement,
+so the "other drivers don't carry ctl" class shrinks to `run_thread` (non-fiber baseline) only.
+
 *Public Domain (The Unlicense).*
