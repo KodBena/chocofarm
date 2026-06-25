@@ -98,14 +98,18 @@ using SteadyClock = std::chrono::steady_clock;
 //   a genuinely-too-big ask.
 // NOTE (finding #34, cursor retirement): the producer's engine is now the explicit-state cursor, which has
 //   NO 512 KiB fiber stack (it runs on the thread stack), so this fiber-calibrated estimate is now
-//   *conservative with extra margin* — still a sound over-estimating backstop. A cursor-specific
-//   re-calibration (and a rename off `fiber`) is filed (BACKLOG.md). Non-fiber (--fibers 0) runs ONE tree
-//   per thread, so the live count is `threads`, not threads*fibers.
-[[nodiscard]] std::uint64_t est_fiber_resident_bytes(int n_sims) {
-    constexpr std::uint64_t kFiberBaseBytes = 256ull * 1024;   // measured per-tree floor (TreeState/cursor +
-                                                               //   policy + bounded belief memo)
+//   *conservative with extra margin* — still a sound over-estimating backstop. Renamed off `fiber`
+//   (est_tree_resident_bytes); the cursor-specific NUMERIC re-calibration (a down-fit that would admit more)
+//   is still filed (BACKLOG.md) — deferred because it loosens admission. Non-fiber (--fibers 0) runs ONE
+//   tree per thread, so the live count is `threads`, not threads*fibers.
+[[nodiscard]] std::uint64_t est_tree_resident_bytes(int n_sims) {
+    constexpr std::uint64_t kTreeBaseBytes = 256ull * 1024;    // per-tree floor (TreeState/cursor + policy +
+                                                               //   bounded belief memo). CONSERVATIVE for the
+                                                               //   cursor (no 512 KiB fiber stack) — an
+                                                               //   over-estimating fail-loud backstop; a
+                                                               //   measured down-recalibration is filed (BACKLOG).
     constexpr std::uint64_t kBytesPerSim = 5ull * 1024;        // measured live node storage per sim (post-fix)
-    return kFiberBaseBytes
+    return kTreeBaseBytes
            + static_cast<std::uint64_t>(std::max(n_sims, 0)) * kBytesPerSim;
 }
 
@@ -559,14 +563,15 @@ int main(int argc, char** argv) {
     // unreadable (a typed absence, never a guess).
     const std::uint64_t live_trees =
         static_cast<std::uint64_t>(threads) * (fibers > 0 ? static_cast<std::uint64_t>(fibers) : 1ull);
-    const std::uint64_t per_fiber = est_fiber_resident_bytes(cfg.n_sims);
-    const std::uint64_t est_resident = live_trees * per_fiber;
+    const std::uint64_t per_tree = est_tree_resident_bytes(cfg.n_sims);
+    const std::uint64_t est_resident = live_trees * per_tree;
     std::cout << "tlab-real-producer: est_resident=" << (est_resident >> 20) << " MiB ("
-              << live_trees << " live trees x " << (per_fiber >> 10) << " KiB)\n";
+              << live_trees << " live trees x " << (per_tree >> 10) << " KiB)\n";
     if (const auto avail = mem_available_bytes()) {
-        if (est_resident > *avail / 2) {
+        constexpr std::uint64_t kAvailHeadroomDivisor = 2;  // a single producer uses <= 50% of MemAvailable (room for server + a 2nd producer; the 1/(N+1) split is not yet a param -- BACKLOG). Named, not a bare literal (ADR-0012 F).
+        if (est_resident > *avail / kAvailHeadroomDivisor) {
             std::cerr << "tlab-real-producer: FATAL: estimated resident " << (est_resident >> 20)
-                      << " MiB (" << live_trees << " live trees x " << (per_fiber >> 10)
+                      << " MiB (" << live_trees << " live trees x " << (per_tree >> 10)
                       << " KiB/tree at n_sims=" << cfg.n_sims << ") exceeds 50% of MemAvailable "
                       << (*avail >> 20) << " MiB. Reduce --fibers, --threads, or --n-sims (resident scales "
                          "linearly with each). Refusing rather than risk an OOM SIGKILL mid-run.\n";
