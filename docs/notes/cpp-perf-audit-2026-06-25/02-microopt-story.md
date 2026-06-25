@@ -1,3 +1,38 @@
+# Micro-opt per-stage perf CPU stats
+
+All single-process, **core 3**, `nice -n -19`, `--mode cursor` (the production engine path), production
+config (m=24 n_sims=256 c_outcome=2 max_depth=24). throughput = median µs/decision; topdown =
+retiring/backend/frontend/bad-spec %; cache = `mem_load_retired` L1i/L2/L3 misses + dTLB; prefetch =
+`l2_rqsts.pf_miss`. The raw harness output is preserved below the table as provenance.
+
+| stage | µs/dec | cycles (e9) | retiring | backend | frontend | bad-spec | L1i-miss (M) | L2-miss (M) | L3-miss (k) | dTLB-miss (M) | prefetch-miss (M) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline (901be39) | 7096 | 17.81 | 57.4% | 24.1% | 12.6% | 5.9% | 159.8 | 45.2 | 748 | 2.21 | 554.6 |
+| **C** eval_finish ws (`2d160ee`) | 7081 | 17.69 | 57.3% | 24.1% | 12.7% | 5.9% | 158.3 | 46.0 | 663 | 2.20 | 462.7 |
+| **D** collected inline (`5cba058`) | ~7095 † | 17.85 † | 57.2% | 24.1% | 12.7% | 6.0% | 162.5 | 41.1 | 895 | 2.24 | 360.3 |
+
+† D's single full-matrix run was noisy (7139 µs/dec, 17.85e9 cyc); the **interleaved D-vs-C A/B** showed
+throughput **tied** (~7095 both). The cache/prefetch deltas are robust.
+
+**Reading it:** throughput is ~flat across C and D and the topdown mix barely moves — because the 55%
+hotspot is the bitset popcount (no easy lever; candidate A refuted). What the two malloc-removals (C, D)
+*do* move is allocation/cache pressure: **prefetch-miss −35% cumulative** (554.6 → 360.3M), L2-miss −9%
+(45.2 → 41.1M), cycles −0.6% at C. So the wins are structural (no per-leaf alloc on the production path)
++ cache, not raw cycles.
+
+**Candidate A** (int64→uint32 accumulators) measured ~0.6% faster vs the **direct-mode** baseline (7160
+µs/dec) — but in the *dead flat arm* (production runs the bitset popcount), so that delta is unattributable
+code-layout noise → **reverted/refuted**. **#8/#13** (guard legibility) had no perf change (no behavior
+change; not measured).
+
+**Earlier major stages (context, measured separately — see findings #34/#35/#36 + 04/05):** producer-bound
+CPU `cursor 7339 < direct 7374 < fiber 7458` µs/dec (Option B, finding #34); prior_d removal was CPU-neutral
+but **−17% producer RSS** (#36). Those were distinct A/Bs (not this uniform cursor-mode sweep), so they
+are referenced, not merged into the table above, to avoid apples-to-oranges.
+
+---
+# Raw harness measurements (provenance)
+
 ## BASELINE (901be39: cursor + prior_d removed)
 throughput(median us/dec): 7160.29
 topdown: 57.0 %  tma_retiring 13.1 %  tma_frontend_bound 24.0 %  tma_backend_bound 5.8 %  tma_bad_speculation 
