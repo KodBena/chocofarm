@@ -24,6 +24,7 @@
 #pragma once
 
 #include <boost/context/fiber.hpp>
+#include <boost/context/protected_fixedsize_stack.hpp>  // mmap'd guard-page stack (OS-releasing; ADR-0000)
 
 #include <optional>
 #include <random>
@@ -87,8 +88,20 @@ struct TreeState {
     // temporaries (e.g. NOT start(loc, env.full_belief(), {}, lam) — that belief dies at the `;`).
     void start(const Loc& loc, const Belief& bw, const CollectedSet& coll, double lam) {
         GumbelSource& source = active_source();
+        // STACK ALLOCATOR (ADR-0000 O(fibers)-resident fix, part 2; RCA tlab_finding #23/#26). protected_
+        // fixedsize_stack mmaps the stack (MAP_PRIVATE|ANON) with a trailing GUARD PAGE and munmaps it on
+        // fiber destruction — vs the former fixedsize_stack, which malloc()s the stack so glibc RETAINS each
+        // freed stack (start() reallocates the fiber EVERY decision, so the per-fiber freed-stack retention
+        // accumulated). Two structural wins at the SAME 512 KiB size (no overflow-risk size cut — the R5 the
+        // prior RCA deferred for safety is intentionally NOT taken; the depth headroom is preserved): (a)
+        // freed stacks RETURN to the OS (munmap), so per-fiber stack resident tracks the LIVE fiber, not the
+        // lifetime of freed ones; (b) the demand-paged mapping means only the pages the descent actually
+        // touches are resident (the massif "stacks only partly paged in" observation), and the guard page
+        // turns a deep-belief overflow into a loud SIGSEGV instead of silent corruption (ADR-0002). Search
+        // behavior is unchanged — the allocator does not touch WHAT the fiber computes (P9), only WHERE its
+        // frames live.
         fib = boost::context::fiber{
-            std::allocator_arg, boost::context::fixedsize_stack(512 * 1024),
+            std::allocator_arg, boost::context::protected_fixedsize_stack(512 * 1024),
             [this, &loc, &bw, &coll, lam, &source](boost::context::fiber&& caller) {
                 ch.caller = std::move(caller);
                 decision = policy.run_search(loc, bw, coll, lam, source);

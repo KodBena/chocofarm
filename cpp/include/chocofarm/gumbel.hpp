@@ -69,6 +69,7 @@
 #include "chocofarm/features.hpp"
 #include "chocofarm/net_evaluator.hpp"
 #include "chocofarm/policy.hpp"
+#include "chocofarm/releasing_arena.hpp"  // MmapUpstream — the OS-releasing arena overflow (ADR-0000 fix)
 
 namespace chocofarm {
 
@@ -403,13 +404,34 @@ class GumbelAZPolicy final : public Policy {
     // e2e wire profile's ~6% allocator bucket (_int_malloc 4.06% + unlink_chunk/_int_free/__memmove) in
     // the search descent (see GumbelNode). Explicit typed members read by name (no thread_local / global) —
     // the P9-rule-4 typed-arena form. `mutable`: logical-const, single-owner storage reuse, exactly as ws_.
-    // MEMORY TRADE: kArenaInitialBytes is an INLINE member buffer, so it is a fixed per-policy / per-fiber
-    // resident floor (~kArenaInitialBytes x K across the K wire fibers, e.g. 16 MiB at K=64) traded for the
-    // up-front no-upstream-touch the maintainer directed — sized so a typical decision's tree fits without
-    // the monotonic resource reaching upstream, the geometric 2x growth covering the deep-tree tail.
-    static constexpr std::size_t kArenaInitialBytes = 256 * 1024;  // up-front; grows ~2x from upstream
-    mutable std::array<std::byte, kArenaInitialBytes> arena_buf_;
-    mutable std::pmr::monotonic_buffer_resource arena_{arena_buf_.data(), arena_buf_.size()};
+    //
+    // O(fibers)-RESIDENT DISSOLUTION (ADR-0000; RCA tlab_finding #23/#26, massif-attributed, ADR-0009).
+    // The node-pool arena was the DOMINANT per-fiber resident term and the one that scaled UNBOUNDEDLY with
+    // the fiber population: a plain monotonic_buffer_resource over a large INLINE buffer with the DEFAULT
+    // (new_delete -> glibc) upstream NEVER returns its grown high-water to the OS (release() only rewinds its
+    // own chain; glibc retains the large frees — the measured R4 null result, <4% from the trim env knobs).
+    // With every one of K fibers' trees held live, each fiber settled at its deepest-EVER decision's tree
+    // size and held it for life -> resident = threads*K*max_tree (~2.4 GiB/producer at K=1024/n_sims=256;
+    // four coincident producers OOM the 8 GiB box). TWO structural changes break the scaling, at BYTE-
+    // IDENTICAL search output (only the allocator's upstream + the inline floor size change; ADR-0012 P6 —
+    // an allocator swap perturbs no value; the parity gates + the Option-A proof re-validate this):
+    //   (1) The overflow UPSTREAM is now MmapUpstream (releasing_arena.hpp): it mmap()s each block the
+    //       monotonic resource overflows into and munmap()s it on deallocate, so run_search's per-decision
+    //       arena_.release() (gumbel.cpp) RETURNS the prior decision's deep chunks to the OS. A parked fiber
+    //       therefore holds only its CURRENT decision's live tree (release() runs at the NEXT decision's
+    //       start, after the fiber's prior search has fully unwound), not its lifetime maximum. Episodic
+    //       fibers sit mostly at shallow belief depths, so the coincident per-fiber high-water collapses.
+    //   (2) The inline floor is cut 256 KiB -> kArenaInlineBytes (a shallow-decision floor): the inline buffer
+    //       is itself an O(K) member term (256 KiB x K = 256 MiB at K=1024), pure waste for a PARKED fiber.
+    //       It is sized so the COMMON shallow decision still fits without an upstream syscall (the hot path is
+    //       unchanged); only deep decisions reach the mmap upstream, and that block is returned at the next
+    //       release(). MEASURED sizing (ADR-0009): see the structural-fix run; the shallow-decision tree fits
+    //       within kArenaInlineBytes, so the per-decision upstream-touch rate stays low (deep-tree tail only).
+    static constexpr std::size_t kArenaInlineBytes = 32 * 1024;  // shallow-decision inline floor (was 256 KiB)
+    mutable MmapUpstream arena_upstream_;                        // overflow -> OS-releasing mmap blocks
+    mutable std::array<std::byte, kArenaInlineBytes> arena_buf_;
+    mutable std::pmr::monotonic_buffer_resource arena_{arena_buf_.data(), arena_buf_.size(),
+                                                       &arena_upstream_};
 };
 
 }  // namespace chocofarm

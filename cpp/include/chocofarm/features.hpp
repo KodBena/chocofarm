@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <deque>
 #include <map>
 #include <span>
 #include <unordered_map>
@@ -204,15 +205,35 @@ class FeatureBuilder {
     // fingerprint) -> a bucket of (owned belief copy, features); a hit walks the bucket verifying FULL
     // belief-equality (the fingerprint is collision-resistant, not -free), so a collision never returns
     // another belief's features. The bucket owns a COPY of the belief (a stored span would dangle); paid
-    // per miss only. The cap is a memory backstop mirroring Python's _belief_cache_cap.
-    static constexpr int kBeliefCacheCap = 50000;
+    // per miss only.
+    //
+    // BOUNDED RESIDENT (ADR-0000 O(fibers)-resident fix; RCA tlab_finding #26, heaptrack-attributed —
+    // ADR-0009). This memo was the DOMINANT per-fiber resident term and the one that scaled UNBOUNDEDLY
+    // with the fiber population: the former cap was 50000 entries, cleared WHOLESALE only on overflow, so a
+    // fiber mid-decision held EVERY distinct belief it had reached (~113 avg / ~357 max at n_sims=256, each
+    // an owned 2 KiB BitsetBelief + features). With K fibers parked mid-decision across the RTT, resident =
+    // threads*K*memo-high-water -> the OOM that scales with K. The cap is now a HARD, SMALL bound enforced
+    // by SINGLE-ENTRY FIFO eviction (evict_oldest_belief_), so per-fiber resident is O(kBeliefCacheCap), not
+    // O(tree-size). The memo is purely an amortization cache (a hit is bit-identical to a recompute, a miss
+    // recomputes — P6 correctness-invariant), and gumbel's node transposition table already captures the
+    // repeated-belief reuse, so the small cap holds throughput (MEASURED). Overridable for the sweep by env
+    // CHOCO_BELIEF_CACHE_CAP (ADR-0009 tuning knob); the default is the measured throughput-neutral knee.
+    static int belief_cache_cap();  // kDefault, or CHOCO_BELIEF_CACHE_CAP if the env var is set (>0)
+    // MEASURED knee (ADR-0009, the structural-fix cap sweep at K=1024/n_sims=256): leaves/s is FLAT from
+    // cap 50000 down to 16 (47752 -> 46693, < 2%, server-bound), while per-producer peak RSS falls 2442 ->
+    // 1417 MiB; below 16 RSS plateaus (~1.32 GiB, the irreducible per-fiber TreeState floor) and throughput
+    // starts to dip (the memo begins missing genuinely-reused beliefs). 16 is the throughput-neutral knee.
+    static constexpr int kDefaultBeliefCacheCap = 16;
     mutable std::map<BeliefKey, std::vector<std::pair<Belief, BeliefFeatures>>> belief_cache_;
+    mutable std::deque<BeliefKey> belief_fifo_;  // insertion order, for single-entry FIFO eviction
     mutable int belief_cache_n_ = 0;
+    const int belief_cache_cap_ = belief_cache_cap();  // resolved once per builder (env read is one-shot)
     mutable std::unordered_map<Point, GeometryFeatures, PointHash, PointEq> loc_cache_;
 
     // Thin memo wrappers: look up, compute-on-miss via the private pure functions, store, return a ref.
     [[nodiscard]] const BeliefFeatures& belief_feats_(const Belief& bw) const;
     [[nodiscard]] const GeometryFeatures& geometry_feats_(const Point& loc) const;
+    void evict_oldest_belief_() const;  // FIFO drop one entry when at cap (bounds per-fiber resident)
 };
 
 }  // namespace chocofarm

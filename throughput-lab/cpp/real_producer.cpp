@@ -82,21 +82,24 @@ using SteadyClock = std::chrono::steady_clock;
 
 // Estimated RESIDENT bytes one fiber holds while parked mid-decision. The driver keeps EVERY fiber's tree
 // live simultaneously (each parked on a leaf across the multiplexed RTT), so the producer's resident floor
-// is threads*fibers*this — the unbounded-in-fiber-count footprint that OOM-kills a 4-producer run (RCA
-// tlab_finding #23; rc=137/SIGKILL + MemAvailable->19 MiB REPRODUCED 4-up; VALGRIND/massif-attributed at
-// 128 fibers / n_sims 256 to a 323 MiB peak split TWO ways, both per-fiber and both confirmed in the heap):
-//   (a) the boost.context fiber STACK — fixedsize_stack(512 KiB) per TreeState (fiber_tree.hpp), massif's
-//       largest bucket (TreeState::start, 67 MiB / 128 fibers == exactly 512 KiB each);
-//   (b) the per-decision Gumbel node ARENA (the per-policy monotonic_buffer_resource, gumbel.hpp), which
-//       scales LINEARLY with n_sims (MEASURED, ADR-0009: 256 KiB inline arena floor + ~9 KiB/sim of grown
-//       node storage — n_sims 16/64/256 -> 0.26/0.95/2.4 MiB per fiber on the K=256 RSS sweep; massif's
-//       run_thread_fiber_episodic 33.6 MiB / 128 == ~256 KiB floor each at the snapshot before growth).
+// is threads*fibers*this. This model is RE-CALIBRATED to the post-structural-fix footprint (RCA
+// tlab_finding #26; the O(fibers)-resident dissolution: the per-fiber belief memo is now BOUNDED to a small
+// ring (FeatureBuilder::kDefaultBeliefCacheCap, features.hpp), the node arena's overflow now RETURNS to the
+// OS per decision (releasing_arena.hpp), and the fiber stack is a demand-paged guard-page mmap (fiber_tree.
+// hpp) — so the former dominant unbounded term, the belief memo, no longer scales with tree size). MEASURED
+// (ADR-0009, the structural-fix per-fiber sweep at default cap, /usr/bin/time peak RSS / K, both n_sims):
+//   K 256/512/1024 @ n_sims=256 -> ~1489/1475/1314 KiB per fiber;  @ n_sims=48 -> ~411/395/389 KiB per
+//   fiber. A two-point fit gives base ~256 KiB + ~5 KiB/sim (the residual is the live TreeState + policy +
+//   node arena; the bounded belief memo is cap*~2.6 KiB ~= 42 KiB, no longer the dominant term). The
+//   constants below are rounded slightly CONSERVATIVE (over- not under-estimate) so the admission guard
+//   stays a true fail-loud backstop — it ADMITS the full config (1024/256: ~1536 KiB*1024 ~= 1.5 GiB/
+//   producer, well under 50% of an 8 GiB box) yet still rejects a genuinely-too-big ask.
 // Non-fiber (--fibers 0) runs ONE tree per thread, so the live count is `threads`, not threads*fibers.
 [[nodiscard]] std::uint64_t est_fiber_resident_bytes(int n_sims) {
-    constexpr std::uint64_t kFiberStackBytes = 512ull * 1024;   // boost fixedsize_stack (fiber_tree.hpp start())
-    constexpr std::uint64_t kArenaFloorBytes = 256ull * 1024;   // the per-policy inline arena_buf_ (gumbel.hpp)
-    constexpr std::uint64_t kBytesPerSim = 9ull * 1024;         // measured grown node storage per sim
-    return kFiberStackBytes + kArenaFloorBytes
+    constexpr std::uint64_t kFiberBaseBytes = 256ull * 1024;   // measured per-fiber floor (TreeState+policy+
+                                                               //   stack-resident+bounded belief memo)
+    constexpr std::uint64_t kBytesPerSim = 5ull * 1024;        // measured live node storage per sim (post-fix)
+    return kFiberBaseBytes
            + static_cast<std::uint64_t>(std::max(n_sims, 0)) * kBytesPerSim;
 }
 

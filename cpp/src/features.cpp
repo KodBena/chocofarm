@@ -28,7 +28,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -398,8 +400,21 @@ void FeatureBuilder::legal_mask_into(std::span<const float> feat, std::vector<fl
     out[static_cast<size_t>(N_ + nD_)] = 1.0f;  // TERMINATE always legal (term_slot = N+nD)
 }
 
+// The belief-memo capacity: the measured throughput-neutral default, OR an env override
+// (CHOCO_BELIEF_CACHE_CAP) for the ADR-0009 validation sweep. Read once per builder (belief_cache_cap_).
+// A non-positive / unparseable env value falls back to the default (fail-soft on a tuning knob; the
+// search is correct at ANY cap >= 1, so this never affects results, only the recompute/memory trade).
+int FeatureBuilder::belief_cache_cap() {
+    if (const char* e = std::getenv("CHOCO_BELIEF_CACHE_CAP")) {
+        const int v = std::atoi(e);
+        if (v > 0) return v;
+    }
+    return kDefaultBeliefCacheCap;
+}
+
 void FeatureBuilder::reset_belief_cache() const {
     belief_cache_.clear();
+    belief_fifo_.clear();
     belief_cache_n_ = 0;
     // the per-loc memo is NOT cleared — it is bounded by the env's fixed coordinate set (mirrors Python:
     // reset_belief_cache clears _belief_cache only; _loc_cache persists).
@@ -412,14 +427,51 @@ const BeliefFeatures& FeatureBuilder::belief_feats_(const Belief& bw) const {
     if (auto it = belief_cache_.find(key); it != belief_cache_.end())
         for (const auto& entry : it->second)
             if (entry.first == bw) return entry.second;  // hit — full belief-equality verified (L5)
-    // miss: the cap is a memory backstop (mirrors _belief_cache_cap); compute, store an OWNED copy of bw
-    // (a stored span would dangle), return the cached ref.
-    if (belief_cache_n_ >= kBeliefCacheCap) { belief_cache_.clear(); belief_cache_n_ = 0; }
+    // miss: compute, store an OWNED copy of bw (a stored span would dangle), return the cached ref.
+    //
+    // BOUNDED-RESIDENT EVICTION (ADR-0000 O(fibers)-resident fix; RCA tlab_finding #26, heaptrack-
+    // attributed — ADR-0009). This memo was the DOMINANT per-fiber resident term (~75% of peak at the
+    // banked config): the former backstop was kBeliefCacheCap=50000 entries cleared WHOLESALE only on
+    // overflow, so a fiber mid-decision held EVERY distinct belief it had reached this decision — an owned
+    // BitsetBelief (a fixed std::array<u64,256> = 2 KiB) + its BeliefFeatures, ~113 avg / ~357 max at
+    // n_sims=256 (MEASURED). With the driver parking ALL K fibers mid-decision across the RTT, resident =
+    // threads*K*memo-high-water -> the unbounded-in-fiber-population OOM. The memo is PURELY a within-
+    // decision amortization of the O(nb) belief sweep, and gumbel's NODE transposition table (children,
+    // keyed by belief_key) already dedups the repeated-belief reuse, so the memo's marginal hit rate is
+    // low; bounding it to a small ring barely moves throughput (MEASURED — see the structural-fix sweep)
+    // while making per-fiber resident O(cap), NOT O(tree-size). Correctness is INVARIANT: a hit is bit-
+    // identical to a recompute and a miss recomputes (P6), so eviction only trades a recompute for memory.
+    // FIFO eviction (insertion order ~= recency under the search's depth-first revisit pattern): on cap,
+    // drop the OLDEST single entry, not the whole cache (whole-clear at a small cap would thrash). SAFETY:
+    // belief_feats_ returns a ref into the bucket consumed by the caller BEFORE the next belief_feats_
+    // call (build_into reads bf then only touches loc_cache_), so an eviction on the NEXT miss never
+    // invalidates a live ref (the lifetime contract the former whole-clear already relied on).
+    if (belief_cache_n_ >= belief_cache_cap_) evict_oldest_belief_();
     BeliefFeatures feats = belief_features(env_, bw);  // visits the rep (flat sweep / bitset popcount)
     auto& bucket = belief_cache_[key];
     bucket.emplace_back(bw, std::move(feats));
+    belief_fifo_.push_back(key);  // record insertion order for FIFO eviction
     ++belief_cache_n_;
     return bucket.back().second;
+}
+
+// Evict the oldest cached belief entry (FIFO): pop the front insertion key, drop one entry from its
+// bucket (the front-most surviving entry of that key — bucket order is insertion order within the key),
+// and erase the bucket if it empties. Bounds per-fiber resident to kBeliefCacheCap entries. The dropped
+// entry is never a live reference (see belief_feats_ SAFETY note). O(1) amortized.
+void FeatureBuilder::evict_oldest_belief_() const {
+    while (!belief_fifo_.empty()) {
+        const BeliefKey key = belief_fifo_.front();
+        belief_fifo_.pop_front();
+        auto it = belief_cache_.find(key);
+        if (it == belief_cache_.end()) continue;       // bucket already gone (key re-evicted) — skip
+        auto& bucket = it->second;
+        if (bucket.empty()) { belief_cache_.erase(it); continue; }
+        bucket.erase(bucket.begin());                  // drop the oldest entry of this key
+        if (bucket.empty()) belief_cache_.erase(it);
+        --belief_cache_n_;
+        return;                                        // evicted exactly one
+    }
 }
 
 const GeometryFeatures& FeatureBuilder::geometry_feats_(const Point& loc) const {
