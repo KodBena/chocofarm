@@ -83,7 +83,7 @@ using SteadyClock = std::chrono::steady_clock;
 // Estimated RESIDENT bytes one fiber holds while parked mid-decision. The driver keeps EVERY fiber's tree
 // live simultaneously (each parked on a leaf across the multiplexed RTT), so the producer's resident floor
 // is threads*fibers*this — the unbounded-in-fiber-count footprint that OOM-kills a 4-producer run (RCA
-// tlab_finding #22; rc=137/SIGKILL + MemAvailable->19 MiB REPRODUCED 4-up; VALGRIND/massif-attributed at
+// tlab_finding #23; rc=137/SIGKILL + MemAvailable->19 MiB REPRODUCED 4-up; VALGRIND/massif-attributed at
 // 128 fibers / n_sims 256 to a 323 MiB peak split TWO ways, both per-fiber and both confirmed in the heap):
 //   (a) the boost.context fiber STACK — fixedsize_stack(512 KiB) per TreeState (fiber_tree.hpp), massif's
 //       largest bucket (TreeState::start, 67 MiB / 128 fibers == exactly 512 KiB each);
@@ -595,7 +595,7 @@ int main(int argc, char** argv) {
                   << " cadence_ms=" << cadence_ms << ")\n";
     }
 
-    // ADMISSION GUARD (RCA tlab_finding #22; ADR-0000 make-the-illegal-state-unrepresentable + ADR-0002
+    // ADMISSION GUARD (RCA tlab_finding #23; ADR-0000 make-the-illegal-state-unrepresentable + ADR-0002
     // a config the receiver can't honor must not be silently accepted). The fiber driver keeps EVERY fiber's
     // Gumbel tree live simultaneously, so the producer's resident floor is threads*fibers*est_tree_bytes
     // (non-fiber: threads*est_tree_bytes — one tree per thread). At --fibers 1024 --n-sims 256 that is
