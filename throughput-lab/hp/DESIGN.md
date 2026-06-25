@@ -503,3 +503,77 @@ Claims 1–7 are **conjectures until the implementation runs them** (per
 `model-bound-is-conjecture-not-witness`): the operational witness is the compiler enumerating
 each `Target`, both oracles agreeing, and the parity gate passing. None of these is to be
 recorded as a proven fact before that witness exists.
+
+---
+
+## 11. Amendment 2026-06-25 — STATIC_LAB populated, the `OperatingPoint` concept, the `CppFlag` lint
+
+*(ADR-0005 Rule 8 amend-by-append; the §0–§10 body above is the adjudicated point-in-time record
+and is left intact. This section records SSOT changes landed 2026-06-25; commits `8de75c6`,
+`74afccf`, `6ab0113`. ADR-0012 P1 is the law these descend from.)*
+
+### 11.1 STATIC_LAB is now POPULATED (closes the §8 step-6 / §9 follow-on deferral)
+
+The STATIC_LAB surface — scaffolded but empty in the §0–§10 body — now declares **9 `HParam`
+descriptors** in `spec.py::_STATIC_LAB`: `fibers`, `msg_rows`, `inflight_msgs`, `driver`,
+`seconds`, `n_sims`, `m`, `max_batch`, `warmup_ladder`. Each is homed on its **real code default**
+(not a copied literal), per the §1.4 one-home rule:
+
+- the producer flags (`fibers`/`msg_rows`/`inflight_msgs`/`driver`/`seconds`) home on
+  `throughput-lab/cpp/real_producer.cpp` via `CppFlag`;
+- `n_sims`/`m` home on `cpp/include/chocofarm/gumbel.hpp` `GumbelConfig` via `CppField`;
+- `max_batch` homes on `throughput-lab/server/__main__.py` argparse via `PyArg`;
+- `warmup_ladder` is the one `NoCodeHome` list literal (its list-valued extractor is the deferral
+  named in 11.3 / §9).
+
+All nine carry an `Effect` (`Measured` with an `EvidenceRef`, or `Hypothesized`/`Unknown`),
+preserving §0's "effects annotate; constraints prune." The eight scalar homes are drift-linted
+(11.3).
+
+### 11.2 NEW concept — `OperatingPoint` (a selected point, distinct from a sweep-axis `HParam`)
+
+The §0–§10 body modelled only **axes** (`HParam`: a domain the compiler enumerates over). 2026-06-25
+adds a second, orthogonal SSOT concept: an **`OperatingPoint`** — a *selected* point **within** an
+enumerated surface (the tuned, banked winner of a sweep). It is deliberately **not** an `HParam`:
+forcing a banked joint config onto a surface axis would add an enumeration variable and break the
+§6 bit-for-bit parity gate. It is the **`pool_threads`/`pool_batch` pattern** generalized — a tuned
+value diverging from the code default — and is owned by the SSOT as a `NoCodeHome` literal (the
+sanctioned literal-with-reason of §1.4).
+
+Two instances are declared in `spec.py`:
+
+- **`BANKED_TOPOLOGY`** — a `config_id` *into* the TOPOLOGY surface. Resolved to placements by
+  `harness/topology_enum.py::config_by_id`, which **validates membership against the live
+  enumeration** (ADR-0002 fail-loud on an unknown id). Replaces the hand-pinned `taskset` literals
+  formerly smeared across `episodic_dps.sh`. Its effect is recorded honestly as a **low-regret**
+  adoption (server off the housekeeping core 0: +0.68%, paired one-sided p=0.045, bootstrap CI
+  straddling 0; `tlab_finding` #20, status provisional), **not** a clean win.
+- **`BANKED_STATIC`** — the tuned producer/server scalars (`fibers=1024`/`msg_rows=256`/
+  `driver=greedy`/`max_batch=256`/`seconds=10`/…). Accessors: `banked_static()` returns the dict
+  **validated against each value's `HParam` domain** at call time (ADR-0000: a banked value outside
+  its axis domain is a loud error, not a silent bad default); `banked_static_env()` emits the
+  banked point as shell `eval`-able `BANKED_*` assignments.
+
+**One home for the banked launch shape.** Harnesses derive their **defaults** from these emitters
+(`hp.cli --banked-static-env`; `harness/topology_enum.py --banked-env` for the topology side), with
+override args still winning for sweeps. Because the banked `--seconds=10` now has a single home, the
+per-harness run-length drift that confounded a run-length comparison (`tlab_finding` #21 — episodic
+ran 14s, topology_sweep ran 5/10s) **can no longer recur**: it is derived, not re-authored.
+
+### 11.3 The drift lint gained a `CppFlag` extractor (§9 follow-on statuses, by dated append)
+
+`tests/test_ssot_drift.py` gained `_cpp_flag_default`, which parses the producer's
+`opt(args,"--flag") ? <conv> : DEFAULT` ternary (the `' : '` is space-delimited, so it never
+collides with a C++ `::` in the true-branch conversion) and recovers int/double/string/bool. The
+producer `CppFlag` homes (the five STATIC_LAB producer flags) are therefore now **drift-guarded**,
+alongside the existing `CppField`/`PyArg`/`PyField` coverage. Only the `warmup_ladder` **list-valued**
+literal remains un-extracted.
+
+**§9 deferral statuses (amended by append; the §9 list above is left as its point-in-time record):**
+
+- *The STATIC_LAB follow-on (the §8 step-6 surface)* → **DONE** 2026-06-25 (11.1).
+- *The `CppFlag` producer-flag lint extractor* → **DONE** 2026-06-25 (this section).
+- *The P7-strongest "generate-from-one-source" extractor* → **still DEFERRED** (the lint *checks*
+  drift; it does not yet *generate* descriptors from source — §1.4 / §9 unchanged).
+- *The list-valued home extractor* (the `warmup_ladder` ladder literal) → **still DEFERRED** (the
+  named list-valued deferral; the ladder homes as a `NoCodeHome` literal until it exists).
