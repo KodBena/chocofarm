@@ -135,11 +135,13 @@ struct ParseError {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto ms = parse_long(*v);
             if (!ms) return std::unexpected(ParseError{"--recv-timeout-ms must be an integer"});
-            // CLI ACL: a value <= 0 is the "block forever" case -> empty OptMilliseconds (typed absence,
-            // ADR-0002), never a sign sentinel threaded onward; a positive ms -> Milliseconds via the ctor.
-            cfg.recv_timeout_ms = (*ms <= 0)
-                ? tlab::OptMilliseconds{}
-                : tlab::OptMilliseconds{tlab::Milliseconds{static_cast<std::uint32_t>(*ms)}};
+            // CLI ACL (ADR-0002): the lab is strictly ALWAYS-BOUNDED — block-forever is unsupported (it would
+            // reintroduce the permanent-hang-on-dead-server this lab exists to prevent). A NEGATIVE timeout is a
+            // loud parse error; 0 = non-blocking, positive = the bounded RCVTIMEO. Always a present Milliseconds.
+            if (*ms < 0)
+                return std::unexpected(ParseError{"--recv-timeout-ms must be >= 0 (0 = non-blocking; "
+                                                  "block-forever is unsupported — the lab must not hang, ADR-0002)"});
+            cfg.recv_timeout_ms = tlab::Milliseconds{static_cast<std::uint32_t>(*ms)};
         } else if (flag == "--send-queue-mb") {
             auto v = need_value(i);  if (!v) return std::unexpected(v.error());
             auto mb = parse_long(*v);

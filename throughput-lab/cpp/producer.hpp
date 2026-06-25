@@ -104,7 +104,8 @@ struct ProducerConfig {
     double run_seconds = 5.0;                   // measured run duration (STEP 3 emission window)
     double calib_window_seconds = 0.2;          // STEP 1 timed-spin window
     std::string endpoint = "ipc:///tmp/tlab-infer.sock";   // the server's ZMQ ipc endpoint
-    OptMilliseconds recv_timeout_ms = Milliseconds{5000};  // bounds Boundary recv()/poll() (loud timeout, P5; empty = block forever)
+    Milliseconds recv_timeout_ms{5000};         // bounds Boundary recv()/poll() (loud timeout, P5). ALWAYS bounded:
+                                                //   block-forever unsupported (ADR-0002, the lab must not hang); 0 = non-blocking.
     ByteCount send_queue_bytes{256ull << 20};   // TOTAL outstanding-send byte budget (back-pressure cap; <=1G)
 
     // ---- per-thread scheduling priority (the "renice ONE generator thread" lever) ----------------

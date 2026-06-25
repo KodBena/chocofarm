@@ -266,11 +266,10 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     // deadline (a few RTTs past the last send) and stop when nothing remains outstanding OR the deadline
     // passes. A genuinely lost reply (server never answered) thus bounds the drain by time, never hangs.
     if (cfg.mode == ProducerMode::Decoupled) {
-        // OptMilliseconds ACL: the drain deadline is a few RTTs past the last send. The legacy code used
-        // max(recv_timeout_ms, 100) on the raw int — for the "block forever" case (empty optional, formerly
-        // <= 0) that max floored to 100 ms, preserved here. A present timeout floors at 100 ms identically.
+        // The drain deadline is a few RTTs past the last send: max(recv_timeout_ms, 100) ms (the legacy floor).
+        // recv_timeout_ms is always a present, bounded Milliseconds (block-forever unsupported, ADR-0002).
         const std::uint32_t drain_ms =
-            cfg.recv_timeout_ms ? std::max<std::uint32_t>(cfg.recv_timeout_ms->value(), 100u) : 100u;
+            std::max<std::uint32_t>(cfg.recv_timeout_ms.value(), 100u);
         const auto drain_deadline =
             SteadyClock::now() + std::chrono::milliseconds(drain_ms);
         while (boundary.any_outstanding() && SteadyClock::now() < drain_deadline) {
@@ -323,14 +322,12 @@ void run_one_thread(const ProducerConfig& cfg, Boundary& boundary, std::atomic<s
     //     immediate. The decoupled tail-drain is deadline-bounded, not recv-blocked; see run_one_thread.)
     //   COUPLED — recv() legitimately waits for the round-trip, so we honor cfg.recv_timeout_ms (a slow
     //     or absent server then surfaces as a loud bounded timeout, ADR-0002).
-    // BoundaryConfig.recv_timeout_ms is a typed Milliseconds (the ZMQ RCVTIMEO port crosses it to int at the
-    // ZMQ ACL; 0 = block forever there). DECOUPLED forces 0ms (truly non-blocking poll); COUPLED honors the
-    // configured timeout, an EMPTY optional ("block forever") collapsing to 0ms the port reads as "no timeout"
-    // — bit-faithful to the legacy <= 0 path. Stays in the Milliseconds DOMAIN end to end (no int round-trip).
+    // recv_timeout_ms is always a PRESENT, bounded Milliseconds (the CLI rejects a negative; block-forever is
+    // unsupported, ADR-0002). DECOUPLED forces 0ms (truly non-blocking poll); COUPLED honors the configured
+    // bounded timeout. Stays in the Milliseconds DOMAIN end to end — the ZMQ RCVTIMEO int crossing (0ms =
+    // non-blocking at the port) is at the dealer ACL, not here.
     const Milliseconds boundary_recv_timeout =
-        (cfg.mode == ProducerMode::Decoupled)
-            ? Milliseconds{0}
-            : (cfg.recv_timeout_ms ? *cfg.recv_timeout_ms : Milliseconds{0});
+        (cfg.mode == ProducerMode::Decoupled) ? Milliseconds{0} : cfg.recv_timeout_ms;
 
     // BoundaryConfig speaks the SAME typed domains as ProducerConfig (Milliseconds/ThreadCount/RowCount/
     // FeatureDim/ByteCount — boundary.hpp), so these are same-domain assignments, no raw crossing (P8).
