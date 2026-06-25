@@ -126,12 +126,20 @@ class TreeCursor {
     // LINEAR chain (each descend recurses into exactly ONE child before unwinding), so descend_stack_ is
     // that chain made explicit; the cursor parks when the frame's node needs an eval leaf, and on unwind
     // applies the W/N backup exactly as descend()'s tail does.
+    //
+    // BY-REFERENCE BELIEF PARKING (the post-ref memory/CPU lever; ADR-0001 COW). A frame DELIBERATELY does
+    // NOT hold the (loc, bw, collected, world) it descends from — those live in the SINGLE per-cursor
+    // descent_* state below, narrowed IN PLACE down the chain. The earlier by-COPY draft stored a 2064-byte
+    // Belief (the inline bitset arm, sizeof probed) in EVERY frame: a parked tree at max_depth=24 held ~24
+    // belief copies (~48 KiB) and paid a 2 KiB memcpy on every descent step. This is sound because the
+    // descent NEVER re-reads an ancestor's belief: a frame reads its (loc, bw, collected) only WHILE it is
+    // descend_stack_.back() (to eval/park or to puct_select+apply the ONE child it steps into); once it has
+    // pushed its child it is never back() again until unwind_with pops the WHOLE chain at once, and unwind
+    // touches only W/N (never a belief). So one live narrowing belief per cursor suffices — the depth-d
+    // belief lives in descent_bw_, reset from bw_ at each c_outcome determinization start (the one copy
+    // that remains, see "needs a copy" below). The frame keeps ONLY what the W/N backup needs.
     struct DescendFrame {
         int node = -1;          // arena index of this frame's node
-        Loc loc;                // the (loc, bw, collected, world) this frame descends from
-        Belief bw;
-        CollectedSet collected;
-        uint32_t world = 0;
         int depth = 0;          // descent depth (root-action child enters at depth 1, as descend does)
         int action_slot = -1;   // the puct_select'd action this frame stepped on (for the W/N backup)
         double step = 0.0;      // the immediate λ-penalized step reward of action_slot (added to cont)
@@ -205,6 +213,20 @@ class TreeCursor {
     double sim_total_ = 0.0;           // running Σ_k (step + descend cont) for the current root-action sim
 
     std::vector<DescendFrame> descend_stack_;  // the reified descend recursion (linear chain)
+
+    // THE SINGLE LIVE DESCENT STATE (the by-reference belief parking — one narrowing belief per cursor,
+    // NOT one per frame). At a c_outcome determinization start these are COPIED ONCE from the decision-
+    // level (bw_, loc_, collected_) + the drawn world; thereafter env.apply narrows them IN PLACE as the
+    // descent steps deeper (the COW filter returns a fresh belief, but apply writes it back into
+    // descent_bw_ — one belief alive at a time, the deepest frame's). pump_descent reads/steps these; the
+    // frame holds only node/depth/action_slot/step (the W/N-backup state). descent_world_ is constant down
+    // a determinization (descend reuses `world`). Correct because no ancestor belief is re-read after its
+    // child is produced (see DescendFrame's by-reference note + the unwind-touches-only-W/N invariant).
+    Loc descent_loc_;
+    Belief descent_bw_;
+    CollectedSet descent_coll_;
+    uint32_t descent_world_ = 0;
+
     GumbelAZPolicy::Decision decision_;         // built by finalize()
 
     bool parked_ = false;              // true iff a leaf is outstanding (resume() expected next)

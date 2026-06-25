@@ -188,13 +188,18 @@ Step TreeCursor::drive() {
                 // order simulate_root_action uses (no draw for k==0, one sample_world per k>0).
                 uint32_t w = (cur_k_ == 0) ? cur_world_ : src_.sample_world(bw_);
                 ++cur_k_;  // this determinization is now consumed (advance before pushing the descent)
-                Loc nloc = loc_;
-                Belief nbw = bw_;
-                CollectedSet nc = collected_;
-                StepResult sr = p_.env_.apply(nloc, nbw, nc, a, w);
+                // BY-REFERENCE: seed the SINGLE live descent state from the decision-level (loc_, bw_,
+                // collected_) — the ONE belief copy that remains, per determinization (the decision belief
+                // is reused across c_outcome, so it must be preserved; descent_bw_ is the mutable narrowing
+                // copy). env.apply then narrows descent_* IN PLACE to the depth-1 child state.
+                descent_loc_ = loc_;
+                descent_bw_ = bw_;
+                descent_coll_ = collected_;
+                descent_world_ = w;
+                StepResult sr = p_.env_.apply(descent_loc_, descent_bw_, descent_coll_, a, descent_world_);
                 double step = sr.reward - lam_ * sr.dt;
                 // find/create the root child node for (slot, belief_key) (simulate_root_action's body).
-                std::tuple<int, GBeliefKey> ckey{cur_root_slot_, gumbel_belief_key(p_.env_, nbw)};
+                std::tuple<int, GBeliefKey> ckey{cur_root_slot_, gumbel_belief_key(p_.env_, descent_bw_)};
                 int child;
                 auto cit = nodes_[0].children.find(ckey);
                 if (cit == nodes_[0].children.end()) {
@@ -209,12 +214,8 @@ Step TreeCursor::drive() {
                 sim_total_ += step;
                 DescendFrame fr;
                 fr.node = child;
-                fr.loc = nloc;
-                fr.bw = std::move(nbw);
-                fr.collected = std::move(nc);
-                fr.world = w;
                 fr.depth = 1;
-                descend_stack_.push_back(std::move(fr));
+                descend_stack_.push_back(fr);  // the depth-1 child state lives in descent_* (not the frame)
                 continue;  // loop: pump_descent drives the new frame (park or complete)
             }
             // c_outcome loop finished for this root action: the sim value is sim_total_/c_outcome.
@@ -346,19 +347,22 @@ Step TreeCursor::pump_descent() {
         assert(!descend_stack_.empty());
         DescendFrame& f = descend_stack_.back();
         GumbelNode& node = nodes_[static_cast<size_t>(f.node)];
+        // BY-REFERENCE: the deepest frame's (loc, bw, collected, world) live in the single descent_*
+        // members (NOT the frame). f is the back() frame, so descent_* IS its state (the descent narrowed
+        // them in place to this depth). No per-frame belief copy is read here.
 
         // descend()'s top: depth>=max_depth || empty(bw).
-        if (f.depth >= p_.cfg_.max_depth || p_.env_.empty(f.bw)) {
+        if (f.depth >= p_.cfg_.max_depth || p_.env_.empty(descent_bw_)) {
             if (!node.evaluated) {
-                if (p_.env_.empty(f.bw)) {
+                if (p_.env_.empty(descent_bw_)) {
                     // empty belief: return -lam*exit_cost (NO leaf, NO eval).
-                    double val = -lam_ * p_.env_.exit_cost(f.loc.pt);
+                    double val = -lam_ * p_.env_.exit_cost(descent_loc_.pt);
                     descend_stack_.pop_back();
                     unwind_with(val);
                     return CursorDecided{};  // descent done (no-leaf return); drive() handles c_outcome
                 }
                 // depth-cap leaf eval: park.
-                (void)p_.eval_build_features(node, f.loc, f.bw, f.collected, ws_);
+                (void)p_.eval_build_features(node, descent_loc_, descent_bw_, descent_coll_, ws_);
                 parked_ = true;
                 return CursorNeedsLeaf{ws_.feat32};
             }
@@ -372,7 +376,7 @@ Step TreeCursor::pump_descent() {
         // not at the boundary: if unevaluated, this is the first visit -> eval leaf (park). descend()
         // returns node.value immediately after this eval (the leaf estimate; no W/N touch here).
         if (!node.evaluated) {
-            (void)p_.eval_build_features(node, f.loc, f.bw, f.collected, ws_);
+            (void)p_.eval_build_features(node, descent_loc_, descent_bw_, descent_coll_, ws_);
             parked_ = true;
             return CursorNeedsLeaf{ws_.feat32};
         }
@@ -382,7 +386,7 @@ Step TreeCursor::pump_descent() {
         int a = p_.puct_select(node);
         Action act = action_of_slot(p_.env_, a);
         if (act.kind == ActionKind::Terminate) {
-            double ret = -lam_ * p_.env_.exit_cost(f.loc.pt);  // stop now: only the exit toll
+            double ret = -lam_ * p_.env_.exit_cost(descent_loc_.pt);  // stop now: only the exit toll
             // descend()'s tail on THIS node: cur.W[a]+=ret; cur.N[a]+=1; return ret. (The terminate edge's
             // own W/N is on this node, then the value backs up to the parents as their step+cont.)
             node.W[static_cast<size_t>(a)] += ret;
@@ -391,13 +395,13 @@ Step TreeCursor::pump_descent() {
             unwind_with(ret);
             return CursorDecided{};
         }
-        // step the action, create/find the child, push the deeper frame.
-        Loc nloc = f.loc;
-        Belief nbw = f.bw;
-        CollectedSet nc = f.collected;
-        StepResult sr = p_.env_.apply(nloc, nbw, nc, act, f.world);
+        // step the action: NARROW descent_* IN PLACE to the child state (the parent's state is never
+        // re-read — see the by-reference note). env.apply mutates descent_loc_/bw_/coll_ to the child;
+        // descent_world_ is unchanged (descend reuses `world` down the chain). This is the per-frame 2 KiB
+        // belief COPY the by-reference design removes: apply writes the narrowed belief back in place.
+        StepResult sr = p_.env_.apply(descent_loc_, descent_bw_, descent_coll_, act, descent_world_);
         double step = sr.reward - lam_ * sr.dt;
-        std::tuple<int, GBeliefKey> ckey{a, gumbel_belief_key(p_.env_, nbw)};
+        std::tuple<int, GBeliefKey> ckey{a, gumbel_belief_key(p_.env_, descent_bw_)};
         int child;
         auto cit = node.children.find(ckey);
         if (cit == node.children.end()) {
@@ -413,15 +417,11 @@ Step TreeCursor::pump_descent() {
         descend_stack_.back().action_slot = a;
         descend_stack_.back().step = step;
         descend_stack_.back().stepped = true;
-        // push the child frame at depth+1 (the SAME world threads down — descend reuses `world`).
+        // push the child frame at depth+1; its (loc, bw, collected, world) ARE the just-narrowed descent_*.
         DescendFrame cf;
         cf.node = child;
-        cf.loc = nloc;
-        cf.bw = std::move(nbw);
-        cf.collected = std::move(nc);
-        cf.world = descend_stack_.back().world;
         cf.depth = descend_stack_.back().depth + 1;
-        descend_stack_.push_back(std::move(cf));
+        descend_stack_.push_back(cf);
         // loop: pump the new top frame.
     }
 }
