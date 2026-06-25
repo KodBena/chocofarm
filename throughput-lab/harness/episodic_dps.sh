@@ -2,8 +2,13 @@
 # throughput-lab/harness/episodic_dps.sh — the EPISODIC-static DPS baseline (the number any dynamic-control
 #   attempt must beat; ADR-0009 measured). Runs the production-shape workload: real episodes (env stepped by
 #   each executed action, --episodic) at the production search config (sims256/m24), --no-early-exit so
-#   episodes run full-length, over the banked static optimum (server@0, 3 gens@1,2,3, SCHED_IDLE surplus@0,
-#   --msg-rows from $4). Sums decisions across the 4 producers -> aggregate DPS; reports leaf-rows/s, LPD,
+#   episodes run full-length, over the banked static optimum. The PROCESS TOPOLOGY is resolved at run time
+#   from the hp SSOT (hp/spec.BANKED_TOPOLOGY, currently s2p1_g0.0-1.0-3.0_u2p0 = server@2 + gens@0,1,3 +
+#   SCHED_IDLE surplus@2) — NOT pinned here; see the --banked-env eval below. The server is placed OFF the
+#   housekeeping core 0 (a plain generator takes core 0): a paired test (tlab_finding #20) found the server
+#   benefits from a clean core by ~+0.68% (marginal, one-sided p=0.045) — the generalizable lever is "server
+#   not on core 0", core 2 is one representative. --msg-rows from $4.
+#   Sums decisions across the 4 producers -> aggregate DPS; reports leaf-rows/s, LPD,
 #   and the server serve-path breakdown. DPS is eval-limited here, so msg-rows (the coalescing floor) moves
 #   it directly: run with MSG_ROWS=1 vs 64 for the auditable coalescing-translates-to-DPS comparison.
 #
@@ -20,6 +25,15 @@ PYBIN=/home/bork/w/vdc/venvs/generic/bin/python
 PROD=throughput-lab/cpp/build/tlab-real-producer; W=throughput-lab/cpp/build/sched_wrap
 INST=chocofarm/data/instance.json; FACES=chocofarm/data/faces.json
 EP="ipc:///tmp/tlab-edps-$$.sock"; rm -f "${EP#ipc://}"; LOG="$(mktemp -t tlab-edps-XXXX.log)"
+# Banked PROCESS TOPOLOGY — resolved from the hp SSOT (hp/spec.BANKED_TOPOLOGY), NOT hand-pinned here.
+# topology_enum --banked-env derives SRV_CORE / GEN_CORES / SURPLUS_CORE / *_WRAP_ARGS / TOPOLOGY_STR from
+# the one banked config_id (validated against the live enumeration; fails loud on a stale id — ADR-0002).
+# This kills the prior drift: the taskset literals + the duplicated provenance string had to be hand-synced.
+# (Assign-then-eval so the resolver's non-zero exit propagates — `eval "$(...)"` would mask it.)
+_BANKED_ENV="$(PYTHONPATH=throughput-lab:throughput-lab/harness "$PYBIN" \
+  throughput-lab/harness/topology_enum.py --banked-env)" \
+  || { echo "FATAL: could not resolve the banked topology from the hp SSOT" >&2; exit 1; }
+eval "$_BANKED_ENV"
 # DRIVER defaults to greedy. NOTE: the earlier "+31% clean win" was RETRACTED (an unstamped single-session
 # reading; journey doc Witness 2, commit 2ac1cef). The stamped quiet-box 2x2 shows the driver is
 # REGIME-DEPENDENT: ~+4.5% and NOT clean at the pad-tax 4096 ladder (server compute-bound, no idle to
@@ -70,7 +84,7 @@ for b in "$PROD" "$W"; do [ -x "$b" ] || { echo "missing $b (build -DTLAB_REAL_G
 # an empty or non-empty $SRVENV both work. Keep the `env`.
 # NET (env, a path to a real AZ .npz checkpoint, jax only) serves the REAL trained net (Gate B) instead of a
 # random one -> AZ-relevant metrics (the real net's LPD/throughput, ~+13% vs random; finding #15). Empty = random.
-env $SRVENV PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c 0 "$PYBIN" -m server --bind "$EP" \
+env $SRVENV PYTHONPATH=throughput-lab PYTHONUNBUFFERED=1 taskset -c "$SRV_CORE" "$PYBIN" -m server --bind "$EP" \
   --in-dim 241 --n-actions 65 --hidden 256 --max-batch "$MAXBATCH" --warmup "$WARMUP" \
   --poll-timeout-ms 50 ${SINGLE_THREAD:+--single-thread} --forward "$FORWARD" ${NET:+--net "$NET"} >"$LOG" 2>&1 & SRV=$!
 cleanup(){ kill -INT "$SRV" 2>/dev/null||true; sleep 1; kill "$SRV" 2>/dev/null||true; rm -f "${EP#ipc://}"; }
@@ -83,8 +97,13 @@ G(){ taskset -c "$1" ${2:-} "$PROD" --instance "$INST" --faces "$FACES" --endpoi
      --episodic --no-early-exit --driver "$DRIVER" \
      --seconds "$S" --n-sims "$NSIMS" --m 24; }
 TMP="$(mktemp -d)"
-G 1 "" >"$TMP/e1" 2>&1 & a=$!; G 2 "" >"$TMP/e2" 2>&1 & b=$!; G 3 "" >"$TMP/e3" 2>&1 & c=$!
-G 0 "$W --policy idle --" >"$TMP/es" 2>&1 & d=$!
+# banked topology resolved from the hp SSOT (the --banked-env eval above): server@$SRV_CORE off the
+# housekeeping core, 3 working gens on $GEN_CORES, SCHED_IDLE surplus@$SURPLUS_CORE sharing the server core.
+# The *_WRAP_ARGS carry the per-role sched_wrap policy; we prepend our own $W (sched_wrap path).
+read -r g1 g2 g3 <<<"$GEN_CORES"
+GEN_WRAP="${GEN_WRAP_ARGS:+$W $GEN_WRAP_ARGS --}"; SURPLUS_WRAP="${SURPLUS_WRAP_ARGS:+$W $SURPLUS_WRAP_ARGS --}"
+G "$g1" "$GEN_WRAP" >"$TMP/e1" 2>&1 & a=$!; G "$g2" "$GEN_WRAP" >"$TMP/e2" 2>&1 & b=$!; G "$g3" "$GEN_WRAP" >"$TMP/e3" 2>&1 & c=$!
+G "$SURPLUS_CORE" "$SURPLUS_WRAP" >"$TMP/es" 2>&1 & d=$!
 wait "$a" "$b" "$c" "$d"
 # SIGINT the server NOW and wait for its teardown summary to flush, so the server-side stats (mean batch,
 # util) are available to the report AND the auto-record. (The EXIT trap still hard-kills it afterwards.)
@@ -111,8 +130,8 @@ grep -E 'served|forwards|compute-busy|latency' "$LOG"
 # exp_db --record is loud-but-non-fatal (a DB blip dumps the reading under ~/w/vdc, never fails the run).
 # Set TLAB_NO_DB=1 to skip; TLAB_TAG to label a cohort.
 if [ "${TLAB_NO_DB:-0}" != "1" ]; then
-  RID=$(printf '{"config":{"driver":"%s","server_impl":"%s","producer_bin":"tlab-real-producer","msg_rows":%s,"fibers":%s,"inflight_msgs":%s,"n_sims":%s,"m":24,"max_batch":%s,"warmup_ladder":[%s],"topology":"srv@0,gens@1,2,3,surplus@0(idle)"},"reading":{"command":"episodic_dps.sh %s","tool":"episodic_dps.sh","tag":"%s","leaf_rows_s":%s,"dps":%s,"decisions":%s,"leaves":%s,"wall_s":%s,"real_rows_per_fwd":%s,"server_util_pct":%s},"stamp":{"commit":"%s","tree":"%s"}}' \
-    "$DRIVER" "$SERVER_IMPL" "$MSG_ROWS" "$K" "$INFLIGHT" "$NSIMS" "$MAXBATCH" "$WARMUP" "$*" \
+  RID=$(printf '{"config":{"driver":"%s","server_impl":"%s","producer_bin":"tlab-real-producer","msg_rows":%s,"fibers":%s,"inflight_msgs":%s,"n_sims":%s,"m":24,"max_batch":%s,"warmup_ladder":[%s],"topology":"%s"},"reading":{"command":"episodic_dps.sh %s","tool":"episodic_dps.sh","tag":"%s","leaf_rows_s":%s,"dps":%s,"decisions":%s,"leaves":%s,"wall_s":%s,"real_rows_per_fwd":%s,"server_util_pct":%s},"stamp":{"commit":"%s","tree":"%s"}}' \
+    "$DRIVER" "$SERVER_IMPL" "$MSG_ROWS" "$K" "$INFLIGHT" "$NSIMS" "$MAXBATCH" "$WARMUP" "$TOPOLOGY_STR" "$*" \
     "${TLAB_TAG:-episodic_dps}" "$((lv/S))" "$((dec/S))" "$dec" "$lv" "$S" "${RPF:-null}" "${UTIL:-null}" \
     "$GIT_COMMIT" "$GIT_TREE" \
     | PYTHONPATH=throughput-lab "$PYBIN" throughput-lab/harness/exp_db.py --record 2>>"$LOG")

@@ -179,6 +179,90 @@ def build_and_enumerate(p: ModelParams) -> list[TopologyConfig]:
     return sorted(configs, key=lambda c: _canonical_key(_raw_from_config(c, p), p))
 
 
+# ----------------------------------------------------------------------------------------------------
+# Resolver — turn a banked config_id (the hp SSOT's selected operating point) into runnable placements,
+# and emit a shell env for the harness. This is the consumer seam for hp/spec.banked_topology_config_id:
+# the SSOT owns the CHOICE (one config_id); this resolves it to cores/policies, validated (ADR-0002).
+# ----------------------------------------------------------------------------------------------------
+def config_by_id(config_id: str, p: Optional[ModelParams] = None) -> TopologyConfig:
+    """Resolve a config_id to its typed TopologyConfig by enumerating the space and matching. Fails LOUD
+    if the id is not a member (ADR-0002) — a stale/typo'd banked id is a configuration error, not a
+    silent miss."""
+    p = p or ModelParams()
+    configs = build_and_enumerate(p)
+    for c in configs:
+        if c.config_id == config_id:
+            return c
+    raise ValueError(f"config_id {config_id!r} is not in the {p.n_cores}c/{p.n_gens}g topology space "
+                     f"({len(configs)} configs) — stale banked id? (ADR-0002)")
+
+
+def banked_config(p: Optional[ModelParams] = None) -> TopologyConfig:
+    """The banked topology operating point (hp/spec.BANKED_TOPOLOGY), resolved to runnable placements."""
+    from hp import spec
+    return config_by_id(spec.banked_topology_config_id(), p)
+
+
+def _wrap_args(pl: Placement) -> str:
+    """The sched_wrap ARGS for a placement's policy (no taskset, no wrapper path, no trailing `--`) — ''
+    for a plain nice-0 SCHED_OTHER (no wrapper needed). Mirrors topology_sweep.launch_prefix's policy map."""
+    if pl.policy == SchedPolicy.OTHER:
+        if pl.nice:
+            raise ValueError(f"{pl.role}: SCHED_OTHER nice={pl.nice} uses `nice`, not sched_wrap; "
+                             f"--banked-env supports only nice-0 plain OTHER")
+        return ""
+    if pl.policy == SchedPolicy.IDLE:
+        return "--policy idle"
+    if pl.policy == SchedPolicy.BATCH:
+        return "--policy batch" + (f" --nice {pl.nice}" if pl.nice else "")
+    raise ValueError(f"{pl.role}: policy {pl.policy.value} is not launchable via --banked-env "
+                     f"(SCHED_OTHER_LATNICE needs a slice + a wrapped server line the harness lacks)")
+
+
+def _shq(s: str) -> str:
+    """POSIX single-quote a value for safe shell `eval`."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def emit_banked_env(p: Optional[ModelParams] = None) -> str:
+    """Emit shell `eval`-able assignments for the banked topology — SRV_CORE, GEN_CORES, GEN_WRAP_ARGS,
+    SURPLUS_CORE, SURPLUS_WRAP_ARGS, TOPOLOGY_STR, BANKED_CONFIG_ID — derived from the ONE home
+    (hp/spec.banked_topology_config_id). The consuming harness prepends its own $W (sched_wrap path) to
+    the *_WRAP_ARGS. Asserts the harness-supported shape (plain server line, a present surplus) and fails
+    LOUD otherwise (ADR-0002): a future bank needing a wrapped server is a deliberate harness extension,
+    never a silent mis-launch."""
+    cfg = banked_config(p)
+    pn = p or ModelParams()
+    by_role = {pl.role: pl for pl in cfg.placements}
+    srv = by_role["server"]
+    if srv.policy != SchedPolicy.OTHER or srv.nice:
+        raise ValueError(f"banked server policy {srv.policy.value} (nice={srv.nice}) is not plain "
+                         f"SCHED_OTHER; the harness launches the server without a sched_wrap prefix — "
+                         f"extend episodic_dps.sh before banking a wrapped server (ADR-0002)")
+    gens = [by_role[f"gen{g}"] for g in range(pn.n_gens)]
+    gen_wrap = {_wrap_args(g) for g in gens}
+    if len(gen_wrap) != 1:
+        raise ValueError(f"banked gens have non-uniform policies {gen_wrap}; --banked-env assumes the "
+                         f"model's single uniform gen_policy knob")
+    if "surplus" not in by_role:
+        raise ValueError("banked topology has no surplus; the harness runs 4 producers (3 gens + "
+                         "surplus) — a no-surplus bank needs a harness change (ADR-0002)")
+    sur = by_role["surplus"]
+    gen_cores = ",".join(str(g.cpus[0]) for g in gens)
+    short = sur.policy.value.replace("SCHED_", "").lower()
+    topo_str = f"srv@{srv.cpus[0]},gens@{gen_cores},surplus@{sur.cpus[0]}({short})"
+    lines = [
+        f"SRV_CORE={srv.cpus[0]}",
+        f"GEN_CORES={_shq(' '.join(str(g.cpus[0]) for g in gens))}",
+        f"GEN_WRAP_ARGS={_shq(next(iter(gen_wrap)))}",
+        f"SURPLUS_CORE={sur.cpus[0]}",
+        f"SURPLUS_WRAP_ARGS={_shq(_wrap_args(sur))}",
+        f"TOPOLOGY_STR={_shq(topo_str)}",
+        f"BANKED_CONFIG_ID={_shq(cfg.config_id)}",
+    ]
+    return "\n".join(lines)
+
+
 # A policy-index lookup over the single home's tables: a (policy, nice, latency_nice) triple -> its
 # index. Built once from hp.relations (the home), so a config's enum policy round-trips to the index
 # the config_id / canonical key encode.
@@ -332,6 +416,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--verify", action="store_true",
                     help="run the independent orbit self-check and fail loudly if the reduction is "
                          "not exactly one-representative-per-orbit (ADR-0002)")
+    ap.add_argument("--banked-env", action="store_true",
+                    help="resolve hp/spec's banked topology operating point and print shell `eval`-able "
+                         "launch vars (SRV_CORE/GEN_CORES/SURPLUS_CORE/*_WRAP_ARGS/TOPOLOGY_STR); the "
+                         "single home episodic_dps.sh consumes instead of hand-pinned taskset literals")
     args = ap.parse_args(argv)
 
     if args.gens + 1 > args.cores:
@@ -340,6 +428,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     params = ModelParams(n_cores=args.cores, n_gens=args.gens, housekeeping_core=args.housekeeping_core)
+
+    if args.banked_env:
+        # Resolve-and-emit only: the banked config_id (hp SSOT) -> shell launch vars on stdout. Validation
+        # (membership, harness-supported shape) is inside emit_banked_env and fails loud (ADR-0002).
+        print(emit_banked_env(params))
+        return 0
     configs = build_and_enumerate(params)
 
     if args.verify:

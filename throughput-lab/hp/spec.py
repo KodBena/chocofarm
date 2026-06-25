@@ -612,5 +612,53 @@ def registry() -> Registry:
     return _REGISTRY
 
 
+# ==================================================================================================
+# BANKED OPERATING POINTS — a SELECTED point within an enumerated surface, NOT a sweep axis.
+# An HParam models an AXIS (a domain the compiler enumerates over); a banked operating point names the
+# JOINT config the lab actually RUNS at — the tuned winner of a sweep. It is deliberately NOT an HParam:
+# forcing a 40-way config_id into a TOPOLOGY-surface axis would add an enumeration variable and break the
+# bit-for-bit parity gate (DESIGN.md §6). And the per-axis enumeration defaults above are NOT the bank
+# (server_policy defaults to LATNICE, surplus_present to False) — those are the axis baselines the space
+# spans, not the chosen point. Owned by this SSOT as a NoCodeHome operating point (the same status as the
+# OVERCOMMIT pool_threads=3 / pool_batch=64 literals): its only prior home was a hand-pinned literal
+# smeared across episodic_dps.sh's taskset args plus a duplicated provenance string — exactly the drift
+# this hoist closes. The config_id is validated against the live enumeration at resolve time (consumers
+# fail loud on an unknown id — ADR-0002); harness/topology_enum.py is the resolver (config_by_id).
+FINDINGS = "throughput_research.tlab_finding (exp_db)"
+
+
+@dataclass(frozen=True)
+class OperatingPoint:
+    """A SELECTED config within an enumerated surface (the tuned winner the lab runs), with provenance.
+    Distinct from an HParam (a sweep axis): this names a joint point, not a domain to enumerate."""
+    surface: Surface
+    value: object
+    home: SourceRef
+    effect: Effect
+    note: str = ""
+
+
+BANKED_TOPOLOGY = OperatingPoint(
+    surface=Surface.TOPOLOGY,
+    value="s2p1_g0.0-1.0-3.0_u2p0",   # server isolated@2 + gens@0,1,3 + SCHED_IDLE surplus@2
+    home=NoCodeHome("banked topology operating point: tuned across the 40-config quiet-box screen + a "
+                    "paired test; no code-home literal — owned by this SSOT the way pool_threads/pool_batch "
+                    "are. Resolved to placements by harness/topology_enum.config_by_id (validated)."),
+    effect=Measured("+", "server off the housekeeping core 0: +0.68% (paired, one-sided p=0.045, "
+                         "two-sided p=0.090, bootstrap CI straddles 0) — a LOW-REGRET adoption, NOT a "
+                         "clean win; tlab_finding #20 (status provisional)",
+                    EvidenceRef(FINDINGS, "#20 / topo-pair-20260625T080841Z")),
+    note="server isolated@2 + gens@0,1,3 + surplus@2 IDLE. The generalizable lever is 'server NOT on the "
+         "housekeeping core 0'; core 2 is one representative (the server-isolated family was tied).",
+)
+
+
+def banked_topology_config_id() -> str:
+    """The single home of the banked process-topology choice (a config_id into the TOPOLOGY surface).
+    Consumers resolve it to placements via harness.topology_enum.config_by_id (which validates membership
+    against the live enumeration — ADR-0002). Replaces the hand-pinned taskset literals in episodic_dps.sh."""
+    return BANKED_TOPOLOGY.value
+
+
 def ceil_div(num: int, den: int) -> int:
     return -(-num // den)

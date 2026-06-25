@@ -80,7 +80,7 @@ def launch_prefix(p: dict, slice_ns: int) -> list[str]:
 def run_config(cfg: dict, *, fibers: int, seconds: float, n_sims: int, slice_ns: int, seq: int,
                logdir: Path, msg_rows: int = 1, inflight: int = 8, driver: str = "round-sync",
                m: int = 24, episodic: bool = False, single_thread: bool = False,
-               warmup: str = "") -> dict:
+               warmup: str = "", max_batch: int = MAX_BATCH) -> dict:
     placements = cfg["placements"]
     server = next(p for p in placements if p["role"] == "server")
     gens = [p for p in placements if p["role"] != "server"]
@@ -96,13 +96,16 @@ def run_config(cfg: dict, *, fibers: int, seconds: float, n_sims: int, slice_ns:
     senv = {**os.environ, "PYTHONPATH": str(ROOT / "throughput-lab"), "PYTHONUNBUFFERED": "1"}
     server_cmd = launch_prefix(server, slice_ns) + [
         PYBIN, "-m", "server", "--bind", endpoint, "--in-dim", str(IN_DIM),
-        "--n-actions", str(N_ACTIONS), "--hidden", str(HIDDEN), "--max-batch", str(MAX_BATCH),
+        "--n-actions", str(N_ACTIONS), "--hidden", str(HIDDEN), "--max-batch", str(max_batch),
         "--poll-timeout-ms", "50", "--forward", "jax"]
     if warmup:
         server_cmd += ["--warmup", warmup]            # banked bucket ladder (else the server default)
     if single_thread:
         server_cmd += ["--single-thread"]             # banked serve mode (finding #5)
-    srv = subprocess.Popen(server_cmd, stdout=slog, stderr=subprocess.STDOUT, env=senv)
+    # cwd=ROOT (not the caller's cwd): the C++ producer loads chocofarm/data/feature_layout.json by a
+    # RELATIVE path and FATAL-aborts (SIGABRT) otherwise — launching from the repo root makes this harness
+    # cwd-independent for every caller (ADR-0002: a relative-path dependence must not be a silent footgun).
+    srv = subprocess.Popen(server_cmd, stdout=slog, stderr=subprocess.STDOUT, env=senv, cwd=str(ROOT))
     logpath = logdir / f"server-{cfg['config_id']}.log"
     ready = False
     for _ in range(240):
@@ -129,7 +132,8 @@ def run_config(cfg: dict, *, fibers: int, seconds: float, n_sims: int, slice_ns:
             cmd += ["--episodic", "--no-early-exit"]   # banked production-shape workload
         # NB the surplus role: a surplus gen ("surplus" role) is a 4th producer the topology places + schedules
         # (e.g. SCHED_IDLE on the server core) — it is launched here exactly like a working gen.
-        procs.append((g["role"], subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)))
+        procs.append((g["role"], subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                   text=True, cwd=str(ROOT))))  # cwd=ROOT: see server launch
 
     total_leaves, walls, fails = 0, [], []
     for role, pr in procs:
@@ -178,6 +182,12 @@ def main() -> int:
     ap.add_argument("--episodic", action="store_true", help="real episodes (production-shape workload)")
     ap.add_argument("--single-thread", action="store_true", help="banked single-thread serve mode (finding #5)")
     ap.add_argument("--warmup", default="", help="server bucket ladder, e.g. 64,256 (else server default)")
+    ap.add_argument("--max-batch", type=int, default=MAX_BATCH,
+                    help="server cap on rows/forward. DEFAULT %(default)s is the LEGACY big-batch/overcommit "
+                         "regime; the BANKED single-pull point is 256 (cap == MSG_ROWS, so every batch pads "
+                         "cleanly into the warmed 256 bucket). At 4096 with --warmup 64,256 the ladder gap "
+                         "256->4096 makes ~1.5k-row coalesced batches pad up to 4096 (~37%% util) -- it "
+                         "measures pad-waste sensitivity, NOT the banked topology. Pass 256 for the banked screen.")
     args = ap.parse_args()
 
     for b in (PRODUCER, SCHED_WRAP):
@@ -203,7 +213,7 @@ def main() -> int:
                            slice_ns=args.slice_ns, seq=seq, logdir=outdir,
                            msg_rows=args.msg_rows, inflight=args.inflight, driver=args.driver,
                            m=args.m, episodic=args.episodic, single_thread=args.single_thread,
-                           warmup=args.warmup)
+                           warmup=args.warmup, max_batch=args.max_batch)
             if r["ok"]:
                 samples[c["config_id"]].append(r["leaves_per_sec"])
             tag = r["tag"]
