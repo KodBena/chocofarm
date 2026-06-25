@@ -315,6 +315,62 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
     return node.value;
 }
 
+// ---- OPTION B eval split (additive; evaluate() above is UNTOUCHED) --------------------------------
+// The pre-predict half of evaluate(): build the feature row + legal mask + node.legal_slots, returning
+// the float32 feature span the leaf must forward. BYTE-IDENTICAL to evaluate()'s body up to (not
+// including) net_.predict — the SAME fb_.build_into / fb_.legal_mask_into / legal-slot collection. The
+// cursor parks on the returned span, the driver predicts, then eval_finish() consumes the prediction.
+// Uses the CALLER's FeatureWorkspace (the cursor's own — never ws_), so a TreeCursor's per-leaf scratch
+// is isolated from run_search's / the fiber's ws_ (P9 rule 4, per-owner scratch).
+std::span<const float> GumbelAZPolicy::eval_build_features(GumbelNode& node, const Loc& loc,
+                                                           const Belief& bw, const CollectedSet& collected,
+                                                           FeatureWorkspace& ws) const {
+    fb_.build_into(loc.pt, bw, collected, ws.feat64);
+    ws.feat32.assign(ws.feat64.begin(), ws.feat64.end());  // the wire dtype the port consumes (float32)
+    std::span<const float> feat(ws.feat32);
+    fb_.legal_mask_into(feat, ws.mask);
+    const std::vector<float>& mask = ws.mask;
+    node.legal_slots.clear();
+    const int N = env_.N(), nD = env_.n_detectors();
+    for (int i = 0; i < N; ++i)
+        if (mask[static_cast<size_t>(i)] != 0.0f) node.legal_slots.push_back(i);
+    for (int j = 0; j < nD; ++j)
+        if (mask[static_cast<size_t>(N + j)] != 0.0f) node.legal_slots.push_back(N + j);
+    node.legal_slots.push_back(term_slot_);  // TERMINATE is always legal
+    return feat;
+}
+
+// The post-predict half of evaluate(): given the leaf NetPrediction, build node.prior_d (float64 masked
+// softmax) + node.prior (its float32 narrowing, the 1b seam-1) + store node.value — BYTE-IDENTICAL to
+// evaluate()'s tail (same masked_softmax_1a_into, same per-element float32 store). node.legal_slots must
+// already be set (by eval_build_features). The masked softmax that BUILDS the prior runs in float64;
+// only the stored node.prior is narrowed (the precision Python's float32 root.prior carries). Reuses a
+// LOCAL logits_d/prior_scratch (one per call, not ws_) so this method has no hidden cross-leaf scratch
+// dependence — the cursor owns no shared state with run_search.
+void GumbelAZPolicy::eval_finish(GumbelNode& node, const NetPrediction& np) const {
+    std::vector<double> logits_d(static_cast<size_t>(n_slots_), -1e30);
+    for (int s : node.legal_slots) {
+        assert(!np.logits.empty() && "gumbel(cursor): net has no policy head (logits empty)");
+        logits_d[static_cast<size_t>(s)] = static_cast<double>(np.logits[static_cast<size_t>(s)]);
+    }
+    std::vector<double> prior_d;
+    masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, prior_d);
+    node.prior_d.assign(prior_d.begin(), prior_d.end());
+    node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
+    for (int s = 0; s < n_slots_; ++s)
+        node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_d[static_cast<size_t>(s)]);
+    node.value = static_cast<double>(np.value);
+    node.evaluated = true;
+}
+
+double GumbelAZPolicy::sh_cut_sigma(const GumbelNode& root) const {
+    return sigma_scale_1a(root, cfg_.c_visit, cfg_.c_scale);
+}
+
+double GumbelAZPolicy::root_logit(const GumbelNode& root, int s) const {
+    return std::log(std::max(prior_read(root, s), 1e-12));
+}
+
 // ---- AlphaZero PUCT select (mirrors _puct_select) -------------------------------------------------
 int GumbelAZPolicy::puct_select(const GumbelNode& node) const {
     // total_n = ΣN over the slot space. The former std::map held ONLY visited slots; the dense vector holds

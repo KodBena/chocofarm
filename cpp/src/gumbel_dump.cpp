@@ -66,6 +66,7 @@
 #include "chocofarm/env.hpp"
 #include "chocofarm/features.hpp"
 #include "chocofarm/gumbel.hpp"
+#include "chocofarm/gumbel_cursor.hpp"  // OPTION B: the explicit-state resumable driver (CHOCO_GUMBEL_DRIVER)
 #include "chocofarm/instance.hpp"
 #include "chocofarm/net_evaluator.hpp"
 
@@ -307,7 +308,26 @@ int main(int argc, char** argv) {
     chocofarm::GumbelAZPolicy policy(cfg, *net, env);
     ScriptedGumbelSource src(env, std::move(gumbels), std::move(world_idxs));
 
-    chocofarm::GumbelAZPolicy::Decision dec = policy.run_search(loc, bw, collected, lam, src);
+    // DRIVER SELECTION (test seam; default = the validated Option-A path run_search). CHOCO_GUMBEL_DRIVER
+    // =optionb drives the SAME search through the Option-B explicit-state cursor (gumbel_cursor.hpp),
+    // feeding each parked leaf through the SAME ScriptedNet. The parity harnesses (gumbel_logic.py /
+    // gumbel_precision.py) run UNCHANGED with this env var set, re-proving the crown jewels against B
+    // (they pass env through). Bit-identity is the gate: B must produce the SAME (exec, argmax, n_spent).
+    chocofarm::GumbelAZPolicy::Decision dec;
+    const char* drv = std::getenv("CHOCO_GUMBEL_DRIVER");
+    if (drv != nullptr && std::string_view(drv) == "optionb") {
+        chocofarm::TreeCursor cur(policy, loc, bw, collected, lam, src);
+        chocofarm::Step st = cur.advance();
+        while (std::holds_alternative<chocofarm::CursorNeedsLeaf>(st)) {
+            const auto& need = std::get<chocofarm::CursorNeedsLeaf>(st);
+            auto pred = net->predict(need.features);  // the SAME scripted leaf the direct path forwards
+            assert(pred.has_value() && "gumbel-dump(optionb): scripted net failed");
+            st = cur.resume(*pred);
+        }
+        dec = std::get<chocofarm::CursorDecided>(st).decision;
+    } else {
+        dec = policy.run_search(loc, bw, collected, lam, src);
+    }
 
     // executed action slot.
     int exec_slot;

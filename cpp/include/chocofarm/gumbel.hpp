@@ -317,7 +317,52 @@ class GumbelAZPolicy final : public Policy {
 
     [[nodiscard]] const GumbelConfig& config() const { return cfg_; }
 
+    // OPTION B (the explicit-state resumable cursor — cpp/{include/chocofarm/gumbel_cursor.hpp,
+    //   src/gumbel_cursor.cpp}; docs/design/cpp-search-runtime.md §3.2). TreeCursor reifies run_search's
+    //   five-level recursion (run_search -> sequential_halving -> visit -> simulate_root_action ->
+    //   descend -> evaluate -> predict) into an explicit reentrant state machine that RETURNS a leaf
+    //   request by value and is RESUMED with the prediction — no fiber, no boost.context, no hidden
+    //   control-flow yield (the P9-functional-core shape). It is declared a friend so it can reuse THIS
+    //   policy's VALIDATED precision-critical helpers VERBATIM (puct_select / improved_policy and the
+    //   eval split below, all of which call gumbel.cpp's file-local prior_read / v_mix_mixed /
+    //   sigma_scale_1a / masked_softmax_1a) rather than re-implementing the four 1b float32 seams — so B
+    //   is bit-identical to run_search BY CONSTRUCTION (it reuses, never re-derives, the seam math). The
+    //   friend grant is scoped: TreeCursor reads cfg_/env_/n_slots_/term_slot_ and calls the eval split +
+    //   the two selection helpers; it does NOT touch ws_/arena_ (it owns its OWN NodePool + workspace).
+    friend class TreeCursor;
+
   private:
+    // ---- OPTION B eval split (additive; run_search's evaluate() is UNTOUCHED) -------------------------
+    // evaluate() above does {build features, predict, finish (masked-softmax prior + store)} as one
+    // straight-line call — it cannot suspend at the predict. Option B's cursor must park AT the predict
+    // and resume with the value, so it needs the SAME work in two halves that bracket the leaf:
+    //   * eval_build_features: the pre-predict half — build the feature row + the legal mask + set
+    //     node.legal_slots, returning the length-in_dim() float32 feature span the leaf must forward.
+    //     BIT-IDENTICAL to evaluate()'s lines up to net_.predict (same fb_/mask/legal_slots build), only
+    //     it returns the features instead of calling predict.
+    //   * eval_finish: the post-predict half — given the leaf NetPrediction, build node.prior(_d) (the
+    //     masked-softmax prior, the 1b seam-1 float32 narrowing) + store node.value, exactly as
+    //     evaluate()'s tail. Returns node.value.
+    // Composing eval_build_features ; (the cursor parks, the driver predicts) ; eval_finish reproduces
+    // evaluate() with the leaf hoisted out — the value written is byte-identical (P6: same softmax, same
+    // float32 store). These use a CALLER-supplied FeatureWorkspace (the cursor owns its own, P9 rule 4),
+    // NOT ws_, so a TreeCursor never aliases the fiber/run_search path's scratch.
+    [[nodiscard]] std::span<const float> eval_build_features(GumbelNode& node, const Loc& loc,
+                                                             const Belief& bw, const CollectedSet& collected,
+                                                             FeatureWorkspace& ws) const;
+    void eval_finish(GumbelNode& node, const NetPrediction& pred) const;
+
+    // The SH-cut σ-prefactor for the root node (sigma_scale_1a(root, c_visit, c_scale)) — re-exposed for
+    // the cursor's explicit SH loop so the cut key g+logit+σ·q̂ is computed with the IDENTICAL σ as
+    // sequential_halving's. A thin forwarder to the file-local sigma_scale_1a (gumbel.cpp).
+    [[nodiscard]] double sh_cut_sigma(const GumbelNode& root) const;
+
+    // The root log-prior logit for slot s: std::log(std::max(prior_read(root, s), 1e-12)) — the 1b seam-1
+    // dominant float32 effect (run_search's logits build). Re-exposed so the cursor builds the SAME root
+    // logits array (feeding the Gumbel-top-k AND the SH cut key) through the SAME prior_read precision.
+    [[nodiscard]] double root_logit(const GumbelNode& root, int s) const;
+
+
     // Populate node.value/prior/legal_slots from one net forward (mirrors _evaluate). The leaf goes
     // through the injected NetEvaluator: it returns (value, logits); the prior is the masked softmax of
     // logits over the legal slots (mirrors predict_both). 1b SEAM 1: the masked softmax runs in float64

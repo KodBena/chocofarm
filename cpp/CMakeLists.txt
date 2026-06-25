@@ -143,6 +143,7 @@ add_library(chocofarm_core
   src/nmcs.cpp
   src/ismcts.cpp
   src/gumbel.cpp
+  src/gumbel_cursor.cpp
   src/search_runtime.cpp
   src/runner.cpp
   src/actor_config.cpp
@@ -237,6 +238,15 @@ target_compile_options(chocofarm-ismcts-dump PRIVATE -Wall -Wextra)
 add_executable(chocofarm-gumbel-dump src/gumbel_dump.cpp)
 target_link_libraries(chocofarm-gumbel-dump PRIVATE chocofarm_core)
 target_compile_options(chocofarm-gumbel-dump PRIVATE -Wall -Wextra)
+
+# OPTION B foundation proof (NOT the runner): drive the Gumbel-AZ search through the explicit-state
+# TreeCursor (gumbel_cursor.hpp) and assert BIT-IDENTITY (executed action + improved-π argmax + n_spent +
+# survivor + the full leaf-request sequence) to a DIRECT run_search fed the same scripted leaves/draws —
+# the Option-B analogue of fiber_proto.cpp's Option-A proof (docs/design/cpp-search-runtime.md §7.1/§7.2
+# layer 2). Deterministic DetNet + CyclicGumbelSource, in-process; no redis, no weights. (P3, one-owner.)
+add_executable(chocofarm-gumbel-cursor-proto src/gumbel_cursor_proto.cpp)
+target_link_libraries(chocofarm-gumbel-cursor-proto PRIVATE chocofarm_core)
+target_compile_options(chocofarm-gumbel-cursor-proto PRIVATE -Wall -Wextra)
 
 # The SearchRuntime seam's self-contained SEAM-FAITHFULNESS check (NOT the runner): runs SerialRuntime
 # over a batch of independent tasks against a deterministic, stateless, in-process net, and asserts each
