@@ -305,7 +305,14 @@ double GumbelAZPolicy::evaluate(GumbelNode& node, const Loc& loc, const Belief& 
     // store BOTH: the full-float64 prior (prior_d, read by the uniform discrimination arm) AND its
     // float32 narrowing (prior, read by the default mixed arm — the precision Python's root.prior holds).
     const std::vector<double>& prior_d = ws_.prior_scratch;
-    node.prior_d.assign(prior_d.begin(), prior_d.end());  // pmr<-std value copy (byte-identical; allocator differs)
+    // prior_d (the full-float64 prior) is read ONLY by the kUniform discrimination control (prior_read,
+    // ~:115). In the PRODUCTION mixed path (kUniform=false) node.prior_d is NEVER read, so populating it
+    // per node was pure dead work (a 65-double pmr alloc + .assign + realloc-copies on every node —
+    // finding #32). Gate it on kUniform: production nodes leave prior_d empty. Bit-identical in BOTH arms
+    // (kUniform still populates AND reads it; !kUniform never touches it). MEASURED: ~2-3% producer-CPU
+    // win (the per-node .assign + alloc skipped); ~0 RSS change (the arena's monotonic-block granularity
+    // dominates resident, not the prior_d bytes — the ~25% RSS estimate was refuted by the witness).
+    if (kUniform) node.prior_d.assign(prior_d.begin(), prior_d.end());  // control arm only (pmr<-std copy)
     node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
     for (int s = 0; s < n_slots_; ++s)
         node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_d[static_cast<size_t>(s)]);
