@@ -316,21 +316,24 @@ std::span<const float> GumbelAZPolicy::eval_build_features(GumbelNode& node, con
 // masked softmax, narrowed to its float32 store — the 1b seam-1) + store node.value — BYTE-IDENTICAL to
 // evaluate()'s tail (same masked_softmax_1a_into, same per-element float32 store). node.legal_slots must
 // already be set (by eval_build_features). The masked softmax that BUILDS the prior runs in float64;
-// only the stored node.prior is narrowed (the precision Python's float32 root.prior carries). Reuses a
-// LOCAL logits_d/prior_scratch (one per call, not ws_) so this method has no hidden cross-leaf scratch
-// dependence — the cursor owns no shared state with run_search. (The retired kUniform control once also
-// stored node.prior_d here; removed on experiment/drop-prior-d.)
-void GumbelAZPolicy::eval_finish(GumbelNode& node, const NetPrediction& np) const {
-    std::vector<double> logits_d(static_cast<size_t>(n_slots_), -1e30);
+// only the stored node.prior is narrowed (the precision Python's float32 root.prior carries). Reuses the
+// caller's FeatureWorkspace logits_d/prior_scratch (the cursor owns one per slot — the SAME ws eval_build_
+// features wrote feat32/mask into; logits_d/prior_scratch are disjoint from those, and feat32 is already
+// consumed by the time the driver returns the prediction, so there is no aliasing). This amortizes the
+// per-leaf heap alloc the local vectors re-paid every leaf — the exact ws_ amortization evaluate() has
+// (finding #32-sibling: the cursor's eval-half had re-introduced the per-leaf malloc bucket). BYTE-
+// IDENTICAL: same masked_softmax_1a_into, same per-element float32 store; only the buffers are reused.
+void GumbelAZPolicy::eval_finish(GumbelNode& node, const NetPrediction& np, FeatureWorkspace& ws) const {
+    std::vector<double>& logits_d = ws.logits_d;
+    logits_d.assign(static_cast<size_t>(n_slots_), -1e30);
     for (int s : node.legal_slots) {
         assert(!np.logits.empty() && "gumbel(cursor): net has no policy head (logits empty)");
         logits_d[static_cast<size_t>(s)] = static_cast<double>(np.logits[static_cast<size_t>(s)]);
     }
-    std::vector<double> prior_f64;
-    masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, prior_f64);
+    masked_softmax_1a_into(logits_d, node.legal_slots, n_slots_, ws.prior_scratch);
     node.prior.assign(static_cast<size_t>(n_slots_), 0.0f);
     for (int s = 0; s < n_slots_; ++s)
-        node.prior[static_cast<size_t>(s)] = static_cast<float>(prior_f64[static_cast<size_t>(s)]);
+        node.prior[static_cast<size_t>(s)] = static_cast<float>(ws.prior_scratch[static_cast<size_t>(s)]);
     node.value = static_cast<double>(np.value);
     node.evaluated = true;
 }

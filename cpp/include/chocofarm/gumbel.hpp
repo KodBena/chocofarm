@@ -353,7 +353,7 @@ class GumbelAZPolicy final : public Policy {
     [[nodiscard]] std::span<const float> eval_build_features(GumbelNode& node, const Loc& loc,
                                                              const Belief& bw, const CollectedSet& collected,
                                                              FeatureWorkspace& ws) const;
-    void eval_finish(GumbelNode& node, const NetPrediction& pred) const;
+    void eval_finish(GumbelNode& node, const NetPrediction& pred, FeatureWorkspace& ws) const;
 
     // The SH-cut σ-prefactor for the root node (sigma_scale_1a(root, c_visit, c_scale)) — re-exposed for
     // the cursor's explicit SH loop so the cut key g+logit+σ·q̂ is computed with the IDENTICAL σ as

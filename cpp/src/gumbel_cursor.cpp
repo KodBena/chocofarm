@@ -88,7 +88,7 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
     if (phase_ == Phase::RootEval) {
         // finish the ROOT eval (the masked-softmax prior + value store), then do run_search's post-root
         // setup: the root logits (seam 1), the Gumbel-top-k draw + sort, and the SH bracket init.
-        p_.eval_finish(nodes_[0], prediction);
+        p_.eval_finish(nodes_[0], prediction, ws_);
         // root logits = log(prior) over legal slots (seam 1: float32 prior precision -> log) — illegal -1e30.
         root_logits_.assign(static_cast<size_t>(n_slots_), -1e30);
         for (int s : nodes_[0].legal_slots)
@@ -140,7 +140,7 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
     // phase_ == Running: the parked leaf is the TOP descend frame's node eval. Finish it, then unwind.
     assert(!descend_stack_.empty() && "resume(Running) with an empty descend stack");
     DescendFrame& f = descend_stack_.back();
-    p_.eval_finish(nodes_[static_cast<size_t>(f.node)], prediction);
+    p_.eval_finish(nodes_[static_cast<size_t>(f.node)], prediction, ws_);
     // The eval branches of descend() all RETURN node.value immediately after evaluating (the leaf
     // estimate; no deeper recursion this call, NO W/N touch on the evaluated node). Pop this frame and
     // back its node.value up the chain — exactly descend()'s eval-branch return propagating up.
