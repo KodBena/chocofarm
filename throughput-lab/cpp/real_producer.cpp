@@ -14,13 +14,16 @@
 #include <sys/syscall.h>    // SYS_gettid
 #include <unistd.h>         // syscall
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -59,6 +62,42 @@ using SteadyClock = std::chrono::steady_clock;
     for (size_t i = 1; i + 1 < a.size(); ++i)
         if (a[i] == k) return a[i + 1];
     return std::nullopt;
+}
+
+// MemAvailable from /proc/meminfo (the kernel's own estimate of allocatable-without-swap bytes), as a
+// std::optional: present iff the field was read. Absence is a typed value, NOT a sentinel (ADR-0012 P9 /
+// ADR-0002): on a kernel/container without MemAvailable the admission guard SKIPS rather than guessing.
+[[nodiscard]] std::optional<std::uint64_t> mem_available_bytes() {
+    std::ifstream f("/proc/meminfo");
+    if (!f) return std::nullopt;
+    std::string key;
+    std::uint64_t kb = 0;
+    std::string unit;
+    while (f >> key >> kb >> unit) {
+        if (key == "MemAvailable:") return kb * 1024ull;
+        f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    return std::nullopt;
+}
+
+// Estimated RESIDENT bytes one fiber holds while parked mid-decision. The driver keeps EVERY fiber's tree
+// live simultaneously (each parked on a leaf across the multiplexed RTT), so the producer's resident floor
+// is threads*fibers*this — the unbounded-in-fiber-count footprint that OOM-kills a 4-producer run (RCA
+// tlab_finding #22; rc=137/SIGKILL + MemAvailable->19 MiB REPRODUCED 4-up; VALGRIND/massif-attributed at
+// 128 fibers / n_sims 256 to a 323 MiB peak split TWO ways, both per-fiber and both confirmed in the heap):
+//   (a) the boost.context fiber STACK — fixedsize_stack(512 KiB) per TreeState (fiber_tree.hpp), massif's
+//       largest bucket (TreeState::start, 67 MiB / 128 fibers == exactly 512 KiB each);
+//   (b) the per-decision Gumbel node ARENA (the per-policy monotonic_buffer_resource, gumbel.hpp), which
+//       scales LINEARLY with n_sims (MEASURED, ADR-0009: 256 KiB inline arena floor + ~9 KiB/sim of grown
+//       node storage — n_sims 16/64/256 -> 0.26/0.95/2.4 MiB per fiber on the K=256 RSS sweep; massif's
+//       run_thread_fiber_episodic 33.6 MiB / 128 == ~256 KiB floor each at the snapshot before growth).
+// Non-fiber (--fibers 0) runs ONE tree per thread, so the live count is `threads`, not threads*fibers.
+[[nodiscard]] std::uint64_t est_fiber_resident_bytes(int n_sims) {
+    constexpr std::uint64_t kFiberStackBytes = 512ull * 1024;   // boost fixedsize_stack (fiber_tree.hpp start())
+    constexpr std::uint64_t kArenaFloorBytes = 256ull * 1024;   // the per-policy inline arena_buf_ (gumbel.hpp)
+    constexpr std::uint64_t kBytesPerSim = 9ull * 1024;         // measured grown node storage per sim
+    return kFiberStackBytes + kArenaFloorBytes
+           + static_cast<std::uint64_t>(std::max(n_sims, 0)) * kBytesPerSim;
 }
 
 struct ThreadStat {
@@ -543,6 +582,34 @@ int main(int argc, char** argv) {
         bridge->start();
         std::cout << "tlab-real-producer: control plane ON (endpoint=" << *control_ep
                   << " cadence_ms=" << cadence_ms << ")\n";
+    }
+
+    // ADMISSION GUARD (RCA tlab_finding #22; ADR-0000 make-the-illegal-state-unrepresentable + ADR-0002
+    // a config the receiver can't honor must not be silently accepted). The fiber driver keeps EVERY fiber's
+    // Gumbel tree live simultaneously, so the producer's resident floor is threads*fibers*est_tree_bytes
+    // (non-fiber: threads*est_tree_bytes — one tree per thread). At --fibers 1024 --n-sims 256 that is
+    // ~3.4 GiB for ONE producer; four concurrent producers exceed an 8 GiB box and the OOM killer fires an
+    // opaque rc=-9 mid-run (and a single producer's throughput halves under the memory-pressure regime as
+    // its RSS climbs through 3+ GiB). Reject that footprint LOUDLY up front — naming the estimate and the
+    // available memory — instead of letting it SIGKILL. Only a SINGLE producer's own footprint is checked
+    // here (a process can't see its siblings); the >50% bar leaves headroom for the server + a second
+    // producer, and the operator running N producers divides accordingly. Skipped only if MemAvailable is
+    // unreadable (a typed absence, never a guess).
+    const std::uint64_t live_trees =
+        static_cast<std::uint64_t>(threads) * (fibers > 0 ? static_cast<std::uint64_t>(fibers) : 1ull);
+    const std::uint64_t per_fiber = est_fiber_resident_bytes(cfg.n_sims);
+    const std::uint64_t est_resident = live_trees * per_fiber;
+    std::cout << "tlab-real-producer: est_resident=" << (est_resident >> 20) << " MiB ("
+              << live_trees << " live trees x " << (per_fiber >> 10) << " KiB)\n";
+    if (const auto avail = mem_available_bytes()) {
+        if (est_resident > *avail / 2) {
+            std::cerr << "tlab-real-producer: FATAL: estimated resident " << (est_resident >> 20)
+                      << " MiB (" << live_trees << " live trees x " << (per_fiber >> 10)
+                      << " KiB/tree at n_sims=" << cfg.n_sims << ") exceeds 50% of MemAvailable "
+                      << (*avail >> 20) << " MiB. Reduce --fibers, --threads, or --n-sims (resident scales "
+                         "linearly with each). Refusing rather than risk an OOM SIGKILL mid-run.\n";
+            return 1;
+        }
     }
 
     std::vector<ThreadStat> stats(static_cast<size_t>(threads));

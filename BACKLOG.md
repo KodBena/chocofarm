@@ -207,6 +207,34 @@ touches every measurement producer (the harness, the C++ bench RESULT parse, the
 recorder. Until then: the guard + the discipline that **a baseline/target is a stamped reading, not a prose
 number, and a finding cites a `reading_id` not a bare figure** (the executive-lapse half of finding #12).
 
+## Fiber producer per-fiber resident footprint — let high fiber counts fit (found 2026-06-25)
+
+`tlab-real-producer`'s greedy/round-sync fiber drivers keep EVERY `--fibers K` TreeState live (parked on a
+leaf) for the whole run — `run_thread_fiber_episodic` starts all K up front (`ready.push_back(i)` over K) and
+re-arms each on completion — so producer resident memory is `threads*K*per_fiber`. VALGRIND/massif (128 fibers,
+n_sims 256, 323 MiB peak) attributes per_fiber to TWO per-fiber costs, both confirmed in the heap:
+- **the boost.context fiber STACK** — `fixedsize_stack(512 * 1024)` per TreeState (`fiber_tree.hpp:91`),
+  massif's largest bucket (`TreeState::start`, 67 MiB / 128 == exactly 512 KiB each). The Gumbel search
+  recurses at most `max_depth` (24) deep with modest frames, so 512 KiB is almost certainly oversized;
+- **the per-decision Gumbel node ARENA** — the per-policy `monotonic_buffer_resource` (`gumbel.hpp`), 256 KiB
+  inline floor + ~9 KiB/sim grown (n_sims 16/64/256 -> 0.26/0.95/2.4 MiB/fiber, MEASURED RSS sweep).
+At the banked `--fibers 1024 --n-sims 256` this is ~3 MiB/fiber == ~3 GiB per producer; four concurrent
+producers' bursty peaks align past an 8 GiB box and the OOM killer SIGKILLs one mid-run (REPRODUCED 4-up:
+rc=137, MemAvailable->19 MiB; slab/page-cache flat, so it is process heap not transport — refuting the
+original finding-#22 "NOT memory" read, which was a single-producer/under-sampled observation that missed the
+4-up spike alignment). An ADMISSION GUARD now FAILS LOUD (`real_producer.cpp` main, ADR-0002) instead of a
+silent SIGKILL, but it REFUSES the banked config rather than making it run. The deeper fixes that would let
+1024 fibers fit (each independent, mandate-aligned, deferred only because they touch the validated SHARED
+fiber core `fiber_tree.hpp` used by three drivers + the Option-A proof, so out of scope for a producer-only
+stability fix — ADR-0004 minimal-touch):
+- **(a) right-size the fiber stack** (e.g. `protected_fixedsize_stack` or a measured smaller `fixedsize_stack`)
+  — measure the search's true stack high-water first (n_sims 256, m 24, max_depth 24); a 64–128 KiB stack
+  would cut the 1024-fiber footprint by ~400 MiB. Re-run the bench + Option-A parity after.
+- **(b) bound the count of fibers with a LIVE arena** to the in-flight budget rather than K — only
+  `inflight_msgs * msg_rows` leaves are ever mid-flight, so most of the K live arenas are idle parked state;
+  decoupling "coalescing batch width K" from "K resident arenas" is the structural win (and the ADR-0000
+  invariant that makes the OOM unrepresentable: resident is O(in-flight), not O(K)).
+
 ## Retired
 
 - **NMCS parity tests** marked `skip` in `tests/test_cpp_runner.py` (2026-06-16): validated repeatedly,
