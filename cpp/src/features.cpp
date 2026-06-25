@@ -295,21 +295,6 @@ namespace {
 }
 
 // --- collected-set indicator: one axis. coll[i] = 1 iff treasure i collected.
-struct CollectedFeatures {
-    std::vector<double> coll;     // N indicator
-    double n_collected = 0.0;     // |collected|
-};
-
-[[nodiscard]] CollectedFeatures collected_features(const CollectedSet& collected, int N) {
-    CollectedFeatures cf;
-    cf.coll.assign(N, 0.0);
-    // Ascending iteration (low bit -> high bit == the former std::set<int> sorted order); the indicator
-    // write is position-independent regardless, but ascending keeps the bit-exactness basis explicit.
-    collected.for_each_ascending([&](int i) { cf.coll[i] = 1.0; });
-    cf.n_collected = static_cast<double>(collected.size());
-    return cf;
-}
-
 }  // namespace
 
 std::vector<double> FeatureBuilder::build(const Point& loc, const Belief& bw,
@@ -331,7 +316,10 @@ void FeatureBuilder::build_into(const Point& loc, const Belief& bw, const Collec
     // O(nb·(N+nD)) bottleneck), separable geometry, the collected indicator. Each is a pure unit.
     const BeliefFeatures& bf = belief_feats_(bw);          // memoized by belief VALUE (P6 bit-identical hit)
     const GeometryFeatures& gf = geometry_feats_(loc);     // memoized by loc
-    const CollectedFeatures cf = collected_features(collected, N);
+    // The collected indicator is written DIRECTLY into out[off_.collected] below (out is pre-zeroed by
+    // assign, so non-collected slots stay 0) and read back for the `available`/`sum_unc` couplings;
+    // |collected| comes from collected.size(). No per-leaf CollectedFeatures vector (audit #5 — the one
+    // per-leaf temporary that slipped past the FeatureWorkspace amortization). Bit-identical (same values).
 
     // --- assemble by NAMED block: the layout SSOT (audit R6 / ADR-0012 P7) owns the order + offsets; the
     // ctor resolved them once into off_ (no positional `o += N` ladder re-encoding the layout here, and no
@@ -347,22 +335,22 @@ void FeatureBuilder::build_into(const Point& loc, const Belief& bw, const Collec
     // exact). `assign` reuses the existing capacity across leaves (no per-leaf alloc on the steady path).
     out.assign(static_cast<size_t>(dim_), 0.0);
     { const int s = off_.marg;        for (int i = 0; i < N; ++i) out[s + i] = bf.marg[i]; }
-    { const int s = off_.collected;   for (int i = 0; i < N; ++i) out[s + i] = cf.coll[i]; }
+    { const int s = off_.collected;   collected.for_each_ascending([&](int i) { out[s + i] = 1.0; }); }
     { const int s = off_.available;   for (int i = 0; i < N; ++i)
-          out[s + i] = ((bf.marg[i] > 0.0) && (cf.coll[i] == 0.0)) ? 1.0 : 0.0; }
+          out[s + i] = ((bf.marg[i] > 0.0) && (out[off_.collected + i] == 0.0)) ? 1.0 : 0.0; }
     { const int s = off_.dist_t;      for (int i = 0; i < N; ++i) out[s + i] = gf.dist_t[i]; }
     double sum_unc = 0.0;
     { const int s = off_.unc;
       for (int i = 0; i < N; ++i) {
           double u = bf.marg[i] * (1.0 - bf.marg[i]);                     // unc
           out[s + i] = u;
-          if (cf.coll[i] == 0.0) sum_unc += u;       // Σ over UNCOLLECTED treasures (order preserved)
+          if (out[off_.collected + i] == 0.0) sum_unc += u;  // Σ over UNCOLLECTED treasures (order preserved)
       } }
     { const int s = off_.informative; for (int j = 0; j < nD; ++j) out[s + j] = bf.informative[j]; }
     { const int s = off_.p_pos;       for (int j = 0; j < nD; ++j) out[s + j] = bf.p_pos[j]; }
     { const int s = off_.dist_d;      for (int j = 0; j < nD; ++j) out[s + j] = gf.dist_d[j]; }
     out[off_.sharpness]   = bf.sharpness;                                 // log|bw|/log Nworlds
-    out[off_.n_collected] = cf.n_collected / static_cast<double>(env_.K());  // n_collected/K
+    out[off_.n_collected] = static_cast<double>(collected.size()) / static_cast<double>(env_.K());  // n_collected/K
     out[off_.marg_sum]    = bf.marg_sum / static_cast<double>(env_.K());     // Σmarg/K
     out[off_.exit_norm]   = gf.exit_norm;                                 // exit geometry
     out[off_.nonempty]    = bf.nonempty;                                  // non-empty belief flag
