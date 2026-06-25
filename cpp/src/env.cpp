@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <numeric>   // std::iota (build_worlds combination seed)
 
 #include "chocofarm/belief_bitset_ops.hpp"  // popcount_all / popcount_and / rth_set_bit_index (the ONE home, P1)
 
@@ -35,8 +36,10 @@ namespace {
 // way the inline-array operator== could silently diverge — the out-of-frame audit's named residual risk).
 inline void assert_tail_zero([[maybe_unused]] const BitsetBelief& b) {
 #ifndef NDEBUG
-    for (int w = b.kw64_; w < kBitsetMaxWords; ++w)
-        assert(b.bits[static_cast<size_t>(w)] == 0ull &&
+    // GENERATOR-FED: the tail words [kw64_, kBitsetMaxWords) are walked in order and the index is not
+    // consumed — range over the tail subspan, no counter (ADR-0000). Debug-only/cold. Bit-identical.
+    for (uint64_t tail_word : std::span<const uint64_t>(b.bits).subspan(static_cast<size_t>(b.kw64_)))
+        assert(tail_word == 0ull &&
                "BitsetBelief tail word nonzero — operator== invariant broken by a writer past kw64_");
 #endif
 }
@@ -83,7 +86,7 @@ static std::vector<uint32_t> build_worlds(int N, int K) {
     std::vector<uint32_t> out;
     if (K < 0 || K > N) return out;
     std::vector<int> c(K);
-    for (int i = 0; i < K; ++i) c[i] = i;
+    std::iota(c.begin(), c.end(), 0);  // GENERATOR-FED seed 0..K-1, counter-free (cold; the raw-int "next combination" kernel below is unchanged)
     while (true) {
         uint32_t mask = 0;
         for (int t : c) mask |= (uint32_t{1} << t);
@@ -176,7 +179,7 @@ Belief Environment::full_belief() const {
         // (the tail-zero invariant operator== relies on); we write ONLY the live words [0, kw64_).
         BitsetBelief b;  // bits{} zero-initialized; tail words past kw64_ stay 0
         b.kw64_ = kW64_;
-        for (int w = 0; w < kW64_; ++w) b.bits[static_cast<size_t>(w)] = ~uint64_t{0};
+        std::fill_n(b.bits.begin(), kW64_, ~uint64_t{0});  // GENERATOR-FED all-ones over the live words [0,kW64_), counter-free (tail-zero invariant preserved)
         const size_t nworlds = worlds_.size();
         const int tail = static_cast<int>(nworlds & 63u);  // live bits in the final word (0 => the word is full)
         if (tail != 0) b.bits[static_cast<size_t>(kW64_ - 1)] = (uint64_t{1} << tail) - 1;

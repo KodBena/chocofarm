@@ -52,4 +52,18 @@ clean", 1 violation.
   index only where consumed, phantom-typed.
 - The **DMZ lint**: clang-tidy/clang-query gate so raw int/long/char live only in a designated boundary DMZ.
 
+## Loop-modernization (core) — attempted, measured, CARVED OUT
+A core-first sweep (typed counters / counter-free walks) passed ALL bit-identity gates but **regressed the
+hot path**: interleaved A/B cursor +1.05% [+0.59,+1.19], direct +0.70% [+0.32,+0.88], both CIs excluding 0,
+survives order-reversal + null A/A control. Scouting (disasm + perf, no bisection): NOT lazy casts — the hot
+`belief_features` conversion opcodes were UNCHANGED (6=6); it was **frontend/code-size** (binary +4 KB,
+belief_features +18 non-conversion insns, frontend-bound +0.6pp, instructions flat). The phantom-counter
+idiom (`t = t + Rep{1}` + per-index `.value()`) and the `std::ranges` rewrites emit bulkier hot code → more
+i-cache/decode pressure. **Decision:** keep only the COLD counter-free env walks (`std::iota` seed,
+`std::fill_n` all-ones, the debug tail-subspan range-for — zero hot cost); leave the HOT loop counters as raw
+`int` (a measured exception the DMZ lint will carry as `// NOLINT(perf)`). Carve-out A/B is NEUTRAL vs the
+pre-sweep state (cursor −0.12%, direct −0.03%, CIs span 0) — the +1.7% is intact. The full sweep is preserved
+on branch `loop-mod-full` (`fb34cc7`) for reference. Lesson: phantom *data* paid (+1.7%); phantom *loop
+counters* in hot code cost ~1% via frontend bloat — so the DMZ lint allowlists hot counters by measurement.
+
 Public Domain (The Unlicense).
