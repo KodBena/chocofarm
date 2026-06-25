@@ -42,6 +42,7 @@
 
 #include "boundary.hpp"
 #include "boundary_net_evaluator.hpp"
+#include "cursor_slot.hpp"   // OPTION B: the explicit-state CursorSlot engine (selectable, default fiber)
 
 namespace {
 // A small fixed Gumbel script (the scripted CyclicGumbelSource path, as wire_parallel_bench uses): the
@@ -161,9 +162,17 @@ void run_thread(int idx, const chocofarm::Environment& env, const std::string& e
 // server-side and fewer/bigger forwards (the static S_min coalescing floor; M=1 = the per-leaf B=1 path).
 // corr -> the group's fibers (submit order) so each B=G reply's G preds route home in order; then recv all
 // groups and resume each fiber. Returns false (out.failed set) on a transport/decode fault. Shared by the
-// root and episodic fiber drivers (ADR-0012 P1: one home for the coalescing send/recv).
+// root and episodic drivers (ADR-0012 P1: one home for the coalescing send/recv).
+//
+// TEMPLATED over the per-slot engine TYPE (ADR-0012 P1, ENGINE-PARAMETERIZED one-home): `Slot` is
+// chocofarm::TreeState (Option A, the fiber) or tlab::CursorSlot (Option B, the explicit-state cursor).
+// Both expose the SAME surface this body reads — `slot->ch.features` (the parked leaf row) and
+// `slot->resume_with(pred)` — so the coalescing send/recv is byte-identical across engines and the fiber
+// instantiation compiles to the exact code it did before (deduced on TreeState). Only the slot type
+// differs; the pipe + routing are one home.
+template <class Slot>
 [[nodiscard]] bool drive_round(tlab::Boundary& boundary,
-                               std::vector<std::unique_ptr<chocofarm::TreeState>>& trees,
+                               std::vector<std::unique_ptr<Slot>>& trees,
                                const std::vector<int>& active, int coalesce_rows, int in_dim,
                                tlab::wire::corr_t& corr, ThreadStat& out) {
     std::unordered_map<tlab::wire::corr_t, std::vector<int>> corr_to_group;
@@ -279,10 +288,24 @@ void run_thread_fiber(int idx, const chocofarm::Environment& env, const std::str
 //                + re-arm its fibers immediately and re-send -> producer compute overlaps the server forward.
 // Coalescing (coalesce_rows) is held IDENTICAL across both, so an A/B isolates the pipe shape, not the
 // batch width -- the within-stack driver attribution the ours/overcommit bridge needs (ADR-0013).
-void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
-                               const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
-                               int fibers_k, int coalesce_rows, const std::string& driver,
-                               int inflight_msgs, chocofarm::IssueController* ctl, ThreadStat& out) {
+//
+// TEMPLATED over the per-slot engine (ADR-0012 P1): `Slot` is chocofarm::TreeState (Option A, fiber) or
+// tlab::CursorSlot (Option B, explicit-state cursor); `make_slot(i)` builds slot i (the per-slot rotated
+// gumbel table differs only in the slot TYPE, not the rotation). EVERYTHING else — the per-slot episode
+// state (ep_loc/ep_bw/ep_coll/ep_world/ep_step/ep_rng), new_episode, the advance() state machine, the
+// greedy + round-sync pipe shapes, the control-plane gate — is REUSED VERBATIM across engines, because
+// both slot types expose the SAME surface (.start/.running/.ch.features/.resume_with/.decision). The
+// engine is the ONLY thing that differs; the episode logic is one home. run_thread_fiber_episodic /
+// run_thread_cursor_episodic are one-line wrappers that bind `Slot` + the factory (below).
+template <class Slot, class MakeSlot>
+void run_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
+                  double run_seconds, int in_dim,
+                  int fibers_k, int coalesce_rows, const std::string& driver,
+                  int inflight_msgs, chocofarm::IssueController* ctl, MakeSlot make_slot,
+                  ThreadStat& out) {
+    // NOTE: the GumbelConfig is NOT a parameter here — it is baked into each slot by `make_slot` (the
+    // engine factory), exactly where it is needed (the per-slot policy ctor). The episode body reads only
+    // env (max_steps/empty/apply) + the slot surface, so threading cfg through here would be a dead param.
     if (coalesce_rows < 1) coalesce_rows = 1;
     tlab::BoundaryConfig bcfg;
     bcfg.endpoint = endpoint; bcfg.recv_timeout_ms = 10000; bcfg.n_producer_threads = 1;
@@ -301,7 +324,7 @@ void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const
     std::vector<std::uint32_t> ep_world(static_cast<size_t>(fibers_k), 0);
     std::vector<int> ep_step(static_cast<size_t>(fibers_k), 0);
     std::vector<std::mt19937_64> ep_rng; ep_rng.reserve(static_cast<size_t>(fibers_k));
-    std::vector<std::unique_ptr<chocofarm::TreeState>> trees; trees.reserve(static_cast<size_t>(fibers_k));
+    std::vector<std::unique_ptr<Slot>> trees; trees.reserve(static_cast<size_t>(fibers_k));
 
     auto new_episode = [&](int i) {
         ep_loc[static_cast<size_t>(i)] = chocofarm::Loc{env.entry_point()};
@@ -317,10 +340,7 @@ void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const
         ep_bw.emplace_back(env.full_belief());
         ep_coll.emplace_back();
         ep_rng.emplace_back(static_cast<std::uint64_t>(idx) * 1'000'003ull + static_cast<std::uint64_t>(i) + 1ull);
-        std::vector<double> table(kGumbelTable.size());
-        for (size_t j = 0; j < kGumbelTable.size(); ++j)
-            table[j] = kGumbelTable[(j + static_cast<size_t>(i)) % kGumbelTable.size()];
-        trees.push_back(std::make_unique<chocofarm::TreeState>(cfg, env, std::move(table)));
+        trees.push_back(make_slot(i));   // the engine-specific slot factory (fiber TreeState or CursorSlot)
     }
     for (int i = 0; i < fibers_k; ++i) {
         new_episode(i);
@@ -435,6 +455,44 @@ void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const
     }
 }
 
+// The per-slot rotated gumbel table (the K trees differ only by the rotation) — shared by both engine
+// factories so the scripted source is IDENTICAL across A and B at the same slot (ADR-0012 P1).
+[[nodiscard]] std::vector<double> slot_table(int i) {
+    std::vector<double> table(kGumbelTable.size());
+    for (size_t j = 0; j < kGumbelTable.size(); ++j)
+        table[j] = kGumbelTable[(j + static_cast<size_t>(i)) % kGumbelTable.size()];
+    return table;
+}
+
+// OPTION A wrapper: bind run_episodic to the fiber TreeState (the DEFAULT engine — byte-untouched). The
+// factory reproduces the original per-slot TreeState construction (cfg, env, rotated table).
+void run_thread_fiber_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
+                               const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
+                               int fibers_k, int coalesce_rows, const std::string& driver,
+                               int inflight_msgs, chocofarm::IssueController* ctl, ThreadStat& out) {
+    auto make = [&](int i) {
+        return std::make_unique<chocofarm::TreeState>(cfg, env, slot_table(i));
+    };
+    run_episodic<chocofarm::TreeState>(idx, env, endpoint, run_seconds, in_dim, fibers_k,
+                                       coalesce_rows, driver, inflight_msgs, ctl, make, out);
+}
+
+// OPTION B wrapper: bind run_episodic to the explicit-state CursorSlot (CHOCO_PRODUCER_ENGINE=cursor /
+// --engine cursor). The factory builds a CursorSlot per slot (the SAME cfg/env/rotated table) — the
+// cursor adapter exposes the SAME .start/.running/.ch.features/.resume_with surface, so the entire
+// episodic body (state machine + both pipe shapes + the control gate) is reused (ADR-0012 P1). The
+// search the cursor runs is bit-identical to the fiber's run_search (cpp/parity + gumbel_cursor_proto).
+void run_thread_cursor_episodic(int idx, const chocofarm::Environment& env, const std::string& endpoint,
+                                const chocofarm::GumbelConfig& cfg, double run_seconds, int in_dim,
+                                int fibers_k, int coalesce_rows, const std::string& driver,
+                                int inflight_msgs, chocofarm::IssueController* ctl, ThreadStat& out) {
+    auto make = [&](int i) {
+        return std::make_unique<tlab::CursorSlot>(cfg, env, slot_table(i));
+    };
+    run_episodic<tlab::CursorSlot>(idx, env, endpoint, run_seconds, in_dim, fibers_k,
+                                   coalesce_rows, driver, inflight_msgs, ctl, make, out);
+}
+
 // One GREEDY-ASYNC fiber producer thread (wire_pool_bench's discipline): keep ~K leaves CONTINUOUSLY in
 // flight and process replies as they land — recv ONE, resume that fiber (it computes its next leaf), and
 // re-submit it immediately, rather than the round-synchronous barrier (submit all, wait for all). The
@@ -520,8 +578,9 @@ int main(int argc, char** argv) {
     auto inst_p = opt(args, "--instance"), faces_p = opt(args, "--faces"), ep = opt(args, "--endpoint");
     if (!inst_p || !faces_p || !ep) {
         std::cerr << "usage: tlab-real-producer --instance <p> --faces <p> --endpoint <ipc://...> "
-                     "[--threads N --fibers K --msg-rows M --driver round-sync|greedy --seconds S --n-sims K --m M --in-dim D]\n"
+                     "[--threads N --fibers K --msg-rows M --driver round-sync|greedy --engine fiber|cursor --seconds S --n-sims K --m M --in-dim D]\n"
                      "  --fibers 0 (default) = non-fiber baseline; K>=1 = K fibers/thread (the fiber model)\n"
+                     "  --engine fiber (default) | cursor = Option A (stackful fiber) vs Option B (explicit-state TreeCursor); cursor requires --fibers K>=1 + --episodic (also via CHOCO_PRODUCER_ENGINE)\n"
                      "  --msg-rows M (default 1) = coalesce up to M round leaves per message (round-sync; the S_min floor)\n"
                      "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n"
                      "  --inflight-msgs N (default 8) = greedy-episodic pipe depth (coalesced msgs in flight; round-sync ignores)\n"
@@ -557,6 +616,29 @@ int main(int argc, char** argv) {
         std::cerr << "tlab-real-producer: --driver must be round-sync|greedy, got " << driver << "\n";
         return 2;
     }
+    // --engine fiber (DEFAULT) | cursor: which per-slot resumable-search ENGINE multiplexes the K trees.
+    //   fiber  = Option A (chocofarm::TreeState, a boost.context stackful fiber — the byte-untouched baseline).
+    //   cursor = Option B (tlab::CursorSlot, the explicit-state TreeCursor — no fiber, runs on the thread
+    //            stack). Bit-identical search to the fiber (cpp/parity + gumbel_cursor_proto). The engine is
+    //            ADDITIVE and selectable; the default is fiber so the baseline is unchanged (ADR-0004). Also
+    //            settable via CHOCO_PRODUCER_ENGINE (the env overrides the default, the flag overrides the env).
+    //   B is wired ONLY into the EPISODIC path (the production-shape workload the e2e measures); the root /
+    //   non-episodic drivers stay fiber-only (a loud reject if cursor is asked for there — never a silent
+    //   fallback, ADR-0002).
+    std::string engine = "fiber";
+    if (const char* e = std::getenv("CHOCO_PRODUCER_ENGINE")) engine = e;
+    if (auto v = opt(args, "--engine")) engine = std::string(*v);
+    if (engine != "fiber" && engine != "cursor") {
+        std::cerr << "tlab-real-producer: --engine must be fiber|cursor, got " << engine << "\n";
+        return 2;
+    }
+    if (engine == "cursor" && !(opt(args, "--fibers") && episodic)) {
+        std::cerr << "tlab-real-producer: --engine cursor requires --fibers K>=1 AND --episodic (the "
+                     "cursor engine is wired into the EPISODIC multiplexed path only — the production-shape "
+                     "workload). Got fibers/episodic absent. Refusing rather than silently falling back to "
+                     "the fiber engine (ADR-0002).\n";
+        return 2;
+    }
     // Renice ONE generator thread DOWN (the generator-bound core-sharing lever): a 4th generator on the
     // server's core, reniced, soaks its idle slack but yields to the server's forward.
     const int low_prio_thread = opt(args, "--low-prio-thread")
@@ -573,7 +655,8 @@ int main(int argc, char** argv) {
     chocofarm::Environment env(*inst);
 
     std::cout << "tlab-real-producer: generator=real(" << (fibers > 0 ? "fiber" : "non-fiber")
-              << ") driver=" << (fibers > 0 ? driver : std::string("n/a"))
+              << ") engine=" << engine
+              << " driver=" << (fibers > 0 ? driver : std::string("n/a"))
               << " threads=" << threads << " fibers_per_thread=" << fibers << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " inflight_msgs=" << inflight_msgs
@@ -633,7 +716,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < threads; ++i)
         pool.emplace_back([&, i] {
             apply_thread_priority(i, low_prio_thread, low_prio_nice);   // renice iff designated
-            if (fibers > 0 && episodic)
+            if (fibers > 0 && episodic && engine == "cursor")
+                run_thread_cursor_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
+            else if (fibers > 0 && episodic)
                 run_thread_fiber_episodic(i, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
             else if (fibers > 0 && driver == "greedy")
                 run_thread_fiber_greedy(i, env, endpoint, cfg, seconds, in_dim, fibers, stats[static_cast<size_t>(i)]);
@@ -657,7 +742,8 @@ int main(int argc, char** argv) {
     }
     const double dps = wall > 0 ? static_cast<double>(dec) / wall : 0.0;
     const double lps = wall > 0 ? static_cast<double>(leaves) / wall : 0.0;
-    std::cout << "REAL-AGG threads=" << threads << " fibers=" << fibers << " msg_rows=" << msg_rows
+    std::cout << "REAL-AGG threads=" << threads << " fibers=" << fibers << " engine=" << engine
+              << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " driver=" << (fibers > 0 ? driver : std::string("n/a")) << " wall_s=" << wall
               << " control=" << (control_ep ? 1 : 0)
