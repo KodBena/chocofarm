@@ -1,0 +1,12 @@
+# DMZ lint companions (run flag-mode in CI; never blind --fix on the numeric core — modernize-loop-convert's
+# autofix can reorder float accumulation, which the byte-for-byte oracle would catch but we don't risk it).
+# The custom raw-int-field rule lives in tools/lint/dmz-lint.sh (clang-query); these are the off-the-shelf
+# companions: the generator-fed loop antipattern + narrowing/sign hazards. -Wsign-compare is set in the CI
+# build flags (already clean post-phantom).
+Checks: >
+  -*,
+  modernize-loop-convert,
+  bugprone-narrowing-conversions,
+  cppcoreguidelines-narrowing-conversions
+WarningsAsErrors: ''
+HeaderFilterRegex: 'chocofarm/.*\.hpp$'

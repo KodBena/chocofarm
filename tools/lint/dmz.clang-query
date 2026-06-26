@@ -1,0 +1,11 @@
+# DMZ lint matcher — high-signal raw-integer DOMAIN leaks: struct/class FIELDS and function PARAMS whose
+# type is a builtin integer (not bool), declared anywhere under our source tree (cpp/ or throughput-lab/).
+# These are where an un-typed domain quantity (a count/id/rank typed as bare int/size_t) leaks past the
+# phantom-type discipline (ADR-0000/ADR-0012). Loop-counter LOCALS are intentionally NOT matched here (the
+# measured-hot ones are kept raw by the loop-mod carve-out; generator-fed ones are caught by clang-tidy
+# modernize-loop-convert). The dmz-lint.sh driver post-filters each hit: keeps only BARE-int spellings
+# (int/long/short/char/size_t/uNN_t — NOT the domain aliases World/count_t nor Quantity<>), and clears
+# anything in a DMZ file or carrying a // NOLINT(dmz...) marker. Run per-TU over the compile DB; the driver
+# dedups header hits seen through multiple TUs.
+set output diag
+match fieldDecl( hasType(isInteger()), unless(hasType(booleanType())), isExpansionInFileMatching("chocofarm-phantom/(cpp|throughput-lab)/"))
