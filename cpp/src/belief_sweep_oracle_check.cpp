@@ -232,8 +232,8 @@ namespace {
         if (env.informative(j, fb) != env.informative(j, zb))
             return note("informative[" + std::to_string(j) + "]");
     for (const chocofarm::CollectedSet& coll :
-         {chocofarm::CollectedSet{}, chocofarm::CollectedSet{}.with(0),
-          chocofarm::CollectedSet{}.with(0).with(3).with(7)})
+         {chocofarm::CollectedSet{}, chocofarm::CollectedSet{}.with(chocofarm::TreasureId{0}),
+          chocofarm::CollectedSet{}.with(chocofarm::TreasureId{0}).with(chocofarm::TreasureId{3}).with(chocofarm::TreasureId{7})})
         if (env.legal_actions(fb, coll) != env.legal_actions(zb, coll)) return note("legal_actions");
     {
         const chocofarm::BeliefFeatures ff = chocofarm::belief_features(env, fb);

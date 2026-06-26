@@ -125,3 +125,11 @@ builds clean; `fiber_proto` remains blocked by the *pre-existing* `DetNet(SlotCo
 upstream of my edits), so they stay type-consistent for when the maintainer fixes the upstream breakage.
 
 ### SearchBudget design ambiguity (the maintainer-requested test) — see below when it lands.
+
+## ZDD fair shot (2026-06-26) — KILLED (measured)
+Producer-compute A/B (box quiet): ZDD belief_features READ −9.5% (faster, 10.70 vs 11.82 ns/world) but FULL
+SEARCH ~10.5x SLOWER (cursor + direct) — the per-descent restrict+copy+sampling lifecycle swamps the read
+win. Verdict: ZDD no good for the producer; e2e/GPU moot (producer at ~73ms/dec dominates by 10x). Details:
+~/w/vdc/chocobo/runs/tlab/zdd-fair-shot-20260626.md. Retrofitted belief_sweep_oracle_check's stale ZDD arm
+(.with(int)->.with(TreasureId)) so the ZDD bit-identity oracle builds (features byte-identical; sampling
+re-baselines by §4). ZDD code stays in-tree opt-in for the record.
