@@ -132,8 +132,10 @@ int main(int argc, char** argv) {
     }
 
     chocofarm::ISMCTSConfig cfg;
-    cfg.iterations = opt(args, "--iterations") ? to_int(*opt(args, "--iterations")) : 300;
-    cfg.max_depth = opt(args, "--max-depth") ? to_int(*opt(args, "--max-depth")) : 24;
+    cfg.iterations = chocofarm::SimBudget{static_cast<chocofarm::SimBudget::rep_type>(
+        opt(args, "--iterations") ? to_int(*opt(args, "--iterations")) : 300)};
+    cfg.max_depth = chocofarm::PlyDepth{static_cast<chocofarm::PlyDepth::rep_type>(
+        opt(args, "--max-depth") ? to_int(*opt(args, "--max-depth")) : 24)};
     cfg.c = opt(args, "--c") ? to_double(*opt(args, "--c")) : chocofarm::UCB_C;
     double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
 
@@ -201,7 +203,7 @@ int main(int argc, char** argv) {
     chocofarm::Action action = policy.run_search(env, loc, bw, collected, lam, src);
 
     int slot;
-    if (action.kind == chocofarm::ActionKind::Terminate) slot = chocofarm::term_slot(env);
+    if (action.kind == chocofarm::ActionKind::Terminate) slot = chocofarm::term_slot(env).value();
     else if (action.kind == chocofarm::ActionKind::Treasure) slot = action.i;
     else slot = env.N() + action.i;
 

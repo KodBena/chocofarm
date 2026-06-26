@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
     auto [score, action] = policy.search(env, loc, bw, collected, lam, level, src);
 
     int slot;
-    if (action.kind == chocofarm::ActionKind::Terminate) slot = chocofarm::term_slot(env);
+    if (action.kind == chocofarm::ActionKind::Terminate) slot = chocofarm::term_slot(env).value();
     else if (action.kind == chocofarm::ActionKind::Treasure) slot = action.i;
     else slot = env.N() + action.i;
 

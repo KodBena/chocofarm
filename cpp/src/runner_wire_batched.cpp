@@ -73,8 +73,8 @@ std::expected<int, Error> run_episodes_wire_batched(
     // the WIRE driver does NOT use this shared connection: hiredis's redisContext is not thread-safe, so
     // each worker thread creates its OWN RedisClient (below) for its result writes (single-writer-per-
     // connection). Marked [[maybe_unused]] so the unused shared handle does not warn under -Wextra.
-    const int n_slots = n_action_slots(env);
-    const int feat_dim = fb.dim();
+    const int n_slots = n_action_slots(env).value();
+    const int feat_dim = fb.dim().value();
     const std::vector<uint32_t>& worlds = env.worlds();
     if (worlds.empty())
         return std::unexpected(make_error("run_episodes_wire_batched: empty world-set (no prior)"));
@@ -213,13 +213,13 @@ std::expected<int, Error> run_episodes_wire_batched(
 
             if (action.kind == ActionKind::Terminate) {
                 sl.eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
-                                      /*is_terminate=*/true, /*is_collect=*/false, term_slot(env));
+                                      /*is_terminate=*/true, /*is_collect=*/false, term_slot(env).value());
                 finalize_and_write(s);
                 return false;
             }
             const bool is_collect = (action.kind == ActionKind::Treasure);
             sl.eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
-                                  /*is_terminate=*/false, is_collect, action_to_slot(env, action));
+                                  /*is_terminate=*/false, is_collect, action_to_slot(env, action).value());
             StepResult sr = env.apply(sl.loc, sl.bw, sl.collected, action, sl.world);
             sl.eb.record_step(sr.reward, sr.dt);
             ++sl.ply;
@@ -432,8 +432,8 @@ std::expected<int, Error> run_episodes_wire_pipelined(
     [[maybe_unused]] RedisClient& redis, const RunnerConfig& cfg, const WireRunnerConfig& wcfg,
     std::ostream* stats_out, const std::vector<SlotSnapshot>* warm_pool, long settle_budget,
     std::vector<SlotSnapshot>* snapshot_out, IssueController* controller) {
-    const int n_slots = n_action_slots(env);
-    const int feat_dim = fb.dim();
+    const int n_slots = n_action_slots(env).value();
+    const int feat_dim = fb.dim().value();
     const std::vector<uint32_t>& worlds = env.worlds();
     if (worlds.empty())
         return std::unexpected(make_error("run_episodes_wire_pipelined: empty world-set (no prior)"));
@@ -596,13 +596,13 @@ std::expected<int, Error> run_episodes_wire_pipelined(
             std::vector<float> pi(dec.improved.begin(), dec.improved.end());
             if (action.kind == ActionKind::Terminate) {
                 sl.eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
-                                      /*is_terminate=*/true, /*is_collect=*/false, term_slot(env));
+                                      /*is_terminate=*/true, /*is_collect=*/false, term_slot(env).value());
                 finalize_and_write(s);
                 return false;
             }
             const bool is_collect = (action.kind == ActionKind::Treasure);
             sl.eb.record_decision(std::move(feat), std::move(pi), std::move(mask),
-                                  /*is_terminate=*/false, is_collect, action_to_slot(env, action));
+                                  /*is_terminate=*/false, is_collect, action_to_slot(env, action).value());
             StepResult sr = env.apply(sl.loc, sl.bw, sl.collected, action, sl.world);
             sl.eb.record_step(sr.reward, sr.dt);
             ++sl.ply;

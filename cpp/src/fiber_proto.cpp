@@ -98,12 +98,16 @@ int main(int argc, char** argv) {
     }
     const double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
     chocofarm::GumbelConfig cfg;
-    cfg.n_sims = 24;
-    cfg.max_depth = 8;
-    if (auto v = opt(args, "--m")) cfg.m = to_int(*v);
-    if (auto v = opt(args, "--n-sims")) cfg.n_sims = to_int(*v);
-    if (auto v = opt(args, "--max-depth")) cfg.max_depth = to_int(*v);
-    if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = to_int(*v);
+    cfg.n_sims = chocofarm::SimBudget{24};
+    cfg.max_depth = chocofarm::PlyDepth{8};
+    if (auto v = opt(args, "--m"))
+        cfg.m = chocofarm::CandidateCount{static_cast<chocofarm::CandidateCount::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--n-sims"))
+        cfg.n_sims = chocofarm::SimBudget{static_cast<chocofarm::SimBudget::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--max-depth"))
+        cfg.max_depth = chocofarm::PlyDepth{static_cast<chocofarm::PlyDepth::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--c-outcome"))
+        cfg.c_outcome = chocofarm::OutcomeIndex{static_cast<chocofarm::OutcomeIndex::rep_type>(to_int(*v))};
 
     auto inst = chocofarm::load_instance(*instance, *faces);
     if (!inst) {
@@ -111,7 +115,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     chocofarm::Environment env(*inst);
-    DetNet net(chocofarm::n_action_slots(env));
+    DetNet net(chocofarm::n_action_slots(env).value());
 
     chocofarm::Loc loc{env.entry_point()};
     chocofarm::Belief bw = env.full_belief();   // the seam's belief construction entry

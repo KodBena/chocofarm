@@ -193,19 +193,25 @@ int main(int argc, char** argv) {
         policy = std::make_unique<chocofarm::NMCSPolicy>(nc);  // nested Monte-Carlo search (P2 drop-in)
     } else if (policy_name == "ismcts") {
         chocofarm::ISMCTSConfig ic;  // defaults match ISMCTSConfig (iterations=300, c=UCB_C, depth=24)
-        if (auto v = opt(args, "--ismcts-iterations")) ic.iterations = to_int(*v);
+        if (auto v = opt(args, "--ismcts-iterations"))
+            ic.iterations = chocofarm::SimBudget{static_cast<chocofarm::SimBudget::rep_type>(to_int(*v))};
         if (auto v = opt(args, "--ismcts-c")) ic.c = to_double(*v);
-        if (auto v = opt(args, "--ismcts-max-depth")) ic.max_depth = to_int(*v);
+        if (auto v = opt(args, "--ismcts-max-depth"))
+            ic.max_depth = chocofarm::PlyDepth{static_cast<chocofarm::PlyDepth::rep_type>(to_int(*v))};
         policy = std::make_unique<chocofarm::ISMCTSPolicy>(ic);  // single-observer ISMCTS (P2 drop-in)
     } else if (policy_name == "gumbel") {
         chocofarm::GumbelConfig gc;  // defaults match GumbelConfig (m=12, n_sims=48, c_puct=1.25, ...)
-        if (auto v = opt(args, "--gumbel-m")) gc.m = to_int(*v);
-        if (auto v = opt(args, "--gumbel-n-sims")) gc.n_sims = to_int(*v);
+        if (auto v = opt(args, "--gumbel-m"))
+            gc.m = chocofarm::CandidateCount{static_cast<chocofarm::CandidateCount::rep_type>(to_int(*v))};
+        if (auto v = opt(args, "--gumbel-n-sims"))
+            gc.n_sims = chocofarm::SimBudget{static_cast<chocofarm::SimBudget::rep_type>(to_int(*v))};
         if (auto v = opt(args, "--gumbel-c-puct")) gc.c_puct = to_double(*v);
         if (auto v = opt(args, "--gumbel-c-visit")) gc.c_visit = to_double(*v);
         if (auto v = opt(args, "--gumbel-c-scale")) gc.c_scale = to_double(*v);
-        if (auto v = opt(args, "--gumbel-c-outcome")) gc.c_outcome = to_int(*v);
-        if (auto v = opt(args, "--gumbel-max-depth")) gc.max_depth = to_int(*v);
+        if (auto v = opt(args, "--gumbel-c-outcome"))
+            gc.c_outcome = chocofarm::OutcomeIndex{static_cast<chocofarm::OutcomeIndex::rep_type>(to_int(*v))};
+        if (auto v = opt(args, "--gumbel-max-depth"))
+            gc.max_depth = chocofarm::PlyDepth{static_cast<chocofarm::PlyDepth::rep_type>(to_int(*v))};
         // read the leaf net off the SAME weight-read seam (P1) and build the local NetForward leaf.
         auto wp = redis->read_weights(cfg.run, cfg.phase, cfg.version);
         if (!wp) {
@@ -247,7 +253,7 @@ int main(int argc, char** argv) {
     }
     std::cerr << prog << ": wrote " << *written << " episode(s) under res_token="
               << cfg.res_token << " (policy=" << policy_name << " run=" << cfg.run
-              << " phase=" << cfg.phase << " version=" << cfg.version << " feat_dim=" << fb.dim()
-              << " n_slots=" << chocofarm::n_action_slots(env) << ")\n";
+              << " phase=" << cfg.phase << " version=" << cfg.version << " feat_dim=" << fb.dim().value()
+              << " n_slots=" << chocofarm::n_action_slots(env).value() << ")\n";
     return 0;
 }

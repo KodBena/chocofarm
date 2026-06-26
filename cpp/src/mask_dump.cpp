@@ -60,8 +60,8 @@ int main(int argc, char** argv) {
     if (!inst) { std::cerr << "mask-dump: FATAL: " << inst.error().message << "\n"; return 1; }
     chocofarm::Environment env(*inst);
     chocofarm::FeatureBuilder fb(env);
-    const int n_slots = chocofarm::n_action_slots(env);
-    const int term = chocofarm::term_slot(env);
+    const int n_slots = chocofarm::n_action_slots(env).value();
+    const int term = chocofarm::term_slot(env).value();
 
     // read the action sequence (slot indices) from stdin
     std::vector<int> seq;
