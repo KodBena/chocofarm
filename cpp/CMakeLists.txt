@@ -281,6 +281,17 @@ add_executable(chocofarm-belief-sweep-bench src/belief_sweep_bench.cpp)
 target_link_libraries(chocofarm-belief-sweep-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-belief-sweep-bench PRIVATE -Wall -Wextra)
 
+# The ADDITIVE de-risk PROTOTYPE (idea #3, derisk-batched-featurization-2026-06-26.md): does featurizing
+# B parked beliefs TOGETHER in a MASK-MAJOR (cache-restructured) pass beat B separate per-leaf
+# belief_features (the BITSET arm) calls? The producer parks B leaves per RTT; the mask matrix
+# ((N+nD)*kW64*8 ≈ 121.5 KiB) does not fit L1, so B separate calls re-stream it B times. The prototype
+# transposes the loop nest (mask row outer, B beliefs inner) so the mask streams ~once. It asserts the
+# batched output is BYTE-IDENTICAL to per-leaf belief_features (the oracle's reference), then A/Bs the two.
+# A prototype, NOT wired into the search; reuses belief_features as the reference. Separate (P3, one-owner).
+add_executable(chocofarm-batched-featurization-proto src/batched_featurization_proto.cpp)
+target_link_libraries(chocofarm-batched-featurization-proto PRIVATE chocofarm_core)
+target_compile_options(chocofarm-batched-featurization-proto PRIVATE -Wall -Wextra)
+
 # The ISOLATED belief-FILTER microbench + bit-exact A/B (NOT the runner): times the branchless
 # chocofarm::filter_inplace against the former branchy erase(remove_if) across belief sizes, and asserts
 # byte-identical output. The belief UPDATE side of the same O(nb) belief problem (the K=32 native profile's
