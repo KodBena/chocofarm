@@ -328,6 +328,21 @@ int main(int argc, char** argv) {
               << " c_outcome=" << cfg.c_outcome.value() << " max_depth=" << cfg.max_depth.value()
               << "; decisions/point=" << decisions << " reps=" << reps << ")\n";
 
+    // PERF-ISOLATION MODE: --arm perleaf|batched runs ONLY that arm in a tight loop (for `perf stat` to
+    // measure one arm's CPU), skipping the A/B + the bit-identity gate. --K selects the multiplex width.
+    if (auto arm = opt(args, "--arm")) {
+        const bool batched = (*arm == "batched");
+        const size_t K = opt(args, "--K") ? static_cast<size_t>(to_int(*opt(args, "--K"))) : 64;
+        long leaves = 0;
+        for (int r = 0; r < reps; ++r) {
+            auto slots = make_slots(env, net, base, K, batched);
+            (void)drive_mux(slots, cfg, batched, batched ? &bf : nullptr, decisions, leaves, nullptr);
+        }
+        std::cout << "arm=" << *arm << " K=" << K << " reps=" << reps
+                  << " decisions/rep=" << decisions << " leaves=" << leaves << "\n";
+        return 0;
+    }
+
     // ------------------- BIT-IDENTITY GATE (PER-LEAF vs BATCHED, same multiplexed search) ---------------
     // Drive the SAME K cursors both ways and assert every completed decision + its full leaf-row sequence is
     // identical. The batched rows are byte-identical to the per-leaf rows (the deferred-featurize seam only
