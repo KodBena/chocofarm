@@ -98,8 +98,8 @@ inline constexpr int kBitsetMaxWords = 256;
 // every derived value byte-identical to the flat arm).
 struct BitsetBelief {
     std::array<uint64_t, kBitsetMaxWords> bits{};  // first kw64_ words live; tail [kw64_,end) always 0
-    int kw64_ = 0;                                 // runtime word count (= env.kW64() <= kBitsetMaxWords)
-    int count_ = 0;                                // cached popcount(first kw64_ words) — the O(1) nb
+    WordCount kw64_{0};                            // runtime word count (= env.kW64() <= kBitsetMaxWords)
+    WorldCount count_{0};                          // cached popcount(first kw64_ words) — the O(1) nb
     bool operator==(const BitsetBelief&) const = default;
 
     // The LIVE words [0, kw64_) as a span — the ONE place the inline-array/runtime-count split is bridged
@@ -107,10 +107,10 @@ struct BitsetBelief {
     // never the full kBitsetMaxWords array (which would count the always-zero tail — harmless for popcount
     // but wrong for any size-derived op). Const + mutable overloads so the filter can &= in place.
     [[nodiscard]] std::span<const uint64_t> live() const {
-        return {bits.data(), static_cast<size_t>(kw64_)};
+        return {bits.data(), static_cast<size_t>(kw64_.value())};  // WordCount -> span size ACL
     }
     [[nodiscard]] std::span<uint64_t> live() {
-        return {bits.data(), static_cast<size_t>(kw64_)};
+        return {bits.data(), static_cast<size_t>(kw64_.value())};  // WordCount -> span size ACL
     }
 };
 
@@ -262,7 +262,7 @@ class Environment {
         return std::visit([](const auto& a) -> int {
             using T = std::decay_t<decltype(a)>;
             if constexpr (std::is_same_v<T, FlatBelief>) return static_cast<int>(a.worlds.size());
-            else if constexpr (std::is_same_v<T, BitsetBelief>) return a.count_;  // cached popcount, never a recount
+            else if constexpr (std::is_same_v<T, BitsetBelief>) return static_cast<int>(a.count_.value());  // cached popcount (WorldCount -> raw nb ACL), never a recount
             CHOCO_ZDD_ELSE(return zdd::nb(a);)  // ZDD arm (opt-in): the cached_count_, O(1) (empty in the default build)
         }, b);
     }
@@ -332,18 +332,18 @@ class Environment {
     // from worlds()); this is the WHOLE selection surface — no call site decides (the gate does, §4).
     bool use_zdd() const { return use_zdd_; }
 #endif
-    int kW64() const { return kW64_; }  // ceil(|worlds|/64) — the bitset word count (0 when not enumerable)
+    int kW64() const { return static_cast<int>(kW64_.value()); }  // ceil(|worlds|/64) — the bitset word count (WordCount -> raw-int public-API ACL; 0 when not enumerable)
     // The env-static masks the bitset bodies AND-against, homed in the ctor like face_masks_ (P1):
     // treasure_mask_[t] = bitvector of worlds (by rank) with bit t set; detector_mask_[j] = bitvector of
     // worlds where (w & face_masks()[j]) != 0 (the identity env.observe rests on). Each is kW64 words.
     // Built only when use_bitset_; empty otherwise.
     std::span<const uint64_t> treasure_mask(int t) const {
-        return {treasure_mask_.data() + static_cast<size_t>(t) * static_cast<size_t>(kW64_),
-                static_cast<size_t>(kW64_)};
+        const size_t kw = static_cast<size_t>(kW64_.value());  // WordCount -> the row-stride/size ACL
+        return {treasure_mask_.data() + static_cast<size_t>(t) * kw, kw};
     }
     std::span<const uint64_t> detector_mask(int j) const {
-        return {detector_mask_.data() + static_cast<size_t>(j) * static_cast<size_t>(kW64_),
-                static_cast<size_t>(kW64_)};
+        const size_t kw = static_cast<size_t>(kW64_.value());  // WordCount -> the row-stride/size ACL
+        return {detector_mask_.data() + static_cast<size_t>(j) * kw, kw};
     }
 
   private:
@@ -357,7 +357,7 @@ class Environment {
 #ifdef CHOCO_BELIEF_ZDD
     bool use_zdd_ = false;      // the §B.4(b) gate (ON build only): worlds enumerable -> select the ZDD arm
 #endif
-    int kW64_ = 0;              // ceil(|worlds|/64) — derived, never the literal 243
+    WordCount kW64_{0};         // ceil(|worlds|/64) — derived, never the literal 243 (the bitset word count)
     // Flattened kW64-word mask tables (row t/j is masks[row*kW64_ .. row*kW64_+kW64_]). std::vector (not
     // std::array): kW64_ is runtime-derived (see BitsetBelief). treasure: N rows; detector: nD rows.
     std::vector<uint64_t> treasure_mask_;

@@ -257,10 +257,10 @@ namespace {
 // guarantees it).
 [[nodiscard]] BeliefFeatures belief_features_bitset(const Environment& env, const BitsetBelief& b,
                                                     TreasureCount N, FaceCount nD, double log_nworlds) {
-    // b.count_ is the cached nb (raw int, env.hpp out of scope) -> WorldCount via the count ACL; >= 1 here
-    // (the dispatcher guarantees it). env.treasure_mask(t)/detector_mask(j) take a raw int (out of scope),
-    // so the id .value() crosses at that mask-lookup call.
-    const WorldCount nb{static_cast<WorldCountRep>(b.count_)};
+    // b.count_ is the cached nb — now a WorldCount directly (no wrap; >= 1 here, the dispatcher guarantees
+    // it). env.treasure_mask(t)/detector_mask(j) take a raw int (out of scope), so the id .value() crosses
+    // at that mask-lookup call.
+    const WorldCount nb = b.count_;
     const size_t Nn = static_cast<size_t>(N.value());
     const size_t nDn = static_cast<size_t>(nD.value());
     BeliefFeatures bf;
@@ -307,7 +307,7 @@ BeliefFeatures belief_features(const Environment& env, const Belief& bw) {
                        : belief_features_nonempty(std::span<const uint32_t>(a.worlds), env.face_masks(),
                                                   N, nD, log_nworlds);
         } else if constexpr (std::is_same_v<T, BitsetBelief>) {
-            return a.count_ == 0
+            return a.count_ == WorldCount{0}
                        ? belief_features_empty(N, nD)
                        : belief_features_bitset(env, a, N, nD, log_nworlds);
         }

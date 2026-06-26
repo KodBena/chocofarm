@@ -6,12 +6,13 @@
 //
 //   PHANTOM-TYPE NOTE (ADR-0000 / ADR-0012 P8): the bitset kernels + this TU's internal word loops speak
 //   the typed word/world domains (WordCount/WordIndex/WorldCount/WorldRank — domains.hpp/world.hpp), with
-//   the raw<->domain crossings named at the ACL (popcount_all().value(), last_rank(), the .size()/kw64_
-//   wrap). The BELIEF MEMBER types (BitsetBelief::count_ / kw64_, ZddBelief::cached_count_) and the env's
-//   CROSS-FILE public API (nb()/world_at_rank()/sample_world()/belief_key()/Action.i) stay RAW int here:
-//   they are read/written by out-of-frame TUs (features.cpp, feature_compute.hpp, gumbel/ismcts/nmcs/
-//   policy, the parity/bench harnesses) whose signatures this slice does not touch — the member/API-type
-//   migration is gated on retyping those readers together (ADR-0004 minimal-touch under partial scope).
+//   the raw<->domain crossings named at the ACL (popcount_all() returns a WorldCount, last_rank(),
+//   words_to_words64(), the .value() at a .size()/index/normalizer). The BELIEF MEMBER counts now carry
+//   their domains: BitsetBelief::count_ is a WorldCount and ::kw64_ a WordCount, Environment::kW64_ a
+//   WordCount (popcount_all()/words_to_words64() store same-domain, no cast). What stays RAW int is only
+//   the env's CROSS-FILE public API (nb()/world_at_rank()/sample_world()/belief_key()/kW64()/Action.i),
+//   read by out-of-frame TUs whose signatures this slice does not touch — the .value() crosses at those
+//   named accessors (ADR-0004 minimal-touch). (ZddBelief::cached_count_ is the opt-in ZDD arm, untouched.)
 //
 // Public Domain (The Unlicense).
 #include "chocofarm/env.hpp"
@@ -38,7 +39,7 @@ inline void assert_tail_zero([[maybe_unused]] const BitsetBelief& b) {
 #ifndef NDEBUG
     // GENERATOR-FED: the tail words [kw64_, kBitsetMaxWords) are walked in order and the index is not
     // consumed — range over the tail subspan, no counter (ADR-0000). Debug-only/cold. Bit-identical.
-    for (uint64_t tail_word : std::span<const uint64_t>(b.bits).subspan(static_cast<size_t>(b.kw64_)))
+    for (uint64_t tail_word : std::span<const uint64_t>(b.bits).subspan(static_cast<size_t>(b.kw64_.value())))
         assert(tail_word == 0ull &&
                "BitsetBelief tail word nonzero — operator== invariant broken by a writer past kw64_");
 #endif
@@ -51,15 +52,14 @@ inline void assert_tail_zero([[maybe_unused]] const BitsetBelief& b) {
 // it never touches the always-zero tail, preserving the tail-zero invariant operator== relies on.
 void filter_bits(BitsetBelief& b, std::span<const uint64_t> mask, bool want) {
     std::span<uint64_t> bits = b.live();
-    // The live word stride as a typed WordCount; the AND scan walks the WordIndex domain (domains.hpp).
-    // `kw64_` is the still-raw BitsetBelief member (its count/word-domain migration is gated by the
-    // cross-file readers of the member, see this file's header note) — wrapped here at the loop boundary.
-    const WordCount nwords{static_cast<WordRep>(b.kw64_)};
+    // The live word stride is the belief's typed WordCount member; the AND scan walks the WordIndex domain
+    // (domains.hpp). No wrap is needed any more — kw64_ already carries its WordCount domain.
+    const WordCount nwords = b.kw64_;
     if (want) for (WordIndex w{0}; w.value() < nwords.value(); w = w + WordRep{1}) bits[w.value()] &=  mask[w.value()];
     else      for (WordIndex w{0}; w.value() < nwords.value(); w = w + WordRep{1}) bits[w.value()] &= ~mask[w.value()];
-    // popcount_all returns a typed WorldCount; count_ is still the raw cached int (the count-domain
-    // migration of the Belief members is a follow-on sweep) — unwrap at this seam (ADR-0000 item 5).
-    b.count_ = static_cast<int>(popcount_all(b.live()).value());
+    // popcount_all returns a typed WorldCount; count_ is now the SAME WorldCount domain (a same-domain
+    // store, no cast — the count-domain migration of the Belief members landed).
+    b.count_ = popcount_all(b.live());
     assert_tail_zero(b);  // debug-only: an AND never sets a tail word, but net the invariant explicitly
 }
 
@@ -123,15 +123,17 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
     // the world count, NEVER the literal 243.
     const std::size_t nworlds = worlds_.size();
     const bool worlds_enumerable = nworlds > 0;  // build_worlds returns the full C(N,K) set; empty only if K out of range
-    kW64_ = static_cast<int>((nworlds + 63) / 64);
+    // kW64 = ceil(|worlds|/64): the named WorldCount -> WordCount bridge (words_to_words64, domains.hpp),
+    // not an ad-hoc int division at the seam (ADR-0000 item 5). |worlds| fits the 32-bit WorldCount rep.
+    kW64_ = words_to_words64(WorldCount{static_cast<WorldCountRep>(nworlds)});
     const std::size_t mask_bytes =
-        static_cast<std::size_t>(N() + n_detectors()) * static_cast<std::size_t>(kW64_) * sizeof(uint64_t);
+        static_cast<std::size_t>(N() + n_detectors()) * static_cast<std::size_t>(kW64_.value()) * sizeof(uint64_t);
     // The gate's THIRD conjunct (the inline-buffer fit): the BitsetBelief now holds its words in a
     // FIXED-CAPACITY inline std::array<.., kBitsetMaxWords> (env.hpp — the per-copy heap alloc this kills),
     // so a belief with kW64 > kBitsetMaxWords CANNOT be represented in the bitset arm and MUST fall to the
     // flat arm. Conjoin it here (and print it in the GATE: line) so the inline cap is an EXPLICIT gate
     // input, not a silent overflow (ADR-0002).
-    const bool fits_inline = kW64_ <= kBitsetMaxWords;
+    const bool fits_inline = kW64_.value() <= kBitsetMaxWords;  // WordCount -> the inline-cap compare ACL
     use_bitset_ = worlds_enumerable && (mask_bytes <= kTargetMaskCacheBudgetBytes) && fits_inline;
 
 #ifdef CHOCO_BELIEF_ZDD
@@ -148,7 +150,7 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
         // treasure_mask_[t] = worlds (by rank) with bit t set; detector_mask_[j] = worlds where
         // (w & face_masks()[j]) != 0 — the SAME enumeration + face masks the env owns, so the masks
         // derive from worlds_/face_masks_ (the identity env.observe rests on; the oracle pins it).
-        const size_t kw = static_cast<size_t>(kW64_);
+        const size_t kw = static_cast<size_t>(kW64_.value());  // WordCount -> the mask-table sizing ACL
         treasure_mask_.assign(static_cast<size_t>(N()) * kw, 0ull);
         detector_mask_.assign(static_cast<size_t>(n_detectors()) * kw, 0ull);
         for (size_t r = 0; r < nworlds; ++r) {
@@ -179,12 +181,13 @@ Belief Environment::full_belief() const {
         // The inline array is zero-initialized ({}), so the unused tail words [kw64_, kBitsetMaxWords) STAY 0
         // (the tail-zero invariant operator== relies on); we write ONLY the live words [0, kw64_).
         BitsetBelief b;  // bits{} zero-initialized; tail words past kw64_ stay 0
-        b.kw64_ = kW64_;
-        std::fill_n(b.bits.begin(), kW64_, ~uint64_t{0});  // GENERATOR-FED all-ones over the live words [0,kW64_), counter-free (tail-zero invariant preserved)
+        b.kw64_ = kW64_;  // WordCount -> WordCount (same domain)
+        const size_t kw = static_cast<size_t>(kW64_.value());  // WordCount -> the fill-length/index ACL
+        std::fill_n(b.bits.begin(), kw, ~uint64_t{0});  // GENERATOR-FED all-ones over the live words [0,kW64_), counter-free (tail-zero invariant preserved)
         const size_t nworlds = worlds_.size();
         const int tail = static_cast<int>(nworlds & 63u);  // live bits in the final word (0 => the word is full)
-        if (tail != 0) b.bits[static_cast<size_t>(kW64_ - 1)] = (uint64_t{1} << tail) - 1;
-        b.count_ = static_cast<int>(nworlds);  // = popcount(all-ones over nworlds bits), the C(N,K) prior
+        if (tail != 0) b.bits[kw - 1] = (uint64_t{1} << tail) - 1;
+        b.count_ = WorldCount{static_cast<WorldCountRep>(nworlds)};  // = popcount(all-ones over nworlds bits), the C(N,K) prior
         assert_tail_zero(b);  // debug-only: full_belief writes only [0,kW64_); the tail stays zero-init
         return b;
     }
@@ -261,8 +264,8 @@ std::vector<double> Environment::marginals(const Belief& bw) const {
             for (double& v : m) v *= inv;  // mean over the world-set (mirrors env.marginals)
             return m;
         } else if constexpr (std::is_same_v<T, BitsetBelief>) {
-            if (a.count_ == 0) return m;
-            const double inv = 1.0 / static_cast<double>(a.count_);
+            if (a.count_ == WorldCount{0}) return m;
+            const double inv = 1.0 / static_cast<double>(a.count_.value());  // WorldCount -> the double normalizer ACL
             for (int t = 0; t < N(); ++t)
                 m[static_cast<size_t>(t)] = static_cast<double>(popcount_and(a.live(), treasure_mask(t)).value()) * inv;
             return m;
@@ -286,8 +289,9 @@ bool Environment::informative(int face_id, const Belief& bw) const {
             }
             return false;  // mirrors SenseAction.informative: hit.any() and (~hit).any()
         } else if constexpr (std::is_same_v<T, BitsetBelief>) {
-            const int cnt = static_cast<int>(popcount_and(a.live(), detector_mask(face_id)).value());
-            return cnt > 0 && cnt < a.count_;
+            // 0 < cover-count < nb: both operands are WorldCount, so the compare is same-domain (no unwrap).
+            const WorldCount cnt = popcount_and(a.live(), detector_mask(face_id));
+            return cnt > WorldCount{0} && cnt < a.count_;
         }
         CHOCO_ZDD_ELSE(return zdd::informative(*this, face_id, a);)  // ZDD arm: 0 < det_cnt < nb — byte-identical
     }, bw);

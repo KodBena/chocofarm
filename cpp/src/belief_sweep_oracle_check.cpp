@@ -111,14 +111,16 @@ namespace {
                                                 const std::map<uint32_t, size_t>& rank,
                                                 const std::vector<uint32_t>& flat) {
     chocofarm::BitsetBelief b;  // bits{} zero-initialized inline (the fixed-capacity array); tail stays 0
-    b.kw64_ = env.kW64();       // the runtime word count (the env gates ON so kW64 <= kBitsetMaxWords)
+    // the runtime word count (the env gates ON so kW64 <= kBitsetMaxWords). env.kW64() is the raw-int
+    // public-API accessor; wrap it into the WordCount domain at this construction boundary.
+    b.kw64_ = chocofarm::WordCount{static_cast<chocofarm::WordRep>(env.kW64())};
     for (uint32_t w : flat) {
         const auto it = rank.find(w);
         // every belief here is a subset of env.worlds(), so the world is always found (invariant).
         const size_t r = it->second;
         b.bits[r >> 6] |= (uint64_t{1} << (r & 63u));  // only live words [0,kw64_) are ever written here
     }
-    b.count_ = static_cast<int>(flat.size());
+    b.count_ = chocofarm::WorldCount{static_cast<chocofarm::WorldCountRep>(flat.size())};  // the set-bit count (size_t -> WorldCount ACL)
     return b;
 }
 
