@@ -115,6 +115,39 @@ class TreeCursor {
     // — asserted (P9: assert for one's own impossible state, expected for the world's boundary).
     [[nodiscard]] Step resume(const NetPrediction& prediction);
 
+    // ---- ADDITIVE: the BatchPredict (lever #3) producer-compute A/B measurement seam ------------------
+    // NONE of this is on the production path. The production producer/runtime drive advance()/resume() and
+    // each cursor builds its OWN feature row inside eval_build_features (the PER-LEAF arm). To measure the
+    // BATCHED arm (the in-process batched featurizer over the K multiplexed cursors' parked leaves), a
+    // driver needs (a) to make the cursor SKIP its per-leaf feature build at the park, (b) to read the
+    // parked (loc, bw, collected) triple so it can batch-featurize them together, and (c) to feed each
+    // cursor its batch-built row back. These three additive members provide exactly that — the search
+    // control flow + the RNG draw order + every precision seam are UNCHANGED (deferred featurization only
+    // moves WHERE the identical feature row is computed; the legal-slots collection from the row is the
+    // byte-identical tail eval_legal_from_features runs), so the BATCHED arm's decisions are bit-identical
+    // to the PER-LEAF arm's. The harness's bit-identity gate proves it.
+
+    // (a) Put this cursor in DEFERRED-FEATURIZE mode for the rest of its life: at each leaf park it sets
+    // parked_ + records the parked node but does NOT call eval_build_features (no per-leaf belief sweep).
+    // The driver must then resume via resume_with_features (NOT resume) so the legal-slots tail runs on the
+    // externally-supplied row. Call before the first advance(). Idempotent.
+    void enable_deferred_featurize() { defer_featurize_ = true; }
+
+    // (b) The parked leaf's (loc, bw, collected) — valid ONLY while parked (between an advance()/resume that
+    // returned CursorNeedsLeaf and the matching resume). For the root-eval park these are the decision-level
+    // (loc_, bw_, collected_); for an interior/descent park they are the single live descent state
+    // (descent_loc_, descent_bw_, descent_coll_) — exactly the triple eval_build_features would have swept.
+    [[nodiscard]] const Loc& parked_loc() const { return *parked_loc_; }
+    [[nodiscard]] const Belief& parked_belief() const { return *parked_bw_; }
+    [[nodiscard]] const CollectedSet& parked_collected() const { return *parked_coll_; }
+
+    // (c) Resume a DEFERRED-FEATURIZE park with the externally-built feature ROW + its prediction. It runs
+    // eval_legal_from_features(parked_node, row) — the byte-identical legal-slots tail of eval_build_features
+    // — to set node.legal_slots, then proceeds EXACTLY as resume(prediction). `row` MUST be the length-dim()
+    // feature row for THIS cursor's parked (loc, bw, collected) (the batched featurizer's row for it). Only
+    // valid in deferred mode; asserted.
+    [[nodiscard]] Step resume_with_features(std::span<const double> row, const NetPrediction& prediction);
+
   private:
     // The reentry phase of the OUTER (root/SH) machine. The descend recursion is reified separately as
     // the descend_stack_ below; PHASE tracks where the OUTER loop is so resume() re-enters correctly.
@@ -245,6 +278,17 @@ class TreeCursor {
     GumbelAZPolicy::Decision decision_;         // built by finalize()
 
     bool parked_ = false;              // true iff a leaf is outstanding (resume() expected next)
+
+    // ---- ADDITIVE: deferred-featurize state (the BatchPredict A/B seam; off on the production path) -----
+    // In deferred mode the park sites SKIP eval_build_features and instead record the parked node index +
+    // the parked (loc, bw, collected) views, so the driver can batch-featurize and feed the row back via
+    // resume_with_features. parked_node_ identifies which node eval_legal_from_features must populate (the
+    // same node resume() would finish — nodes_[0] at root-eval, descend_stack_.back().node at a descent).
+    bool defer_featurize_ = false;
+    NodeIndex parked_node_{0};                       // the node parked (deferred): the eval_finish target
+    const Loc* parked_loc_ = nullptr;                // the parked leaf's loc (root-eval or descent), or null
+    const Belief* parked_bw_ = nullptr;              // the parked leaf's belief
+    const CollectedSet* parked_coll_ = nullptr;      // the parked leaf's collected set
 };
 
 }  // namespace chocofarm
