@@ -397,24 +397,25 @@ SlotIndex GumbelAZPolicy::puct_select(const GumbelNode& node) const {
 }
 
 // ---- interior PUCT descent; net value at the leaf (mirrors _descend) ------------------------------
-double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
+double GumbelAZPolicy::descend(NodePool& nodes, NodeIndex node, const Loc& loc,
                                const Belief& bw, const CollectedSet& collected,
                                World world, double lam, GumbelSource& src, PlyDepth depth) const {
     // cfg_.max_depth is now a PlyDepth directly (the config field carries its domain); no wrap at the cap.
     const PlyDepth max_depth = cfg_.max_depth;
+    const size_t ni = static_cast<size_t>(node.value());  // NodeIndex -> the NodePool subscript ACL
     if (depth >= max_depth || env_.empty(bw)) {
-        if (!nodes[static_cast<size_t>(node)].evaluated) {
+        if (!nodes[ni].evaluated) {
             if (env_.empty(bw)) return -lam * env_.exit_cost(loc.pt);
-            return evaluate(nodes[static_cast<size_t>(node)], loc, bw, collected);
+            return evaluate(nodes[ni], loc, bw, collected);
         }
-        return nodes[static_cast<size_t>(node)].value;
+        return nodes[ni].value;
     }
-    if (!nodes[static_cast<size_t>(node)].evaluated) {
+    if (!nodes[ni].evaluated) {
         // first visit to this leaf: the net value IS the leaf estimate (no playout — the F4 cure)
-        return evaluate(nodes[static_cast<size_t>(node)], loc, bw, collected);
+        return evaluate(nodes[ni], loc, bw, collected);
     }
 
-    SlotIndex a = puct_select(nodes[static_cast<size_t>(node)]);
+    SlotIndex a = puct_select(nodes[ni]);
     Action act = action_of_slot(env_, a);
     double ret;
     if (act.kind == ActionKind::Terminate) {
@@ -426,13 +427,14 @@ double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
         StepResult sr = env_.apply(nloc, nbw, nc, act, world);  // World == uint32_t (env.apply ACL)
         double step = sr.reward - lam * sr.dt;
         std::tuple<SlotIndex, GBeliefKey> ckey{a, gumbel_belief_key(env_, nbw)};
-        auto& cur = nodes[static_cast<size_t>(node)];
-        int child;
+        auto& cur = nodes[ni];
+        NodeIndex child;
         auto cit = cur.children.find(ckey);
         if (cit == cur.children.end()) {
             nodes.emplace_back(n_slots_);  // dense W/N sized to the slot space, zero-initialized
-            child = static_cast<int>(nodes.size()) - 1;
-            nodes[static_cast<size_t>(node)].children[ckey] = child;  // re-index after possible realloc
+            // child = the just-appended arena slot (size-1): the named size_t -> NodeIndex crossing.
+            child = NodeIndex{static_cast<SearchRep>(nodes.size())} - SearchRep{1};
+            nodes[ni].children[ckey] = child;  // re-index after possible realloc (ni is a value, stays valid)
         } else {
             child = cit->second;
         }
@@ -440,7 +442,7 @@ double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
                               depth + SearchRep{1});  // PlyDepth affine: depth + 1 ply
         ret = step + cont;
     }
-    auto& cur = nodes[static_cast<size_t>(node)];
+    auto& cur = nodes[ni];
     cur.W[static_cast<size_t>(a.value())] += ret;       // dense, zero-init: += is the former (count?W[a]:0)+ret
     cur.N[static_cast<size_t>(a.value())] += VisitCount{1};  // dense, zero-init: += is the former (count?N[a]:0)+1
     return ret;
@@ -467,11 +469,11 @@ double GumbelAZPolicy::simulate_root_action(NodePool& nodes, const Loc& loc,
         StepResult sr = env_.apply(nloc, nbw, nc, a, w);
         double step = sr.reward - lam * sr.dt;
         std::tuple<SlotIndex, GBeliefKey> ckey{slot, gumbel_belief_key(env_, nbw)};
-        int child;
+        NodeIndex child;
         auto cit = nodes[0].children.find(ckey);
         if (cit == nodes[0].children.end()) {
             nodes.emplace_back(n_slots_);  // dense W/N sized to the slot space, zero-initialized
-            child = static_cast<int>(nodes.size()) - 1;
+            child = NodeIndex{static_cast<SearchRep>(nodes.size())} - SearchRep{1};  // arena slot size-1 (size_t -> NodeIndex)
             nodes[0].children[ckey] = child;
         } else {
             child = cit->second;

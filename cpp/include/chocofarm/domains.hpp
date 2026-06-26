@@ -240,6 +240,17 @@ struct WorkerCountTag {};
 using WorkerCount = Quantity<WorkerCountTag, SearchRep>;
 template <> struct quantity_additive<WorkerCountTag> : std::true_type {};
 
+// A 0-based index into the per-decision GumbelNode arena (NodePool = std::pmr::vector<GumbelNode>): the
+// children-transposition-table value (action-slot,belief_key) -> arena idx, the descend frame's `node`,
+// the `child` produced by emplace_back. DISTINCT from a SlotIndex (a node arena position is not an
+// action slot) and from a PlyDepth (not a tree level) — the load-bearing foreclosure: a node index used
+// where a slot/depth is owed does not compile. Affine (an index into a contiguous arena; child = size-1).
+// The root is arena index 0; the former -1 "no node" sentinel on DescendFrame::node is a typed default
+// (the frame's `node` is always assigned a real index before it is read — `stepped`/push order guarantee).
+struct NodeIndexTag {};
+using NodeIndex = Quantity<NodeIndexTag, SearchRep>;
+template <> struct quantity_affine<NodeIndexTag> : std::true_type {};
+
 // ============================================================================================
 //  THE MEMORY-SIZE + OPAQUE-SEED DOMAINS (where size_t / a wide opaque rep IS the motivated width)
 // ============================================================================================

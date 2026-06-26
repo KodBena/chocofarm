@@ -191,10 +191,11 @@ struct GumbelNode {
     std::pmr::vector<SlotIndex> legal_slots;  // legal action slots, in env.legal_actions + TERMINATE order
     std::pmr::vector<double> W;             // (n_slots,) action-slot -> summed λ-penalized return (0 unvisited)
     std::pmr::vector<VisitCount> N;         // (n_slots,) action-slot -> selection count (0 unvisited)
-    // (action-slot, belief_key) -> child arena idx. A find/insert-only transposition table (never iterated
-    // in key order), so a pmr::unordered_map is bit-exact with the former std::unordered_map / the older
-    // std::map — same GBeliefChildKeyHash + tuple operator==, only the allocator differs (GBeliefChildKeyHash).
-    std::pmr::unordered_map<std::tuple<SlotIndex, GBeliefKey>, int, GBeliefChildKeyHash> children;
+    // (action-slot, belief_key) -> child NodeIndex (arena idx). A find/insert-only transposition table
+    // (never iterated in key order), so a pmr::unordered_map is bit-exact with the former std::unordered_map
+    // — same GBeliefChildKeyHash + tuple operator==, only the value carries its NodeIndex domain (the arena
+    // index, distinct from a slot/depth) and the allocator differs (GBeliefChildKeyHash).
+    std::pmr::unordered_map<std::tuple<SlotIndex, GBeliefKey>, NodeIndex, GBeliefChildKeyHash> children;
 
     // The allocator-aware ctors (uses-allocator construction): the no-arg + n_slots forms forward an
     // allocator (the pmr arena, supplied by std::pmr::vector<GumbelNode>::emplace_back) to EVERY inner
@@ -430,7 +431,7 @@ class GumbelAZPolicy final : public Policy {
 
     // Interior PUCT descent; net value at the leaf (mirrors _descend). `node` is an arena index; `depth`
     // is a PlyDepth.
-    [[nodiscard]] double descend(NodePool& nodes, int node, const Loc& loc,
+    [[nodiscard]] double descend(NodePool& nodes, NodeIndex node, const Loc& loc,
                                  const Belief& bw, const CollectedSet& collected,
                                  World world, double lam, GumbelSource& src, PlyDepth depth) const;
 

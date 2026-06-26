@@ -141,7 +141,9 @@ class TreeCursor {
     // belief lives in descent_bw_, reset from bw_ at each c_outcome determinization start (the one copy
     // that remains, see "needs a copy" below). The frame keeps ONLY what the W/N backup needs.
     struct DescendFrame {
-        int node = -1;             // arena index of this frame's node (a NodePool container index, raw)
+        NodeIndex node{0};         // arena index of this frame's node (NodePool container index; the former
+                                   //   -1 default is a typed 0 — `node` is always assigned a real index
+                                   //   before it is read, by start_root/pump_descent push order)
         PlyDepth depth{0};         // descent depth (root-action child enters at depth 1, as descend does)
         SlotIndex action_slot{0};  // the puct_select'd action this frame stepped on (for the W/N backup);
                                    //   only read when `stepped` (the former -1 "not stepped" carried no
@@ -207,11 +209,14 @@ class TreeCursor {
                                        //   the while-condition is re-checked only when this clears (so the
                                        //   cut ALWAYS fires for an entered phase, even if budget hit 0)
     bool sh_phase_broke_ = false;      // the per-action loop broke early on v<=0 (still cuts afterwards)
-    int sh_phase_idx_ = 0;             // position into considered_ within the phase's per-action loop (a raw
-                                       //   container cursor 0..size, not a slot index)
+    OutcomeIndex sh_phase_idx_{0};     // position into considered_ within the phase's per-action loop (an
+                                       //   affine cursor 0..size — the shared OutcomeIndex affine-index
+                                       //   domain, domains.hpp; NOT a slot value — considered_[idx] IS one)
     SimBudget sh_per_action_{0};       // this phase's per-action sim count
     SimBudget sh_action_done_{0};      // sims already issued for considered_[sh_phase_idx_] this phase
-    size_t sh_rr_ = 0;                 // round-robin index for the remainder loop (raw container cursor)
+    OutcomeIndex sh_rr_{0};            // round-robin cursor for the remainder loop (the OutcomeIndex affine
+                                       //   domain domains.hpp explicitly assigns "the round-robin survivor
+                                       //   cursor, read modulo considered.size()")
 
     // The current sim's root-action context (simulate_root_action's locals): the root action slot under
     // test, its c_outcome accumulation, and which determinization k we are on. `sim_total_` accumulates

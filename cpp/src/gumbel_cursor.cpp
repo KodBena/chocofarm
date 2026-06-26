@@ -139,7 +139,7 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
             SimBudget phase_budget{std::min(sh_per_phase_.value(), sh_budget_.value())};
             sh_per_action_ = SimBudget{static_cast<SearchRep>(std::max(
                 1, static_cast<int>(phase_budget.value()) / static_cast<int>(considered_.size())))};
-            sh_phase_idx_ = 0;
+            sh_phase_idx_ = OutcomeIndex{0};
             sh_action_done_ = SimBudget{0};
         }
         // begin the first sim of the first candidate
@@ -149,11 +149,11 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
     // phase_ == Running: the parked leaf is the TOP descend frame's node eval. Finish it, then unwind.
     assert(!descend_stack_.empty() && "resume(Running) with an empty descend stack");
     DescendFrame& f = descend_stack_.back();
-    p_.eval_finish(nodes_[static_cast<size_t>(f.node)], prediction, ws_);
+    p_.eval_finish(nodes_[static_cast<size_t>(f.node.value())], prediction, ws_);  // NodeIndex -> arena subscript ACL
     // The eval branches of descend() all RETURN node.value immediately after evaluating (the leaf
     // estimate; no deeper recursion this call, NO W/N touch on the evaluated node). Pop this frame and
     // back its node.value up the chain — exactly descend()'s eval-branch return propagating up.
-    double leaf_val = nodes_[static_cast<size_t>(f.node)].value;
+    double leaf_val = nodes_[static_cast<size_t>(f.node.value())].value;
     descend_stack_.pop_back();
     unwind_with(leaf_val);
     return drive();  // advance the c_outcome loop / finish the sim
@@ -210,11 +210,11 @@ Step TreeCursor::drive() {
                 double step = sr.reward - lam_ * sr.dt;
                 // find/create the root child node for (slot, belief_key) (simulate_root_action's body).
                 std::tuple<SlotIndex, GBeliefKey> ckey{*cur_root_slot_, gumbel_belief_key(p_.env_, descent_bw_)};
-                int child;
+                NodeIndex child;
                 auto cit = nodes_[0].children.find(ckey);
                 if (cit == nodes_[0].children.end()) {
                     nodes_.emplace_back(n_slots_);
-                    child = static_cast<int>(nodes_.size()) - 1;
+                    child = NodeIndex{static_cast<SearchRep>(nodes_.size())} - SearchRep{1};  // arena slot size-1
                     nodes_[0].children[ckey] = child;
                 } else {
                     child = cit->second;
@@ -270,19 +270,20 @@ Step TreeCursor::drive() {
                     SimBudget phase_budget{std::min(sh_per_phase_.value(), sh_budget_.value())};
                     sh_per_action_ = SimBudget{static_cast<SearchRep>(std::max(
                         1, static_cast<int>(phase_budget.value()) / static_cast<int>(considered_.size())))};
-                    sh_phase_idx_ = 0;
+                    sh_phase_idx_ = OutcomeIndex{0};
                     sh_action_done_ = SimBudget{0};
                     sh_phase_broke_ = false;
                     continue;
                 }
                 // bracket finished (size==1 or budget==0): enter the remainder round-robin.
                 sh_remainder_ = true;
-                sh_rr_ = 0;
+                sh_rr_ = OutcomeIndex{0};
                 continue;
             }
-            // a phase is active: run its per-action loop, then ALWAYS cut.
-            if (!sh_phase_broke_ && sh_phase_idx_ < static_cast<int>(considered_.size())) {
-                SlotIndex s = considered_[static_cast<size_t>(sh_phase_idx_)];
+            // a phase is active: run its per-action loop, then ALWAYS cut. .value() at the size compare +
+            // the considered_ subscript (the affine cursor crosses to a raw container position here).
+            if (!sh_phase_broke_ && sh_phase_idx_.value() < static_cast<SearchRep>(considered_.size())) {
+                SlotIndex s = considered_[static_cast<size_t>(sh_phase_idx_.value())];
                 SimBudget v{std::min(sh_per_action_.value(), sh_budget_.value())};
                 if (v == SimBudget{0}) {  // unsigned: v<=0 is v==0 (the never-negative invariant, ADR-0000)
                     // sequential_halving: `if (v <= 0) break;` -> end this phase's per-action loop early
@@ -301,12 +302,12 @@ Step TreeCursor::drive() {
                     sh_action_done_ += SimBudget{1};
                     if (sh_action_done_ == v) {
                         sh_budget_ = SimBudget{sh_budget_.value() - v.value()};  // budget draws down
-                        ++sh_phase_idx_;
+                        sh_phase_idx_ = sh_phase_idx_ + SearchRep{1};  // affine step (the former ++)
                         sh_action_done_ = SimBudget{0};
                     }
                     continue;
                 }
-                ++sh_phase_idx_;  // defensive; action_done resets at v
+                sh_phase_idx_ = sh_phase_idx_ + SearchRep{1};  // defensive; action_done resets at v (affine step)
                 sh_action_done_ = SimBudget{0};
                 continue;
             }
@@ -335,13 +336,14 @@ Step TreeCursor::drive() {
 
         // --- the full-budget remainder loop (round-robin on the survivors) ---
         if (sh_budget_ > SimBudget{0} && !considered_.empty()) {
-            SlotIndex s = considered_[sh_rr_ % considered_.size()];
+            // .value() at the modulo + subscript: the affine RR cursor crosses to a raw container position.
+            SlotIndex s = considered_[static_cast<size_t>(sh_rr_.value()) % considered_.size()];
             cur_root_slot_ = s;
             cur_world_ = src_.sample_world(bw_);
             cur_k_ = OutcomeIndex{0};
             sim_total_ = 0.0;
             sh_budget_ = SimBudget{sh_budget_.value() - 1};  // budget draws down
-            ++sh_rr_;
+            sh_rr_ = sh_rr_ + SearchRep{1};  // affine step (the former ++)
             continue;
         }
         // SH complete: survivor is considered_.front().
@@ -357,7 +359,7 @@ Step TreeCursor::pump_descent() {
     for (;;) {
         assert(!descend_stack_.empty());
         DescendFrame& f = descend_stack_.back();
-        GumbelNode& node = nodes_[static_cast<size_t>(f.node)];
+        GumbelNode& node = nodes_[static_cast<size_t>(f.node.value())];  // NodeIndex -> arena subscript ACL
         // BY-REFERENCE: the deepest frame's (loc, bw, collected, world) live in the single descent_*
         // members (NOT the frame). f is the back() frame, so descent_* IS its state (the descent narrowed
         // them in place to this depth). No per-frame belief copy is read here.
@@ -413,14 +415,14 @@ Step TreeCursor::pump_descent() {
         StepResult sr = p_.env_.apply(descent_loc_, descent_bw_, descent_coll_, act, descent_world_);
         double step = sr.reward - lam_ * sr.dt;
         std::tuple<SlotIndex, GBeliefKey> ckey{a, gumbel_belief_key(p_.env_, descent_bw_)};
-        int child;
+        NodeIndex child;
         auto cit = node.children.find(ckey);
         if (cit == node.children.end()) {
             nodes_.emplace_back(n_slots_);
-            child = static_cast<int>(nodes_.size()) - 1;
+            child = NodeIndex{static_cast<SearchRep>(nodes_.size())} - SearchRep{1};  // arena slot size-1
             // emplace_back may reallocate nodes_; `node`/`f` references are now DANGLING. Re-index the
             // parent by f.node (a stable arena index) — do NOT touch `node`/`f` after this point.
-            nodes_[static_cast<size_t>(f.node)].children[ckey] = child;
+            nodes_[static_cast<size_t>(f.node.value())].children[ckey] = child;
         } else {
             child = cit->second;
         }
@@ -448,8 +450,9 @@ void TreeCursor::unwind_with(double cont) {
     while (!descend_stack_.empty()) {
         DescendFrame& parent = descend_stack_.back();
         double ret = parent.step + cont;  // descend(): ret = step + cont
-        nodes_[static_cast<size_t>(parent.node)].W[static_cast<size_t>(parent.action_slot.value())] += ret;
-        nodes_[static_cast<size_t>(parent.node)].N[static_cast<size_t>(parent.action_slot.value())] += VisitCount{1};
+        const size_t pni = static_cast<size_t>(parent.node.value());  // NodeIndex -> arena subscript ACL
+        nodes_[pni].W[static_cast<size_t>(parent.action_slot.value())] += ret;
+        nodes_[pni].N[static_cast<size_t>(parent.action_slot.value())] += VisitCount{1};
         descend_stack_.pop_back();
         cont = ret;  // this frame's ret becomes its parent's cont
     }
