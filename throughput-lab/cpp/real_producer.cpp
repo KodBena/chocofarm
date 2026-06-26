@@ -37,6 +37,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "chocofarm/batch_predict.hpp"          // BatchPredict lever #3: in-process per-RTT batched featurizer
 #include "chocofarm/env.hpp"
 #include "chocofarm/gumbel.hpp"
 #include "chocofarm/instance.hpp"
@@ -203,10 +204,32 @@ template <class Slot>
                                std::vector<std::unique_ptr<Slot>>& trees,
                                const std::vector<int>& active, int coalesce_rows,
                                tlab::wire::FeatureDim in_dim,
-                               tlab::wire::ProducerCorr& corr, ThreadStat& out) {
+                               tlab::wire::ProducerCorr& corr,
+                               const chocofarm::BatchFeaturizer* bf, ThreadStat& out) {
     // corr_to_group is keyed by the OPAQUE wire corr_t (the token the reply echoes); the running `corr` is the
     // typed ProducerCorr seq, crossed to corr_t at the LeafBatch stamp + the map key. `coalesce_rows`/`active`
     // /`group`/`n_msgs` are pipeline counters with NO SSOT typedef (see the cross-file note) — kept raw.
+    //
+    // BatchPredict (lever #3): if `bf` is non-null, the slots ran in DEFERRED-featurize mode (no per-leaf
+    // belief sweep at park). Featurize ALL `active` parked leaves TOGETHER here — ONE mask-resident batched
+    // belief sweep per round instead of B per-leaf sweeps — then install each slot's row so the wire send
+    // below (which always concats slot->ch.features) is byte-UNCHANGED. This is the exact integration the mux
+    // producer-compute bench proved bit-identical (cpp/src/multiplexed_producer_compute_bench.cpp): the rows
+    // are byte-identical to the per-leaf rows, so the decisions are identical (proof inherited by construction).
+    // bf==null = the PER-LEAF baseline (slot->ch.features is the cursor's own per-leaf row) — byte-unchanged.
+    if (bf != nullptr) {
+        std::vector<chocofarm::BatchLeaf> blv(active.size());
+        for (size_t k = 0; k < active.size(); ++k) {
+            Slot& s = *trees[static_cast<size_t>(active[k])];
+            blv[k].loc = s.parked_loc().pt;
+            blv[k].bw = &s.parked_belief();
+            blv[k].collected = &s.parked_collected();
+        }
+        std::vector<std::vector<double>> rows;
+        bf->featurize_batch(std::span<const chocofarm::BatchLeaf>(blv.data(), blv.size()), rows);
+        for (size_t k = 0; k < active.size(); ++k)
+            trees[static_cast<size_t>(active[k])]->install_batched_row(rows[k]);
+    }
     std::unordered_map<tlab::wire::corr_t, std::vector<int>> corr_to_group;
     std::vector<float> buf;
     int n_msgs = 0;
@@ -217,6 +240,13 @@ template <class Slot>
         group.reserve(g_end - off);
         for (size_t k = off; k < g_end; ++k) {
             const std::span<const float> feats = trees[static_cast<size_t>(active[k])]->ch.features;
+            // install-before-read NET (ADR-0002): in batched mode the slot poisons ch.features to EMPTY at
+            // park, so a non-empty row here proves install_batched_row ran for this slot this round. An empty
+            // row means a missing install (a driver bug) — fail LOUD rather than ship a malformed wire frame.
+            if (bf != nullptr && feats.empty()) {
+                out.failed = true; out.err = "drive_round: batched leaf row not installed (slot "
+                                             + std::to_string(active[k]) + ")"; return false;
+            }
             buf.insert(buf.end(), feats.begin(), feats.end());   // concat the group's feature rows
             group.push_back(active[k]);
         }
@@ -243,7 +273,11 @@ template <class Slot>
             chocofarm::NetPrediction pred;
             pred.value = reply->preds[j].value;
             pred.logits = std::move(reply->preds[j].logits);
-            trees[static_cast<size_t>(it->second[j])]->resume_with(pred);
+            Slot& s = *trees[static_cast<size_t>(it->second[j])];
+            // BatchPredict: in deferred mode resume on the INSTALLED float64 row (the legal-slots tail runs on
+            // it — byte-identical to per-leaf); else the cursor's own per-leaf row via resume_with. (bf!=null
+            // <=> the slots are batched; the slot's own flag is the SSOT — read it, don't re-derive from bf.)
+            if (s.batched) s.resume_with_batched(pred); else s.resume_with(pred);
             out.leaves += 1;
         }
     }
@@ -280,12 +314,20 @@ template <class Slot, class MakeSlot>
 void run_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env, const std::string& endpoint,
                   double run_seconds, tlab::wire::FeatureDim in_dim,
                   int fibers_k, int coalesce_rows, const std::string& driver,
-                  int inflight_msgs, chocofarm::IssueController* ctl, MakeSlot make_slot,
+                  int inflight_msgs, chocofarm::IssueController* ctl, bool batched, MakeSlot make_slot,
                   ThreadStat& out) {
     // NOTE: the GumbelConfig is NOT a parameter here — it is baked into each slot by `make_slot` (the
     // engine factory), exactly where it is needed (the per-slot policy ctor). The episode body reads only
     // env (max_steps/empty/apply) + the slot surface, so threading cfg through here would be a dead param.
     if (coalesce_rows < 1) coalesce_rows = 1;
+    // BatchPredict (lever #3): when `batched`, build ONE per-thread BatchFeaturizer (its own FeatureBuilder +
+    // belief/loc memos; single-thread-owned like every FeatureBuilder consumer) and pass it to the pipe so the
+    // K parked leaves are featurized in ONE mask-resident belief sweep per RTT instead of K per-leaf sweeps.
+    // `bf` is null in the per-leaf baseline (byte-unchanged). The slots are armed in deferred-featurize mode by
+    // make_slot (the factory) iff batched — the two MUST agree (asserted by the cursor's resume_with_features).
+    std::optional<chocofarm::BatchFeaturizer> batch_featurizer;
+    if (batched) batch_featurizer.emplace(env);
+    const chocofarm::BatchFeaturizer* bf = batch_featurizer ? &*batch_featurizer : nullptr;
     // BoundaryConfig speaks the typed tlab domains; assign literals in-domain. coalesce_rows is a raw int
     // arg (the driver's CLI knob) wrapped into RowCount at this crossing; in_dim is already a FeatureDim.
     tlab::BoundaryConfig bcfg;
@@ -365,12 +407,38 @@ void run_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env, cons
         for (int i = 0; i < fibers_k; ++i) ready.push_back(i);   // all parked on a leaf after start
         std::vector<float> buf;
         int in_flight = 0;
+        std::vector<chocofarm::BatchLeaf> blv;            // batched: this group's parked leaves (lever #3)
+        std::vector<std::vector<double>> grows;           // batched: featurize_batch output rows
         auto send_group = [&]() -> bool {
             const size_t g = std::min(ready.size(), static_cast<size_t>(coalesce_rows));
+            // BatchPredict (lever #3): featurize THIS group's parked leaves together (the greedy batch is the
+            // group — coalesce_rows wide) in ONE belief sweep, then install each row so the concat below reads
+            // slot->ch.features byte-UNCHANGED. bf==null = the per-leaf baseline (unchanged). Bit-identity is
+            // inherited from the deferred-featurize seam the mux bench proved (see drive_round's note).
+            if (bf != nullptr) {
+                blv.resize(g);
+                size_t b = 0;
+                for (size_t k = ready.size() - g; k < ready.size(); ++k, ++b) {
+                    Slot& s = *trees[static_cast<size_t>(ready[k])];
+                    blv[b].loc = s.parked_loc().pt;
+                    blv[b].bw = &s.parked_belief();
+                    blv[b].collected = &s.parked_collected();
+                }
+                bf->featurize_batch(std::span<const chocofarm::BatchLeaf>(blv.data(), g), grows);
+                b = 0;
+                for (size_t k = ready.size() - g; k < ready.size(); ++k, ++b)
+                    trees[static_cast<size_t>(ready[k])]->install_batched_row(grows[b]);
+            }
             buf.clear();
             std::vector<int> group; group.reserve(g);
             for (size_t k = ready.size() - g; k < ready.size(); ++k) {
                 const std::span<const float> feats = trees[static_cast<size_t>(ready[k])]->ch.features;
+                // install-before-read NET (ADR-0002): batched mode poisons ch.features to EMPTY at park; an
+                // empty row here = a missing install (driver bug) -> fail LOUD, never ship a malformed frame.
+                if (bf != nullptr && feats.empty()) {
+                    out.failed = true; out.err = "send_group: batched leaf row not installed (slot "
+                                                 + std::to_string(ready[k]) + ")"; return false;
+                }
                 buf.insert(buf.end(), feats.begin(), feats.end());   // concat the group's feature rows
                 group.push_back(ready[k]);
             }
@@ -418,7 +486,10 @@ void run_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env, cons
                 chocofarm::NetPrediction pred;
                 pred.value = reply->preds[j].value;
                 pred.logits = std::move(reply->preds[j].logits);
-                trees[static_cast<size_t>(i)]->resume_with(pred);            // advance to next leaf (or finish)
+                Slot& s = *trees[static_cast<size_t>(i)];
+                // BatchPredict: deferred mode resumes on the installed float64 row (byte-identical legal tail);
+                // else the cursor's own per-leaf row. The slot's own flag is the SSOT (don't re-derive from bf).
+                if (s.batched) s.resume_with_batched(pred); else s.resume_with(pred);   // -> next leaf or finish
                 out.leaves += 1;
                 if (!trees[static_cast<size_t>(i)]->running) advance(i);     // decision done -> step + re-park
                 ready.push_back(i);                                          // running again -> ready to send
@@ -442,7 +513,7 @@ void run_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env, cons
                 if (trees[static_cast<size_t>(i)]->running) active.push_back(i);
             }
             if (active.empty()) break;
-            if (!drive_round(*boundary, trees, active, coalesce_rows, in_dim, corr, out)) return;
+            if (!drive_round(*boundary, trees, active, coalesce_rows, in_dim, corr, bf, out)) return;
         }
     }
 }
@@ -464,17 +535,23 @@ void run_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env, cons
 // pipe shapes + the control gate) is reused (ADR-0012 P1). The search is bit-identical to the former
 // fiber's run_search (cpp/parity + gumbel_cursor_proto). The cpp/ fiber machinery (fiber_tree.hpp etc.)
 // is UNTOUCHED — it still backs the C++ runner / serve / wire-benches; only the PRODUCER retired it.
+// `batched` arms BatchPredict (lever #3): the factory builds each CursorSlot in DEFERRED-featurize mode and
+// run_episodic featurizes the K parked leaves in one batched belief sweep per RTT (BatchFeaturizer::
+// featurize_batch) instead of K per-leaf eval_build_features sweeps — the proven +13-15% producer-compute win
+// moved into the live driver. The factory's deferred flag and run_episodic's `batched` MUST agree (the slot
+// parks deferred iff the driver batches); both are driven by this one `batched` argument so they cannot drift.
 void run_thread_cursor_episodic(tlab::ThreadIndex idx, const chocofarm::Environment& env,
                                 const std::string& endpoint,
                                 const chocofarm::GumbelConfig& cfg, double run_seconds,
                                 tlab::wire::FeatureDim in_dim,
                                 int fibers_k, int coalesce_rows, const std::string& driver,
-                                int inflight_msgs, chocofarm::IssueController* ctl, ThreadStat& out) {
+                                int inflight_msgs, chocofarm::IssueController* ctl, bool batched,
+                                ThreadStat& out) {
     auto make = [&](int i) {
-        return std::make_unique<tlab::CursorSlot>(cfg, env, slot_table(i));
+        return std::make_unique<tlab::CursorSlot>(cfg, env, slot_table(i), /*deferred_featurize=*/batched);
     };
     run_episodic<tlab::CursorSlot>(idx, env, endpoint, run_seconds, in_dim, fibers_k,
-                                   coalesce_rows, driver, inflight_msgs, ctl, make, out);
+                                   coalesce_rows, driver, inflight_msgs, ctl, batched, make, out);
 }
 
 }  // namespace
@@ -487,6 +564,7 @@ int main(int argc, char** argv) {
                      "[--threads N --fibers K --msg-rows M --driver round-sync|greedy --seconds S --n-sims K --m M --in-dim D --episodic]\n"
                      "  --fibers 0 (default) = non-fiber SerialRuntime baseline; K>=1 = K cursor trees/thread (the multiplexed engine; requires --episodic)\n"
                      "  --engine cursor (default, only value) = the explicit-state TreeCursor (Option B); the stackful-fiber engine was retired from the producer (finding #34). Also via CHOCO_PRODUCER_ENGINE\n"
+                     "  --featurize batched (default) | per-leaf = BatchPredict lever #3: featurize the K parked leaves in ONE belief sweep/RTT (the +13-15% win) vs the per-leaf build. Multiplexed only. Also via CHOCO_PRODUCER_FEATURIZE\n"
                      "  --msg-rows M (default 1) = coalesce up to M round leaves per message (round-sync; the S_min floor)\n"
                      "  --driver round-sync (default) | greedy (keep ~K leaves continuously in flight)\n"
                      "  --inflight-msgs N (default 8) = greedy-episodic pipe depth (coalesced msgs in flight; round-sync ignores)\n"
@@ -547,6 +625,24 @@ int main(int argc, char** argv) {
                      "fiber path lives on in the C++ runner / serve / wire-benches. Got " << engine << ".\n";
         return 2;
     }
+    // --featurize batched (DEFAULT) | per-leaf: the BatchPredict lever (#3). batched = the K parked leaves
+    // are featurized TOGETHER in ONE mask-resident belief sweep per RTT (BatchFeaturizer::featurize_batch),
+    // the proven +13-15% producer-compute win (cpp/src/multiplexed_producer_compute_bench.cpp, bit-identical
+    // across K in {8,32,64}). per-leaf = each cursor builds its own row at park (eval_build_features — the
+    // historical path), kept selectable as the byte-unchanged A/B baseline. The rows are byte-IDENTICAL
+    // between the two (the deferred-featurize seam only moves WHERE the identical row is computed), so the
+    // decisions are identical — bit-identity inherited by construction from the mux bench's proof. Multiplexed
+    // (--fibers K>=1) only; the non-fiber baseline does B=1 per-leaf round-trips (no batch to form). Also
+    // settable via CHOCO_PRODUCER_FEATURIZE (flag overrides env overrides the default).
+    std::string featurize = "batched";
+    if (const char* f = std::getenv("CHOCO_PRODUCER_FEATURIZE")) featurize = f;
+    if (auto v = opt(args, "--featurize")) featurize = std::string(*v);
+    if (featurize != "batched" && featurize != "per-leaf") {
+        std::cerr << "tlab-real-producer: --featurize must be batched|per-leaf, got " << featurize << "\n";
+        return 2;
+    }
+    const bool batched_featurize = (featurize == "batched");
+
     // The cursor engine drives the EPISODIC production-shape multiplexed path; --fibers K>=1 therefore
     // requires --episodic (the former non-episodic root fiber drivers were retired with Option A). --fibers
     // 0 is the non-fiber SerialRuntime baseline (one tree/thread, engine irrelevant).
@@ -573,19 +669,19 @@ int main(int argc, char** argv) {
         std::cerr << "tlab-real-producer: --low-prio-nice must be an integer in [-20, 19]\n";
         return 2;
     }
-    // CLI ACL (ADR-0002 fail-loud): --n-sims / --m are core search-shape ints consumed straight into the
-    // core's typed GumbelConfig (n_sims/m are the core's raw-int fields — that typedef is the core's home, not
-    // tlab's; here the boundary VALIDATES rather than feeding a meaningless budget onward).
+    // CLI ACL (ADR-0002 fail-loud): --n-sims / --m are core search-shape ints VALIDATED here then wrapped into
+    // the core's typed GumbelConfig fields (SimBudget / CandidateCount — the core's home; the SearchRep ctor
+    // crossing happens at this CLI boundary, mirroring gumbel_cursor_proto / the mux producer-compute bench).
     chocofarm::GumbelConfig cfg;
     if (auto v = opt(args, "--n-sims")) {
         const int n = std::atoi(std::string(*v).c_str());
         if (n < 1) { std::cerr << "tlab-real-producer: --n-sims must be >= 1\n"; return 2; }
-        cfg.n_sims = n;
+        cfg.n_sims = chocofarm::SimBudget{static_cast<chocofarm::SearchRep>(n)};
     }
     if (auto v = opt(args, "--m")) {
         const int m = std::atoi(std::string(*v).c_str());
         if (m < 1) { std::cerr << "tlab-real-producer: --m must be >= 1\n"; return 2; }
-        cfg.m = m;
+        cfg.m = chocofarm::CandidateCount{static_cast<chocofarm::SearchRep>(m)};
     }
     cfg.no_early_exit = no_early_exit;   // HPO/benchmark-only: substitute Terminate so episodes run full
 
@@ -595,11 +691,12 @@ int main(int argc, char** argv) {
 
     std::cout << "tlab-real-producer: generator=real(" << (fibers > 0 ? "multiplexed" : "non-fiber")
               << ") engine=" << engine
+              << " featurize=" << (fibers > 0 ? featurize : std::string("per-leaf"))  // batch only forms in the multiplex
               << " driver=" << (fibers > 0 ? driver : std::string("n/a"))
               << " threads=" << threads.value() << " fibers_per_thread=" << fibers << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " inflight_msgs=" << inflight_msgs
-              << " seconds=" << seconds << " n_sims=" << cfg.n_sims << " m=" << cfg.m
+              << " seconds=" << seconds << " n_sims=" << cfg.n_sims.value() << " m=" << cfg.m.value()
               << " n_slots=" << chocofarm::n_action_slots(env).value() << " endpoint=" << *ep << "\n";  // SlotCount -> raw for print
 
     // Gate A (consolidation): optionally inject the control plane — a process-shared IssueController + an
@@ -637,7 +734,8 @@ int main(int argc, char** argv) {
     // thread count crosses to u64 here, at the /proc-sizing boundary.
     const std::uint64_t live_trees =
         static_cast<std::uint64_t>(threads.value()) * (fibers > 0 ? static_cast<std::uint64_t>(fibers) : 1ull);
-    const std::uint64_t per_tree = est_tree_resident_bytes(cfg.n_sims);
+    // SimBudget ACL: the resident model takes the raw search-shape int; cross the typed budget here.
+    const std::uint64_t per_tree = est_tree_resident_bytes(static_cast<int>(cfg.n_sims.value()));
     const std::uint64_t est_resident = live_trees * per_tree;
     std::cout << "tlab-real-producer: est_resident=" << (est_resident >> 20) << " MiB ("
               << live_trees << " live trees x " << (per_tree >> 10) << " KiB)\n";
@@ -646,7 +744,7 @@ int main(int argc, char** argv) {
         if (est_resident > *avail / kAvailHeadroomDivisor) {
             std::cerr << "tlab-real-producer: FATAL: estimated resident " << (est_resident >> 20)
                       << " MiB (" << live_trees << " live trees x " << (per_tree >> 10)
-                      << " KiB/tree at n_sims=" << cfg.n_sims << ") exceeds 50% of MemAvailable "
+                      << " KiB/tree at n_sims=" << cfg.n_sims.value() << ") exceeds 50% of MemAvailable "
                       << (*avail >> 20) << " MiB. Reduce --fibers, --threads, or --n-sims (resident scales "
                          "linearly with each). Refusing rather than risk an OOM SIGKILL mid-run.\n";
             return 1;
@@ -663,7 +761,7 @@ int main(int argc, char** argv) {
             const tlab::ThreadIndex tix{i};   // the 0-based producer-thread index (typed, distinct from the count)
             apply_thread_priority(tix, low_prio_thread, low_prio_nice);   // renice iff designated
             if (fibers > 0)   // validated above: cursor engine + --episodic (the multiplexed path)
-                run_thread_cursor_episodic(tix, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), stats[static_cast<size_t>(i)]);
+                run_thread_cursor_episodic(tix, env, endpoint, cfg, seconds, in_dim, fibers, msg_rows, driver, inflight_msgs, ctl.get(), batched_featurize, stats[static_cast<size_t>(i)]);
             else
                 run_thread(tix, env, endpoint, cfg, seconds, in_dim, stats[static_cast<size_t>(i)]);   // non-fiber baseline
         });
@@ -683,6 +781,7 @@ int main(int argc, char** argv) {
     const double dps = wall > 0 ? static_cast<double>(dec) / wall : 0.0;
     const double lps = wall > 0 ? static_cast<double>(leaves) / wall : 0.0;
     std::cout << "REAL-AGG threads=" << threads.value() << " fibers=" << fibers << " engine=" << engine
+              << " featurize=" << (fibers > 0 ? featurize : std::string("per-leaf"))
               << " msg_rows=" << msg_rows
               << " episodic=" << (episodic ? 1 : 0) << " no_early_exit=" << (cfg.no_early_exit ? 1 : 0)
               << " driver=" << (fibers > 0 ? driver : std::string("n/a")) << " wall_s=" << wall

@@ -63,16 +63,32 @@ struct CursorSlot {
     chocofarm::GumbelAZPolicy policy;
     chocofarm::CyclicGumbelSource src;
     std::optional<chocofarm::TreeCursor> cur;   // (re)constructed each decision (move-deleted -> optional)
-    CursorLeafView ch;                          // OUT: the parked leaf row (mirrors TreeState::ch.features)
+    CursorLeafView ch;                          // OUT: the parked leaf row (mirrors TreeState::ch.features);
+                                                //   per-leaf mode only — UNUSED in batched mode (see below)
     chocofarm::GumbelAZPolicy::Decision decision;
     bool running = false;                       // parked at a leaf (vs the decision finished)
+    bool batched = false;                       // BatchPredict (lever #3): if set, the cursor runs in
+                                                //   DEFERRED-featurize mode — it parks WITHOUT building its
+                                                //   per-leaf row, and the driver featurizes the K parked
+                                                //   leaves TOGETHER (one belief sweep per RTT instead of K)
+                                                //   then installs the batch-built row here. After
+                                                //   install_batched_row, ch.features points at row32_ — so
+                                                //   the driver's wire send path is byte-IDENTICAL across
+                                                //   engines (it always concats slot->ch.features).
+    std::vector<double> row64;                  // batched: the float64 featurized row (the resume_with_features
+                                                //   input — the cursor's eval_legal tail consumes float64,
+                                                //   exactly as the per-leaf eval_build_features does)
+    std::vector<float> row32;                   // batched: the float32 narrow the wire forwards (== what the
+                                                //   per-leaf path narrows from ch.features before send)
 
     // The scripted (RNG-free) ctor — mirrors TreeState's scripted ctor: `table` scripts the
     // CyclicGumbelSource draws. The producer rotates the table per slot so the K trees differ, exactly as
-    // the fiber path does.
+    // the fiber path does. `deferred_featurize` arms BatchPredict (lever #3): the cursor skips its per-leaf
+    // feature build at every park, and the driver builds the rows in one batched belief sweep per RTT (the
+    // same seam the mux producer-compute bench proved bit-identical — cpp/src/multiplexed_producer_compute_bench.cpp).
     CursorSlot(const chocofarm::GumbelConfig& cfg, const chocofarm::Environment& env,
-               std::vector<double> table)
-        : policy(cfg, leaf_port(), env), src(env, std::move(table)) {}
+               std::vector<double> table, bool deferred_featurize = false)
+        : policy(cfg, leaf_port(), env), src(env, std::move(table)), batched(deferred_featurize) {}
 
     // Move-deleted (owns a move-deleted TreeCursor that captures references into THIS slot's `src`).
     CursorSlot(const CursorSlot&) = delete;
@@ -88,12 +104,44 @@ struct CursorSlot {
     void start(const chocofarm::Loc& loc, const chocofarm::Belief& bw,
                const chocofarm::CollectedSet& coll, double lam) {
         cur.emplace(policy, loc, bw, coll, lam, src);
+        if (batched) cur->enable_deferred_featurize();  // lever #3: skip the per-leaf build; the driver batches
         apply_step(cur->advance());
     }
 
     // Feed the driver-evaluated leaf back and advance to the next leaf (or finish). Mirrors
-    // TreeState::resume_with — the driver calls it identically across engines.
+    // TreeState::resume_with — the driver calls it identically across engines (PER-LEAF mode).
     void resume_with(const chocofarm::NetPrediction& pred) { apply_step(cur->resume(pred)); }
+
+    // ---- BatchPredict (lever #3) seam: the deferred-featurize triple + the row-resume -------------------
+    // These mirror the TreeCursor's deferred-featurize members (gumbel_cursor.hpp) one-to-one, exposing them
+    // through the slot ACL so the driver can collect the K parked leaves' (loc, bw, collected) into a
+    // BatchLeaf vector, featurize them ONCE per RTT (BatchFeaturizer::featurize_batch), and resume each slot
+    // with its batch-built row. Valid ONLY in batched mode (asserted by the cursor); the parked triple is
+    // valid only while `running` (between this slot's park and its resume_with_features), exactly as
+    // TreeCursor::parked_* documents. The row crossed back must be THIS slot's length-dim() featurized row.
+    [[nodiscard]] const chocofarm::Loc& parked_loc() const { return cur->parked_loc(); }
+    [[nodiscard]] const chocofarm::Belief& parked_belief() const { return cur->parked_belief(); }
+    [[nodiscard]] const chocofarm::CollectedSet& parked_collected() const { return cur->parked_collected(); }
+
+    // Install the batch-built float64 row for THIS slot's parked leaf (called once per RTT after
+    // featurize_batch). Stores the float64 row (kept for resume_with_features) AND its float32 narrow, then
+    // points ch.features at the narrow — so the driver's wire send concats slot->ch.features UNCHANGED across
+    // engines (the float32 row is byte-identical to what the per-leaf cursor would have produced; the mux
+    // bench proves it). The float64 row outlives the send→reply window (it lives in this slot, parked).
+    void install_batched_row(std::span<const double> row) {
+        row64.assign(row.begin(), row.end());
+        row32.assign(row.begin(), row.end());                 // double -> float32 (the wire dtype)
+        ch.features = std::span<const float>(row32.data(), row32.size());
+    }
+
+    // Resume a batched (deferred-featurize) park with the installed float64 row + its prediction. Runs the
+    // byte-identical legal-slots tail (eval_legal_from_features) then proceeds exactly as resume_with — so the
+    // BATCHED arm is bit-identical to PER-LEAF (the seam the mux bench proved bit-identical). Uses row64
+    // (installed above), NOT row32: the legal-slots tail consumes the float64 row, exactly as the per-leaf
+    // eval_build_features does (the float32 narrow is only the wire's; precision seams unchanged).
+    void resume_with_batched(const chocofarm::NetPrediction& pred) {
+        apply_step(cur->resume_with_features(std::span<const double>(row64.data(), row64.size()), pred));
+    }
 
   private:
     // The leaf the policy holds is irrelevant for the cursor (TreeCursor never calls policy.net_ — it parks
@@ -115,9 +163,19 @@ struct CursorSlot {
 
     // Translate a Step into the imperative surface: NeedsLeaf -> running + expose the features; Decided ->
     // not running + capture the decision (the driver then reads `decision` + steps the episode).
+    //
+    // BatchPredict (lever #3) — the install-before-read NET (ADR-0000 make-the-illegal-state-unrepresentable
+    // + ADR-0002 fail-loud): in DEFERRED mode the cursor parks WITHOUT building its row, so the span the Step
+    // carries (the cursor's ws_.feat32) is STALE — the previous leaf's row, or empty on the first park. If the
+    // driver ever forwarded THAT, it would silently send a wrong row. So here, in batched mode, we POISON
+    // ch.features to an EMPTY span: it is non-empty ONLY after install_batched_row writes the batch-built row.
+    // A missed install therefore ships a zero-length row, which the wire/recv size-match guard rejects LOUDLY
+    // (a B-vs-preds mismatch) rather than corrupting a decision — the illegal "send an uninstalled batched
+    // row" state is made structurally visible, not left to the two drivers' hand-matched call ordering.
     void apply_step(const chocofarm::Step& st) {
         if (std::holds_alternative<chocofarm::CursorNeedsLeaf>(st)) {
-            ch.features = std::get<chocofarm::CursorNeedsLeaf>(st).features;
+            ch.features = batched ? std::span<const float>{}                               // poison: install required
+                                  : std::get<chocofarm::CursorNeedsLeaf>(st).features;     // per-leaf: the cursor's own row
             running = true;
         } else {
             decision = std::get<chocofarm::CursorDecided>(st).decision;

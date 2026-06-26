@@ -103,7 +103,9 @@ int main(int argc, char** argv) {
     }
 
     chocofarm::GumbelConfig cfg;
-    cfg.n_sims = n_sims;
+    // SimBudget ACL: n_sims is a validated CLI int wrapped into the core's typed SimBudget field here (the
+    // SearchRep ctor crossing, as gumbel_cursor_proto / real_producer do at the same boundary).
+    cfg.n_sims = chocofarm::SimBudget{static_cast<chocofarm::SearchRep>(n_sims)};
     chocofarm::SearchTask t;
     t.loc = chocofarm::Loc{env.entry_point()};
     t.bw = env.full_belief();
@@ -120,7 +122,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "tlab-real-gen-smoke: OK  n_slots=" << n_slots
-              << "  n_sims=" << cfg.n_sims
+              << "  n_sims=" << cfg.n_sims.value()
               << "  leaf_requests=" << (*out)[0].leaf_requests.value() << "\n";  // SimBudget -> raw for print
     return 0;
 }
