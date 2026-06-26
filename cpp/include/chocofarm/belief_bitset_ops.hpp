@@ -40,7 +40,11 @@ namespace chocofarm {
 // 1 word/cyc while vpshufb does 4 words/instr across ports. Build is -march=native (AVX2); the
 // [[gnu::target("avx2")]] makes the codegen explicit + inlinable into the (also-native) callers. popcount is
 // EXACT + order-independent, so these return the SAME integer count as the old scalar loop — bit-identical
-// belief_features / count_ (the belief-sweep oracle nets it byte-for-byte). ----
+// belief_features / count_ (the belief-sweep oracle nets it byte-for-byte). COMPILE-TIME GATED on __AVX2__:
+// on a non-AVX2 target the whole kernel is absent and popcount_*() use the scalar std::popcount fallback
+// (byte-identical counts — popcount is exact + order-independent), so older hardware compiles + runs correctly,
+// just without the speedup. ----
+#ifdef __AVX2__
 namespace detail {
 // nibble-LUT popcount of 4x uint64 lanes, horizontally summed per 64-bit lane (sad_epu8).
 [[gnu::target("avx2")]] inline __m256i popcnt256(__m256i v) {
@@ -79,17 +83,31 @@ namespace detail {
     return s;
 }
 }  // namespace detail
+#endif  // __AVX2__
 
 // popcount over the whole belief — the cached count_'s definition (recompute count_ after a filter).
 [[nodiscard]] inline WorldCount popcount_all(std::span<const uint64_t> bits) {
+#ifdef __AVX2__
     return WorldCount{static_cast<WorldCountRep>(detail::pc_all_avx2(bits.data(), bits.size()))};
+#else
+    WorldCountRep s = 0;  // scalar fallback (non-AVX2 target) — byte-identical to the AVX2 kernel
+    for (uint64_t w : bits) s += static_cast<WorldCountRep>(std::popcount(w));
+    return WorldCount{s};
+#endif
 }
 
 // popcount(belief & mask): the masked overlap count — marginals[t]=Σ_w bit_t(w), the detector cover cnt[j],
 // the informative split test. AVX2 vpshufb kernel (the de-risk +74% lever); bits/mask are exactly kW64
 // words by construction; bit-identical to the prior scalar loop (popcount exact + order-independent).
 [[nodiscard]] inline WorldCount popcount_and(std::span<const uint64_t> bits, std::span<const uint64_t> mask) {
+#ifdef __AVX2__
     return WorldCount{static_cast<WorldCountRep>(detail::pc_and_avx2(bits.data(), mask.data(), bits.size()))};
+#else
+    WorldCountRep s = 0;  // scalar fallback (non-AVX2 target) — byte-identical to the AVX2 kernel
+    const std::size_t W = bits.size();
+    for (std::size_t w = 0; w < W; ++w) s += static_cast<WorldCountRep>(std::popcount(bits[w] & mask[w]));
+    return WorldCount{s};
+#endif
 }
 
 // The r-th set bit's GLOBAL index (0-based world RANK): scan words, early-exit on the containing word,
