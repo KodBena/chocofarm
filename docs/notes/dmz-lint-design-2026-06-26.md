@@ -57,4 +57,32 @@ typed / DMZ / NOLINT'd, the gate goes green and wires into CI (flag-mode, never 
 core — `modernize-loop-convert`'s autofix can reorder float accumulation; conversions are reviewed + pass the
 byte-for-byte oracle).
 
+## Amendment 2026-06-26 — final dispositions: all 11 FIELD holdouts resolved, gate GREEN (exit 0)
+
+The 11 raw-int FIELD holdouts the table above projected were resolved (the phantom-typing completion
+mandate, branch `feat/tlab-phantom-counts`). The **expectation was WRONG in its key prediction**: the
+loop-mod evidence led the table to expect "most hot-adjacent ones will regress → `NOLINT(perf)`." In the
+event, **every hot field typed neutral-or-FASTER** — none regressed, so there is not a single `NOLINT(perf)`
+on the list. The deep lesson held: the loop-mod regression was the COUNTER IDIOM in the per-WORLD hot loop
+(`belief_features`), not stored values read in compares/bounds nor cursors that step per-candidate. The full
+per-field evidence (bit-identity + the A/B numbers) is in `docs/notes/phantom-mandate-ledger-2026-06-26.md`.
+
+| field | final disposition (commit) |
+| --- | --- |
+| `env.hpp` `entry_idx_` | TYPED `TeleportId` (`600dc9b`, cold) |
+| `gumbel.hpp` `Decision::n_spent` | TYPED `SimBudget` (`600dc9b`, cold) |
+| `gumbel.hpp` `Decision::survivor_slot` | TYPED `std::optional<SlotIndex>` — `-1` sentinel killed (`600dc9b`, cold) |
+| `env.hpp` `BitsetBelief::count_` | TYPED `WorldCount` — A/B cursor -0.49% / direct -1.14%, both faster (`8031bd6`) |
+| `env.hpp` `BitsetBelief::kw64_` | TYPED `WordCount` (`8031bd6`) |
+| `env.hpp` `Environment::kW64_` | TYPED `WordCount` (`8031bd6`) |
+| `gumbel.hpp` `GumbelConfig::m`/`n_sims`/`c_outcome`/`max_depth` | TYPED `CandidateCount`/`SimBudget`/`OutcomeIndex`/`PlyDepth` — NOT a merged `SearchBudget` (the existing domains are right-grained); A/B cursor -0.33% / direct neutral (`aa63507`) |
+| `gumbel_cursor.hpp` `DescendFrame::node` | TYPED `NodeIndex` (new domain; also `GumbelNode::children` value + run_search locals); A/B neutral (`dac3c5b`) |
+| `gumbel_cursor.hpp` `sh_rr_`/`sh_phase_idx_` | TYPED `OutcomeIndex` (the documented affine-cursor domain); A/B neutral (`dac3c5b`) |
+| `features.hpp` `belief_cache_n_`/`belief_cache_cap_` | `NOLINT(dmz)` — generic cache-residency count/capacity, no class at stake (ADR-0000 over-typing carve; out-of-frame review confirmed) (`6c0c66c`) |
+
+The two NOLINTs are `NOLINT(dmz: ...)` (no-class / generic-capacity), NOT `NOLINT(perf)`. The earlier
+`NOLINT(dmz)` config-knob markers (`375fd51`) were REPLACED by real types (`aa63507`); the
+`Action.i` dual-domain seam and `releasing_arena.hpp` byte-size boundaries remain `NOLINT(dmz)` boundaries
+as the table above filed them (not FIELD holdouts on the worklist). `tools/lint/dmz-lint.sh` now exits 0.
+
 Public Domain (The Unlicense).
