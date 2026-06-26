@@ -69,8 +69,8 @@ class MmapUpstream final : public std::pmr::memory_resource {
     // self-describing (munmaps the exact length) regardless of the requested bytes pmr replays. We over-
     // align the returned pointer to the requested alignment within the first page.
     struct Header {
-        std::size_t map_len;  // total munmap length (header + payload, page-rounded)
-        std::size_t pad;      // keep the header a 2-word (16B) unit so payload start is 16-aligned
+        std::size_t map_len;  // total munmap length — NOLINT(dmz: mmap/pmr byte length, allocator boundary)
+        std::size_t pad;      // 16B-unit pad — NOLINT(dmz: alignment pad bytes, allocator boundary)
     };
 
     void* do_allocate(std::size_t bytes, std::size_t alignment) override {

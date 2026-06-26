@@ -196,7 +196,7 @@ inline constexpr std::size_t kTargetMaskCacheBudgetBytes = 128 * 1024;
 enum class ActionKind { Treasure, Detector, Terminate };
 struct Action {
     ActionKind kind = ActionKind::Terminate;
-    int i = -1;  // treasure id (Treasure) or face id (Detector); -1 for Terminate
+    int i = -1;  // treasure id XOR face id — NOLINT(dmz: dual-domain Action.i seam; Action reshape filed)
     bool operator==(const Action& o) const { return kind == o.kind && i == o.i; }
 };
 inline Action terminate_action() { return Action{ActionKind::Terminate, -1}; }

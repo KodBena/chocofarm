@@ -87,13 +87,13 @@ namespace chocofarm {
 // out of the scalar config. Defaults match the Python defaults: m=12, n_sims=48, c_puct=1.25,
 // c_visit=50, c_scale=1.0, c_outcome=2, max_depth=24.
 struct GumbelConfig {
-    int m = 12;            // root actions sampled by Gumbel-Top-k
-    int n_sims = 48;       // simulations spent by Sequential Halving (the full budget)
+    int m = 12;            // root actions — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
+    int n_sims = 48;       // SH budget — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
     double c_puct = 1.25;  // PUCT exploration constant
     double c_visit = 50.0; // the Danihelka σ-transform visit prefactor (c_visit + max_a N(a))
     double c_scale = 1.0;  // the Danihelka σ-transform scale
-    int c_outcome = 2;     // immediate-outcome determinizations averaged per root-action sim
-    int max_depth = 24;    // interior descent depth cap
+    int c_outcome = 2;     // outcome determinizations — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
+    int max_depth = 24;    // descent depth cap — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
     // HPO/BENCHMARK-ONLY (default false → production search byte-unchanged). When true, the search runs
     // EXACTLY as normal (Gumbel-Top-k, Sequential Halving, the early-exit Terminate edge SAMPLED and
     // BACKPROPPED correctly) — but if the chosen EXECUTED action is Terminate AND a non-terminate legal
