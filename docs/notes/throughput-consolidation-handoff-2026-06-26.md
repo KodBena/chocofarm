@@ -17,7 +17,7 @@ The target was `belief_features`, the ~55% producer hotspot. Four levers were pu
 | lever | result (% faster = higher better) | bit-identity | status |
 | --- | --- | --- | --- |
 | **AVX2 popcount** | producer compute ~25% less time (≈34% faster), scalar→vpshufb | byte-identical | consolidated, gated |
-| **#3 batched featurizer** | featurizer +27%; producer-compute +22–25% (mux); ~+13–15% est; **e2e +5% vs CPU JAX (measured)** | byte-identical | consolidated + integrated |
+| **#3 batched featurizer** | featurizer +27%; producer-compute +22–25% (mux); ~+13–15% est; ~~**e2e +5% vs CPU JAX (measured)**~~ **⚠ SUPERSEDED — wrong config; see [Amendment A](#amendment-a-2026-06-26-same-day--canonical-config-correction--the-snag): +0.0% e2e at the canonical config (server-bound) / +35.5% generation (server-unbound)** | byte-identical | consolidated + integrated |
 | **#1 fused-JAX** | featurization parity f64-exact / f32 ≤1e-6; 2.02× wire | f64 exact, f32 behavioral | **staged** (not consolidated) |
 | **ZDD belief engine** | full search 10.5× slower (construction-bound) | n/a | killed |
 
@@ -76,6 +76,13 @@ throughput number was then deferred to "the GPU" — which conflated two things:
 the GPU) vs. maximizing #3's realized win (does benefit from a cheaper net). #1 is the only lever that
 *needs* a server change (it ships beliefs, not features → the server must featurize); that's why #1 has its
 own `featurize_predict.py`. #1 is staged, so it doesn't bear on the #3 e2e.
+
+> **⚠ SUPERSEDED 2026-06-26 (same day) — see [Amendment A](#amendment-a-2026-06-26-same-day--canonical-config-correction--the-snag).** The table below was
+> taken at a NON-canonical config (`msg-rows=1`, `n_sims=48`, `fibers=32`) and read the unreliable `dec/s`
+> counter. At the real canonical config (hp SSOT: `n_sims=256`, `msg-rows=256`, `K=1024`) the e2e delta is
+> **+0.0%** (server-bound) and the true generation win, measured server-unbound, is **+35.5%**. The numbers
+> below are preserved as the point-in-time record of the error, not as a result. The boundedness *reasoning*
+> stands; only this measurement of it was wrong.
 
 **Measured today (CPU JAX server, no GPU, `--net ""` random weights, core-0 server / core-3 producer):**
 
@@ -176,6 +183,75 @@ Start from `feat/tlab-throughput`.
 1. Copy `server/server.py`; set the JAX default device to the RTX 2080Ti; IPC→TCP ZMQ; repoint URIs.
 2. Sample pure VM↔host ZMQ latency (TCP loopback vs cross-boundary).
 3. Run the boundedness / linear-latency study (§3) — batched vs per-leaf at each latency point.
-4. Expectation to TEST (not assume): #3's e2e win grows from ~+5% (CPU JAX, partially server-bound) toward
-   ~+13–15% (compute ceiling) as the GPU cheapens the net; added VM↔host latency pushes it back toward
-   server-bound. Whether throughput falls *linearly* in added latency is the open question this study answers.
+4. Expectation to TEST (not assume): #3's e2e win grows from ~0% (CPU JAX, fully server-bound — see
+   Amendment A) toward the ~+35% generation ceiling as the GPU cheapens the net; added VM↔host latency
+   pushes it back toward server-bound. Whether throughput falls *linearly* in added latency is the open
+   question this study answers.
+
+---
+
+## Amendment A (2026-06-26, same day) — canonical-config correction + the snag
+
+*Appended per ADR-0005 Rule 8 (amend by append; the superseded figures above are left in place as the
+point-in-time record of the error — the error is itself the lesson). This amendment supersedes the §1 #3-row
+e2e cell and the §3 "Measured today" table.*
+
+### A.1 The corrected measurement (the real canonical config)
+
+The canonical operating point is **not** any script's arg defaults — it is resolved from the **hp SSOT**
+(`hp/spec.BANKED_TOPOLOGY` + `hp/spec.BANKED_STATIC`) and exercised by `episodic_dps.sh` (the default DPS
+tool, which auto-records to `throughput_research`) and `ksweep.sh`. It is: **episodic, `n_sims=256`, `m=24`,
+`msg-rows=256`, `max-batch=256`, warmup `[64,256]`, `inflight=8`, `driver=greedy`, `K` up to 1024, 10 s.**
+
+A/B of the two producer binaries at this config — baseline `37075c3` (no AVX2, no #3) vs consolidation
+`7f183dd` — interleaved replicates, median + bootstrap 95% CI, all readings stamped + recorded to the DB:
+
+| regime | bottleneck | baseline (leaf-rows/s) | consolidation (leaf-rows/s) | delta |
+| --- | --- | --- | --- | --- |
+| `--forward jax` (canonical, n=8) | server (~126k single-core serve ceiling) | 126,322 | 126,323 | **+0.0%** (CI [−3.1%, +4.7%]) |
+| `--forward null` (pure generation, n=6) | producer generation | 162,790 | 220,620 | **+35.5%** (CI [+34.9%, +36.7%]) |
+
+DB tags: `ab_base_37075c3` / `ab_consol_7f183dd` (jax), `ab_nullfwd_base` / `ab_nullfwd_consol` (null).
+
+**Why +0% e2e is the *expected*, correct result here, not a failure of the win.** The jax server caps at
+~126k leaf-rows/s — which is *below even the baseline's* 162.8k generation rate. So at the canonical config
+the server is the sole bottleneck in **both** arms; the producer-side wins have no room to express. Remove
+the server ceiling (`--forward null`, server util ~1%) and the full win appears: **+35.5%**. Cross-check:
+the AVX2 lever alone (−25.5% producer time) predicts `1/(1−0.255) = +34.2%` throughput; we measure +35.5%
+(the rest is #3). The producer-level numbers and the end-to-end generation number agree — the win is real
+and large; it was simply latent under the server ceiling.
+
+### A.2 The snag — RCA and how to avoid it (the reason this amendment exists)
+
+Two compounding errors produced the bogus "+5% e2e":
+
+1. **Config provenance not verified.** The "+5%" was measured at `msg-rows=1, n_sims=48, fibers=32` — a
+   pathological point (`msg-rows=1` forces the B=1 wire regime nobody runs). It was then mislabelled "the
+   canonical bench" by citing the *arg defaults* of `throughput-lab/harness/run_real_best.sh` — a helper
+   script that was itself **agent-authored** (commit `6bfabad`, carries a `Co-Authored-By: Claude` trailer),
+   whose `K=128/n_sims=24` defaults are placeholders the maintainer never invokes.
+2. **An unreliable metric.** `dec/s` (DPS) in the episodic producer increments only when a fiber's *entire*
+   `n_sims`-deep decision completes (`real_producer.cpp` `advance()`, gated on `!running`). At `n_sims=256`
+   in a 10 s window almost none complete cleanly, so the DB logs `dps=0` in **roughly half** of all
+   historical runs at the exact canonical config, and otherwise jumps between 153/175/219. **`leaf_rows_s`
+   is the stable canonical throughput metric; DPS is not.**
+
+**How to avoid (mechanizable, ADR-0000/0011):**
+
+- **Resolve the config from the SSOT, never from a script's defaults.** `episodic_dps.sh` already does this
+  (`topology_enum.py --banked-env`, `hp.cli --banked-static-env`); use it / `ksweep.sh` rather than
+  hand-rolled args. Treat any `K`/`n_sims` not traceable to `hp/spec.BANKED_*` as suspect.
+- **Report `leaf_rows_s`, not `dec/s`,** for episodic throughput. (A latent net for the DPS counter: if it
+  reads 0 while leaves flow, fail loud rather than record a 0 — a follow-up.)
+- **Establish boundedness *before* quoting an e2e delta.** A producer-compute win shows in throughput only
+  when generation-bound. Run BOTH `--forward null` (generation-bound — does the win exist?) and
+  `--forward jax` (server-bound — does it express here?). +0% at jax with +35.5% at null is the complete,
+  honest story; either number alone misleads.
+- **Multiple interleaved replicates + median/bootstrap-CI,** never a 2-run mean (the original "134.1, 134.1"
+  was both off-config and under-powered). cf. `robust-benchmark-statistics`.
+
+### A.3 Branch-state correction
+
+§5 cites the consolidation tip as `@ ef49818` (the #3-integration commit); the current tip is **`7f183dd`**.
+The main worktree (`/home/bork/w/vdc/1/chocofarm`) has been moved onto `feat/tlab-throughput @ 7f183dd` and
+the producer rebuilt there (core `chocofarm_core` + `tlab-real-producer`) as the GPU-session starting point.
