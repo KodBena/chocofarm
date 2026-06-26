@@ -141,11 +141,15 @@ int main(int argc, char** argv) {
     // --- compare: executed action slot, improved-pi argmax, n_spent ---
     const bool exec_ok = (direct.action == fib.action);
     const bool argmax_ok = (argmax(direct.improved) == argmax(fib.improved));
-    const bool nspent_ok = (direct.n_spent == fib.n_spent);
-    std::cout << "direct:  survivor_slot=" << direct.survivor_slot << " argmax=" << argmax(direct.improved)
-              << " n_spent=" << direct.n_spent << "\n";
-    std::cout << "fibered: survivor_slot=" << fib.survivor_slot << " argmax=" << argmax(fib.improved)
-              << " n_spent=" << fib.n_spent << " (leaves via fiber=" << leaves << ")\n";
+    const bool nspent_ok = (direct.n_spent == fib.n_spent);  // SimBudget == SimBudget
+    // .value() at the ostream boundary; the optional<SlotIndex> renders its slot or -1 for "no survivor".
+    auto slot_str = [](const std::optional<chocofarm::SlotIndex>& s) {
+        return s ? static_cast<int>(s->value()) : -1;
+    };
+    std::cout << "direct:  survivor_slot=" << slot_str(direct.survivor_slot) << " argmax=" << argmax(direct.improved)
+              << " n_spent=" << direct.n_spent.value() << "\n";
+    std::cout << "fibered: survivor_slot=" << slot_str(fib.survivor_slot) << " argmax=" << argmax(fib.improved)
+              << " n_spent=" << fib.n_spent.value() << " (leaves via fiber=" << leaves << ")\n";
 
     if (exec_ok && argmax_ok && nspent_ok) {
         std::cout << "RESULT: PASS (executed/argmax/n_spent identical, " << leaves

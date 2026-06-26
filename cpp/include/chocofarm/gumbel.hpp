@@ -66,6 +66,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory_resource>
+#include <optional>
 #include <random>
 #include <tuple>
 #include <unordered_map>
@@ -303,18 +304,20 @@ class GumbelAZPolicy final : public Policy {
     // exploits). Runs the full Gumbel search from a FIXED (loc, belief, collected) and returns
     // (executed_action, improved_pi). Mirrors GumbelAZSearch._decide_root (temperature 0). Exposed for
     // the logic-check fixture so the structure + selection logic is validated independent of RNG.
-    // Decision is a CROSS-FILE wire/contract value: its fields are read as raw int by out-of-scope
-    // consumers (search_runtime.cpp's to_decision, the *_proto.cpp / *_runtime_check.cpp parity asserts +
-    // std::cout, runner_wire_batched.cpp). n_spent is a SimBudget and survivor_slot a SlotIndex by DOMAIN
-    // (-1 = "no survivor", the empty-belief / unreachable contract path), but the public field types stay
-    // raw int so those out-of-scope readers are unbroken (ADR-0004 minimal-touch; ADR-0012 P8 — the SSOT
-    // signature here is bounded by the consumers this header cannot edit). The crossing to the typed
-    // SlotIndex/SimBudget is at the internal use sites in gumbel.cpp/gumbel_cursor.cpp.
+    // Decision is a CROSS-FILE wire/contract value (read by search_runtime.cpp's to_decision, the
+    // *_proto.cpp / *_runtime_check.cpp parity asserts + std::cout, runner_wire_batched.cpp). Its count/slot
+    // fields now carry their DOMAINS directly (ADR-0000 / ADR-0012 P8 — the typed signature IS the SSOT):
+    // n_spent is a SimBudget (sims spent = n_sims when bw non-empty) and survivor_slot a
+    // std::optional<SlotIndex> — the former `-1 = no survivor` sentinel is now typed absence (ADR-0002:
+    // make the "no survivor" state unrepresentable as a negative slot, the empty-belief / unreachable
+    // contract path). The internal producers (gumbel.cpp / gumbel_cursor.cpp) assign the typed values with
+    // no cast; the only crossings are the named .value() at the ostream prints in the proto/dump tools and
+    // search_runtime's to_decision (a now-trivial pass-through). All in-tree consumers are in scope.
     struct Decision {
         Action action;                 // the executed action (the SH survivor at temperature 0)
         std::vector<double> improved;  // (n_slots,) improved-π target (softmax of completed logits)
-        int n_spent = 0;               // total root-action sims spent (= n_sims when bw non-empty) — SimBudget
-        int survivor_slot = -1;        // the SH survivor slot (the executed action's slot) — SlotIndex, -1 = none
+        SimBudget n_spent{0};          // total root-action sims spent (= n_sims when bw non-empty)
+        std::optional<SlotIndex> survivor_slot;  // the SH survivor slot, or nullopt = "no survivor" (typed absence)
     };
     [[nodiscard]] Decision run_search(const Loc& loc, const Belief& bw,
                                       const CollectedSet& collected, double lam,

@@ -19,13 +19,13 @@ namespace chocofarm {
 namespace {
 // Map the search's full Decision (action + improved-π in double + n_spent) onto the runtime Decision
 // (improved-π narrowed to float32, the wire/trainer dtype), stamping the per-decision leaf-request count.
-// Shared by both runtimes so the mapping has one home (P1). `dec.n_spent` is the gumbel Decision's raw int
-// (kept raw at that boundary for std::cout); it crosses into the SimBudget domain via the explicit ctor.
+// Shared by both runtimes so the mapping has one home (P1). `dec.n_spent` is now the gumbel Decision's
+// SimBudget directly (the cross-file field carries its domain), so this is a same-domain pass-through.
 [[nodiscard]] Decision to_decision(const GumbelAZPolicy::Decision& dec, SimBudget leaf_requests) {
     Decision d;
     d.executed = dec.action;
     d.improved_pi.assign(dec.improved.begin(), dec.improved.end());  // double -> float32
-    d.n_spent = SimBudget{static_cast<SearchRep>(dec.n_spent)};      // gumbel raw int -> SimBudget (ACL)
+    d.n_spent = dec.n_spent;                                         // SimBudget -> SimBudget (same domain)
     d.leaf_requests = leaf_requests;                                 // already the counter's SimBudget
     return d;
 }

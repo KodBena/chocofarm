@@ -621,8 +621,8 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
         out.action = terminate_action();
         out.improved.assign(static_cast<size_t>(n_slots_.value()), 0.0);
         out.improved[static_cast<size_t>(term_slot_.value())] = 1.0;
-        out.survivor_slot = static_cast<int>(term_slot_.value());  // ACL: Decision field is raw int
-        out.n_spent = 0;
+        out.survivor_slot = term_slot_;  // typed SlotIndex (the empty-belief Terminate survivor)
+        out.n_spent = SimBudget{0};
         return out;
     }
 
@@ -668,18 +668,18 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
     for (int i = 0; i < m; ++i) considered.push_back(scored[static_cast<size_t>(i)].second);
 
     // Sequential Halving over n_sims; returns the surviving slot (the executed action at temperature 0).
-    // n_spent is a SimBudget internally; assign to the raw-int Decision field at the boundary below.
+    // n_spent is a SimBudget; Decision.n_spent is now the SAME domain (no cast at the store).
     SimBudget n_spent{0};
     SlotIndex survivor = sequential_halving(nodes, loc, bw, collected, lam, src, considered, g, logits,
                                             n_spent);
-    out.n_spent = static_cast<int>(n_spent.value());  // ACL: Decision.n_spent is raw int
+    out.n_spent = n_spent;
 
     // the improved-π target over the FULL legal set.
     out.improved = improved_policy(nodes[0], logits);
 
     // executed action = the SH survivor (Danihelka §2; temperature 0). The temperature>0 sampling path
     // is a 1b/production concern; 1a's logic check is temperature 0 (the eval policy's rule).
-    out.survivor_slot = static_cast<int>(survivor.value());  // ACL: Decision field is raw int
+    out.survivor_slot = survivor;  // typed SlotIndex (the SH survivor; was a raw-int store)
     out.action = action_of_slot(env_, survivor);
 
     // HPO/BENCHMARK-ONLY no-early-exit substitution (cfg_.no_early_exit, default false → this whole block
@@ -707,7 +707,7 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
             }
         }
         if (best_slot.has_value()) {  // a non-terminate legal action exists → continue the episode on it
-            out.survivor_slot = static_cast<int>(best_slot->value());  // ACL: Decision field is raw int
+            out.survivor_slot = best_slot;  // typed SlotIndex (the substituted survivor)
             out.action = action_of_slot(env_, *best_slot);
         }
         // else: no non-terminate legal action (only term_slot_ legal) → leave Terminate; the episode

@@ -66,8 +66,8 @@ Step TreeCursor::advance() {
             decision_.action = terminate_action();
             decision_.improved.assign(static_cast<size_t>(n_slots_.value()), 0.0);
             decision_.improved[static_cast<size_t>(term_slot_.value())] = 1.0;
-            decision_.survivor_slot = static_cast<int>(term_slot_.value());  // ACL: Decision field raw int
-            decision_.n_spent = 0;
+            decision_.survivor_slot = term_slot_;  // typed SlotIndex (empty-belief Terminate survivor)
+            decision_.n_spent = SimBudget{0};
             phase_ = Phase::Done;
             return CursorDecided{decision_};
         }
@@ -117,7 +117,7 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
         // SH bracket init (mirrors sequential_halving's head).
         n_spent_ = SimBudget{0};
         if (considered_.empty()) {  // unreachable on a non-empty belief, kept for the contract
-            decision_.survivor_slot = -1;  // raw-int Decision field (the unreachable "no survivor")
+            decision_.survivor_slot = std::nullopt;  // typed absence (the unreachable "no survivor")
             finalize();
             phase_ = Phase::Done;
             return CursorDecided{decision_};
@@ -245,7 +245,7 @@ Step TreeCursor::drive() {
                 continue;
             }
             // done: survivor is considered_[0].
-            decision_.survivor_slot = static_cast<int>(considered_[0].value());  // ACL: Decision field raw int
+            decision_.survivor_slot = considered_[0];  // typed SlotIndex (the lone-survivor fast path)
             finalize();
             phase_ = Phase::Done;
             return CursorDecided{decision_};
@@ -344,7 +344,7 @@ Step TreeCursor::drive() {
             continue;
         }
         // SH complete: survivor is considered_.front().
-        decision_.survivor_slot = static_cast<int>(considered_.front().value());  // ACL: Decision field raw int
+        decision_.survivor_slot = considered_.front();  // typed SlotIndex (the SH survivor)
         finalize();
         phase_ = Phase::Done;
         return CursorDecided{decision_};
@@ -471,13 +471,13 @@ void TreeCursor::on_sim_complete(double ret) {
 
 // ---- finalize: improved-π + executed action + the no-early-exit substitution ----------------------
 void TreeCursor::finalize() {
-    decision_.n_spent = static_cast<int>(n_spent_.value());  // ACL: Decision.n_spent is raw int
+    decision_.n_spent = n_spent_;  // SimBudget -> the SAME domain (no cast at the store)
     decision_.improved = p_.improved_policy(nodes_[0], root_logits_);
-    // survivor_slot is the raw-int Decision field set by drive()/resume(); cross back to SlotIndex for the
-    // bijection lookup. It is never -1 here on a non-empty belief (drive() always sets a real survivor).
-    const int survivor = decision_.survivor_slot;
-    assert(survivor != -1 && "gumbel(cursor): SH returned no survivor on a non-empty belief");
-    decision_.action = action_of_slot(p_.env_, SlotIndex{static_cast<LayoutRep>(survivor)});
+    // survivor_slot is the typed-SlotIndex Decision field set by drive()/resume(); it is never nullopt
+    // here on a non-empty belief (drive() always sets a real survivor — typed presence over the -1 sentinel).
+    assert(decision_.survivor_slot.has_value() &&
+           "gumbel(cursor): SH returned no survivor on a non-empty belief");
+    decision_.action = action_of_slot(p_.env_, *decision_.survivor_slot);
 
     // HPO/BENCHMARK-ONLY no-early-exit substitution (cfg_.no_early_exit; default false -> skipped, the
     // decision byte-unchanged). Identical to run_search's tail.
@@ -493,7 +493,7 @@ void TreeCursor::finalize() {
             }
         }
         if (best_slot.has_value()) {
-            decision_.survivor_slot = static_cast<int>(best_slot->value());  // ACL: Decision field raw int
+            decision_.survivor_slot = best_slot;  // typed SlotIndex (the substituted survivor)
             decision_.action = action_of_slot(p_.env_, *best_slot);
         }
     }

@@ -110,10 +110,11 @@ Environment::Environment(const Instance& inst) : inst_(inst) {
     // stride (ADR-0012 P1 — one contiguous home, env still owns them). Order = face id (== faces order).
     face_masks_.reserve(inst_.faces.size());
     for (const Face& f : inst_.faces) face_masks_.push_back(f.bitmask);
-    // resolve the entry teleport index
-    entry_idx_ = 0;
+    // resolve the entry teleport index. The std::vector index k is the raw container-position boundary;
+    // wrap it into the TeleportId domain at this seam (ADR-0000 item 5).
+    entry_idx_ = TeleportId{0};
     for (size_t k = 0; k < inst_.teleport_names.size(); ++k) {
-        if (inst_.teleport_names[k] == inst_.entry) { entry_idx_ = static_cast<int>(k); break; }
+        if (inst_.teleport_names[k] == inst_.entry) { entry_idx_ = TeleportId{static_cast<GeometryIdRep>(k)}; break; }
     }
 
     // ---- the bitset-arm gate + env-static masks (§4; built ONCE here, homed like face_masks_, P1) ----

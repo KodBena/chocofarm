@@ -157,17 +157,21 @@ int main(int argc, char** argv) {
     // --- compare: executed action, improved-π argmax, n_spent, survivor slot, AND the leaf sequence ---
     const bool exec_ok = (direct.action == cdec.action);
     const bool argmax_ok = (argmax(direct.improved) == argmax(cdec.improved));
-    const bool nspent_ok = (direct.n_spent == cdec.n_spent);
-    const bool survivor_ok = (direct.survivor_slot == cdec.survivor_slot);
+    const bool nspent_ok = (direct.n_spent == cdec.n_spent);                // SimBudget == SimBudget
+    const bool survivor_ok = (direct.survivor_slot == cdec.survivor_slot);  // optional<SlotIndex> == optional<SlotIndex>
     bool seq_ok = (direct_seq.size() == cursor_seq.size());
     if (seq_ok)
         for (size_t i = 0; i < direct_seq.size(); ++i)
             if (direct_seq[i] != cursor_seq[i]) { seq_ok = false; break; }
 
-    std::cout << "direct:  survivor_slot=" << direct.survivor_slot << " argmax=" << argmax(direct.improved)
-              << " n_spent=" << direct.n_spent << " leaves=" << direct_seq.size() << "\n";
-    std::cout << "cursor:  survivor_slot=" << cdec.survivor_slot << " argmax=" << argmax(cdec.improved)
-              << " n_spent=" << cdec.n_spent << " leaves=" << cursor_seq.size() << " (driven via cursor="
+    // .value() at the ostream boundary; the optional<SlotIndex> renders its slot or -1 for "no survivor".
+    auto slot_str = [](const std::optional<chocofarm::SlotIndex>& s) {
+        return s ? static_cast<int>(s->value()) : -1;
+    };
+    std::cout << "direct:  survivor_slot=" << slot_str(direct.survivor_slot) << " argmax=" << argmax(direct.improved)
+              << " n_spent=" << direct.n_spent.value() << " leaves=" << direct_seq.size() << "\n";
+    std::cout << "cursor:  survivor_slot=" << slot_str(cdec.survivor_slot) << " argmax=" << argmax(cdec.improved)
+              << " n_spent=" << cdec.n_spent.value() << " leaves=" << cursor_seq.size() << " (driven via cursor="
               << leaves << ")\n";
 
     if (exec_ok && argmax_ok && nspent_ok && survivor_ok && seq_ok) {

@@ -347,6 +347,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << exec_slot << " " << argmax_slot << " " << dec.n_spent << "\n";
+    std::cout << exec_slot << " " << argmax_slot << " " << dec.n_spent.value() << "\n";  // .value() at the ostream boundary
     return 0;
 }

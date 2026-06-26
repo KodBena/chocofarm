@@ -235,7 +235,7 @@ class Environment {
     // ---- geometry ----
     double dist(const Point& a, const Point& b) const;        // std::hypot (mirrors env.d/math.hypot)
     double exit_cost(const Point& loc) const;                 // min teleport dist + tp (env.exit_cost)
-    Point entry_point() const { return inst_.teleports[entry_idx_]; }
+    Point entry_point() const { return inst_.teleports[entry_idx_.value()]; }
     Point treasure_pt(int i) const { return inst_.treasures[i]; }
     Point face_pt(int i) const { return inst_.faces[i].rep_point; }
     // Per-treasure reward magnitude (mirrors env.value[i]). The live instance carries unit values
@@ -350,7 +350,7 @@ class Environment {
     Instance inst_;
     std::vector<World> worlds_;
     std::vector<uint32_t> face_masks_;  // contiguous per-detector cover bitmasks (face_masks(); built in ctor)
-    int entry_idx_ = 0;
+    TeleportId entry_idx_{0};  // the entry teleport's id (indexes inst_.teleports; .value() at the index ACL)
 
     // ---- bitset arm gate + env-static masks (built in the ctor, P1) ----
     bool use_bitset_ = false;   // the gate decision (§4): worlds enumerable AND mask_bytes <= budget
