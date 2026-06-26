@@ -319,6 +319,32 @@ std::span<const float> GumbelAZPolicy::eval_build_features(GumbelNode& node, con
     return feat;
 }
 
+// ADDITIVE (the BatchPredict measurement seam, batch_predict.hpp lever #3 — NOT on the production path):
+// the cheap TAIL of eval_build_features when the feature ROW was built ELSEWHERE (the in-process batched
+// featurizer produced it for the whole tile). It narrows the supplied float64 row to ws.feat32, slices the
+// legal mask off it, and collects node.legal_slots — BYTE-IDENTICAL to eval_build_features's tail (same
+// fb_.legal_mask_into / legal-slot collection), only fb_.build_into (the per-leaf belief sweep) is SKIPPED
+// because the batch already did it. Used solely by the multiplexed producer-compute A/B harness's BATCHED
+// arm; the production cursor/runtime never calls it (eval_build_features stays the live path). `row` MUST be
+// a length-dim() build()/featurize_batch row for THIS (loc, bw, collected) (the legal_mask_from_features
+// coupling, asserted downstream in legal_mask_into). Returns the feat32 span (valid until the next leaf).
+std::span<const float> GumbelAZPolicy::eval_legal_from_features(GumbelNode& node,
+                                                               std::span<const double> row,
+                                                               FeatureWorkspace& ws) const {
+    ws.feat32.assign(row.begin(), row.end());  // the wire dtype the port consumes (float32) — same narrow
+    std::span<const float> feat(ws.feat32);
+    fb_.legal_mask_into(feat, ws.mask);
+    const std::vector<float>& mask = ws.mask;
+    node.legal_slots.clear();
+    const int N = env_.N(), nD = env_.n_detectors();  // ACL: env cardinalities raw int (env.hpp)
+    for (int i = 0; i < N; ++i)
+        if (mask[static_cast<size_t>(i)] != 0.0f) node.legal_slots.push_back(SlotIndex{static_cast<LayoutRep>(i)});
+    for (int j = 0; j < nD; ++j)
+        if (mask[static_cast<size_t>(N + j)] != 0.0f) node.legal_slots.push_back(SlotIndex{static_cast<LayoutRep>(N + j)});
+    node.legal_slots.push_back(term_slot_);  // TERMINATE is always legal
+    return feat;
+}
+
 // The post-predict half of evaluate(): given the leaf NetPrediction, build node.prior (the float64
 // masked softmax, narrowed to its float32 store — the 1b seam-1) + store node.value — BYTE-IDENTICAL to
 // evaluate()'s tail (same masked_softmax_1a_into, same per-element float32 store). node.legal_slots must

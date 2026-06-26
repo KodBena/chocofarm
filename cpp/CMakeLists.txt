@@ -135,6 +135,7 @@ add_library(chocofarm_core
   src/instance.cpp
   src/env.cpp
   src/features.cpp
+  src/batch_predict.cpp
   src/feature_layout.cpp
   src/transport.cpp
   src/net.cpp
@@ -280,6 +281,28 @@ target_compile_options(chocofarm-belief-sweep-oracle-check PRIVATE -Wall -Wextra
 add_executable(chocofarm-belief-sweep-bench src/belief_sweep_bench.cpp)
 target_link_libraries(chocofarm-belief-sweep-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-belief-sweep-bench PRIVATE -Wall -Wextra)
+
+# The BatchPredict (lever #3, IN-PROCESS) component bench + bit-identity gate (NOT the runner): the
+# BatchFeaturizer's mask-resident tiled AVX2 belief sweep + the production assembly. The gate asserts every
+# batched feature ROW == B per-leaf FeatureBuilder::build byte-for-byte; the A/B times the batched featurizer
+# vs B per-leaf belief_features across B in {8,32,64} (interleaved/paired, bootstrap CI). Separate executable
+# (ADR-0012 P3, one-owner). No redis/net — pure compute.
+add_executable(chocofarm-batch-predict-bench src/batch_predict_bench.cpp)
+target_link_libraries(chocofarm-batch-predict-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-batch-predict-bench PRIVATE -Wall -Wextra)
+
+# The PRODUCER-LEVEL A/B for the BatchPredict featurizer (lever #3): the MULTIPLEXED-cursor producer-COMPUTE
+# harness (NOT the runner, NO inference server — a DetNet stand-in). Drives K resumable TreeCursors
+# multiplexed in the producer's round-sync park-collect-resume loop; the PER-LEAF arm builds each cursor's
+# feature row at park (the production eval_build_features), the BATCHED arm collects the K parked (loc,bw,
+# collected) and calls BatchFeaturizer::featurize_batch ONCE per RTT (deferred-featurize). It asserts the two
+# arms' multiplexed searches are BIT-IDENTICAL (decisions + per-leaf rows), then times full producer-COMPUTE
+# us/decision BATCHED vs PER-LEAF across K in {8,32,64} (interleaved/paired, bootstrap CI). This turns the
+# featurizer-level +27% into the PRODUCER-LEVEL number. Separate executable (ADR-0012 P3, one-owner); ADDITIVE
+# — does not rewire the production real_producer. No redis/net — pure compute.
+add_executable(chocofarm-mux-producer-compute-bench src/multiplexed_producer_compute_bench.cpp)
+target_link_libraries(chocofarm-mux-producer-compute-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-mux-producer-compute-bench PRIVATE -Wall -Wextra)
 
 # The ISOLATED belief-FILTER microbench + bit-exact A/B (NOT the runner): times the branchless
 # chocofarm::filter_inplace against the former branchy erase(remove_if) across belief sizes, and asserts

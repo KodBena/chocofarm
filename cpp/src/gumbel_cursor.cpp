@@ -159,13 +159,39 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
     return drive();  // advance the c_outcome loop / finish the sim
 }
 
+// ---- ADDITIVE: resume a deferred-featurize park with an externally-built feature row ---------------
+// The BATCHED arm's resume (the BatchPredict A/B harness). The driver collected this cursor's parked
+// (loc, bw, collected) along with the other K-1 cursors', ran ONE BatchFeaturizer::featurize_batch over
+// all of them, and now feeds THIS cursor its row + the net prediction. We run the byte-identical
+// legal-slots tail (eval_legal_from_features) on the supplied row to set the parked node's legal_slots —
+// exactly what eval_build_features's tail did in the PER-LEAF arm — then delegate to resume(), which
+// finishes the node (eval_finish) and continues the search. Search flow + every seam are unchanged, so the
+// decision is bit-identical to the PER-LEAF arm (the only difference is WHERE the row was computed).
+Step TreeCursor::resume_with_features(std::span<const double> row, const NetPrediction& prediction) {
+    assert(defer_featurize_ && "resume_with_features requires enable_deferred_featurize() (driver invariant)");
+    assert(parked_ && "resume_with_features on a cursor not parked at a leaf (driver invariant violation)");
+    // Build node.legal_slots + ws_.feat32 from the externally-built row (the per-leaf build's tail, sans the
+    // belief sweep the batch already did). The parked node is parked_node_ (= nodes_[0] at root-eval, the
+    // descend_stack_.back() node at a descent) — the same node resume() will eval_finish.
+    (void)p_.eval_legal_from_features(nodes_[static_cast<size_t>(parked_node_.value())], row, ws_);
+    return resume(prediction);
+}
+
 // ---- start: build the root node + its eval features, park -----------------------------------------
 void TreeCursor::start_root() {
     nodes_.clear();
     nodes_.emplace_back(n_slots_);  // root at arena index 0; dense W/N
     p_.fb_.reset_belief_cache();    // scope the belief memo to this decision (mirrors run_search)
-    // build the root features into the cursor's OWN workspace and park (eval_finish runs on resume).
-    (void)p_.eval_build_features(nodes_[0], loc_, bw_, collected_, ws_);
+    // Record the parked leaf's (node, loc, bw, collected) for the deferred-featurize seam (the BatchPredict
+    // A/B harness reads them; harmless on the production path — just pointer stores). The root-eval leaf is
+    // the decision-level (loc_, bw_, collected_).
+    parked_node_ = NodeIndex{0};
+    parked_loc_ = &loc_; parked_bw_ = &bw_; parked_coll_ = &collected_;
+    // build the root features into the cursor's OWN workspace and park (eval_finish runs on resume) — UNLESS
+    // deferred (the BATCHED arm: the driver batch-featurizes the parked triple + resumes via
+    // resume_with_features, which runs the legal-slots tail on the supplied row). Search flow is identical.
+    if (!defer_featurize_)
+        (void)p_.eval_build_features(nodes_[0], loc_, bw_, collected_, ws_);
     parked_ = true;
 }
 
@@ -374,8 +400,13 @@ Step TreeCursor::pump_descent() {
                     unwind_with(val);
                     return CursorDecided{};  // descent done (no-leaf return); drive() handles c_outcome
                 }
-                // depth-cap leaf eval: park.
-                (void)p_.eval_build_features(node, descent_loc_, descent_bw_, descent_coll_, ws_);
+                // depth-cap leaf eval: park. Record the parked (node, loc, bw, collected) for the deferred-
+                // featurize seam; build features now UNLESS deferred (the BATCHED arm builds them in the
+                // driver via featurize_batch + resume_with_features — identical search flow).
+                parked_node_ = f.node;
+                parked_loc_ = &descent_loc_; parked_bw_ = &descent_bw_; parked_coll_ = &descent_coll_;
+                if (!defer_featurize_)
+                    (void)p_.eval_build_features(node, descent_loc_, descent_bw_, descent_coll_, ws_);
                 parked_ = true;
                 return CursorNeedsLeaf{ws_.feat32};
             }
@@ -389,7 +420,12 @@ Step TreeCursor::pump_descent() {
         // not at the boundary: if unevaluated, this is the first visit -> eval leaf (park). descend()
         // returns node.value immediately after this eval (the leaf estimate; no W/N touch here).
         if (!node.evaluated) {
-            (void)p_.eval_build_features(node, descent_loc_, descent_bw_, descent_coll_, ws_);
+            // first-visit leaf eval: park. Record the parked (node, loc, bw, collected) for the deferred-
+            // featurize seam; build features now UNLESS deferred (the BATCHED arm — identical search flow).
+            parked_node_ = f.node;
+            parked_loc_ = &descent_loc_; parked_bw_ = &descent_bw_; parked_coll_ = &descent_coll_;
+            if (!defer_featurize_)
+                (void)p_.eval_build_features(node, descent_loc_, descent_bw_, descent_coll_, ws_);
             parked_ = true;
             return CursorNeedsLeaf{ws_.feat32};
         }

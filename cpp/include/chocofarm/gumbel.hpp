@@ -384,6 +384,15 @@ class GumbelAZPolicy final : public Policy {
     [[nodiscard]] std::span<const float> eval_build_features(GumbelNode& node, const Loc& loc,
                                                              const Belief& bw, const CollectedSet& collected,
                                                              FeatureWorkspace& ws) const;
+    // ADDITIVE (the BatchPredict measurement seam, lever #3 — NOT the production path): the cheap tail of
+    // eval_build_features when the feature ROW was built ELSEWHERE (the in-process batched featurizer). It
+    // narrows the supplied float64 row to ws.feat32 + slices legal_mask + collects node.legal_slots —
+    // BYTE-IDENTICAL to eval_build_features's tail, only fb_.build_into (the per-leaf belief sweep) is
+    // SKIPPED (the batch did it). Solely for the multiplexed producer-compute A/B harness's BATCHED arm; the
+    // production cursor calls eval_build_features (this is never on the live path).
+    [[nodiscard]] std::span<const float> eval_legal_from_features(GumbelNode& node,
+                                                                 std::span<const double> row,
+                                                                 FeatureWorkspace& ws) const;
     void eval_finish(GumbelNode& node, const NetPrediction& pred, FeatureWorkspace& ws) const;
 
     // The SH-cut σ-prefactor for the root node (sigma_scale_1a(root, c_visit, c_scale)) — re-exposed for

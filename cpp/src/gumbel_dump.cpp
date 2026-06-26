@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
     }
 
     chocofarm::GumbelConfig cfg;
+    // SearchBudget ACL: the typed GumbelConfig knobs cross from the raw CLI int at parse (the boundary).
     if (auto v = opt(args, "--m"))
         cfg.m = chocofarm::CandidateCount{static_cast<chocofarm::CandidateCount::rep_type>(to_int(*v))};
     if (auto v = opt(args, "--n-sims"))
