@@ -107,12 +107,16 @@ int main(int argc, char** argv) {
     const int timeout_ms = opt(args, "--timeout-ms") ? to_int(*opt(args, "--timeout-ms")) : 15000;
     const double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
     chocofarm::GumbelConfig cfg;
-    cfg.n_sims = 12;
-    cfg.max_depth = 8;
-    if (auto v = opt(args, "--m")) cfg.m = to_int(*v);
-    if (auto v = opt(args, "--n-sims")) cfg.n_sims = to_int(*v);
-    if (auto v = opt(args, "--max-depth")) cfg.max_depth = to_int(*v);
-    if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = to_int(*v);
+    cfg.n_sims = chocofarm::SimBudget{12};
+    cfg.max_depth = chocofarm::PlyDepth{8};
+    if (auto v = opt(args, "--m"))
+        cfg.m = chocofarm::CandidateCount{static_cast<chocofarm::CandidateCount::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--n-sims"))
+        cfg.n_sims = chocofarm::SimBudget{static_cast<chocofarm::SimBudget::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--max-depth"))
+        cfg.max_depth = chocofarm::PlyDepth{static_cast<chocofarm::PlyDepth::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--c-outcome"))
+        cfg.c_outcome = chocofarm::OutcomeIndex{static_cast<chocofarm::OutcomeIndex::rep_type>(to_int(*v))};
 
     // the SSOT parallelism knobs (env defaults), with CLI overrides.
     chocofarm::RuntimeConfig rc = chocofarm::RuntimeConfig::from_env();
@@ -132,9 +136,9 @@ int main(int argc, char** argv) {
     chocofarm::CollectedSet coll;
 
     std::cout << "config: tasks=" << n_tasks << " threads=" << T << " batch=" << rc.batch_size
-              << " fibers_per_thread=" << K << " m=" << cfg.m << " n_sims=" << cfg.n_sims
-              << " max_depth=" << cfg.max_depth << " endpoint=" << *endpoint
-              << " n_slots=" << chocofarm::n_action_slots(env) << "\n";
+              << " fibers_per_thread=" << K << " m=" << cfg.m.value() << " n_sims=" << cfg.n_sims.value()
+              << " max_depth=" << cfg.max_depth.value() << " endpoint=" << *endpoint
+              << " n_slots=" << chocofarm::n_action_slots(env).value() << "\n";
 
     void* zctx = zmq_ctx_new();
     std::atomic<long> leaf_total{0};

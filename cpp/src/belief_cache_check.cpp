@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
 
     if (!ok) return 1;
     const auto k = env.belief_key(bw1);
-    std::cout << "RESULT: PASS belief-memo collision guard + hit-exactness (dim=" << fb.dim()
+    std::cout << "RESULT: PASS belief-memo collision guard + hit-exactness (dim=" << fb.dim().value()
               << ", shared fingerprint=(" << std::get<0>(k) << "," << std::get<1>(k) << ","
               << std::get<2>(k) << "))\n";
     return 0;

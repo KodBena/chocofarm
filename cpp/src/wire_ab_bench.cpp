@@ -166,10 +166,10 @@ int main(int argc, char** argv) {
         ? (to_int(*opt(args, "--lab-decision")) != 0) : false;
 
     GumbelConfig gc;  // the Stage B operating point: m=24, n_sims=256 (overridable)
-    gc.m = opt(args, "--m") ? to_int(*opt(args, "--m")) : 24;
-    gc.n_sims = opt(args, "--n-sims") ? to_int(*opt(args, "--n-sims")) : 256;
-    if (auto v = opt(args, "--max-depth")) gc.max_depth = to_int(*v);
-    if (auto v = opt(args, "--c-outcome")) gc.c_outcome = to_int(*v);
+    gc.m = CandidateCount{static_cast<CandidateCount::rep_type>(opt(args, "--m") ? to_int(*opt(args, "--m")) : 24)};
+    gc.n_sims = SimBudget{static_cast<SimBudget::rep_type>(opt(args, "--n-sims") ? to_int(*opt(args, "--n-sims")) : 256)};
+    if (auto v = opt(args, "--max-depth")) gc.max_depth = PlyDepth{static_cast<PlyDepth::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--c-outcome")) gc.c_outcome = OutcomeIndex{static_cast<OutcomeIndex::rep_type>(to_int(*v))};
 
     WireRunnerConfig wcfg;
     wcfg.endpoint = std::string(*endpoint);
@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
         stats_out = &stats_file;
     }
 
-    std::cout << "config: wire-mode=" << *wire_mode << " m=" << gc.m << " n_sims=" << gc.n_sims
+    std::cout << "config: wire-mode=" << *wire_mode << " m=" << gc.m.value() << " n_sims=" << gc.n_sims.value()
               << " threads=" << wcfg.pool_threads << " pool_batch=" << wcfg.pool_batch
               << " inflight_D=" << wcfg.max_inflight_msgs
               << " trees_per_thread=" << wcfg.trees_per_thread
@@ -357,7 +357,7 @@ int main(int argc, char** argv) {
     //       the rate is a steady-state quantity so the NUMBER is unchanged from the old meter.
     const int K_base = (wcfg.pool_batch + wcfg.pool_threads - 1) / std::max(1, wcfg.pool_threads);
     const int total_slots = wcfg.pool_threads * std::max(1, wcfg.trees_per_thread) * std::max(1, K_base);
-    const int n_slots = n_action_slots(env);
+    const int n_slots = static_cast<int>(n_action_slots(env).value());
 
     // Count recorded decisions (rows) across a pass's episodes — the true search-work numerator (dps).
     auto count_decisions = [&](const std::string& tok, int n_eps) -> long {

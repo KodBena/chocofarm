@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     chocofarm::Environment env(*inst);
-    DetNet net(chocofarm::n_action_slots(env));
+    DetNet net(chocofarm::n_action_slots(env).value());
 
     // a batch of independent root-state tasks, one RNG seed each.
     chocofarm::Loc root_loc{env.entry_point()};
@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
         t.bw = root_bw;
         t.collected = root_collected;
         t.lam = lam;
-        t.seed = static_cast<std::uint64_t>(i) + 1;
+        t.seed = chocofarm::RngSeed{static_cast<std::uint64_t>(i) + 1};
         t.cfg = cfg;
         tasks.push_back(std::move(t));
     }
@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
     std::cout << "config: tasks=" << n_tasks << " workers=" << workers << " reps=" << reps
               << " m=" << cfg.m.value() << " n_sims=" << cfg.n_sims.value() << " max_depth=" << cfg.max_depth.value()
               << " c_outcome=" << cfg.c_outcome.value() << " lam=" << lam
-              << " n_slots=" << chocofarm::n_action_slots(env) << "\n";
+              << " n_slots=" << chocofarm::n_action_slots(env).value() << "\n";
 
     chocofarm::SerialRuntime serial(net);
     chocofarm::PoolRuntime pool(net, workers);
@@ -157,8 +157,8 @@ int main(int argc, char** argv) {
         const chocofarm::Decision& s = (*serial_ref)[i];
         const chocofarm::Decision& p = (*pool_ref)[i];
         if (!(s.executed == p.executed) || s.leaf_requests != p.leaf_requests) ++mismatches;
-        leaf_total += s.leaf_requests;
-        leaf_per_task.push_back(s.leaf_requests);
+        leaf_total += s.leaf_requests.value();
+        leaf_per_task.push_back(static_cast<int>(s.leaf_requests.value()));
     }
     if (mismatches != 0) {
         std::cout << "RESULT: FAIL (" << mismatches << " mismatches between serial and parallel)\n";

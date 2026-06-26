@@ -102,7 +102,7 @@ class DetNet final : public NetEvaluator {
 // the final Decision.action matches. This validates the arm the wire driver runs (CRITIQUE F1).
 [[nodiscard]] bool layer2_structural(const Environment& env, const GumbelConfig& gc, double lam,
                                      uint64_t seed) {
-    DetNet net(n_action_slots(env));
+    DetNet net(static_cast<int>(n_action_slots(env).value()));
     Loc loc{env.entry_point()};
     Belief bw = env.full_belief();
     CollectedSet coll;
@@ -223,11 +223,11 @@ int main(int argc, char** argv) {
     const double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
     const int n_seeds = opt(args, "--seeds") ? to_int(*opt(args, "--seeds")) : 2;
     GumbelConfig gc;
-    gc.n_sims = 48;
-    if (auto v = opt(args, "--m")) gc.m = to_int(*v);
-    if (auto v = opt(args, "--n-sims")) gc.n_sims = to_int(*v);
-    if (auto v = opt(args, "--max-depth")) gc.max_depth = to_int(*v);
-    if (auto v = opt(args, "--c-outcome")) gc.c_outcome = to_int(*v);
+    gc.n_sims = SimBudget{48};
+    if (auto v = opt(args, "--m")) gc.m = CandidateCount{static_cast<CandidateCount::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--n-sims")) gc.n_sims = SimBudget{static_cast<SimBudget::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--max-depth")) gc.max_depth = PlyDepth{static_cast<PlyDepth::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--c-outcome")) gc.c_outcome = OutcomeIndex{static_cast<OutcomeIndex::rep_type>(to_int(*v))};
 
     auto inst = load_instance(*instance, *faces);
     if (!inst) {
@@ -236,7 +236,7 @@ int main(int argc, char** argv) {
     }
     Environment env(*inst);
     FeatureBuilder fb(env);
-    const int n_slots = n_action_slots(env);
+    const int n_slots = static_cast<int>(n_action_slots(env).value());
 
     auto redis = RedisClient::create();
     if (!redis) {

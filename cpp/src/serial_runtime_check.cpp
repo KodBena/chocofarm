@@ -74,7 +74,7 @@ class DetNet final : public chocofarm::NetEvaluator {
 
 // The executed action's slot (for printing / comparison), mirroring gumbel_dump's slot encoding.
 [[nodiscard]] int exec_slot(const chocofarm::Environment& env, const chocofarm::Action& a) {
-    if (a.kind == chocofarm::ActionKind::Terminate) return chocofarm::term_slot(env);
+    if (a.kind == chocofarm::ActionKind::Terminate) return static_cast<int>(chocofarm::term_slot(env).value());
     if (a.kind == chocofarm::ActionKind::Treasure) return a.i;
     return env.N() + a.i;
 }
@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     chocofarm::Environment env(*inst);
-    DetNet net(chocofarm::n_action_slots(env));
+    DetNet net(chocofarm::n_action_slots(env).value());
 
     // A batch of independent tasks at the root state, varying the seed AND the budget, so the seam is
     // exercised across distinct RNG streams and distinct cfgs. A reduced budget keeps the check fast
@@ -106,13 +106,13 @@ int main(int argc, char** argv) {
     chocofarm::CollectedSet root_collected;
 
     chocofarm::GumbelConfig small;
-    small.m = 6;
-    small.n_sims = 12;
-    small.max_depth = 6;
-    small.c_outcome = 1;
+    small.m = chocofarm::CandidateCount{6};
+    small.n_sims = chocofarm::SimBudget{12};
+    small.max_depth = chocofarm::PlyDepth{6};
+    small.c_outcome = chocofarm::OutcomeIndex{1};
     chocofarm::GumbelConfig smaller = small;
-    smaller.m = 4;
-    smaller.n_sims = 8;
+    smaller.m = chocofarm::CandidateCount{4};
+    smaller.n_sims = chocofarm::SimBudget{8};
 
     std::vector<chocofarm::SearchTask> tasks;
     for (std::uint64_t seed = 1; seed <= 6; ++seed) {
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
         t.bw = root_bw;
         t.collected = root_collected;
         t.lam = 0.1;
-        t.seed = seed;
+        t.seed = chocofarm::RngSeed{seed};
         t.cfg = (seed % 2 == 0) ? small : smaller;  // alternate the budget across tasks
         tasks.push_back(std::move(t));
     }
@@ -147,15 +147,15 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < tasks.size(); ++i) {
         const chocofarm::SearchTask& t = tasks[i];
         chocofarm::GumbelAZPolicy direct(t.cfg, net, env);
-        std::mt19937_64 rng(t.seed);
+        std::mt19937_64 rng(t.seed.value());
         chocofarm::Action ref = direct.decide(env, t.loc, t.bw, t.collected, t.lam, rng);
 
         int serial = exec_slot(env, decisions[i].executed);
         int reference = exec_slot(env, ref);
-        bool ok = (decisions[i].executed == ref) && (decisions[i].leaf_requests > 0);
+        bool ok = (decisions[i].executed == ref) && (decisions[i].leaf_requests.value() > 0);
         if (!ok) ++mismatches;
         std::cout << "task " << i << ": serial=" << serial << " direct=" << reference
-                  << " leaves=" << decisions[i].leaf_requests << " " << (ok ? "OK" : "MISMATCH") << "\n";
+                  << " leaves=" << decisions[i].leaf_requests.value() << " " << (ok ? "OK" : "MISMATCH") << "\n";
     }
 
     if (mismatches == 0) {

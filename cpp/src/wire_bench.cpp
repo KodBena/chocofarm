@@ -70,12 +70,16 @@ int main(int argc, char** argv) {
     const int timeout_ms = opt(args, "--timeout-ms") ? to_int(*opt(args, "--timeout-ms")) : 10000;
     const double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
     chocofarm::GumbelConfig cfg;
-    cfg.n_sims = 12;   // a modest default: each leaf is a wire RPC, so keep the RPC count bounded
-    cfg.max_depth = 8;
-    if (auto v = opt(args, "--m")) cfg.m = to_int(*v);
-    if (auto v = opt(args, "--n-sims")) cfg.n_sims = to_int(*v);
-    if (auto v = opt(args, "--max-depth")) cfg.max_depth = to_int(*v);
-    if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = to_int(*v);
+    cfg.n_sims = chocofarm::SimBudget{12};   // a modest default: each leaf is a wire RPC, so keep the RPC count bounded
+    cfg.max_depth = chocofarm::PlyDepth{8};
+    if (auto v = opt(args, "--m"))
+        cfg.m = chocofarm::CandidateCount{static_cast<chocofarm::CandidateCount::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--n-sims"))
+        cfg.n_sims = chocofarm::SimBudget{static_cast<chocofarm::SimBudget::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--max-depth"))
+        cfg.max_depth = chocofarm::PlyDepth{static_cast<chocofarm::PlyDepth::rep_type>(to_int(*v))};
+    if (auto v = opt(args, "--c-outcome"))
+        cfg.c_outcome = chocofarm::OutcomeIndex{static_cast<chocofarm::OutcomeIndex::rep_type>(to_int(*v))};
 
     auto inst = chocofarm::load_instance(*instance, *faces);
     if (!inst) {
@@ -102,14 +106,14 @@ int main(int argc, char** argv) {
         t.bw = root_bw;
         t.collected = root_collected;
         t.lam = lam;
-        t.seed = static_cast<std::uint64_t>(i) + 1;
+        t.seed = chocofarm::RngSeed{static_cast<std::uint64_t>(i) + 1};
         t.cfg = cfg;
         tasks.push_back(std::move(t));
     }
 
-    std::cout << "config: tasks=" << n_tasks << " m=" << cfg.m << " n_sims=" << cfg.n_sims
-              << " max_depth=" << cfg.max_depth << " c_outcome=" << cfg.c_outcome << " lam=" << lam
-              << " endpoint=" << *endpoint << " n_slots=" << chocofarm::n_action_slots(env) << "\n";
+    std::cout << "config: tasks=" << n_tasks << " m=" << cfg.m.value() << " n_sims=" << cfg.n_sims.value()
+              << " max_depth=" << cfg.max_depth.value() << " c_outcome=" << cfg.c_outcome.value() << " lam=" << lam
+              << " endpoint=" << *endpoint << " n_slots=" << chocofarm::n_action_slots(env).value() << "\n";
 
     chocofarm::SerialRuntime serial(*client);
     auto t0 = std::chrono::steady_clock::now();
@@ -123,7 +127,7 @@ int main(int argc, char** argv) {
     }
 
     long leaf_total = 0;
-    for (const chocofarm::Decision& d : *result) leaf_total += d.leaf_requests;
+    for (const chocofarm::Decision& d : *result) leaf_total += d.leaf_requests.value();
     const double wall = secs(t0, t1);
     const double dps = static_cast<double>(n_tasks) / wall;
     const double us_per_leaf = leaf_total > 0 ? (wall * 1e6 / static_cast<double>(leaf_total)) : 0.0;
