@@ -357,15 +357,25 @@ std::vector<double> FeatureBuilder::build(const Point& loc, const Belief& bw,
 
 void FeatureBuilder::build_into(const Point& loc, const Belief& bw, const CollectedSet& collected,
                                 std::vector<double>& out) const {
+    // The belief sweep is the O(nb·(N+nD)) bottleneck (memoized by belief VALUE — a hit is P6 bit-identical
+    // to a recompute). The assembly (geometry + collected + the named-block writes) lives ONCE in
+    // assemble_into (P1), shared with the batched-featurizer seam (batch_predict.hpp): build_into looks up
+    // the belief features here, then delegates — byte-identical to the former monolith (same bf, same body).
+    const BeliefFeatures& bf = belief_feats_(bw);
+    assemble_into(loc, bf, collected, out);
+}
+
+void FeatureBuilder::assemble_into(const Point& loc, const BeliefFeatures& bf,
+                                   const CollectedSet& collected, std::vector<double>& out) const {
     // Raw block-extent reps of the typed cardinalities (.value()) — the per-block write loops run over the
     // raw range [0, count); the WRITE position is the typed block-start offset + the raw within-block index.
     const TreasureRep N = N_.value();
     const GeometryIdRep nD = nD_.value();
     const GeometryIdRep n_tel = n_tel_.value();
 
-    // Three input groups that do not interact until assembly (the dossier's DAG): belief math (the
-    // O(nb·(N+nD)) bottleneck), separable geometry, the collected indicator. Each is a pure unit.
-    const BeliefFeatures& bf = belief_feats_(bw);          // memoized by belief VALUE (P6 bit-identical hit)
+    // Three input groups that do not interact until assembly (the dossier's DAG): belief math (supplied as
+    // the precomputed `bf` — memoized by build_into, batch-computed by the seam), separable geometry, the
+    // collected indicator. The geometry is memoized by loc; the collected indicator is written inline.
     const GeometryFeatures& gf = geometry_feats_(loc);     // memoized by loc
     // The collected indicator is written DIRECTLY into out[off_.collected] below (out is pre-zeroed by
     // assign, so non-collected slots stay 0) and read back for the `available`/`sum_unc` couplings;

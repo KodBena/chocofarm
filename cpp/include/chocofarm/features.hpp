@@ -148,6 +148,20 @@ class FeatureBuilder {
     void build_into(const Point& loc, const Belief& bw, const CollectedSet& collected,
                     std::vector<double>& out) const;
 
+    // The batched-featurizer entry (the BatchPredict seam, batch_predict.hpp): assemble the length-dim()
+    // float64 feature row from an ALREADY-COMPUTED BeliefFeatures (the in-process batched belief sweep
+    // produced it for the whole tile) + the per-loc geometry memo + the collected indicator — i.e.
+    // build_into's body with the belief sweep HOISTED OUT. The WRITTEN VALUES are byte-identical to
+    // build_into(loc, bw, collected, out) for the bf = belief_features(env, bw) of THIS bw (P6): it is the
+    // SAME assemble step (same geometry_feats_ memo, same named-block writes, same float-op order — the
+    // sum_unc accumulation, the per-i unc/available), only the belief sweep is supplied rather than memoized
+    // here. The seam exists so the batched component can drive the production assembly without forking its
+    // float order; build_into delegates to it after its own memo lookup (the ONE body, ADR-0012 P1). `loc`
+    // must be a named env coordinate (the per-loc memo key contract, as in build_into). NOT memoized on bf
+    // (the batched caller owns the BeliefFeatures lifetime + dedup).
+    void assemble_into(const Point& loc, const BeliefFeatures& bf, const CollectedSet& collected,
+                       std::vector<double>& out) const;
+
     // The legal-action mask sliced from an ALREADY-BUILT feature vector (mirrors
     // actions.legal_mask_from_features): the per-treasure `available` block IS the collect-legal mask,
     // the per-detector `informative` block IS the sense-legal mask, TERMINATE always legal. The hot-path

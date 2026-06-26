@@ -135,6 +135,7 @@ add_library(chocofarm_core
   src/instance.cpp
   src/env.cpp
   src/features.cpp
+  src/batch_predict.cpp
   src/feature_layout.cpp
   src/transport.cpp
   src/net.cpp
@@ -280,6 +281,15 @@ target_compile_options(chocofarm-belief-sweep-oracle-check PRIVATE -Wall -Wextra
 add_executable(chocofarm-belief-sweep-bench src/belief_sweep_bench.cpp)
 target_link_libraries(chocofarm-belief-sweep-bench PRIVATE chocofarm_core)
 target_compile_options(chocofarm-belief-sweep-bench PRIVATE -Wall -Wextra)
+
+# The BatchPredict (lever #3, IN-PROCESS) component bench + bit-identity gate (NOT the runner): the
+# BatchFeaturizer's mask-resident tiled AVX2 belief sweep + the production assembly. The gate asserts every
+# batched feature ROW == B per-leaf FeatureBuilder::build byte-for-byte; the A/B times the batched featurizer
+# vs B per-leaf belief_features across B in {8,32,64} (interleaved/paired, bootstrap CI). Separate executable
+# (ADR-0012 P3, one-owner). No redis/net — pure compute.
+add_executable(chocofarm-batch-predict-bench src/batch_predict_bench.cpp)
+target_link_libraries(chocofarm-batch-predict-bench PRIVATE chocofarm_core)
+target_compile_options(chocofarm-batch-predict-bench PRIVATE -Wall -Wextra)
 
 # The ISOLATED belief-FILTER microbench + bit-exact A/B (NOT the runner): times the branchless
 # chocofarm::filter_inplace against the former branchy erase(remove_if) across belief sizes, and asserts
