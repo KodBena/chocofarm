@@ -273,6 +273,16 @@ add_executable(chocofarm-belief-sweep-oracle-check src/belief_sweep_oracle_check
 target_link_libraries(chocofarm-belief-sweep-oracle-check PRIVATE chocofarm_core)
 target_compile_options(chocofarm-belief-sweep-oracle-check PRIVATE -Wall -Wextra)
 
+# The DE-RISK EXPORT tool for idea #1 (the fused-JAX matmul featurization — docs/notes/
+# batchpredict-throughput-design-2026-06-26.md): dumps, as one JSON blob, the env-static
+# world_feature_matrix in its native column-bitset form (treasure_mask/detector_mask over worlds()-rank
+# space) PLUS a spread of reference (belief_indicator rank-bitset, C++ belief_features double-precision)
+# pairs — the parity oracle the JAX f32 matmul is diffed against (cpp/parity/jax_matmul_featurization.py).
+# An ADDITIVE prototype: reads env + belief_features only, no production path. Separate (P3, one-owner).
+add_executable(chocofarm-belief-features-export src/belief_features_export.cpp)
+target_link_libraries(chocofarm-belief-features-export PRIVATE chocofarm_core nlohmann_json::nlohmann_json)
+target_compile_options(chocofarm-belief-features-export PRIVATE -Wall -Wextra)
+
 # The ISOLATED belief-sweep microbenchmark (NOT the runner): times chocofarm::belief_features alone (no
 # search / wire / cache / geometry) across belief sizes, so a sweep optimizer (pospopcount / inline-masks
 # / decision-diagram) iterates with a clean per-world signal. Drives the compute via feature_compute.hpp.
