@@ -87,14 +87,21 @@ namespace chocofarm {
 // NetEvaluator, not a scalar) stays a separate construction param, exactly as Python keeps the net
 // out of the scalar config. Defaults match the Python defaults: m=12, n_sims=48, c_puct=1.25,
 // c_visit=50, c_scale=1.0, c_outcome=2, max_depth=24.
+// SEARCH-BUDGET DOMAIN NOTE (ADR-0000 / ADR-0012 P8): the four integer knobs are NOT collapsed into one
+// "SearchBudget" type — domains.hpp already mints the RIGHT-GRAINED, distinct domains they each are (a
+// candidate-set width, a sim budget, an outcome-determinization count, a ply-depth cap), and the search
+// core already wrapped each knob into its proper domain at every use. Typing the FIELDS with those existing
+// domains DELETES the per-use static_cast<SearchRep> wraps; a single merged SearchBudget would re-merge
+// four deliberately-distinct domains (the count-vs-index discipline ADR-0008 keeps). The .value()/explicit
+// ctor crossings now live only at the CLI parse + the ostream prints (the true boundaries). See the ledger.
 struct GumbelConfig {
-    int m = 12;            // root actions — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
-    int n_sims = 48;       // SH budget — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
+    CandidateCount m{12};      // root actions (the Gumbel-Top-k considered-set width)
+    SimBudget n_sims{48};      // SH sim budget
     double c_puct = 1.25;  // PUCT exploration constant
     double c_visit = 50.0; // the Danihelka σ-transform visit prefactor (c_visit + max_a N(a))
     double c_scale = 1.0;  // the Danihelka σ-transform scale
-    int c_outcome = 2;     // outcome determinizations — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
-    int max_depth = 24;    // descent depth cap — NOLINT(dmz: search-budget config knob + hot loop bound; SearchBudget domain filed)
+    OutcomeIndex c_outcome{2}; // outcome determinizations (the count that bounds the 0..c_outcome-1 index k — the existing shared OutcomeIndex domain, domains.hpp)
+    PlyDepth max_depth{24};    // descent depth cap
     // HPO/BENCHMARK-ONLY (default false → production search byte-unchanged). When true, the search runs
     // EXACTLY as normal (Gumbel-Top-k, Sequential Halving, the early-exit Terminate edge SAMPLED and
     // BACKPROPPED correctly) — but if the chosen EXECUTED action is Terminate AND a non-terminate legal

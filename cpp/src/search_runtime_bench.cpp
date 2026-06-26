@@ -96,11 +96,11 @@ int main(int argc, char** argv) {
     const int workers = opt(args, "--workers") ? to_int(*opt(args, "--workers")) : 4;
     const int reps = opt(args, "--reps") ? to_int(*opt(args, "--reps")) : 3;
     const double lam = opt(args, "--lam") ? to_double(*opt(args, "--lam")) : 0.1;
-    chocofarm::GumbelConfig cfg;
-    if (auto v = opt(args, "--m")) cfg.m = to_int(*v);
-    if (auto v = opt(args, "--n-sims")) cfg.n_sims = to_int(*v);
-    if (auto v = opt(args, "--max-depth")) cfg.max_depth = to_int(*v);
-    if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = to_int(*v);
+    chocofarm::GumbelConfig cfg;  // CLI parse is the boundary: wrap raw to_int into the typed config domains.
+    if (auto v = opt(args, "--m")) cfg.m = chocofarm::CandidateCount{static_cast<chocofarm::SearchRep>(to_int(*v))};
+    if (auto v = opt(args, "--n-sims")) cfg.n_sims = chocofarm::SimBudget{static_cast<chocofarm::SearchRep>(to_int(*v))};
+    if (auto v = opt(args, "--max-depth")) cfg.max_depth = chocofarm::PlyDepth{static_cast<chocofarm::SearchRep>(to_int(*v))};
+    if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = chocofarm::OutcomeIndex{static_cast<chocofarm::SearchRep>(to_int(*v))};
 
     auto inst = chocofarm::load_instance(*instance, *faces);
     if (!inst) {
@@ -128,8 +128,8 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "config: tasks=" << n_tasks << " workers=" << workers << " reps=" << reps
-              << " m=" << cfg.m << " n_sims=" << cfg.n_sims << " max_depth=" << cfg.max_depth
-              << " c_outcome=" << cfg.c_outcome << " lam=" << lam
+              << " m=" << cfg.m.value() << " n_sims=" << cfg.n_sims.value() << " max_depth=" << cfg.max_depth.value()
+              << " c_outcome=" << cfg.c_outcome.value() << " lam=" << lam
               << " n_slots=" << chocofarm::n_action_slots(env) << "\n";
 
     chocofarm::SerialRuntime serial(net);

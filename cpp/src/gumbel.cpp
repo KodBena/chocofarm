@@ -400,8 +400,8 @@ SlotIndex GumbelAZPolicy::puct_select(const GumbelNode& node) const {
 double GumbelAZPolicy::descend(NodePool& nodes, int node, const Loc& loc,
                                const Belief& bw, const CollectedSet& collected,
                                World world, double lam, GumbelSource& src, PlyDepth depth) const {
-    // ACL: cfg_.max_depth is a raw int (GumbelConfig, the CLI-set config) -> PlyDepth at the depth cap.
-    const PlyDepth max_depth{static_cast<SearchRep>(cfg_.max_depth)};
+    // cfg_.max_depth is now a PlyDepth directly (the config field carries its domain); no wrap at the cap.
+    const PlyDepth max_depth = cfg_.max_depth;
     if (depth >= max_depth || env_.empty(bw)) {
         if (!nodes[static_cast<size_t>(node)].evaluated) {
             if (env_.empty(bw)) return -lam * env_.exit_cost(loc.pt);
@@ -455,9 +455,10 @@ double GumbelAZPolicy::simulate_root_action(NodePool& nodes, const Loc& loc,
     if (a.kind == ActionKind::Terminate) return -lam * env_.exit_cost(loc.pt);
     // outcome-averaging over c_outcome determinizations of the IMMEDIATE outcome (k=0 reuses the
     // threaded world; k>0 draws a fresh world from the belief — mirrors _simulate_root_action). k is an
-    // OutcomeIndex (the k==0 reuse vs k>0 redraw distinction); cfg_.c_outcome is a raw int (config ACL).
+    // OutcomeIndex (the k==0 reuse vs k>0 redraw distinction); cfg_.c_outcome is now an OutcomeIndex
+    // directly (the shared count/index domain — domains.hpp), the bound on the determinization loop.
     double total = 0.0;
-    const OutcomeIndex c_outcome{static_cast<SearchRep>(cfg_.c_outcome)};
+    const OutcomeIndex c_outcome = cfg_.c_outcome;
     for (OutcomeIndex k{0}; k < c_outcome; k = k + SearchRep{1}) {
         World w = (k == OutcomeIndex{0}) ? world : src.sample_world(bw);
         Loc nloc = loc;  // COPY: apply computes dt = dist(OLD loc, target) then moves nloc to target
@@ -478,7 +479,7 @@ double GumbelAZPolicy::simulate_root_action(NodePool& nodes, const Loc& loc,
         double cont = descend(nodes, child, nloc, nbw, nc, w, lam, src, PlyDepth{1});
         total += step + cont;
     }
-    return total / static_cast<double>(cfg_.c_outcome);
+    return total / static_cast<double>(cfg_.c_outcome.value());  // OutcomeIndex -> the double divisor ACL
 }
 
 // ---- run `count` sims of root action `slot` (mirrors _visit) --------------------------------------
@@ -504,8 +505,8 @@ SlotIndex GumbelAZPolicy::sequential_halving(NodePool& nodes, const Loc& loc,
     // non-empty belief always has >=1 legal slot => >=1 candidate). The former defensive `return -1` is a
     // typed-absence non-state now (SlotIndex carries no -1); assert the invariant (ADR-0002/P9 own-state).
     assert(!considered.empty() && "sequential_halving on an empty candidate set (caller contract)");
-    // ACL: cfg_.n_sims is a raw int (GumbelConfig, CLI-set) -> SimBudget at the budget seed.
-    const SimBudget n_sims{static_cast<SearchRep>(cfg_.n_sims)};
+    // cfg_.n_sims is now a SimBudget directly (the config field carries its domain); no wrap at the seed.
+    const SimBudget n_sims = cfg_.n_sims;
     if (considered.size() == 1) {
         visit(nodes, loc, bw, collected, considered[0], lam, src, n_sims);
         n_spent = n_sims;
@@ -516,7 +517,7 @@ SlotIndex GumbelAZPolicy::sequential_halving(NodePool& nodes, const Loc& loc,
     // std::max/std::min/division mix the raw ints the formulas demand, crossed at .value()/wrap.
     const CandidateCount m{static_cast<SearchRep>(considered.size())};
     int n_phases = std::max(1, static_cast<int>(std::ceil(std::log2(static_cast<double>(m.value())))));
-    SimBudget per_phase{static_cast<SearchRep>(std::max(1, cfg_.n_sims / n_phases))};  // paper's N/⌈log2 m⌉
+    SimBudget per_phase{static_cast<SearchRep>(std::max(1, static_cast<int>(n_sims.value()) / n_phases))};  // paper's N/⌈log2 m⌉ (SimBudget.value() at the division ACL)
     SimBudget budget = n_sims;
 
     while (considered.size() > 1 && budget > SimBudget{0}) {
@@ -661,8 +662,9 @@ GumbelAZPolicy::Decision GumbelAZPolicy::run_search(const Loc& loc, const Belief
                      [](const std::pair<double, SlotIndex>& a, const std::pair<double, SlotIndex>& b) {
                          return a.first > b.first;
                      });
-    // m = min(self.m, #legal): a CandidateCount. cfg_.m is a raw int (GumbelConfig, CLI-set) -> the ACL.
-    int m = std::min(cfg_.m, static_cast<int>(nodes[0].legal_slots.size()));
+    // m = min(self.m, #legal): cfg_.m is now a CandidateCount; .value() at the std::min with the raw
+    // legal-slot size (the hot top-m loop counter stays a raw int — the loop-mod carve-out).
+    int m = std::min(static_cast<int>(cfg_.m.value()), static_cast<int>(nodes[0].legal_slots.size()));
     std::vector<SlotIndex> considered;
     considered.reserve(static_cast<size_t>(m));
     for (int i = 0; i < m; ++i) considered.push_back(scored[static_cast<size_t>(i)].second);

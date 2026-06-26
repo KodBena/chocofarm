@@ -108,8 +108,9 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
                          [](const std::pair<double, SlotIndex>& a, const std::pair<double, SlotIndex>& b) {
                              return a.first > b.first;
                          });
-        // m = min(self.m, #legal): a CandidateCount; cfg_.m is a raw int (GumbelConfig, CLI-set).
-        int m = std::min(p_.cfg_.m, static_cast<int>(nodes_[0].legal_slots.size()));
+        // m = min(self.m, #legal): cfg_.m is now a CandidateCount; .value() at the std::min (the hot
+        // top-m loop counter stays a raw int — the loop-mod carve-out).
+        int m = std::min(static_cast<int>(p_.cfg_.m.value()), static_cast<int>(nodes_[0].legal_slots.size()));
         considered_.clear();
         considered_.reserve(static_cast<size_t>(m));
         for (int i = 0; i < m; ++i) considered_.push_back(scored[static_cast<size_t>(i)].second);
@@ -128,12 +129,12 @@ Step TreeCursor::resume(const NetPrediction& prediction) {
             sh_single_ = true;
             cur_root_slot_ = considered_[0];
         } else {
-            // ACL: cfg_.n_sims is a raw int (GumbelConfig). m_sz/n_phases are CandidateCount; the budget
-            // family is SimBudget.
+            // cfg_.n_sims is now a SimBudget directly. m_sz/n_phases are raw ints the log2/division demand;
+            // .value() at the per-phase division ACL, same-domain store for the budget.
             int m_sz = static_cast<int>(considered_.size());
             int n_phases = std::max(1, static_cast<int>(std::ceil(std::log2(static_cast<double>(m_sz)))));
-            sh_per_phase_ = SimBudget{static_cast<SearchRep>(std::max(1, p_.cfg_.n_sims / n_phases))};
-            sh_budget_ = SimBudget{static_cast<SearchRep>(p_.cfg_.n_sims)};
+            sh_per_phase_ = SimBudget{static_cast<SearchRep>(std::max(1, static_cast<int>(p_.cfg_.n_sims.value()) / n_phases))};
+            sh_budget_ = p_.cfg_.n_sims;
             // start the first phase's per-action loop
             SimBudget phase_budget{std::min(sh_per_phase_.value(), sh_budget_.value())};
             sh_per_action_ = SimBudget{static_cast<SearchRep>(std::max(
@@ -191,8 +192,8 @@ Step TreeCursor::drive() {
             // simulate_root_action's c_outcome loop. cur_k_ is the NEXT determinization to start; each
             // started determinization either parks (returns up via resume) or completes its descent
             // synchronously (a no-leaf path), folding its (step + descend cont) into sim_total_.
-            // ACL: cfg_.c_outcome is a raw int (GumbelConfig) -> OutcomeIndex at the loop bound.
-            if (cur_k_ < OutcomeIndex{static_cast<SearchRep>(p_.cfg_.c_outcome)}) {
+            // cfg_.c_outcome is now an OutcomeIndex directly (the shared count/index domain); same-domain compare.
+            if (cur_k_ < p_.cfg_.c_outcome) {
                 // k==0 reuses the visit-drawn world (cur_world_), k>0 draws fresh — the IDENTICAL draw
                 // order simulate_root_action uses (no draw for k==0, one sample_world per k>0).
                 World w = (cur_k_ == OutcomeIndex{0}) ? cur_world_ : src_.sample_world(bw_);
@@ -228,7 +229,7 @@ Step TreeCursor::drive() {
                 continue;  // loop: pump_descent drives the new frame (park or complete)
             }
             // c_outcome loop finished for this root action: the sim value is sim_total_/c_outcome.
-            double ret = sim_total_ / static_cast<double>(p_.cfg_.c_outcome);
+            double ret = sim_total_ / static_cast<double>(p_.cfg_.c_outcome.value());  // OutcomeIndex -> the double divisor ACL
             on_sim_complete(ret);
             continue;
         }
@@ -237,7 +238,7 @@ Step TreeCursor::drive() {
         // the budget is exhausted.
         // --- the lone-candidate fast path: visit n_sims on considered_[0] ---
         if (sh_single_) {
-            if (n_spent_ < SimBudget{static_cast<SearchRep>(p_.cfg_.n_sims)}) {  // ACL: cfg_.n_sims raw int
+            if (n_spent_ < p_.cfg_.n_sims) {  // cfg_.n_sims is a SimBudget — same-domain compare
                 cur_root_slot_ = considered_[0];
                 cur_world_ = src_.sample_world(bw_);  // visit(): w = src.sample_world(bw)
                 cur_k_ = OutcomeIndex{0};
@@ -361,8 +362,8 @@ Step TreeCursor::pump_descent() {
         // members (NOT the frame). f is the back() frame, so descent_* IS its state (the descent narrowed
         // them in place to this depth). No per-frame belief copy is read here.
 
-        // descend()'s top: depth>=max_depth || empty(bw). ACL: cfg_.max_depth is a raw int (GumbelConfig).
-        if (f.depth >= PlyDepth{static_cast<SearchRep>(p_.cfg_.max_depth)} || p_.env_.empty(descent_bw_)) {
+        // descend()'s top: depth>=max_depth || empty(bw). cfg_.max_depth is a PlyDepth — same-domain compare.
+        if (f.depth >= p_.cfg_.max_depth || p_.env_.empty(descent_bw_)) {
             if (!node.evaluated) {
                 if (p_.env_.empty(descent_bw_)) {
                     // empty belief: return -lam*exit_cost (NO leaf, NO eval).
