@@ -236,8 +236,8 @@ class FeatureBuilder {
     static constexpr int kDefaultBeliefCacheCap = 16;
     mutable std::map<BeliefKey, std::vector<std::pair<Belief, BeliefFeatures>>> belief_cache_;
     mutable std::deque<BeliefKey> belief_fifo_;  // insertion order, for single-entry FIFO eviction
-    mutable int belief_cache_n_ = 0;
-    const int belief_cache_cap_ = belief_cache_cap();  // resolved once per builder (env read is one-shot)
+    mutable int belief_cache_n_ = 0;  // NOLINT(dmz: generic memo-residency count, NOT a modeled domain — see the cap-family note above; no class foreclosed, ADR-0000 "no class at stake")
+    const int belief_cache_cap_ = belief_cache_cap();  // resolved once per builder (env read is one-shot) — NOLINT(dmz: generic cache-backstop capacity, NOT a domain magnitude — ADR-0000 over-typing carve, see note above)
     mutable std::unordered_map<Point, GeometryFeatures, PointHash, PointEq> loc_cache_;
 
     // Thin memo wrappers: look up, compute-on-miss via the private pure functions, store, return a ref.
