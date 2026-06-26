@@ -25,7 +25,9 @@
 #pragma once
 
 #include <bit>
+#include <cstddef>
 #include <cstdint>
+#include <immintrin.h>  // AVX2 vpshufb popcount (the de-risk +74% lever; build is -march=native => AVX2)
 #include <optional>
 #include <span>
 
@@ -33,28 +35,61 @@
 
 namespace chocofarm {
 
+// ---- AVX2 vpshufb popcount kernel (the de-risk's +74% lever, throughput-derisk-verdict-2026-06-26): the
+// belief sweep is popcount-throughput-bound with masks L2-resident, and scalar POPCNT is port-1-bound at
+// 1 word/cyc while vpshufb does 4 words/instr across ports. Build is -march=native (AVX2); the
+// [[gnu::target("avx2")]] makes the codegen explicit + inlinable into the (also-native) callers. popcount is
+// EXACT + order-independent, so these return the SAME integer count as the old scalar loop — bit-identical
+// belief_features / count_ (the belief-sweep oracle nets it byte-for-byte). ----
+namespace detail {
+// nibble-LUT popcount of 4x uint64 lanes, horizontally summed per 64-bit lane (sad_epu8).
+[[gnu::target("avx2")]] inline __m256i popcnt256(__m256i v) {
+    const __m256i lut = _mm256_setr_epi8(
+        0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4, 0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4);
+    const __m256i lo_mask = _mm256_set1_epi8(0x0f);
+    const __m256i lo = _mm256_and_si256(v, lo_mask);
+    const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), lo_mask);
+    const __m256i pc = _mm256_add_epi8(_mm256_shuffle_epi8(lut, lo), _mm256_shuffle_epi8(lut, hi));
+    return _mm256_sad_epu8(pc, _mm256_setzero_si256());
+}
+[[gnu::target("avx2")]] inline std::uint64_t hsum256(__m256i acc) {
+    std::uint64_t t[4]; _mm256_storeu_si256(reinterpret_cast<__m256i*>(t), acc);
+    return t[0] + t[1] + t[2] + t[3];
+}
+// popcount(b & m) over W words: 4 words/iter (AVX2) + scalar tail.
+[[gnu::target("avx2")]] inline std::uint64_t pc_and_avx2(const std::uint64_t* b, const std::uint64_t* m, std::size_t W) {
+    __m256i acc = _mm256_setzero_si256();
+    std::size_t w = 0;
+    for (; w + 4 <= W; w += 4)
+        acc = _mm256_add_epi64(acc, popcnt256(_mm256_and_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + w)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(m + w)))));
+    std::uint64_t s = hsum256(acc);
+    for (; w < W; ++w) s += static_cast<std::uint64_t>(std::popcount(b[w] & m[w]));
+    return s;
+}
+// popcount(b) over W words (no mask) — the count_ recompute.
+[[gnu::target("avx2")]] inline std::uint64_t pc_all_avx2(const std::uint64_t* b, std::size_t W) {
+    __m256i acc = _mm256_setzero_si256();
+    std::size_t w = 0;
+    for (; w + 4 <= W; w += 4)
+        acc = _mm256_add_epi64(acc, popcnt256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + w))));
+    std::uint64_t s = hsum256(acc);
+    for (; w < W; ++w) s += static_cast<std::uint64_t>(std::popcount(b[w]));
+    return s;
+}
+}  // namespace detail
+
 // popcount over the whole belief — the cached count_'s definition (recompute count_ after a filter).
-// Returns a typed WorldCount. ZERO-COST ACL: the hot loop accumulates a RAW WorldCountRep over the raw
-// span (so the AVX popcount auto-vectorizer sees a plain-integer reduction), re-wrapped ONCE at return.
 [[nodiscard]] inline WorldCount popcount_all(std::span<const uint64_t> bits) {
-    WorldCountRep s = 0;
-    for (uint64_t w : bits) s += static_cast<WorldCountRep>(std::popcount(w));
-    return WorldCount{s};
+    return WorldCount{static_cast<WorldCountRep>(detail::pc_all_avx2(bits.data(), bits.size()))};
 }
 
-// popcount(belief & mask): the masked overlap count — the bitset twin of a per-world predicate sum
-// (marginals[t] = Σ_w bit_t(w), the detector cover cnt[j], the informative split test). Words stride
-// together. Same zero-cost ACL: raw-rep accumulation over the raw spans, re-wrap at the boundary.
+// popcount(belief & mask): the masked overlap count — marginals[t]=Σ_w bit_t(w), the detector cover cnt[j],
+// the informative split test. AVX2 vpshufb kernel (the de-risk +74% lever); bits/mask are exactly kW64
+// words by construction; bit-identical to the prior scalar loop (popcount exact + order-independent).
 [[nodiscard]] inline WorldCount popcount_and(std::span<const uint64_t> bits, std::span<const uint64_t> mask) {
-    // The shared word stride as the typed WordCount (the .size() ACL: a container size_t -> a word count;
-    // bits/mask are exactly kW64 words by construction). The inner index + accumulator stay RAW inside the
-    // sweep (the documented zero-cost vectorizer ACL above — the AVX popcount/AND loop sees plain integers),
-    // re-wrapped into WorldCount ONCE at the return boundary.
-    const WordCount nwords{static_cast<WordRep>(bits.size())};
-    WorldCountRep s = 0;
-    for (WordRep w = 0; w < nwords.value(); ++w)
-        s += static_cast<WorldCountRep>(std::popcount(bits[w] & mask[w]));
-    return WorldCount{s};
+    return WorldCount{static_cast<WorldCountRep>(detail::pc_and_avx2(bits.data(), mask.data(), bits.size()))};
 }
 
 // The r-th set bit's GLOBAL index (0-based world RANK): scan words, early-exit on the containing word,

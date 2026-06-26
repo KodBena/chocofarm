@@ -186,13 +186,14 @@ int main(int argc, char** argv) {
     }
 
     chocofarm::GumbelConfig cfg;
-    if (auto v = opt(args, "--m")) cfg.m = to_int(*v);
-    if (auto v = opt(args, "--n-sims")) cfg.n_sims = to_int(*v);
+    // SearchBudget ACL: the typed GumbelConfig knobs cross from the raw CLI int at parse (the boundary).
+    if (auto v = opt(args, "--m")) cfg.m = chocofarm::CandidateCount{static_cast<unsigned>(to_int(*v))};
+    if (auto v = opt(args, "--n-sims")) cfg.n_sims = chocofarm::SimBudget{static_cast<unsigned>(to_int(*v))};
     if (auto v = opt(args, "--c-puct")) cfg.c_puct = to_double(*v);
     if (auto v = opt(args, "--c-visit")) cfg.c_visit = to_double(*v);
     if (auto v = opt(args, "--c-scale")) cfg.c_scale = to_double(*v);
-    if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = to_int(*v);
-    if (auto v = opt(args, "--max-depth")) cfg.max_depth = to_int(*v);
+    if (auto v = opt(args, "--c-outcome")) cfg.c_outcome = chocofarm::OutcomeIndex{static_cast<unsigned>(to_int(*v))};
+    if (auto v = opt(args, "--max-depth")) cfg.max_depth = chocofarm::PlyDepth{static_cast<unsigned>(to_int(*v))};
     // HPO/BENCHMARK-ONLY no-early-exit (default false). A presence flag (no value): when present the
     // executed-action Terminate substitution in run_search is exercised, so the parity test can compare
     // flag-off vs flag-on executed action on the SAME scripted input (gumbel.hpp GumbelConfig::no_early_exit).
